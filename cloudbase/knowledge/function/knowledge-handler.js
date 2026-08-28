@@ -31,6 +31,7 @@ const uploadHeaderNames = [
 ]
 const actionKeys = {
   beginSync: ['action', 'requestId', 'knowledgeBaseId', 'name', 'revision', 'generationId'],
+  beginGeneration: ['action', 'requestId', 'knowledgeBaseId', 'name', 'revision', 'generationId'],
   authorizeUpload: ['action', 'requestId', 'knowledgeBaseId', 'documentId', 'versionId', 'byteSize', 'sha256', 'mimeType'],
   completeUpload: ['action', 'uploadTicket'],
   pushMutation: ['action', 'mutationId', 'knowledgeBaseId', 'entityKind', 'entityId', 'operation', 'baseRevision', 'payload'],
@@ -250,6 +251,7 @@ function validResponse(action, value) {
   if (safeSerializedSize(value) > maximumResponseBytes || !isRecord(value)) return false
   switch (action) {
     case 'beginSync':
+    case 'beginGeneration':
       return exactKeys(value, ['knowledgeBaseId', 'generationId', 'status'])
         && nonEmptyString(value.knowledgeBaseId) && nonEmptyString(value.generationId)
         && value.status === 'staging'
@@ -669,12 +671,15 @@ function parseAction(event, uid) {
   const common = { p_caller_user_id: uid }
   switch (event.action) {
     case 'beginSync':
+    case 'beginGeneration':
       if (!nonEmptyString(event.requestId)
         || !validStorageSegment(event.knowledgeBaseId)
         || !nonEmptyString(event.name, 200)
         || !nonEmptyString(event.revision)
         || !nonEmptyString(event.generationId)) return undefined
-      return ['autoforge_knowledge_begin_sync', {
+      return [event.action === 'beginSync'
+        ? 'autoforge_knowledge_begin_sync'
+        : 'autoforge_knowledge_begin_generation', {
         ...common, p_request_id: event.requestId, p_knowledge_base_id: event.knowledgeBaseId,
         p_name: event.name, p_revision: event.revision, p_generation_id: event.generationId,
       }]
@@ -1009,7 +1014,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
       }
       if (!validResponse(event.action, data)) throw { code: 'INTERNAL_ERROR' }
       if ((event.action === 'pushMutation' && data.mutationId !== event.mutationId)
-        || (event.action === 'beginSync'
+        || ((event.action === 'beginSync' || event.action === 'beginGeneration')
           && (data.knowledgeBaseId !== event.knowledgeBaseId
             || data.generationId !== event.generationId))
         || (event.action === 'publishGeneration' && data.generationId !== event.generationId)
@@ -1026,9 +1031,13 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
   }
 }
 
-function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
+function createEmbeddingGenerationWorker({ rpc, tokenHub, maximumChunksPerRun = 24 }) {
   if (!rpc || !tokenHub || typeof tokenHub.embed !== 'function') {
     throw new Error('Embedding worker is not configured')
+  }
+  if (!Number.isSafeInteger(maximumChunksPerRun)
+    || maximumChunksPerRun < 1 || maximumChunksPerRun > 24) {
+    throw new Error('Embedding worker batch limit is invalid')
   }
   return {
     async run({ workerId, jobId, leaseToken }) {
@@ -1037,14 +1046,14 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
       }
       const batch = await rpc('autoforge_knowledge_claim_embedding_batch', {
         p_worker_id: workerId, p_job_id: jobId, p_lease_token: leaseToken,
-        p_limit: 24,
+        p_limit: maximumChunksPerRun,
       })
       if (safeSerializedSize(batch) > maximumResponseBytes || !exactKeys(batch, [
         'ownerId', 'knowledgeBaseId', 'generationId', 'consentEpoch', 'chunks',
       ]) || !nonEmptyString(batch.ownerId, 64) || !nonEmptyString(batch.knowledgeBaseId)
         || !nonEmptyString(batch.generationId)
         || !Number.isSafeInteger(batch.consentEpoch) || batch.consentEpoch < 0
-        || !Array.isArray(batch.chunks) || batch.chunks.length > 24
+        || !Array.isArray(batch.chunks) || batch.chunks.length > maximumChunksPerRun
         || batch.chunks.some(chunk => !exactKeys(chunk, ['id', 'versionId', 'body'])
           || !nonEmptyString(chunk.id) || !nonEmptyString(chunk.versionId)
           || typeof chunk.body !== 'string'
@@ -1113,7 +1122,7 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
         }
         currentBatch = await rpc('autoforge_knowledge_claim_embedding_batch', {
           p_worker_id: workerId, p_job_id: jobId, p_lease_token: leaseToken,
-          p_limit: 24,
+          p_limit: maximumChunksPerRun,
         })
         if (safeSerializedSize(currentBatch) > maximumResponseBytes || !exactKeys(currentBatch, [
           'ownerId', 'knowledgeBaseId', 'generationId', 'consentEpoch', 'chunks',
@@ -1121,13 +1130,15 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
           || currentBatch.knowledgeBaseId !== batch.knowledgeBaseId
           || currentBatch.generationId !== batch.generationId
           || currentBatch.consentEpoch !== batch.consentEpoch
-          || !Array.isArray(currentBatch.chunks) || currentBatch.chunks.length > 24
+          || !Array.isArray(currentBatch.chunks)
+          || currentBatch.chunks.length > maximumChunksPerRun
           || currentBatch.chunks.some(chunk => !exactKeys(chunk, ['id', 'versionId', 'body'])
             || !nonEmptyString(chunk.id) || !nonEmptyString(chunk.versionId)
             || typeof chunk.body !== 'string'
             || Buffer.byteLength(chunk.body, 'utf8') > 64 * 1024)) {
           throw { code: 'INTERNAL_ERROR' }
         }
+        if (currentBatch.chunks.length > 0) return { state: 'partial', embedded }
       }
     },
   }

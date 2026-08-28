@@ -25,7 +25,8 @@ Stop if the two forward migrations are not byte-identical.
 
 ## Staging gates
 
-1. Apply the migration in an isolated staging database. Prove every knowledge
+1. Apply `0001_personal_knowledge.sql` and then the additive
+   `0002_personal_knowledge_workers.sql` in an isolated staging database. Prove every knowledge
    table has forced RLS, direct client roles have no table or RPC grants, all
    owner/base/document/object joins use their composite owner keys, and the
    entitlement row defaults to `kill_switch_enabled = true`.
@@ -34,6 +35,12 @@ Stop if the two forward migrations are not byte-identical.
    `AUTOFORGE_PG_STORAGE_UPLOAD_URL_PREFIX`, and `AUTOFORGE_PG_SERVICE_KEY`
    supplied only by the server-side secret manager.
    Confirm the deployed checksum and the one-MiB response ceiling.
+   Separately package `cloudbase/knowledge` from its root `index.js` and root
+   `package.json`, deploy it as the scheduled `autoforge-knowledge-worker`, and
+   inject the PostgreSQL RPC/Storage service credentials plus TokenHub endpoint
+   and key only from the server-side secret manager. Its private Storage adapter
+   additionally requires `POST /objects/read` with an exact byte-size/SHA-256
+   response contract. Never expose worker RPCs or worker credentials to Electron.
 3. With anonymous, Alice, and Bob staging identities, probe every action.
    Anonymous and forged-owner events must fail; cross-owner reads, upload
    tickets, publications, jobs, cleanup, and deletion must expose and mutate
@@ -50,9 +57,11 @@ Stop if the two forward migrations are not byte-identical.
    retention-floor cursor receives one transactionally materialized,
    owner-scoped snapshot through bounded stable pages,
    and the 90-day cleanup advances the durable floor before pruning changes.
-7. Verify job claim and completion CAS with token and expiry. Only
+7. Verify job claim, bounded embedding yield, and completion CAS with token and expiry. Only
    `TRANSIENT_FAILURE` may retry, at most three attempts; the third expired
-   lease becomes terminal `failed`.
+   lease becomes terminal `failed`. A successful two-chunk embedding slice must
+   persist its vectors, yield the exact live lease back to `queued`, and preserve
+   the accumulated transient-failure count rather than consuming a retry.
 8. Verify purge order by instrumenting PG Storage and PostgreSQL: private bytes
    must be deleted before metadata cleanup is acknowledged. A failed Storage
    deletion must leave the durable cleanup/deletion job incomplete. The worker
@@ -81,8 +90,9 @@ publication regression, or metadata-before-Storage purge is an immediate stop.
 1. Close the cloud kill switch and stop cloud writes, reads, uploads, workers,
    and retention cleanup.
 2. Preserve desktop outboxes and conversion journals.
-3. Withdraw the function, then apply
-   `cloudbase/knowledge/migrations/0001_personal_knowledge.rollback.sql`
+3. Stop the scheduled worker, withdraw both functions, then apply
+   `cloudbase/knowledge/migrations/0002_personal_knowledge_workers.rollback.sql`
+   followed by `cloudbase/knowledge/migrations/0001_personal_knowledge.rollback.sql`
    through the approved database process.
 4. The rollback revokes the service-role function/table surface and drops
    externally callable RPC functions. It deliberately retains all tables,

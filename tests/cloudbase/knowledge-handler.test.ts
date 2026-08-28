@@ -76,6 +76,23 @@ describe('CloudBase knowledge function', () => {
     expect(rpc).toHaveBeenCalledTimes(1)
   })
 
+  it('routes additive generation staging through the authenticated RPC boundary', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      knowledgeBaseId: 'kb_1', generationId: 'generation_2', status: 'staging',
+    })
+    const handler = createKnowledgeHandler({ rpc })
+
+    await expect(handler({
+      action: 'beginGeneration', requestId: 'begin_2', knowledgeBaseId: 'kb_1',
+      name: 'Contracts', revision: 'revision_2', generationId: 'generation_2',
+    }, context)).resolves.toMatchObject({ ok: true, data: { status: 'staging' } })
+    expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_begin_generation', {
+      p_caller_user_id: context.auth.uid, p_request_id: 'begin_2',
+      p_knowledge_base_id: 'kb_1', p_name: 'Contracts', p_revision: 'revision_2',
+      p_generation_id: 'generation_2',
+    })
+  })
+
   it('rejects missing identity and invalid or oversized business input', async () => {
     const rpc = vi.fn()
     const handler = createKnowledgeHandler({ rpc })
@@ -153,6 +170,7 @@ describe('CloudBase knowledge function', () => {
     const sha256 = 'a'.repeat(64)
     const events = [
       { action: 'beginSync', requestId: 'r', knowledgeBaseId: 'kb', name: 'n', revision: 'v', generationId: 'g' },
+      { action: 'beginGeneration', requestId: 'r2', knowledgeBaseId: 'kb', name: 'n', revision: 'v2', generationId: 'g2' },
       { action: 'authorizeUpload', requestId: 'r', knowledgeBaseId: 'kb', documentId: 'd', versionId: 'v', byteSize: 1, sha256, mimeType: 'text/plain' },
       { action: 'completeUpload', uploadTicket: 't' },
       { action: 'pushMutation', mutationId: 'm', knowledgeBaseId: 'kb', entityKind: 'document', entityId: 'd', operation: 'upsert', baseRevision: null, payload: {} },
@@ -1505,5 +1523,58 @@ describe('CloudBase embedding consent and retrieval', () => {
     expect(rpc.mock.calls.map(([name]) => name)).toContain(
       'autoforge_knowledge_complete_embedding_generation',
     )
+  })
+
+  it('returns a resumable partial result after one configured embedding slice', async () => {
+    let claims = 0
+    const vector = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0)
+    const rpc = vi.fn().mockImplementation(async (name: string, parameters: {
+      p_request_id?: string
+    }) => {
+      if (name === 'autoforge_knowledge_claim_embedding_batch') {
+        claims += 1
+        return {
+          ownerId: context.auth.uid, knowledgeBaseId: 'kb_1',
+          generationId: 'generation_shadow', consentEpoch: 4,
+          chunks: claims === 1 ? [
+            { id: 'chunk_1', versionId: 'version_1', body: 'one' },
+            { id: 'chunk_2', versionId: 'version_1', body: 'two' },
+          ] : [{ id: 'chunk_3', versionId: 'version_1', body: 'three' }],
+        }
+      }
+      if (name === 'autoforge_knowledge_issue_embedding_dispatch_permit') {
+        return { ...permit('chunk', parameters.p_request_id ?? ''), consentEpoch: 4 }
+      }
+      if (name === 'autoforge_knowledge_reserve_embedding_dispatch_attempt') {
+        return { reserved: true }
+      }
+      if (name === 'autoforge_knowledge_mark_embedding_dispatch_started') {
+        return { started: true }
+      }
+      if (name === 'autoforge_knowledge_record_embedding_dispatch_settlement_intent') {
+        return { recorded: true }
+      }
+      if (name === 'autoforge_knowledge_settle_embedding_dispatch_attempt') {
+        return { settled: true }
+      }
+      if (name === 'autoforge_knowledge_assert_embedding_consent') {
+        return { enabled: true, consentEpoch: 4 }
+      }
+      if (name === 'autoforge_knowledge_store_embedding') return { stored: true }
+      throw new Error(`unexpected rpc ${name}`)
+    })
+    const tokenHub = { embed: vi.fn().mockResolvedValue(vector) }
+    const worker = createEmbeddingGenerationWorker({
+      rpc, tokenHub, maximumChunksPerRun: 2,
+    })
+
+    await expect(worker.run({
+      workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1',
+    })).resolves.toEqual({ state: 'partial', embedded: 2 })
+    expect(claims).toBe(2)
+    expect(tokenHub.embed).toHaveBeenCalledTimes(2)
+    expect(rpc.mock.calls.some(([name]) => (
+      name === 'autoforge_knowledge_complete_embedding_generation'
+    ))).toBe(false)
   })
 })

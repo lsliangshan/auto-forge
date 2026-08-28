@@ -13,6 +13,18 @@ const rollbackUrl = new URL(
   '../../cloudbase/knowledge/migrations/0001_personal_knowledge.rollback.sql',
   import.meta.url,
 )
+const workerCanonicalUrl = new URL(
+  '../../cloudbase/migrations/20260828210000_personal_knowledge_workers.sql',
+  import.meta.url,
+)
+const workerFeatureUrl = new URL(
+  '../../cloudbase/knowledge/migrations/0002_personal_knowledge_workers.sql',
+  import.meta.url,
+)
+const workerRollbackUrl = new URL(
+  '../../cloudbase/knowledge/migrations/0002_personal_knowledge_workers.rollback.sql',
+  import.meta.url,
+)
 
 const tables = [
   'knowledge_bases',
@@ -68,6 +80,47 @@ describe('CloudBase personal knowledge migration', () => {
       readFile(featureUrl, 'utf8'),
     ])
     expect(canonical).toBe(feature)
+  })
+
+  it('ships additive mirrored worker RPCs with a data-preserving rollback', async () => {
+    const [canonicalWorker, featureWorker, rollbackWorker] = await Promise.all([
+      readFile(workerCanonicalUrl, 'utf8'), readFile(workerFeatureUrl, 'utf8'),
+      readFile(workerRollbackUrl, 'utf8'),
+    ])
+    expect(canonicalWorker).toBe(featureWorker)
+    for (const name of [
+      'autoforge_knowledge_begin_generation',
+      'autoforge_knowledge_get_upload_work',
+      'autoforge_knowledge_complete_upload_index',
+      'autoforge_knowledge_yield_job',
+    ]) {
+      const body = staticFunctionBodyFragment(canonicalWorker, name)
+      expect(body).toContain('FOR UPDATE')
+      expect(canonicalWorker).toContain(`REVOKE ALL ON FUNCTION public.${name}`)
+      expect(canonicalWorker).toContain(`GRANT EXECUTE ON FUNCTION public.${name}`)
+      expect(rollbackWorker).toContain(`DROP FUNCTION IF EXISTS public.${name}`)
+    }
+    const upload = staticFunctionBodyFragment(
+      canonicalWorker, 'autoforge_knowledge_complete_upload_index',
+    )
+    expect(upload).toContain("kind = 'upload'")
+    expect(upload).toContain('worker_id = p_worker_id')
+    expect(upload).toContain('lease_token = p_lease_token')
+    expect(upload).toContain('lease_expires_at > clock_timestamp()')
+    expect(upload).toContain('INSERT INTO public.knowledge_blocks')
+    expect(upload).toContain('INSERT INTO public.knowledge_chunks')
+    expect(upload).toContain('INSERT INTO public.knowledge_generation_memberships')
+    expect(upload).toContain("SET status = 'ready'")
+    expect(upload).toContain("'embedding', p_generation_id, 'queued'")
+    expect(upload).toContain("SET state = 'completed'")
+    const yielded = staticFunctionBodyFragment(
+      canonicalWorker, 'autoforge_knowledge_yield_job',
+    )
+    expect(yielded).toContain('attempt = greatest(attempt - 1, 0)')
+    expect(yielded).toContain('worker_id = p_worker_id')
+    expect(yielded).toContain('lease_token = p_lease_token')
+    expect(yielded).toContain('lease_expires_at > clock_timestamp()')
+    expect(rollbackWorker).not.toMatch(/DROP TABLE|TRUNCATE|DELETE\s+FROM/i)
   })
 
   it('uses owner-composite relationships, forced RLS, and default-deny grants', async () => {

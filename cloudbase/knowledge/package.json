@@ -1,0 +1,12 @@
+{
+  "name": "autoforge-knowledge-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "mammoth": "1.12.1",
+    "pdfjs-dist": "3.11.174"
+  }
+}
