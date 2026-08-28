@@ -569,6 +569,7 @@ interface ActiveAgentRun {
   knowledgeSelection: Readonly<KnowledgeSelection>
   knowledgeSearchScope?: KnowledgeSearchScope
   knowledgeSearchScopeReleased: boolean
+  knowledgeProviderConsentGeneration: number
   knowledgeEvidence: CurrentTurnKnowledgeEvidence
   knowledgeSearches: number
   knowledgeCitationRepairs: number
@@ -847,6 +848,10 @@ export class AgentOrchestrator {
   private readonly activeByExecution = new Map<string, ActiveAgentRun>()
   private readonly recognizedExecutionIds = new Set<string>()
   private readonly activeByConversation = new Map<string, string>()
+  private readonly knowledgeProviderConsentFences = new Map<
+    string,
+    { generation: number; changing: boolean }
+  >()
   private readonly id: () => string
   private readonly now: () => number
   private readonly setTimer: (callback: () => void, delayMs: number) => unknown
@@ -966,6 +971,9 @@ export class AgentOrchestrator {
         ...(input.knowledgeSearchScope === undefined
           ? {} : { knowledgeSearchScope: input.knowledgeSearchScope }),
         knowledgeSearchScopeReleased: false,
+        knowledgeProviderConsentGeneration: this.knowledgeProviderConsentFence(
+          input.userId, input.provider,
+        ).generation,
         knowledgeEvidence: new CurrentTurnKnowledgeEvidence(knowledgeSelection.baseIds),
         knowledgeSearches: 0,
         knowledgeCitationRepairs: 0,
@@ -1150,17 +1158,25 @@ export class AgentOrchestrator {
     if (!active.terminal) await this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
   }
 
-  async onKnowledgeProviderConsentRevoked(
+  beginKnowledgeProviderConsentChange(
     userId: string,
     provider: ModelProviderId,
   ): Promise<void> {
+    this.advanceKnowledgeProviderConsentFence(userId, provider, true)
     const affected = [...this.activeByRequest.values()].filter(active => (
       active.userId === userId
       && active.providerSnapshot.providerId === provider
       && active.knowledgeSelection.baseIds.length > 0
       && !active.terminal
     ))
-    await Promise.all(affected.map(active => this.cancel(active.requestId)))
+    return Promise.all(affected.map(active => this.cancel(active.requestId))).then(() => undefined)
+  }
+
+  completeKnowledgeProviderConsentChange(
+    userId: string,
+    provider: ModelProviderId,
+  ): void {
+    this.advanceKnowledgeProviderConsentFence(userId, provider, false)
   }
 
   async takeOverBrowser(requestId: string, bindingId: string, runId: string): Promise<boolean> {
@@ -1303,11 +1319,17 @@ export class AgentOrchestrator {
         active.finalToolNoticeAdded = true
       }
       if (active.knowledgeDisclosedEvidenceIds.size > 0 && this.dependencies.knowledge) {
+        if (!this.isKnowledgeProviderConsentCurrent(active)) {
+          return this.terminalizeKnowledgeConsentFence(active)
+        }
         const consent = await this.dependencies.knowledge.getProviderConsent({
           ownerId: active.userId,
           provider: active.providerSnapshot.providerId,
         })
         if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+        if (!this.isKnowledgeProviderConsentCurrent(active)) {
+          return this.terminalizeKnowledgeConsentFence(active)
+        }
         if (consent !== 'granted') {
           active.knowledgeConsentBlocked = consent === 'denied' ? 'consent_denied' : 'consent_required'
           this.setKnowledgeStatus(active, active.knowledgeConsentBlocked, active.knowledgeEvidence.snapshot().length)
@@ -1589,6 +1611,9 @@ export class AgentOrchestrator {
       this.appendKnowledgeToolExchange(active, call, assistantContent, JSON.stringify({ kind: 'tool_error', code: 'SERVICE_UNAVAILABLE' }))
       return this.drive(active)
     }
+    if (!this.isKnowledgeProviderConsentCurrent(active)) {
+      return this.blockKnowledgeSearchForConsentFence(active, call, assistantContent)
+    }
     let argumentsValue: ReturnType<typeof parseKnowledgeSearchArguments>
     try {
       argumentsValue = parseKnowledgeSearchArguments(call.arguments)
@@ -1614,6 +1639,9 @@ export class AgentOrchestrator {
           ? {} : { scope: active.knowledgeSearchScope }),
       })
       if (active.cancelled || active.controller.signal.aborted || active.terminal) throw appFailure('CANCELLED')
+      if (!this.isKnowledgeProviderConsentCurrent(active)) {
+        return this.blockKnowledgeSearchForConsentFence(active, call, assistantContent)
+      }
       result = knowledgeSearchResultSchema.parse(rawResult)
     } catch (error) {
       if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
@@ -1634,6 +1662,9 @@ export class AgentOrchestrator {
       provider: active.providerSnapshot.providerId,
     })
     if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+    if (!this.isKnowledgeProviderConsentCurrent(active)) {
+      return this.blockKnowledgeSearchForConsentFence(active, call, assistantContent)
+    }
     if (consent !== 'granted') {
       active.knowledgeConsentBlocked = consent === 'denied' ? 'consent_denied' : 'consent_required'
       this.setKnowledgeStatus(active, active.knowledgeConsentBlocked, snapshot.length)
@@ -1643,6 +1674,9 @@ export class AgentOrchestrator {
     this.setKnowledgeStatus(active, 'found', snapshot.length)
     active.knowledgeConsentBlocked = undefined
     for (const item of addedEvidence) active.knowledgeDisclosedEvidenceIds.add(item.id)
+    if (!this.isKnowledgeProviderConsentCurrent(active)) {
+      return this.blockKnowledgeSearchForConsentFence(active, call, assistantContent)
+    }
     this.appendKnowledgeToolExchange(active, call, assistantContent, active.knowledgeEvidence.providerEnvelope(addedEvidence))
     return this.drive(active)
   }
@@ -2178,6 +2212,7 @@ export class AgentOrchestrator {
     for (const evidenceId of evidenceIds) {
       const evidence = active.knowledgeEvidence.snapshot().find(item => item.id === evidenceId)
       if (!evidence) continue
+      if (!this.isKnowledgeProviderConsentCurrent(active)) throw appFailure('CANCELLED')
       const sourceAvailable = knowledge?.sourceAvailable
         ? await knowledge.sourceAvailable({
             ownerId: active.userId,
@@ -2189,6 +2224,7 @@ export class AgentOrchestrator {
           })
         : false
       if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+      if (!this.isKnowledgeProviderConsentCurrent(active)) throw appFailure('CANCELLED')
       allAvailable &&= sourceAvailable
       if (sourceAvailable) availableEvidence.push(evidence)
     }
@@ -2974,6 +3010,64 @@ export class AgentOrchestrator {
     if (active.knowledgeSearchScopeReleased) return
     active.knowledgeSearchScopeReleased = true
     this.releaseKnowledgeSearchScope(active.knowledgeSearchScope)
+  }
+
+  private knowledgeProviderConsentKey(userId: string, provider: ModelProviderId): string {
+    return `${userId}\0${provider}`
+  }
+
+  private knowledgeProviderConsentFence(
+    userId: string,
+    provider: ModelProviderId,
+  ): { generation: number; changing: boolean } {
+    return this.knowledgeProviderConsentFences.get(
+      this.knowledgeProviderConsentKey(userId, provider),
+    ) ?? { generation: 0, changing: false }
+  }
+
+  private advanceKnowledgeProviderConsentFence(
+    userId: string,
+    provider: ModelProviderId,
+    changing: boolean,
+  ): void {
+    const key = this.knowledgeProviderConsentKey(userId, provider)
+    const current = this.knowledgeProviderConsentFences.get(key)
+    this.knowledgeProviderConsentFences.set(key, {
+      generation: (current?.generation ?? 0) + 1,
+      changing,
+    })
+  }
+
+  private isKnowledgeProviderConsentCurrent(active: ActiveAgentRun): boolean {
+    const current = this.knowledgeProviderConsentFence(
+      active.userId, active.providerSnapshot.providerId,
+    )
+    return !current.changing
+      && current.generation === active.knowledgeProviderConsentGeneration
+  }
+
+  private blockKnowledgeSearchForConsentFence(
+    active: ActiveAgentRun,
+    call: Extract<ModelStreamEvent, { type: 'tool_call' }>,
+    assistantContent: string,
+  ): Promise<AgentRunResult> {
+    active.knowledgeConsentBlocked = 'consent_required'
+    this.setKnowledgeStatus(active, 'consent_required', active.knowledgeEvidence.snapshot().length)
+    this.appendKnowledgeToolExchange(
+      active,
+      call,
+      assistantContent,
+      JSON.stringify({ kind: 'consent_required' }),
+    )
+    return this.drive(active)
+  }
+
+  private terminalizeKnowledgeConsentFence(active: ActiveAgentRun): Promise<AgentRunResult> {
+    active.knowledgeConsentBlocked = 'consent_required'
+    this.setKnowledgeStatus(active, 'consent_required', active.knowledgeEvidence.snapshot().length)
+    this.appendText(active, '需要你先授权向当前模型供应商发送最小知识库依据，然后重新发送问题。')
+    this.appendWorkflowProvenance(active)
+    return this.terminalize(active, 'completed')
   }
 
   private safeEmit(event: ChatEvent): void {

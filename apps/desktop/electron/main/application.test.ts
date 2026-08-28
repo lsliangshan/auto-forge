@@ -1754,6 +1754,171 @@ describe('createApplicationRuntime', () => {
     expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
   })
 
+  it('fences knowledge disclosure across concurrent revoke and re-grant before any consent await', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-consent-fence-'))
+    directories.push(root)
+    const emitted: ChatEvent[] = []
+    const providerRequests: ModelStreamRequest[] = []
+    const firstSearch = deferred<{
+      kind: 'results'; strategy: 'trigram'; evidence: Array<{
+        id: string; baseId: string; documentId: string; versionId: string; snippet: string; score: number
+        citation: {
+          evidenceId: string; documentId: string; versionId: string
+          coordinate: { kind: 'text'; line: number; startOffset: number; endOffset: number }
+        }
+      }>
+    }>()
+    const revokeStarted = deferred<void>()
+    const releaseRevoke = deferred<void>()
+    const grantStarted = deferred<void>()
+    const releaseGrant = deferred<void>()
+    const grantCommitted = deferred<void>()
+    const evidence = {
+      id: 'evidence:consent-fence', baseId: 'base_selected',
+      documentId: 'document_1', versionId: 'version_1', snippet: '撤销期间不得泄漏的依据', score: 1,
+      citation: {
+        evidenceId: 'evidence:consent-fence', documentId: 'document_1', versionId: 'version_1',
+        coordinate: { kind: 'text' as const, line: 1, startOffset: 0, endOffset: 12 },
+      },
+    }
+    let consentStatus: 'granted' | 'unknown' = 'granted'
+    let waitForGrantCommit = false
+    let searchCount = 0
+    const searchSelected = vi.fn(async () => {
+      searchCount += 1
+      if (searchCount === 1) return firstSearch.promise
+      return { kind: 'results' as const, strategy: 'trigram' as const, evidence: [evidence] }
+    })
+    const getConsent = vi.fn(async () => {
+      if (waitForGrantCommit) await grantCommitted.promise
+      return {
+        provider: 'openrouter' as const, status: consentStatus,
+        ...(consentStatus === 'granted' ? { updatedAt: '2026-08-28T00:00:00.000Z' } : {}),
+      }
+    })
+    const setConsent = vi.fn(async (_owner, provider: 'openrouter', status: 'granted' | 'denied') => {
+      grantStarted.resolve()
+      await releaseGrant.promise
+      consentStatus = status === 'granted' ? 'granted' : 'unknown'
+      grantCommitted.resolve()
+      return { provider, status, updatedAt: '2026-08-28T00:00:01.000Z' }
+    })
+    const revokeConsent = vi.fn(async (_owner, provider: 'openrouter') => {
+      revokeStarted.resolve()
+      await releaseRevoke.promise
+      consentStatus = 'unknown'
+      return { provider, status: 'unknown' as const }
+    })
+    const admittedScope = Object.freeze({
+      scopeId: 'scope_consent_fence', ownerId: 'test_user_testuser', ownerEpoch: 1,
+      cloudAllowed: false, baseIds: Object.freeze(['base_selected']), entries: Object.freeze([]),
+    })
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => admittedScope), releaseSearchScope: vi.fn(),
+      searchSelected, sourceAvailable: vi.fn(async () => true), getConsent, setConsent, revokeConsent,
+    })
+    let toolCall = 0
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/knowledge-fence', 'Knowledge fence'), supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request: ModelStreamRequest) {
+        providerRequests.push(structuredClone(request))
+        const toolResult = [...request.messages].reverse().find(message => message.role === 'tool')
+        if (!toolResult) {
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0,
+            id: `knowledge_fence_${++toolCall}`, name: 'knowledge_search',
+            arguments: { query: '撤销与授权竞态' },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+          return
+        }
+        const hasEvidence = toolResult.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+        yield {
+          type: 'text_delta' as const, choiceIndex: 0,
+          text: hasEvidence
+            ? '只有授权后新接纳的请求可使用依据。[[kb:evidence:consent-fence]]'
+            : '未使用知识库依据。',
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService, modelProviders: { openrouter: provider },
+      emitChat: event => { emitted.push(event) },
+    }))
+    const session = await authenticate(runtime)
+    const owner = { userId: session.user.id }
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/knowledge-fence' },
+      },
+    })
+    const createSelectedConversation = async () => {
+      const conversation = await runtime.services.chat.createConversation()
+      const current = await runtime.services.chat.getGenerationPreferences(conversation.id)
+      await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+        ...current, knowledgeBaseIds: ['base_selected'], knowledgeMode: 'strict',
+      })
+      return conversation
+    }
+    const waitForTerminal = async (conversationId: string) => {
+      await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+        type: 'status', conversationId, status: expect.stringMatching(/completed|cancelled|failed/u),
+      })))
+    }
+
+    const oldConversation = await createSelectedConversation()
+    await runtime.services.chat.send(chatInput(oldConversation.id, 'old run'))
+    await vi.waitFor(() => expect(searchSelected).toHaveBeenCalledOnce())
+
+    const revoking = runtime.services.knowledge.revokeConsent(owner, 'openrouter')
+    await revokeStarted.promise
+    const duringRevoke = await createSelectedConversation()
+    await runtime.services.chat.send(chatInput(duringRevoke.id, 'during revoke'))
+    await waitForTerminal(duringRevoke.id)
+
+    releaseRevoke.resolve()
+    await revoking
+    firstSearch.resolve({ kind: 'results', strategy: 'trigram', evidence: [evidence] })
+    await waitForTerminal(oldConversation.id)
+
+    const granting = runtime.services.knowledge.setConsent(owner, 'openrouter', 'granted')
+    await grantStarted.promise
+    waitForGrantCommit = true
+    const duringGrant = await createSelectedConversation()
+    await runtime.services.chat.send(chatInput(duringGrant.id, 'during grant'))
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    releaseGrant.resolve()
+    await granting
+    await waitForTerminal(duringGrant.id)
+    waitForGrantCommit = false
+
+    const afterGrant = await createSelectedConversation()
+    await runtime.services.chat.send(chatInput(afterGrant.id, 'after grant'))
+    await waitForTerminal(afterGrant.id)
+
+    expect(searchSelected).toHaveBeenCalledTimes(2)
+    const evidenceRequests = providerRequests.filter(request => (
+      JSON.stringify(request.messages).includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+    ))
+    expect(evidenceRequests.length).toBeGreaterThan(0)
+    expect(evidenceRequests.every(request => (
+      JSON.stringify(request.messages).includes('after grant')
+      && !JSON.stringify(request.messages).includes('during revoke')
+      && !JSON.stringify(request.messages).includes('during grant')
+    ))).toBe(true)
+    expect(revokeConsent).toHaveBeenCalledOnce()
+    expect(setConsent).toHaveBeenCalledOnce()
+    await runtime.close()
+  })
+
   it('records a stale bind cleanup failure retained by the real knowledge lifecycle tail', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-bind-failure-'))
     directories.push(root)

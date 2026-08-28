@@ -2564,9 +2564,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     knowledge: knowledge ? {
       ...knowledge,
+      setConsent: async (owner, provider, status) => {
+        const cancellations = agent.beginKnowledgeProviderConsentChange(owner.userId, provider)
+        await cancellations
+        const result = await knowledge.setConsent(owner, provider, status)
+        agent.completeKnowledgeProviderConsentChange(owner.userId, provider)
+        return result
+      },
       revokeConsent: async (owner, provider) => {
-        await agent.onKnowledgeProviderConsentRevoked(owner.userId, provider)
-        return knowledge.revokeConsent(owner, provider)
+        const cancellations = agent.beginKnowledgeProviderConsentChange(owner.userId, provider)
+        await cancellations
+        const result = await knowledge.revokeConsent(owner, provider)
+        agent.completeKnowledgeProviderConsentChange(owner.userId, provider)
+        return result
       },
     } : createUnavailableKnowledgeService(),
     system: {
