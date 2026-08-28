@@ -37,6 +37,7 @@ const actionKeys = {
   pushMutation: ['action', 'mutationId', 'knowledgeBaseId', 'entityKind', 'entityId', 'operation', 'baseRevision', 'payload'],
   pullChanges: ['action', 'knowledgeBaseId', 'afterSequence', 'limit', 'maxBytes'],
   fullResync: ['action', 'knowledgeBaseId', 'snapshotId', 'afterOrdinal', 'limit', 'maxBytes'],
+  listKnowledgeBases: ['action', 'snapshotId', 'afterOrdinal', 'limit', 'maxBytes'],
   publishGeneration: ['action', 'requestId', 'knowledgeBaseId', 'generationId', 'expectedPublishedGenerationId'],
   deleteKnowledgeBase: ['action', 'requestId', 'knowledgeBaseId', 'expectedPublishedGenerationId'],
   cancelJob: ['action', 'requestId', 'jobId'],
@@ -307,6 +308,19 @@ function validResponse(action, value) {
         && Number.isSafeInteger(value.nextOrdinal) && value.nextOrdinal >= 0
         && typeof value.hasMore === 'boolean'
         && validSnapshotChanges(value.changes, value.snapshotSequence)
+    case 'listKnowledgeBases': {
+      if (!exactKeys(value, [
+        'kind', 'snapshotId', 'totalCount', 'nextOrdinal', 'hasMore',
+        'knowledgeBaseIds',
+      ]) || value.kind !== 'catalog_page' || !nonEmptyString(value.snapshotId)
+        || !Number.isSafeInteger(value.totalCount) || value.totalCount < 0
+        || value.totalCount > 10000
+        || !Number.isSafeInteger(value.nextOrdinal) || value.nextOrdinal < 0
+        || value.nextOrdinal > value.totalCount || typeof value.hasMore !== 'boolean'
+        || !Array.isArray(value.knowledgeBaseIds) || value.knowledgeBaseIds.length > pageLimit
+        || value.knowledgeBaseIds.some(id => !validStorageSegment(id))) return false
+      return new Set(value.knowledgeBaseIds).size === value.knowledgeBaseIds.length
+    }
     case 'publishGeneration':
       return exactKeys(value, ['generationId', 'previousGenerationId', 'sequence'])
         && nonEmptyString(value.generationId)
@@ -737,6 +751,18 @@ function parseAction(event, uid) {
         p_snapshot_id: event.snapshotId, p_after_ordinal: event.afterOrdinal,
         p_limit: event.limit, p_max_bytes: event.maxBytes,
       }]
+    case 'listKnowledgeBases':
+      if (!(event.snapshotId === null || nonEmptyString(event.snapshotId))
+        || !Number.isSafeInteger(event.afterOrdinal) || event.afterOrdinal < 0
+        || !Number.isSafeInteger(event.limit) || event.limit < 1 || event.limit > pageLimit
+        || !Number.isSafeInteger(event.maxBytes)
+        || event.maxBytes < 65536 || event.maxBytes > maximumPageBytes
+        || (event.snapshotId === null && event.afterOrdinal !== 0)) return undefined
+      return ['autoforge_knowledge_list_bases', {
+        ...common, p_snapshot_id: event.snapshotId,
+        p_after_ordinal: event.afterOrdinal, p_limit: event.limit,
+        p_max_bytes: event.maxBytes,
+      }]
     case 'publishGeneration':
       if (!nonEmptyString(event.requestId)
         || !nonEmptyString(event.knowledgeBaseId)
@@ -1013,6 +1039,13 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
         return boundedSuccess(completed)
       }
       if (!validResponse(event.action, data)) throw { code: 'INTERNAL_ERROR' }
+      if (event.action === 'listKnowledgeBases'
+        && ((event.snapshotId !== null && data.snapshotId !== event.snapshotId)
+          || data.nextOrdinal !== event.afterOrdinal + data.knowledgeBaseIds.length
+          || data.hasMore !== (data.nextOrdinal < data.totalCount)
+          || (data.hasMore && data.knowledgeBaseIds.length === 0))) {
+        throw { code: 'INTERNAL_ERROR' }
+      }
       if ((event.action === 'pushMutation' && data.mutationId !== event.mutationId)
         || ((event.action === 'beginSync' || event.action === 'beginGeneration')
           && (data.knowledgeBaseId !== event.knowledgeBaseId

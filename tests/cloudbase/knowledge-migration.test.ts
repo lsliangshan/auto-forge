@@ -25,6 +25,18 @@ const workerRollbackUrl = new URL(
   '../../cloudbase/knowledge/migrations/0002_personal_knowledge_workers.rollback.sql',
   import.meta.url,
 )
+const catalogCanonicalUrl = new URL(
+  '../../cloudbase/migrations/20260828220000_owner_knowledge_catalog.sql',
+  import.meta.url,
+)
+const catalogFeatureUrl = new URL(
+  '../../cloudbase/knowledge/migrations/0003_owner_knowledge_catalog.sql',
+  import.meta.url,
+)
+const catalogRollbackUrl = new URL(
+  '../../cloudbase/knowledge/migrations/0003_owner_knowledge_catalog.rollback.sql',
+  import.meta.url,
+)
 
 const tables = [
   'knowledge_bases',
@@ -121,6 +133,61 @@ describe('CloudBase personal knowledge migration', () => {
     expect(yielded).toContain('lease_token = p_lease_token')
     expect(yielded).toContain('lease_expires_at > clock_timestamp()')
     expect(rollbackWorker).not.toMatch(/DROP TABLE|TRUNCATE|DELETE\s+FROM/i)
+  })
+
+  it('ships a bounded owner catalog snapshot with service-role-only RPCs and preserving rollback', async () => {
+    const [canonicalCatalog, featureCatalog, rollbackCatalog] = await Promise.all([
+      readFile(catalogCanonicalUrl, 'utf8'), readFile(catalogFeatureUrl, 'utf8'),
+      readFile(catalogRollbackUrl, 'utf8'),
+    ])
+    expect(canonicalCatalog).toBe(featureCatalog)
+    for (const table of [
+      'knowledge_owner_catalog_snapshots', 'knowledge_owner_catalog_items',
+    ]) {
+      expect(featureCatalog).toContain(`CREATE TABLE IF NOT EXISTS public.${table}`)
+      expect(featureCatalog).toContain(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`)
+      expect(featureCatalog).toContain(`ALTER TABLE public.${table} FORCE ROW LEVEL SECURITY`)
+      expect(featureCatalog).toContain(`REVOKE ALL ON TABLE public.${table} FROM PUBLIC, anon, authenticated`)
+      expect(featureCatalog).toContain(`GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.${table} TO service_role`)
+    }
+    const list = staticFunctionBodyFragment(
+      featureCatalog, 'autoforge_knowledge_list_bases',
+    )
+    expect(list).toContain('owner bigint := public.autoforge_knowledge_caller(p_caller_user_id)')
+    expect(list).toContain('PERFORM public.autoforge_knowledge_require_cloud(owner)')
+    expect(list).toContain('p_limit NOT BETWEEN 1 AND 512')
+    expect(list).toContain('p_max_bytes NOT BETWEEN 65536 AND 786432')
+    expect(list).toContain('WITH catalog AS MATERIALIZED')
+    expect(list).toContain("base.status <> 'deleted'")
+    expect(list).toContain('base.deleted_at IS NULL')
+    expect(list).toContain('item_count <= 10000')
+    expect(list).toContain('snapshot.expires_at > clock_timestamp()')
+    expect(list).toContain('sum(item.response_bytes) OVER')
+    expect(list).toContain("'totalCount', catalog_snapshot.item_count")
+    expect(list).toContain("'knowledgeBaseIds', knowledge_base_ids")
+    const cleanup = staticFunctionBodyFragment(
+      featureCatalog, 'autoforge_knowledge_cleanup_owner_catalog',
+    )
+    expect(cleanup).toContain('p_limit NOT BETWEEN 1 AND 1000')
+    expect(cleanup).toContain('FOR UPDATE SKIP LOCKED')
+    expect(cleanup).toContain('LIMIT p_limit')
+    expect(cleanup).toContain('snapshot.expires_at <= clock_timestamp()')
+    for (const signature of [
+      'autoforge_knowledge_list_bases(varchar, varchar, integer, integer, integer)',
+      'autoforge_knowledge_cleanup_owner_catalog(varchar, integer)',
+    ]) {
+      expect(featureCatalog).toContain(
+        `REVOKE ALL ON FUNCTION public.${signature} FROM PUBLIC, anon, authenticated`,
+      )
+      expect(featureCatalog).toContain(
+        `GRANT EXECUTE ON FUNCTION public.${signature} TO service_role`,
+      )
+      expect(rollbackCatalog).toContain(`DROP FUNCTION IF EXISTS public.${signature}`)
+    }
+    expect(featureCatalog).not.toMatch(
+      /GRANT\s+(?:ALL|SELECT|INSERT|UPDATE|DELETE|EXECUTE)[^;]*\bTO\s+(?:PUBLIC|anon|authenticated)\b/i,
+    )
+    expect(rollbackCatalog).not.toMatch(/DROP TABLE|TRUNCATE|DELETE\s+FROM|REVOKE ALL ON TABLE/i)
   })
 
   it('uses owner-composite relationships, forced RLS, and default-deny grants', async () => {

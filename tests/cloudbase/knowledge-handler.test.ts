@@ -161,6 +161,68 @@ describe('CloudBase knowledge function', () => {
     })
   })
 
+  it('lists the trusted owner catalog through a bounded stable snapshot page', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+      nextOrdinal: 1, hasMore: true, knowledgeBaseIds: ['kb_1'],
+    })
+    const handler = createKnowledgeHandler({ rpc })
+
+    await expect(handler({
+      action: 'listKnowledgeBases', snapshotId: null, afterOrdinal: 0,
+      limit: 512, maxBytes: 786_432,
+    }, context)).resolves.toEqual({ ok: true, data: {
+      kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+      nextOrdinal: 1, hasMore: true, knowledgeBaseIds: ['kb_1'],
+    } })
+    expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_list_bases', {
+      p_caller_user_id: context.auth.uid, p_snapshot_id: null,
+      p_after_ordinal: 0, p_limit: 512, p_max_bytes: 786_432,
+    })
+    await expect(handler({
+      action: 'listKnowledgeBases', snapshotId: null, afterOrdinal: 0,
+      limit: 512, maxBytes: 786_432, ownerId: 'attacker',
+    }, context)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    expect(rpc).toHaveBeenCalledOnce()
+  })
+
+  it('rejects malformed, duplicate, non-progressing, and mismatched catalog pages', async () => {
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({
+        kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+        nextOrdinal: 2, hasMore: false, knowledgeBaseIds: ['kb_1', 'kb_1'],
+      })
+      .mockResolvedValueOnce({
+        kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 1,
+        nextOrdinal: 0, hasMore: true, knowledgeBaseIds: ['kb_1'],
+      })
+      .mockResolvedValueOnce({
+        kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+        nextOrdinal: 1, hasMore: false, knowledgeBaseIds: ['kb_1'],
+      })
+      .mockResolvedValueOnce({
+        kind: 'catalog_page', snapshotId: 'catalog_other', totalCount: 1,
+        nextOrdinal: 1, hasMore: false, knowledgeBaseIds: ['kb_1'],
+      })
+    const handler = createKnowledgeHandler({ rpc })
+    const first = {
+      action: 'listKnowledgeBases', snapshotId: null, afterOrdinal: 0,
+      limit: 512, maxBytes: 786_432,
+    }
+    await expect(handler(first, context)).resolves.toEqual({
+      ok: false, error: { code: 'INTERNAL_ERROR' },
+    })
+    await expect(handler(first, context)).resolves.toEqual({
+      ok: false, error: { code: 'INTERNAL_ERROR' },
+    })
+    await expect(handler(first, context)).resolves.toEqual({
+      ok: false, error: { code: 'INTERNAL_ERROR' },
+    })
+    await expect(handler({ ...first, snapshotId: 'catalog_1' }, context)).resolves.toEqual({
+      ok: false, error: { code: 'INTERNAL_ERROR' },
+    })
+  })
+
   it('rejects extra keys on every public action before RPC or Storage', async () => {
     const rpc = vi.fn()
     const storage = {
@@ -176,6 +238,7 @@ describe('CloudBase knowledge function', () => {
       { action: 'pushMutation', mutationId: 'm', knowledgeBaseId: 'kb', entityKind: 'document', entityId: 'd', operation: 'upsert', baseRevision: null, payload: {} },
       { action: 'pullChanges', knowledgeBaseId: 'kb', afterSequence: 0, limit: 1, maxBytes: 65536 },
       { action: 'fullResync', knowledgeBaseId: 'kb', snapshotId: null, afterOrdinal: 0, limit: 1, maxBytes: 65536 },
+      { action: 'listKnowledgeBases', snapshotId: null, afterOrdinal: 0, limit: 1, maxBytes: 65536 },
       { action: 'publishGeneration', requestId: 'r', knowledgeBaseId: 'kb', generationId: 'g', expectedPublishedGenerationId: null },
       { action: 'deleteKnowledgeBase', requestId: 'r', knowledgeBaseId: 'kb', expectedPublishedGenerationId: null },
       { action: 'cancelJob', requestId: 'r', jobId: 'j' },
