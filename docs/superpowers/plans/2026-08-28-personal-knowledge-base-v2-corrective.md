@@ -140,6 +140,12 @@
 
 **Files:**
 
+- Modify `apps/desktop/src/stores/auth.ts`
+- Modify `apps/desktop/src/stores/settings.ts`
+- Modify `apps/desktop/src/stores/chat.ts` only if the shared admission contract requires it.
+- Modify `apps/desktop/src/views/SettingsView.vue`
+- Modify `apps/desktop/tests/components/auth.test.ts`
+- Modify `apps/desktop/tests/components/workbench.test.ts`
 - Modify `cloudbase/knowledge/worker/index.js`
 - Modify `cloudbase/knowledge/worker/knowledge-worker.js`
 - Create a dedicated parser-child entry under `cloudbase/knowledge/worker/`
@@ -149,6 +155,8 @@
 
 **Acceptance tests:**
 
+- Before parser work, close the two Task 4 breaker findings. A failed identity transition keeps account admission closed, re-reads the authoritative Main session with `auth.getSession`, binds that actual owner, then restores Settings state. If authoritative consent reload fails, clear the consent projection and reopen only a stable fail-closed owner generation. Renderer-cached owner state must never reopen admission.
+- RED owner-free destructive Settings cases. `clearLocalData` and `clearBrowserData` require one captured opaque account token across confirmation, mutation, result, toast and error; return `applied | stale`; reject Main/Renderer owner skew, owner switch and UID ABA without sending or displaying another owner's result. Renderer still supplies neither owner nor revision.
 - RED never-settling parser case; a job settles to a bounded retry/terminal result before its lease expires and `runOnce()` returns.
 - Parse untrusted bytes in a separate one-request process with scrubbed environment and no service-role, Storage or TokenHub credentials. The credentialed scheduler retains all network access and communicates only through bounded IPC frames.
 - Enforce input bytes, DOCX expanded bytes/compression ratio, PDF pages, text bytes, block count, response bytes, memory and wall-time before or during accumulation, not only after complete parsing.
