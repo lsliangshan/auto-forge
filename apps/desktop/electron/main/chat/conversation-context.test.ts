@@ -374,6 +374,65 @@ describe('conversation context manager', () => {
     expect(provider.stream).not.toHaveBeenCalled()
   })
 
+  it('omits historical media and an attachment-bearing summary only in conversion privacy mode', async () => {
+    const summarizedMedia: Message = {
+      id: 'message_1', conversationId: 'c1', role: 'user', ordinal: 1, createdAt: 1,
+      blocks: [
+        { type: 'text', text: '保留已确认的普通目标' },
+        {
+          type: 'media', blockId: 'block_summary', assetId: 'summary_media_private',
+          kind: 'file', purpose: 'input', name: 'summary-secret.doc',
+          mimeType: 'application/x-summary-private', byteSize: 777_777,
+        },
+      ],
+    }
+    const rawMedia: Message = {
+      id: 'message_3', conversationId: 'c1', role: 'user', ordinal: 3, createdAt: 3,
+      blocks: [
+        { type: 'text', text: '保留近期的普通目标' },
+        {
+          type: 'media', blockId: 'block_raw', assetId: 'raw_media_private',
+          kind: 'file', purpose: 'input', name: 'raw-history-secret.txt',
+          mimeType: 'application/x-raw-private', byteSize: 888_888,
+        },
+      ],
+    }
+    const fixture = {
+      messages: [summarizedMedia, assistant(2, '已确认'), rawMedia, assistant(4, '继续')],
+      context: {
+        conversationId: 'c1',
+        summaryText: [
+          'SUMMARY_ATTACHMENT_PRIVATE_MARKER',
+          'summary-secret.doc application/x-summary-private 777777 bytes',
+          'summary_media_private SUMMARY_PRIVATE_RAW_CONTENT',
+        ].join(' '),
+        throughOrdinal: 2,
+        estimatedTokens: 20,
+        updatedAt: 2,
+      },
+    }
+    const ordinaryHarness = contextHarness(fixture)
+    const ordinary = await ordinaryHarness.manager.prepare(prepareInput({
+      provider: ordinaryHarness.provider, beforeOrdinal: 5, contextLength: 32_000,
+    }))
+    expect(JSON.stringify(ordinary)).toContain('SUMMARY_ATTACHMENT_PRIVATE_MARKER')
+    expect(JSON.stringify(ordinary)).toContain('raw-history-secret.txt')
+
+    const privateHarness = contextHarness(fixture)
+    const privateHistory = await privateHarness.manager.prepare(prepareInput({
+      provider: privateHarness.provider, beforeOrdinal: 5, contextLength: 32_000,
+      omitHistoricalAttachments: true,
+    }))
+    const payload = JSON.stringify(privateHistory)
+
+    expect(payload).toContain('保留近期的普通目标')
+    expect(payload).toContain('继续')
+    expect(payload).not.toMatch(
+      /SUMMARY_ATTACHMENT_PRIVATE_MARKER|summary-secret|raw-history-secret|application\/x-|777777|888888|summary_media_private|raw_media_private|SUMMARY_PRIVATE_RAW_CONTENT|历史附件/,
+    )
+    expect(privateHarness.provider.stream).not.toHaveBeenCalled()
+  })
+
   it('compresses oldest messages and returns a summary plus the protected tail', async () => {
     const { manager, provider, store } = contextHarness({ forceOverflow: true })
     const result = await manager.prepare(prepareInput({ provider }))

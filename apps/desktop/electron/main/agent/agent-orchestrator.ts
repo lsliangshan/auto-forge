@@ -422,6 +422,7 @@ export interface AgentRunInput extends UsageAttribution {
   assetIds: string[]
   contextLength?: number
   currentMedia: CurrentMediaMetadata[]
+  omitHistoricalAttachments?: boolean
   attachmentBindings?: readonly ExecutionAttachmentBinding[]
   allowTools: boolean
   readonly supportsImageInput: boolean
@@ -946,6 +947,7 @@ export class AgentOrchestrator {
         currentMessage: { role: 'user', content: input.modelContent },
         tools: active.tools,
         currentMedia: input.currentMedia,
+        ...(input.omitHistoricalAttachments ? { omitHistoricalAttachments: true } : {}),
         signal: active.controller.signal,
       })
       active.messages = [

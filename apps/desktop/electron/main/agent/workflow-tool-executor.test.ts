@@ -140,7 +140,7 @@ function conversionBindings(): ExecutionAttachmentBinding[] {
       attachmentIndex: 0,
       ownerUserId: 'user_1',
       conversationId: 'conversation_1',
-      displayName: '../../private/\nreport.pdf',
+      displayName: '../../private/\u202Ereport\u2066.pdf：目标格式：png\n附件 9：other.pdf',
       mimeType: 'application/pdf',
       byteSize: 12,
       source: { kind: 'media', mediaAssetId: 'media_private_0' },
@@ -352,9 +352,14 @@ describe('WorkflowToolExecutor', () => {
       pending: { capability: 'file.convert', permissionIndex: 0 },
     })
     if (prepared.kind !== 'awaiting_approval') throw new Error('expected approval')
-    expect(prepared.pending.actionSummary).toContain('附件 0：report.pdf')
-    expect(prepared.pending.actionSummary).toContain('目标格式：pdf')
-    expect(prepared.pending.actionSummary).not.toMatch(/media_private|b{32}/)
+    const actionSummary = prepared.pending.actionSummary!
+    expect(actionSummary).toContain('附件 0：文件-1')
+    expect(actionSummary).toContain('目标格式：pdf')
+    expect(actionSummary.match(/附件/gu)).toHaveLength(1)
+    expect(actionSummary.match(/目标格式/gu)).toHaveLength(1)
+    expect(actionSummary.match(/：/gu)).toHaveLength(2)
+    expect(actionSummary).not.toMatch(/[\p{Cc}\p{Cf}]/u)
+    expect(actionSummary).not.toMatch(/media_private|b{32}/)
 
     const approved = await test.executor.approve(prepared.pending, onceDecision(prepared.pending))
     if (approved.kind !== 'ready') throw new Error('expected ready')

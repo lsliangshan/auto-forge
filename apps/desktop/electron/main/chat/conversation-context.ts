@@ -59,6 +59,7 @@ export interface PrepareConversationContextInput {
   currentMessage: { role: 'user'; content: string | ModelContentPart[] }
   tools: ModelTool[]
   currentMedia: CurrentMediaMetadata[]
+  omitHistoricalAttachments?: boolean
   signal: AbortSignal
 }
 
@@ -123,11 +124,21 @@ function serializeBlock(block: ChatBlock): string[] {
   return unexpectedBlock(block)
 }
 
-export function serializeHistoricalMessage(message: Message): ModelMessage | undefined {
+function hasHistoricalAttachment(message: Message): boolean {
+  return chatBlockSchema.array().parse(message.blocks).some((block) => (
+    block.type === 'media' || block.type === 'media_generation'
+  ))
+}
+
+export function serializeHistoricalMessage(
+  message: Message,
+  omitAttachments = false,
+): ModelMessage | undefined {
   if (message.role !== 'user' && message.role !== 'assistant') {
     throw new Error('Historical message role is invalid')
   }
   const content = chatBlockSchema.array().parse(message.blocks)
+    .filter((block) => !omitAttachments || (block.type !== 'media' && block.type !== 'media_generation'))
     .flatMap(serializeBlock)
     .filter((part) => part.length > 0)
     .join('\n')
@@ -371,11 +382,17 @@ export function createConversationContextManager(
       }
 
       let summary = repositories.conversationContexts.get(input.conversationId)
-      const rawHistory = repositories.messages
+      const persistedHistory = repositories.messages
         .listBeforeOrdinal(input.conversationId, input.beforeOrdinal)
+      let summaryHasAttachment = input.omitHistoricalAttachments === true
+        && summary !== undefined
+        && persistedHistory.some((message) => (
+          message.ordinal <= summary!.throughOrdinal && hasHistoricalAttachment(message)
+        ))
+      const rawHistory = persistedHistory
         .filter((message) => message.ordinal > (summary?.throughOrdinal ?? 0))
         .flatMap((message): HistoricalModelMessage[] => {
-          const serialized = serializeHistoricalMessage(message)
+          const serialized = serializeHistoricalMessage(message, input.omitHistoricalAttachments)
           return serialized === undefined ? [] : [{
             ordinal: message.ordinal,
             message: serialized,
@@ -384,8 +401,9 @@ export function createConversationContextManager(
         })
 
       while (true) {
+        const providerSummary = summaryHasAttachment ? undefined : summary
         const history = [
-          ...(summary === undefined ? [] : [summaryMessage(summary.summaryText)]),
+          ...(providerSummary === undefined ? [] : [summaryMessage(providerSummary.summaryText)]),
           ...rawHistory.map(({ message }) => message),
         ]
         if (requestTokens(history, input) <= chatBudget) return history
@@ -406,7 +424,7 @@ export function createConversationContextManager(
           ? 0
           : rawHistory.length - mutableBarrier
         const chunk = selectCompressionChunk(
-          summary,
+          providerSummary,
           rawHistory,
           Math.max(protectedRawMessageCount(rawHistory), protectedByBarrier),
           summaryInputBudget,
@@ -417,7 +435,7 @@ export function createConversationContextManager(
         const throughOrdinal = chunk.at(-1)!.ordinal
         const summaryText = await streamSummary(
           input,
-          summary,
+          providerSummary,
           chunk,
           summaryOutputTokens,
           `conversation-summary:${input.callIdentity.requestId}:${expectedThroughOrdinal}:${throughOrdinal}`,
@@ -432,6 +450,7 @@ export function createConversationContextManager(
             estimatedTokens: estimateTextTokens(summaryText),
             updatedAt: Date.now(),
           })
+          summaryHasAttachment = false
         } catch (error) {
           if (isCancelled(input, error)) throw toSafeAppError({ code: 'CANCELLED' })
           throw toSafeAppError({ code: 'CONFLICT' })

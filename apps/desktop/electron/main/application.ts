@@ -1917,6 +1917,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 modelContent,
                 assetIds: input.assetIds,
                 currentMedia,
+                ...(localConversionIntent ? { omitHistoricalAttachments: true } : {}),
                 attachmentBindings,
                 allowTools: route.supportsTools,
                 supportsImageInput: route.supportsImageInput,

@@ -4761,16 +4761,19 @@ describe('createApplicationRuntime', () => {
   it('routes current conversion attachments as metadata only and rejects forged persistent approval', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-local-conversion-'))
     directories.push(root)
-    const historicalSource = join(root, 'historical.txt')
+    const summaryHistoricalSource = join(root, 'summary-history-secret.txt')
+    const rawHistoricalSource = join(root, 'raw-history-secret.txt')
     const currentSource = join(root, 'current.doc')
-    const historicalBytes = Buffer.from('HISTORICAL_PRIVATE_ATTACHMENT_CONTENT')
+    const summaryHistoricalBytes = Buffer.from('SUMMARY_PRIVATE_ATTACHMENT_CONTENT_MARKER')
+    const rawHistoricalBytes = Buffer.from('RAW_HISTORY_PRIVATE_ATTACHMENT_CONTENT_MARKER')
     const currentBytes = Buffer.concat([
       Buffer.from('d0cf11e0a1b11ae1', 'hex'),
       Buffer.from('CURRENT_PRIVATE_ATTACHMENT_CONTENT'),
     ])
-    await writeFile(historicalSource, historicalBytes)
+    await writeFile(summaryHistoricalSource, summaryHistoricalBytes)
+    await writeFile(rawHistoricalSource, rawHistoricalBytes)
     await writeFile(currentSource, currentBytes)
-    let selectedFiles = [historicalSource]
+    let selectedFiles = [summaryHistoricalSource]
     const captured: ModelStreamRequest[] = []
     const chatEvents: ChatEvent[] = []
     const modelInput = vi.fn()
@@ -4809,7 +4812,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
     }))
     try {
-      await authenticate(runtime)
+      const session = await authenticate(runtime)
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
       await runtime.services.settings.update({
         activeProvider: 'openrouter',
@@ -4820,24 +4823,50 @@ describe('createApplicationRuntime', () => {
       })
       await installConversionWorkflow(runtime)
       const conversation = await runtime.services.chat.createConversation()
-      const [historicalAsset] = await runtime.services.media.pickFiles({
+      const [summaryHistoricalAsset] = await runtime.services.media.pickFiles({
         conversationId: conversation.id, existingAssetIds: [],
       })
-      const historical = await runtime.services.chat.send({
+      const summaryHistorical = await runtime.services.chat.send({
         ...chatInput(conversation.id, '读取这个文本附件'),
-        assetIds: [historicalAsset!.id], outputType: 'text',
+        assetIds: [summaryHistoricalAsset!.id], outputType: 'text',
       })
       await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
-        type: 'status', requestId: historical.requestId, status: 'completed',
+        type: 'status', requestId: summaryHistorical.requestId, status: 'completed',
       })))
       expect(modelInput).toHaveBeenCalledTimes(1)
+
+      const summaryText = [
+        'SUMMARY_ATTACHMENT_PRIVATE_MARKER',
+        `summary-history-secret.txt application/x-summary-private ${summaryHistoricalBytes.byteLength} bytes`,
+        `${summaryHistoricalAsset!.id} ${summaryHistoricalBytes.toString()}`,
+      ].join(' ')
+      const seed = new Database(userCachePath(root, session.user.id))
+      seed.prepare(`
+        INSERT INTO conversation_contexts (
+          conversation_id, summary_text, through_ordinal, estimated_tokens, updated_at
+        ) VALUES (?, ?, 2, 100, ?)
+      `).run(conversation.id, summaryText, Date.now())
+      seed.close()
+
+      selectedFiles = [rawHistoricalSource]
+      const [rawHistoricalAsset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id, existingAssetIds: [],
+      })
+      const rawHistorical = await runtime.services.chat.send({
+        ...chatInput(conversation.id, '再读取这个文本附件'),
+        assetIds: [rawHistoricalAsset!.id], outputType: 'text',
+      })
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'status', requestId: rawHistorical.requestId, status: 'completed',
+      })))
+      expect(modelInput).toHaveBeenCalledTimes(2)
 
       selectedFiles = [currentSource]
       const [currentAsset] = await runtime.services.media.pickFiles({
         conversationId: conversation.id, existingAssetIds: [],
       })
       const sent = await runtime.services.chat.send({
-        ...chatInput(conversation.id, '把附件转换成 PDF'),
+        ...chatInput(conversation.id, '不要转换成 Word，请转换成 PDF'),
         assetIds: [currentAsset!.id], outputType: 'text',
       })
       await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
@@ -4848,7 +4877,7 @@ describe('createApplicationRuntime', () => {
         }),
       })))
 
-      expect(modelInput).toHaveBeenCalledTimes(1)
+      expect(modelInput).toHaveBeenCalledTimes(2)
       const conversionRequest = agentRequests(captured).at(-1)!
       const providerPayload = JSON.stringify(conversionRequest)
       expect(conversionRequest.toolChoice).toBeUndefined()
@@ -4859,7 +4888,19 @@ describe('createApplicationRuntime', () => {
       expect(providerPayload).not.toContain(currentSource)
       expect(providerPayload).not.toContain(currentBytes.toString('base64'))
       expect(providerPayload).not.toContain(currentBytes.toString())
-      expect(providerPayload).not.toContain(historicalBytes.toString())
+      expect(providerPayload).not.toMatch(/SUMMARY_ATTACHMENT_PRIVATE_MARKER|历史附件/)
+      expect(providerPayload).not.toContain('summary-history-secret.txt')
+      expect(providerPayload).not.toContain('raw-history-secret.txt')
+      expect(providerPayload).not.toContain('application/x-summary-private')
+      expect(providerPayload).not.toContain('text/plain')
+      expect(providerPayload).not.toContain(`${summaryHistoricalBytes.byteLength} bytes`)
+      expect(providerPayload).not.toContain(`${rawHistoricalBytes.byteLength} bytes`)
+      expect(providerPayload).not.toContain(summaryHistoricalAsset!.id)
+      expect(providerPayload).not.toContain(rawHistoricalAsset!.id)
+      expect(providerPayload).not.toContain(summaryHistoricalBytes.toString())
+      expect(providerPayload).not.toContain(rawHistoricalBytes.toString())
+      expect(providerPayload).not.toContain(summaryHistoricalBytes.toString('base64'))
+      expect(providerPayload).not.toContain(rawHistoricalBytes.toString('base64'))
 
       const approval = [...chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
         event.type === 'block' && event.block.type === 'approval'
