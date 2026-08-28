@@ -7,6 +7,7 @@ import {
   accountDataPreferencesSchema,
   byokUsageEventSchema,
   chatBlockSchema,
+  cloudSyncConsentRevokeRequestSchema,
   conversationGenerationPreferencesSchema,
   legacyImportRequestSchema,
   openExternalRequestSchema,
@@ -27,6 +28,7 @@ import {
   type ExecutionSummary,
   type ModelProviderId,
   type PermissionGrant,
+  type PrivacyConsentState,
   type ProviderCredentialStatus,
   type WorkflowChatAvailability,
   type WorkflowDetail,
@@ -747,9 +749,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let notifySyncWarning: (
     binding: { userId: string; generation: number }, warningSince?: number,
   ) => void = () => undefined
+  let notifyConsentChanged: (
+    binding: { userId: string; generation: number },
+    state: PrivacyConsentState | undefined,
+  ) => void = () => undefined
   const userDataSync = new UserDataSyncEngine(userDataSyncPort, userDataStores, {
     onConversationChanged: (conversationIds) => { notifyConversationChanges(conversationIds) },
     onWarningChanged: (binding, warningSince) => { notifySyncWarning(binding, warningSince) },
+    onConsentChanged: (binding, state) => { notifyConsentChanged(binding, state) },
   })
   const legacyUserDataImporter = new LegacyUserDataImporter(database, userDataSync)
   const storedDeviceId = database.appSettings.get('user-data.device-id.v1')?.value
@@ -781,6 +788,22 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   )
   const applyCurrentCloudSyncConsent = (ownerId: string): void => {
     knowledge?.setCloudSyncConsent?.(ownerId, currentCloudSyncConsentAccepted())
+  }
+  notifyConsentChanged = (token, state) => {
+    if (state?.purpose !== 'cloud_sync'
+      || boundUserId !== token.userId
+      || auth.currentUserId() !== token.userId) return
+    let currentToken: { userId: string; generation: number }
+    try {
+      currentToken = userDataSync.captureBinding(token.userId)
+    } catch {
+      return
+    }
+    if (currentToken.generation !== token.generation) return
+    knowledge?.setCloudSyncConsent?.(
+      token.userId,
+      state.state === 'accepted' && state.documentVersion === CLOUD_SYNC_DOCUMENT_VERSION,
+    )
   }
   const pullUserData = async (ownerId: string): Promise<void> => {
     await userDataSync.pull()
@@ -2411,10 +2434,41 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         }
         store.outbox.recordWithConsent({
           id: randomUUID(), kind: 'privacy.consent', entityId: consent.data.documentVersion,
-          baseRevision: 0, occurredAt: consent.data.consentedAt, payload: consent.data,
+          baseRevision: store.account.getConsentState('cloud_sync')?.revision ?? 0,
+          occurredAt: consent.data.consentedAt, payload: consent.data,
         })
         applyCurrentCloudSyncConsent(session.user.id)
         queueUserDataFlush()
+      },
+      getCloudSyncConsentState: async () => {
+        await requireAuthenticatedSession()
+        return currentUserData().account.getConsentState('cloud_sync') ?? null
+      },
+      revokeCloudSyncConsent: async (input) => {
+        const session = await requireAuthenticatedSession()
+        if (!cloudSyncConsentRevokeRequestSchema.safeParse(input).success) {
+          throw failure('INVALID_INPUT')
+        }
+        const store = currentUserData()
+        const currentState = store.account.getConsentState('cloud_sync')
+        if (currentState?.state === 'revoked') {
+          applyCurrentCloudSyncConsent(session.user.id)
+          return currentState
+        }
+        const revokedAt = new Date().toISOString()
+        store.outbox.recordWithConsent({
+          id: randomUUID(), kind: 'privacy.consent.revoke', entityId: 'cloud_sync',
+          baseRevision: currentState?.revision ?? 0, occurredAt: revokedAt,
+          payload: {
+            purpose: 'cloud_sync', revokedAt,
+            clientVersion: options.appInfo?.version ?? '0.1.0',
+          },
+        })
+        applyCurrentCloudSyncConsent(session.user.id)
+        queueUserDataFlush()
+        const revoked = store.account.getConsentState('cloud_sync')
+        if (revoked?.state !== 'revoked') throw failure('INTERNAL_ERROR')
+        return revoked
       },
       previewLegacyImport: async () => {
         const session = await requireAuthenticatedSession()
@@ -2677,6 +2731,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       getTokenUsage: () => userDataAdmission.run(ungatedServices.settings.getTokenUsage),
       recordPrivacyConsent: (input) => userDataAdmission.run(
         () => ungatedServices.settings.recordPrivacyConsent(input),
+      ),
+      getCloudSyncConsentState: () => userDataAdmission.run(
+        ungatedServices.settings.getCloudSyncConsentState,
+      ),
+      revokeCloudSyncConsent: (input) => userDataAdmission.run(
+        () => ungatedServices.settings.revokeCloudSyncConsent(input),
       ),
       previewLegacyImport: () => userDataAdmission.run(
         ungatedServices.settings.previewLegacyImport,

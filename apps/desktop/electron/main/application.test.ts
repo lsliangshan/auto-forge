@@ -1479,7 +1479,7 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
-  it('binds Knowledge with the authoritative current cloud_sync consent and advances it after acceptance', async () => {
+  it('binds Knowledge to the authoritative cloud_sync revision across accept, revoke, and regrant', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-cloud-consent-'))
     directories.push(root)
     const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
@@ -1520,8 +1520,112 @@ describe('createApplicationRuntime', () => {
       purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
       consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
     })
+    await expect(runtime.services.settings.getCloudSyncConsentState()).resolves.toEqual({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+      state: 'accepted', revision: 2,
+    })
     expect(knowledgeService.setCloudSyncConsent)
       .toHaveBeenLastCalledWith(session.user.id, true)
+
+    await expect(runtime.services.settings.revokeCloudSyncConsent({ confirmed: true }))
+      .resolves.toMatchObject({
+        purpose: 'cloud_sync', state: 'revoked', revision: 3, clientVersion: '0.1.0',
+      })
+    expect(knowledgeService.setCloudSyncConsent)
+      .toHaveBeenLastCalledWith(session.user.id, false)
+    expect(userDataStores.current()!.account.getConsent('cloud_sync')).toBeUndefined()
+    await expect(runtime.services.settings.getCloudSyncConsentState())
+      .resolves.toMatchObject({ state: 'revoked', revision: 3 })
+    await expect(runtime.services.settings.revokeCloudSyncConsent(
+      { confirmed: false } as never,
+    )).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+
+    await runtime.services.settings.recordPrivacyConsent({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-28T02:00:00.000Z', clientVersion: '0.1.0',
+    })
+    await expect(runtime.services.settings.getCloudSyncConsentState())
+      .resolves.toMatchObject({ state: 'accepted', revision: 4 })
+    expect(knowledgeService.setCloudSyncConsent)
+      .toHaveBeenLastCalledWith(session.user.id, true)
+    expect(userDataStores.current()!.outbox.list(100)
+      .filter(({ kind }) => kind === 'privacy.consent' || kind === 'privacy.consent.revoke')
+      .map(({ kind, baseRevision }) => ({ kind, baseRevision }))).toEqual([
+      { kind: 'privacy.consent', baseRevision: 0 },
+      { kind: 'privacy.consent', baseRevision: 1 },
+      { kind: 'privacy.consent.revoke', baseRevision: 2 },
+      { kind: 'privacy.consent', baseRevision: 3 },
+    ])
+    await runtime.close()
+  })
+
+  it('advances Knowledge consent synchronously when a current-owner pull applies revocation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-cloud-revoke-pull-'))
+    directories.push(root)
+    let pullCount = 0
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async (...args: [string, boolean?]) => { void args }),
+      setCloudSyncConsent: vi.fn(),
+      refreshEntitlement: vi.fn(async () => undefined),
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({
+        kind: 'results' as const, strategy: 'trigram' as const, evidence: [],
+      })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+        if (input.action === 'syncPush') return {
+          ok: true,
+          data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const,
+              revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'consent-push',
+          },
+        }
+        if (input.action === 'syncPull') {
+          pullCount += 1
+          if (pullCount === 2) {
+            return {
+              ok: true,
+              data: {
+                mutations: [{
+                  id: 'remote-cloud-sync-revoke', kind: 'privacy.consent.revoke',
+                  entityId: 'cloud_sync', baseRevision: 1, resultRevision: 2,
+                  receivedAt: '2026-08-28T03:00:00.000Z',
+                  payload: {
+                    purpose: 'cloud_sync', revokedAt: '2026-08-28T03:00:00.000Z',
+                    clientVersion: '0.1.0',
+                  },
+                }],
+                cursor: 'cursor_consent_revoked',
+              },
+            }
+          }
+          return { ok: true, data: { mutations: [], cursor: `cursor_consent_empty_${pullCount}` } }
+        }
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }),
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService, userDataSyncPort,
+    }))
+    const session = await authenticate(runtime, 'KnowledgeRemoteRevoke')
+    knowledgeService.setCloudSyncConsent.mockClear()
+
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    await runtime.services.chat.listConversations({ limit: 50 })
+    await vi.waitFor(() => expect(pullCount).toBeGreaterThanOrEqual(2))
+    await vi.waitFor(() => expect(knowledgeService.setCloudSyncConsent)
+      .toHaveBeenCalledWith(session.user.id, false))
+    await expect(runtime.services.settings.getCloudSyncConsentState())
+      .resolves.toMatchObject({ state: 'revoked', revision: 2 })
     await runtime.close()
   })
 
