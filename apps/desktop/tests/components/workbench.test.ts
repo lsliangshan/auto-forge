@@ -221,6 +221,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
         provider, configured: false, validation: 'unchecked',
       })),
       listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
+      clearBrowserData: vi.fn(),
       getTokenUsage: vi.fn().mockResolvedValue(usageSnapshot(0)),
       recordPrivacyConsent: vi.fn().mockResolvedValue(undefined),
       getCloudSyncConsentState: vi.fn().mockResolvedValue(null),
@@ -1773,7 +1774,8 @@ describe('workbench', () => {
     const executions = useExecutionStore(); executions.items = [{ id: 'e', workflowId: 'w', workflowVersion: '1.0.0', status: 'completed', createdAt: '2026-07-19T00:00:00.000Z' }]
     const settings = useSettingsStore()
     bindSettingsOwner(settings, authSession.user.id)
-    await settings.clearLocalData('all')
+    await expect(settings.clearLocalData('all', settings.captureAccountGeneration()))
+      .resolves.toBe('applied')
     expect(chat.conversations).toEqual([])
     expect(executions.items).toEqual([])
     expect(api.settings.clearLocalData).toHaveBeenCalledWith('all')
@@ -1810,12 +1812,76 @@ describe('workbench', () => {
     const store = useSettingsStore()
     bindSettingsOwner(store, authSession.user.id)
 
-    await store.clearLocalData('conversations')
+    await store.clearLocalData('conversations', store.captureAccountGeneration())
     expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
 
     vi.mocked(api.settings.getTokenUsage).mockClear()
-    await store.clearLocalData('executions')
+    await store.clearLocalData('executions', store.captureAccountGeneration())
     expect(api.settings.getTokenUsage).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['local clear after owner switch', 'local', ['user_2']],
+    ['local clear after UID ABA', 'local', ['user_2', 'user_1']],
+    ['browser clear after owner switch', 'browser', ['user_2']],
+    ['browser clear after UID ABA', 'browser', ['user_2', 'user_1']],
+  ] as const)('returns stale without destructive IPC for %s', async (_name, kind, owners) => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const settings = useSettingsStore()
+    bindSettingsOwner(settings, authSession.user.id)
+    const accountGeneration = settings.captureAccountGeneration()
+    for (const owner of owners) bindSettingsOwner(settings, owner)
+
+    const result = kind === 'local'
+      ? await settings.clearLocalData('all', accountGeneration)
+      : await settings.clearBrowserData(accountGeneration)
+
+    expect(result).toBe('stale')
+    expect(api.settings.clearLocalData).not.toHaveBeenCalled()
+    expect(api.settings.clearBrowserData).not.toHaveBeenCalled()
+    expect(settings.error).toBe('')
+  })
+
+  it('drops local reset and reload work when clearLocalData resolves after an owner switch', async () => {
+    const api = createApi()
+    const cleared = deferred<void>()
+    vi.mocked(api.settings.clearLocalData).mockReturnValue(cleared.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    chat.conversations = [conversationSummary('alice_conversation', '2026-08-28T00:00:00.000Z')]
+    const settings = useSettingsStore()
+    bindSettingsOwner(settings, authSession.user.id)
+    const accountGeneration = settings.captureAccountGeneration()
+
+    const clearing = settings.clearLocalData('all', accountGeneration)
+    await vi.waitFor(() => expect(api.settings.clearLocalData).toHaveBeenCalledWith('all'))
+    bindSettingsOwner(settings, bobSession.user.id)
+    cleared.resolve(undefined)
+
+    await expect(clearing).resolves.toBe('stale')
+    expect(chat.conversations).toHaveLength(1)
+    expect(api.workflows.list).not.toHaveBeenCalled()
+    expect(settings.error).toBe('')
+  })
+
+  it('drops a late clearBrowserData rejection after UID ABA', async () => {
+    const api = createApi()
+    const cleared = deferred<void>()
+    vi.mocked(api.settings.clearBrowserData).mockReturnValue(cleared.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const settings = useSettingsStore()
+    bindSettingsOwner(settings, authSession.user.id)
+    const accountGeneration = settings.captureAccountGeneration()
+
+    const clearing = settings.clearBrowserData(accountGeneration)
+    await vi.waitFor(() => expect(api.settings.clearBrowserData).toHaveBeenCalledOnce())
+    bindSettingsOwner(settings, bobSession.user.id)
+    bindSettingsOwner(settings, authSession.user.id)
+    cleared.reject(new Error('Alice browser clear failed'))
+
+    await expect(clearing).resolves.toBe('stale')
+    expect(settings.error).toBe('')
   })
 
   it('defaults to today and switches all token usage periods without refetching', async () => {
@@ -2436,6 +2502,51 @@ describe('workbench', () => {
       expect.any(Object),
     )
     confirm.mockRestore()
+  })
+
+  it('drops a deferred local-data confirmation after an owner switch', async () => {
+    const api = createApi()
+    const confirmation = deferred<unknown>()
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const settings = useSettingsStore(pinia)
+    success.mockClear()
+
+    await vi.waitFor(() => expect(wrapper.text()).toContain('清除会话与执行记录'))
+    const button = wrapper.findAll('button').find(entry => entry.text() === '清除会话')
+    await button?.trigger('click')
+    await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
+    bindSettingsOwner(settings, bobSession.user.id)
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(api.settings.clearLocalData).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    expect(settings.error).toBe('')
+  })
+
+  it('drops a deferred browser-data confirmation after UID ABA', async () => {
+    const api = createApi()
+    const confirmation = deferred<unknown>()
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const settings = useSettingsStore(pinia)
+    success.mockClear()
+
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="clear-browser-data"]').exists())
+      .toBe(true))
+    await wrapper.get('[data-testid="clear-browser-data"]').trigger('click')
+    await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
+    bindSettingsOwner(settings, bobSession.user.id)
+    bindSettingsOwner(settings, authSession.user.id)
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(api.settings.clearBrowserData).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    expect(settings.error).toBe('')
   })
 
   it('shows and saves normalized VPN proxy settings without per-character updates', async () => {

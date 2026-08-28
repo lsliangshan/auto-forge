@@ -25,6 +25,8 @@ function createApi(): DesktopAPI {
 function mountSettings(api: DesktopAPI) {
   Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
   const settings = useSettingsStore()
+  const accountAttempt = settings.suspendAccountOperationAdmission()
+  expect(settings.bindAccountOwner('user_1', accountAttempt)).toBe('applied')
   settings.settings = {
     theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
     activeProvider: 'deepseek',

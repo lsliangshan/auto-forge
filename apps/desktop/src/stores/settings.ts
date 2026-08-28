@@ -90,6 +90,8 @@ export const useSettingsStore = defineStore('settings', {
     _cloudDataReadVersion: 0,
     _cloudConsentMutationVersion: 0,
     _cloudConsentMutationPending: false,
+    _accountMaintenanceVersion: 0,
+    _accountMaintenancePending: false,
     _loadVersion: 0,
     _tokenUsageVersion: 0,
     _credentialVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
@@ -137,14 +139,17 @@ export const useSettingsStore = defineStore('settings', {
     },
     suspendAccountOperationAdmission(): AccountOperationAttemptToken {
       const consentMutationPending = this._cloudConsentMutationPending
+      const accountMaintenancePending = this._accountMaintenancePending
       this._accountGeneration += 1
       this._accountOperationAdmissionOpen = false
       this._cloudDataReadVersion += 1
       this._cloudConsentMutationVersion += 1
       this._tokenUsageVersion += 1
+      this._accountMaintenanceVersion += 1
       this._cloudConsentMutationPending = false
+      this._accountMaintenancePending = false
       this.tokenUsageLoading = false
-      if (consentMutationPending) this.saving = false
+      if (consentMutationPending || accountMaintenancePending) this.saving = false
       return this._accountGeneration as AccountOperationAttemptToken
     },
     bindAccountOwner(
@@ -532,11 +537,20 @@ export const useSettingsStore = defineStore('settings', {
         return { defaultModels }
       })
     },
-    async clearLocalData(scope: 'conversations' | 'executions' | 'all') {
+    async clearLocalData(
+      scope: 'conversations' | 'executions' | 'all',
+      accountGeneration: AccountGenerationToken,
+    ): Promise<AccountMutationResult> {
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
+      const mutationVersion = ++this._accountMaintenanceVersion
+      const mutationIsCurrent = () => mutationVersion === this._accountMaintenanceVersion
+        && this.isAccountGenerationCurrent(accountGeneration)
+      this._accountMaintenancePending = true
       this.saving = true
       this.error = ''
       try {
         await getDesktopApi().settings.clearLocalData(scope)
+        if (!mutationIsCurrent()) return 'stale'
         if (scope === 'conversations' || scope === 'all') useChatStore().resetLocalData()
         if (scope === 'executions' || scope === 'all') useExecutionStore().resetLocalData()
         if (scope === 'all') {
@@ -544,23 +558,40 @@ export const useSettingsStore = defineStore('settings', {
         } else if (scope === 'conversations') {
           await this.loadTokenUsage()
         }
+        return mutationIsCurrent() ? 'applied' : 'stale'
       } catch (error) {
+        if (!mutationIsCurrent()) return 'stale'
         this.error = displayError(error, '本地数据清理失败')
         throw error
       } finally {
-        this.saving = false
+        if (mutationIsCurrent()) {
+          this._accountMaintenancePending = false
+          this.saving = false
+        }
       }
     },
-    async clearBrowserData() {
+    async clearBrowserData(
+      accountGeneration: AccountGenerationToken,
+    ): Promise<AccountMutationResult> {
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
+      const mutationVersion = ++this._accountMaintenanceVersion
+      const mutationIsCurrent = () => mutationVersion === this._accountMaintenanceVersion
+        && this.isAccountGenerationCurrent(accountGeneration)
+      this._accountMaintenancePending = true
       this.saving = true
       this.error = ''
       try {
         await getDesktopApi().settings.clearBrowserData()
+        return mutationIsCurrent() ? 'applied' : 'stale'
       } catch (error) {
+        if (!mutationIsCurrent()) return 'stale'
         this.error = displayError(error, '浏览器数据清除失败')
         throw error
       } finally {
-        this.saving = false
+        if (mutationIsCurrent()) {
+          this._accountMaintenancePending = false
+          this.saving = false
+        }
       }
     },
   },
