@@ -4,6 +4,8 @@
 
 **Approved by user:** yes
 
+**Task 4 contract expansion approved by user:** 2026-08-28
+
 **Binding spec:** `docs/superpowers/specs/2026-08-26-personal-knowledge-base-v2-design.md`
 
 **Starting HEAD:** `6031dfb81bf8207ccb95249dabe9d3a8686336b4`
@@ -81,22 +83,58 @@
 **Files:**
 
 - Modify `apps/desktop/electron/main/application.ts`
+- Modify `apps/desktop/electron/main/application.test.ts`
 - Modify `apps/desktop/electron/main/knowledge/knowledge-service.ts`
 - Modify `apps/desktop/electron/main/knowledge/knowledge-service.test.ts`
 - Modify `apps/desktop/electron/main/knowledge/sync-service.ts`
 - Modify `apps/desktop/electron/main/knowledge/sync-service.test.ts`
 - Modify `apps/desktop/electron/main/knowledge/knowledge-schema.ts`
 - Modify `apps/desktop/electron/main/knowledge/knowledge-schema.test.ts`
-- Modify cloud client/contracts only where required by the materialized payload.
+- Modify `apps/desktop/electron/main/knowledge/cloudbase-knowledge-client.ts`
+- Modify `apps/desktop/electron/main/knowledge/cloudbase-knowledge-client.test.ts`
+- Create `cloudbase/knowledge/migrations/0003_owner_knowledge_catalog.sql`
+- Create `cloudbase/knowledge/migrations/0003_owner_knowledge_catalog.rollback.sql`
+- Create the byte-identical deployment mirror `cloudbase/migrations/20260828220000_owner_knowledge_catalog.sql`.
+- Modify `cloudbase/knowledge/function/knowledge-handler.js`
+- Modify `tests/cloudbase/knowledge-handler.test.ts`
+- Modify `tests/cloudbase/knowledge-migration.test.ts`
+- Modify `cloudbase/knowledge/README.md`
+- Modify `packages/shared/src/desktop-api.ts`
+- Modify `packages/shared/src/contracts.test.ts`
+- Create `apps/desktop/resources/user-cache-migrations/0007_privacy_consent_revocation.sql`
+- Modify `apps/desktop/electron/main/database/user-data-client.ts`
+- Modify `apps/desktop/electron/main/database/user-data-repositories.ts`
+- Modify `apps/desktop/electron/main/database/user-data-client.test.ts`
+- Modify `apps/desktop/electron/main/sync/user-data-sync-engine.ts`
+- Modify `apps/desktop/electron/main/sync/user-data-sync-engine.test.ts`
+- Create `cloudbase/user-data/migrations/0003_privacy_consent_revocation.sql`
+- Create `cloudbase/user-data/migrations/0003_privacy_consent_revocation.rollback.sql`
+- Create the byte-identical deployment mirror `cloudbase/migrations/20260828230000_privacy_consent_revocation.sql`.
+- Modify `cloudbase/user-data/function/user-data-handler.js`
+- Modify `tests/cloudbase/user-data-handler.test.ts`
+- Modify `tests/cloudbase/user-data-migration.test.ts`
+- Modify `cloudbase/user-data/README.md`
+- Modify `docs/runbooks/cloudbase-user-data-foundation.md`
+- Modify `apps/desktop/electron/main/ipc/register-ipc.ts`
+- Modify `apps/desktop/electron/main/ipc/register-ipc.test.ts`
+- Modify `apps/desktop/electron/preload/bridge.ts`
+- Modify `apps/desktop/electron/preload/bridge.test.ts`
+- Modify `apps/desktop/src/stores/settings.ts`
+- Modify `apps/desktop/src/views/SettingsView.vue`
+- Modify `apps/desktop/tests/components/workbench.test.ts`
 
 **Acceptance tests:**
 
 - RED queued-generation case where the worker completes after the third poll. Persist retry/backoff state and recover publication on a later bind/sync/list/search cycle without a tight loop or duplicate upload.
 - RED cross-device pull/snapshot cases. Materialize owner-scoped base/document/version/generation projections needed by list, admission and cloud retrieval instead of storing only opaque heads. Stale/zero cursors replace the snapshot atomically; incremental changes preserve sequence and tombstones.
+- RED cold-start case with no local base, no remote projection and no conversation selection. A strict owner-scoped catalog snapshot discovers every non-deleted personal base ID, validates stable snapshot identity/ordinal/duplicates/page bounds, synchronizes every base, and prunes absent remote-only projections only after the whole catalog succeeds. Partial, malformed, expired, cancelled or stale-owner catalogs do not prune.
 - Cloud-only projections never claim a local object exists. Export/convert must download and verify content before publication.
 - Reuse the existing authoritative `privacy_consents` purpose `cloud_sync`. No knowledge upload/publication/search occurs without the current accepted cloud-sync consent, even when entitlement/beta/kill-switch gates allow it. Revocation pauses new cloud work immediately while local management/retrieval remains available.
+- RED accepted/revoked OCC cases. Add one additive current-state projection keyed by owner/purpose while retaining accepted-consent history. Both `privacy.consent` and `privacy.consent.revoke` advance a monotonic revision; stale acceptance cannot overwrite a newer revoke. Local and remote projection callbacks synchronously advance the Knowledge consent epoch before later Cloud work can start; re-acceptance opens only newly captured work.
+- RED strict Shared -> Preload -> IPC -> Application -> user-data outbox path plus a confirmed Settings entry point. Renderer supplies neither owner nor revision. Logout/account switch and late pull cannot apply another owner's consent state.
 - Availability reports cloud available only when executable remote capabilities, entitlement/beta/kill switch and current cloud-sync consent all pass.
-- Run service/sync/client/schema/Application and degradation tests; commit.
+- Rollbacks revoke/remove only the additive RPC surface and retain accepted/revoked state, catalog snapshots and audit data. Forward deployment mirrors are byte-identical to their canonical migrations.
+- Run service/sync/client/schema/Application, Shared/Preload/IPC/Renderer, user-data sync, Cloud handler/migration and degradation tests; commit each contract slice separately, then review the complete Task 4 range.
 
 ## Task 5: Isolate and bound the Cloud knowledge parser worker
 

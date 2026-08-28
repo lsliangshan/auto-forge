@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-26
 
-**Status:** Review-ready; awaiting approval
+**Status:** Approved; Task 4 cloud-catalog and consent-revocation expansion approved 2026-08-28
 
 **Base:** `origin/v2@a2bd28dd4da10aec6aa68113484ba480991fc672`
 
@@ -139,6 +139,22 @@ Every base sync is serialized and bound to a per-base epoch. `pause`, `cancel`, 
 Converting to local-only persists an operation/request ID, downloads and verifies all content, requests cloud deletion, waits for storage bytes and metadata purge, then publishes `local_only`. Pause does not delete cloud state.
 
 Without authorized staging CloudBase/PostgreSQL/Storage access, only artifacts and local contract tests are delivered; cloud kill switch stays off and no RLS/Storage claim is made.
+
+### 9.1 Owner catalog and cold-start discovery
+
+Cross-device synchronization cannot assume that a new device already knows a knowledge-base ID from local state or conversation preferences. The trusted CloudBase knowledge boundary therefore exposes an owner-scoped, stable, bounded catalog snapshot of every non-deleted personal knowledge-base ID. The function derives the owner only from trusted CloudBase context; Electron never supplies an owner ID.
+
+Catalog pages bind one snapshot ID to an exact ordinal sequence, reject duplicates/non-progress, and expire through bounded cleanup. The client first obtains the complete catalog, then performs the existing per-base full/incremental synchronization. Only after every listed base synchronizes successfully may one local transaction prune remote-only projections absent from that completed catalog. A partial, malformed, expired, or cancelled catalog never prunes local projections.
+
+Cold-start acceptance begins with no local knowledge base, no remote projection, and no conversation selection. Listing knowledge bases discovers the owner's catalog, materializes each base/document/version/generation projection, and leaves every cloud-only version marked as lacking a verified local object. Catalog discovery, per-base pull, and pruning are all fenced by owner generation and current cloud-sync consent.
+
+### 9.2 Authoritative cloud-sync consent lifecycle
+
+`privacy_consents` purpose `cloud_sync` is the only authorization for knowledge upload, publication, owner-catalog discovery, Cloud retrieval, and Cloud search. The current state is a versioned `accepted | revoked` projection keyed by owner and purpose; accepted consent and revocation are explicit sync mutations protected by optimistic revision checks. A late accepted mutation cannot overwrite a newer revocation, and a late revocation cannot cross an owner generation.
+
+Main advances the knowledge cloud-access epoch synchronously when local acceptance or revocation commits and when a remote consent projection is applied. Revocation pauses new Cloud work before any asynchronous flush; in-flight work captured under an older consent revision fails closed before every remote await or local commit. Re-acceptance advances the revision again and opens Cloud work only for subsequently captured operations. Local management and local retrieval remain available throughout.
+
+The Renderer receives only the authoritative current state and may request a confirmed `cloud_sync` revocation through a strict Shared/Preload/IPC contract. It cannot supply owner IDs, revisions, entitlement truth, or knowledge epochs. The user-data Cloud function derives owner identity from trusted context, serializes changes under the existing owner lock/OCC boundary, and returns the current revision through normal pull convergence.
 
 ## 10. Embeddings and hybrid retrieval
 
