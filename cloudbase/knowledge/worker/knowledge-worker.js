@@ -1,4 +1,4 @@
-/* global AbortController, Buffer, clearTimeout, fetch, module, process, require, setTimeout, TextDecoder, URL */
+/* global AbortController, Buffer, clearTimeout, fetch, module, performance, process, require, setTimeout, TextDecoder, URL */
 
 const { createHash, randomUUID } = require('node:crypto')
 const { createInflateRaw } = require('node:zlib')
@@ -72,10 +72,22 @@ function validStorageReference(value) {
 function validClaim(value, expectedLeaseToken) {
   if (!exactKeys(value, ['job'])) return false
   if (value.job === null) return true
-  return exactKeys(value.job, ['id', 'kind', 'entityId', 'leaseToken', 'attempt'])
+  return exactKeys(value.job, [
+    'id', 'kind', 'entityId', 'leaseToken', 'attempt',
+    'mutationPermit', 'mutationBudgetMs',
+  ])
     && nonEmptyString(value.job.id) && ['upload', 'embedding', 'purge'].includes(value.job.kind)
     && nonEmptyString(value.job.entityId) && value.job.leaseToken === expectedLeaseToken
     && Number.isSafeInteger(value.job.attempt) && value.job.attempt >= 1 && value.job.attempt <= 3
+    && nonEmptyString(value.job.mutationPermit)
+    && Number.isSafeInteger(value.job.mutationBudgetMs)
+    && value.job.mutationBudgetMs >= 1 && value.job.mutationBudgetMs <= MAX_JOB_TIMEOUT_MS
+}
+
+function validMutationAuthorization(value) {
+  return exactKeys(value, ['capability', 'workerId', 'jobId', 'leaseToken'])
+    && nonEmptyString(value.capability) && nonEmptyString(value.workerId)
+    && nonEmptyString(value.jobId) && nonEmptyString(value.leaseToken)
 }
 
 function validUploadWork(value) {
@@ -130,9 +142,10 @@ function terminateCurrentWorkerExecution() {
 }
 
 function createJobBoundary(
-  timeoutMs, settlementReserveMs, jobIdentity, terminateJobExecution,
+  timeoutMs, settlementReserveMs, jobIdentity, mutationAuthorization,
+  terminateJobExecution, monotonicNow,
 ) {
-  const finalDeadline = Date.now() + timeoutMs
+  const finalDeadline = monotonicNow() + timeoutMs
   const workDeadline = finalDeadline - settlementReserveMs
   const drainSliceMs = Math.max(1, Math.floor(settlementReserveMs / 3))
   const workDrainDeadline = Math.min(finalDeadline - 2, workDeadline + drainSliceMs)
@@ -144,13 +157,15 @@ function createJobBoundary(
   const settlementController = new AbortController()
   const workContext = Object.freeze({
     signal: workController.signal,
-    deadlineAt: workDeadline,
-    timeoutMs: Math.max(1, workDeadline - Date.now()),
+    timeoutMs: Math.max(1, Math.floor(workDeadline - monotonicNow())),
+    remainingMs: () => Math.max(0, workDeadline - monotonicNow()),
+    mutationAuthorization,
   })
   const settlementContext = Object.freeze({
     signal: settlementController.signal,
-    deadlineAt: settlementDeadline,
-    timeoutMs: Math.max(1, settlementDeadline - Date.now()),
+    timeoutMs: Math.max(1, Math.floor(settlementDeadline - monotonicNow())),
+    remainingMs: () => Math.max(0, settlementDeadline - monotonicNow()),
+    mutationAuthorization,
   })
   const pendingWork = new Set()
   const pendingSettlement = new Set()
@@ -167,7 +182,7 @@ function createJobBoundary(
 
   async function drain(pending, deadlineAt) {
     if (pending.size === 0) return true
-    const remaining = deadlineAt - Date.now()
+    const remaining = deadlineAt - monotonicNow()
     if (remaining <= 0) return pending.size === 0
     let timeoutId
     await Promise.race([
@@ -192,8 +207,8 @@ function createJobBoundary(
   ) {
     const operationDeadline = operationTimeoutMs === undefined
       ? deadlineAt
-      : Math.min(deadlineAt, Date.now() + operationTimeoutMs)
-    const remaining = operationDeadline - Date.now()
+      : Math.min(deadlineAt, monotonicNow() + operationTimeoutMs)
+    const remaining = operationDeadline - monotonicNow()
     if (remaining <= 0) {
       await contain(pending, controller, drainDeadline, forcedDeadline)
       throw { code: 'TRANSIENT_FAILURE' }
@@ -255,6 +270,7 @@ function createKnowledgeWorker({
   jobTimeoutMs = DEFAULT_JOB_TIMEOUT_MS,
   settlementReserveMs = DEFAULT_SETTLEMENT_RESERVE_MS,
   terminateJobExecution = terminateCurrentWorkerExecution,
+  monotonicNow = () => performance.now(),
 }) {
   if (typeof rpc !== 'function' || !storage || typeof storage.readObject !== 'function'
     || typeof storage.deleteObjects !== 'function' || !parser || typeof parser.parse !== 'function'
@@ -266,7 +282,7 @@ function createKnowledgeWorker({
     || jobTimeoutMs < 2 || jobTimeoutMs > MAX_JOB_TIMEOUT_MS
     || !Number.isSafeInteger(settlementReserveMs)
     || settlementReserveMs < 1 || settlementReserveMs >= jobTimeoutMs
-    || typeof terminateJobExecution !== 'function') {
+    || typeof terminateJobExecution !== 'function' || typeof monotonicNow !== 'function') {
     throw new Error('Knowledge worker is not configured')
   }
 
@@ -277,7 +293,10 @@ function createKnowledgeWorker({
   }
 
   function mutationParameters(parameters, requestBoundary) {
-    return { ...parameters, p_request_deadline_ms: requestBoundary.deadlineAt }
+    return {
+      ...parameters,
+      p_mutation_permit: requestBoundary.mutationAuthorization.capability,
+    }
   }
 
   async function processUpload(job, boundary) {
@@ -388,17 +407,28 @@ function createKnowledgeWorker({
       for (let index = 0; index < maxJobs; index += 1) {
         const leaseToken = id()
         if (!nonEmptyString(leaseToken)) throw new Error('Invalid worker lease token')
+        const claimStartedAt = monotonicNow()
         const result = await rpc('autoforge_knowledge_claim_job', {
           p_worker_id: workerId, p_lease_token: leaseToken,
           p_lease_seconds: LEASE_SECONDS,
         })
+        const claimElapsedMs = Math.max(0, Math.ceil(monotonicNow() - claimStartedAt))
+        if (!Number.isSafeInteger(claimElapsedMs)) throw { code: 'INTERNAL_ERROR' }
         if (!validClaim(result, leaseToken)) throw { code: 'INTERNAL_ERROR' }
         if (result.job === null) break
         const job = result.job
+        const localBudgetMs = Math.min(
+          jobTimeoutMs, Math.max(0, job.mutationBudgetMs - claimElapsedMs),
+        )
+        if (localBudgetMs <= settlementReserveMs) throw { code: 'TRANSIENT_FAILURE' }
+        const mutationAuthorization = Object.freeze({
+          capability: job.mutationPermit, workerId,
+          jobId: job.id, leaseToken: job.leaseToken,
+        })
         const boundary = createJobBoundary(
-          jobTimeoutMs, settlementReserveMs,
+          localBudgetMs, settlementReserveMs,
           { workerId, jobId: job.id, leaseToken: job.leaseToken },
-          terminateJobExecution,
+          mutationAuthorization, terminateJobExecution, monotonicNow,
         )
         claimed += 1
         let stopAfterJob = false
@@ -836,24 +866,31 @@ function createKnowledgeParser({
 }
 
 function validRequestBoundary(value) {
-  return exactKeys(value, ['signal', 'deadlineAt', 'timeoutMs'])
+  return exactKeys(value, [
+    'signal', 'timeoutMs', 'remainingMs', 'mutationAuthorization',
+  ])
     && isRecord(value.signal)
     && typeof value.signal.aborted === 'boolean'
     && typeof value.signal.addEventListener === 'function'
     && typeof value.signal.removeEventListener === 'function'
-    && Number.isSafeInteger(value.deadlineAt)
     && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0
+    && typeof value.remainingMs === 'function'
+    && validMutationAuthorization(value.mutationAuthorization)
 }
 
 function effectiveRequestTimeout(timeoutMs, requestBoundary) {
   if (requestBoundary === undefined) return { timeoutMs }
   if (!validRequestBoundary(requestBoundary)) throw { code: 'INVALID_INPUT' }
-  const remaining = requestBoundary.deadlineAt - Date.now()
+  const remaining = requestBoundary.remainingMs()
   if (remaining <= 0 || requestBoundary.signal.aborted) throw { code: 'TRANSIENT_FAILURE' }
   return {
     timeoutMs: Math.max(1, Math.min(timeoutMs, requestBoundary.timeoutMs, remaining)),
     signal: requestBoundary.signal,
   }
+}
+
+async function acknowledgeTransportAbort(transport) {
+  try { await transport } catch { /* the original transport acknowledged abort */ }
 }
 
 function deadline(timeoutMs, parentSignal) {
@@ -929,6 +966,7 @@ async function readResponseBytes(response, maximum, signal) {
 
 function createWorkerStorageClient({
   baseUrl, serviceKey, fetchImpl = fetch, timeoutMs = 10_000,
+  mutationPermitPortVersion,
 }) {
   let parsed
   try { parsed = new URL(baseUrl) } catch { parsed = undefined }
@@ -936,28 +974,41 @@ function createWorkerStorageClient({
     || parsed.search || parsed.hash || !serviceKey) {
     throw new Error('Worker Storage is not configured')
   }
+  if (mutationPermitPortVersion !== 'db-job-v1') {
+    throw new Error('Worker Storage mutation permit port is not configured')
+  }
   const normalizedBaseUrl = parsed.href.replace(/\/$/u, '')
 
-  async function request(path, body, allowBytes, requestBoundary) {
+  async function request(path, body, allowBytes, requestBoundary, mutation = false) {
     const requestLimit = effectiveRequestTimeout(timeoutMs, requestBoundary)
     const boundary = deadline(requestLimit.timeoutMs, requestLimit.signal)
     let transport
     try {
       let response
       try {
+        const requestBody = mutation
+          ? { ...body, mutationAuthorization: requestBoundary.mutationAuthorization }
+          : body
         transport = Promise.resolve().then(() => fetchImpl(`${normalizedBaseUrl}${path}`, {
           method: 'POST', headers: {
             authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json',
-          }, body: JSON.stringify(body), signal: boundary.signal,
+            ...(mutation ? {
+              'x-autoforge-mutation-permit-version': mutationPermitPortVersion,
+            } : {}),
+          }, body: JSON.stringify(requestBody), signal: boundary.signal,
         }))
         response = await boundary.race(transport)
       } catch {
-        if (boundary.signal.aborted && transport) await Promise.allSettled([transport])
+        // Do not settle the adapter until the original transport acknowledges.
+        // The outer job containment aborts the process if this acknowledgement stalls.
+        if (boundary.signal.aborted && transport) await acknowledgeTransportAbort(transport)
         throw { code: 'TRANSIENT_FAILURE' }
       }
       if (!response?.ok) throw { code: response?.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
       if (!allowBytes) {
-        if (![204, 205].includes(response.status)) throw { code: 'INTERNAL_ERROR' }
+        if (![204, 205].includes(response.status)
+          || response.headers?.get?.('x-autoforge-mutation-permit-validated')
+            !== mutationPermitPortVersion) throw { code: 'INTERNAL_ERROR' }
         return undefined
       }
       return await boundary.race(readResponseBytes(response, body.byteSize, boundary.signal))
@@ -987,7 +1038,7 @@ function createWorkerStorageClient({
         || storageReferences.some(reference => !validStorageReference(reference))) {
         throw { code: 'INVALID_INPUT' }
       }
-      await request('/objects/delete', { storageReferences }, false, requestBoundary)
+      await request('/objects/delete', { storageReferences }, false, requestBoundary, true)
     },
   }
 }

@@ -43,6 +43,15 @@ Stop if the two forward migrations are not byte-identical.
    response contract. Preserve `worker/parser-process.js`, `worker/parser-child.js`,
    and the version-aligned parser dependencies in `worker/package.json`; run a
    package-resolution smoke with the release Node runtime before deployment.
+   Do not set `AUTOFORGE_KNOWLEDGE_MUTATION_PERMIT_PORT_VERSION=db-job-v1`
+   until both private services implement the reviewed `mutation-permit-port.js`
+   contract: PG Storage must validate `storage_delete` immediately before each
+   object delete and return the validation receipt header; TokenHub must validate
+   `tokenhub_embedding` immediately before each send and return
+   `mutationPermitValidated: true`. Both validations call
+   `autoforge_knowledge_validate_job_mutation_permit` with the same opaque
+   worker/job/lease capability. Without both handlers the scheduled worker is
+   intentionally unstartable.
    Never expose worker RPCs or worker credentials to Electron.
 3. With anonymous, Alice, and Bob staging identities, probe every action.
    Anonymous and forged-owner events must fail; cross-owner reads, upload
@@ -73,7 +82,13 @@ Stop if the two forward migrations are not byte-identical.
    retention-floor cursor receives one transactionally materialized,
    owner-scoped snapshot through bounded stable pages,
    and the 90-day cleanup advances the durable floor before pruning changes.
-7. Verify job claim, bounded embedding yield, and completion CAS with token and expiry. Only
+7. Verify job claim, bounded embedding yield, and completion CAS with token and expiry. Claim
+   must create the opaque mutation permit and deadline with PostgreSQL's clock;
+   worker SQL, PG Storage, and TokenHub must reject a stale or mismatched capability
+   using only the stored DB deadline and lease, even when the worker wall clock is
+   skewed both ahead and behind. Exercise acknowledged abort and an ignored-abort
+   transport: the former must quiesce inside the reserve; the latter must terminate
+   the current scheduled execution containment with no later side effect. Only
    `TRANSIENT_FAILURE` may retry, at most three attempts; the third expired
    lease becomes terminal `failed`. A successful two-chunk embedding slice must
    persist its vectors, yield the exact live lease back to `queued`, and preserve

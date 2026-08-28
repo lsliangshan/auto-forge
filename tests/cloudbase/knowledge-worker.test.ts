@@ -15,14 +15,30 @@ import {
 } from '../../cloudbase/knowledge/worker/knowledge-worker.js'
 
 const claim = (id: string, kind: 'upload' | 'embedding' | 'purge', attempt = 1) => ({
-  job: { id, kind, entityId: `${kind}_entity`, leaseToken: `lease_${id}`, attempt },
+  job: {
+    id, kind, entityId: `${kind}_entity`, leaseToken: `lease_${id}`, attempt,
+    mutationPermit: `permit_${id}`, mutationBudgetMs: 120_000,
+  },
 })
 
 const requestBoundary = () => expect.objectContaining({
   signal: expect.any(AbortSignal),
-  deadlineAt: expect.any(Number),
   timeoutMs: expect.any(Number),
+  remainingMs: expect.any(Function),
+  mutationAuthorization: expect.objectContaining({
+    capability: expect.any(String), workerId: expect.any(String),
+    jobId: expect.any(String), leaseToken: expect.any(String),
+  }),
 })
+
+type Boundary = {
+  signal: AbortSignal
+  timeoutMs: number
+  remainingMs: () => number
+  mutationAuthorization: {
+    capability: string; workerId: string; jobId: string; leaseToken: string
+  }
+}
 
 async function withParserChild<T>(source: string, run: (path: string) => Promise<T>): Promise<T> {
   const directory = await mkdtemp(join(tmpdir(), 'autoforge-parser-child-'))
@@ -608,7 +624,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       expect.objectContaining({
         p_worker_id: 'worker_1', p_job_id: 'job_upload',
         p_lease_token: 'lease_job_upload', p_generation_id: 'generation_1',
-        p_request_deadline_ms: expect.any(Number),
+        p_mutation_permit: expect.any(String),
         p_blocks: expect.any(Array), p_chunks: expect.any(Array),
       }), requestBoundary())
     expect(bytes.every(byte => byte === 0)).toBe(true)
@@ -701,7 +717,7 @@ describe('CloudBase knowledge scheduled worker', () => {
     expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_yield_job', {
       p_worker_id: 'worker_1', p_job_id: 'job_embedding',
       p_lease_token: 'lease_job_embedding',
-      p_request_deadline_ms: expect.any(Number),
+      p_mutation_permit: expect.any(String),
     }, requestBoundary())
     expect(rpc.mock.calls.some(([name]) => name === 'autoforge_knowledge_complete_job')).toBe(false)
     expect(rpc.mock.calls.filter(([name]) => name === 'autoforge_knowledge_claim_job')).toHaveLength(1)
@@ -735,7 +751,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_complete_job', {
         p_worker_id: 'worker_1', p_job_id: 'job_upload',
         p_lease_token: 'lease_job_upload', p_state: 'failed', p_error_code: expectedCode,
-        p_request_deadline_ms: expect.any(Number),
+        p_mutation_permit: expect.any(String),
       }, requestBoundary())
       if (expectedCode === 'TRANSIENT_FAILURE') {
         expect(rpc.mock.calls.filter(([name]) => (
@@ -807,7 +823,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         p_worker_id: 'worker_1', p_job_id: 'job_upload',
         p_lease_token: 'lease_job_upload', p_state: 'failed',
         p_error_code: 'TRANSIENT_FAILURE',
-        p_request_deadline_ms: expect.any(Number),
+        p_mutation_permit: expect.any(String),
       }, requestBoundary())
     } finally {
       vi.useRealTimers()
@@ -818,7 +834,6 @@ describe('CloudBase knowledge scheduled worker', () => {
     vi.useFakeTimers()
     vi.setSystemTime(0)
     try {
-      type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
       let claims = 0
       let embeddingDrained = false
       const rpc = vi.fn().mockImplementation(async (name: string) => {
@@ -870,7 +885,6 @@ describe('CloudBase knowledge scheduled worker', () => {
     vi.useFakeTimers()
     vi.setSystemTime(0)
     try {
-      type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
       let claims = 0
       let storageDrained = false
       const rpc = vi.fn().mockImplementation(async (name: string) => {
@@ -934,7 +948,6 @@ describe('CloudBase knowledge scheduled worker', () => {
       vi.useFakeTimers()
       vi.setSystemTime(0)
       try {
-        type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
         const bytes = Buffer.from('contained source')
         const sha256 = createHash('sha256').update(bytes).digest('hex')
         let claims = 0
@@ -1021,7 +1034,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_complete_job', {
           p_worker_id: 'worker_1', p_job_id: `job_${kind}`,
           p_lease_token: `lease_job_${kind}`, p_state: 'failed',
-          p_error_code: 'TRANSIENT_FAILURE', p_request_deadline_ms: expect.any(Number),
+          p_error_code: 'TRANSIENT_FAILURE', p_mutation_permit: expect.any(String),
         }, requestBoundary())
 
         await vi.advanceTimersByTimeAsync(500)
@@ -1032,14 +1045,108 @@ describe('CloudBase knowledge scheduled worker', () => {
     },
   )
 
+  it.each([-8_640_000_000, 8_640_000_000])(
+    'uses the DB claim budget and opaque permit despite a client clock skew of %i ms',
+    async (clientClock) => {
+      vi.useFakeTimers()
+      vi.setSystemTime(clientClock)
+      try {
+        type Boundary = {
+          signal: AbortSignal
+          timeoutMs: number
+          remainingMs: () => number
+          mutationAuthorization: {
+            capability: string; workerId: string; jobId: string; leaseToken: string
+          }
+        }
+        const bytes = Buffer.from('server-owned permit')
+        const sha256 = createHash('sha256').update(bytes).digest('hex')
+        let claims = 0
+        let monotonicTime = 0
+        const boundaries: Boundary[] = []
+        const rpc = vi.fn(async (
+          name: string, parameters: Record<string, unknown>, boundary?: Boundary,
+        ) => {
+          if (name === 'autoforge_knowledge_claim_job') {
+            claims += 1
+            monotonicTime = 20
+            return claims === 1 ? {
+              job: {
+                id: 'job_upload', kind: 'upload', entityId: 'upload_entity',
+                leaseToken: 'lease_job_upload', attempt: 1,
+                mutationPermit: 'opaque_server_permit', mutationBudgetMs: 100,
+              },
+            } : { job: null }
+          }
+          if (boundary) boundaries.push(boundary)
+          if (name === 'autoforge_knowledge_get_upload_work') return {
+            ownerId: '1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+            versionId: 'version_1', generationId: 'generation_1', objectId: 'object_1',
+            storageReference: 'knowledge/1/kb_1/object_1', byteSize: bytes.byteLength,
+            sha256, mimeType: 'text/plain', name: 'cloud.txt', versionNumber: 1,
+          }
+          if (name === 'autoforge_knowledge_complete_upload_index') {
+            expect(parameters).toMatchObject({ p_mutation_permit: 'opaque_server_permit' })
+            expect(parameters).not.toHaveProperty('p_request_deadline_ms')
+            return { completed: true, generationId: 'generation_1', embeddingJobId: null }
+          }
+          if (name === 'autoforge_knowledge_cleanup_retention') return {
+            prunedChanges: 0, prunedTombstones: 0, prunedSnapshots: 0,
+            prunedGenerations: 0, prunedDispatchPermits: 0,
+          }
+          throw new Error(`unexpected rpc ${name}`)
+        })
+        const storageBoundaries: Boundary[] = []
+        const worker = createKnowledgeWorker({
+          rpc,
+          storage: {
+            readObject: vi.fn((_input: unknown, boundary: Boundary) => {
+              storageBoundaries.push(boundary)
+              return Promise.resolve(bytes)
+            }),
+            deleteObjects: vi.fn(),
+          },
+          parser: { parse: vi.fn().mockResolvedValue({
+            parserVersion: 'cloud-parser-v1',
+            blocks: [{ id: 'block_1', ordinal: 0, kind: 'paragraph',
+              body: 'server-owned permit', coordinates: { kind: 'txt' } }],
+            chunks: [{ id: 'chunk_1', blockId: 'block_1', ordinal: 0,
+              body: 'server-owned permit', coordinates: { kind: 'txt' } }],
+          }) },
+          workerId: 'worker_1', id: () => 'lease_job_upload',
+          jobTimeoutMs: 100, settlementReserveMs: 30,
+          monotonicNow: () => monotonicTime,
+        })
+
+        await expect(worker.runOnce()).resolves.toEqual({ claimed: 1, completed: 1, failed: 0 })
+        expect(boundaries).toHaveLength(2)
+        expect(storageBoundaries).toHaveLength(1)
+        for (const boundary of [...boundaries, ...storageBoundaries]) {
+          expect(boundary).toMatchObject({
+            signal: expect.any(AbortSignal), timeoutMs: expect.any(Number),
+            remainingMs: expect.any(Function),
+            mutationAuthorization: {
+              capability: 'opaque_server_permit', workerId: 'worker_1',
+              jobId: 'job_upload', leaseToken: 'lease_job_upload',
+            },
+          })
+          expect(Number.isSafeInteger(boundary.timeoutMs)).toBe(true)
+          expect(boundary.remainingMs()).toBeGreaterThan(0)
+          expect(boundary.remainingMs()).toBeLessThanOrEqual(50)
+        }
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
   it.each([
     ['upload-work RPC', 'rpc'],
     ['Storage read', 'storage'],
     ['upload completion RPC', 'post-rpc'],
-  ] as const)('shares a 120-second claim deadline with a never-settling %s', async (_name, stalled) => {
+  ] as const)('shares the DB claim budget with a never-settling %s', async (_name, stalled) => {
     vi.useFakeTimers()
     try {
-      type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
       const bytes = Buffer.from('claim deadline source')
       const sha256 = createHash('sha256').update(bytes).digest('hex')
       let claims = 0
@@ -1108,7 +1215,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         p_worker_id: 'worker_1', p_job_id: 'job_upload',
         p_lease_token: 'lease_job_upload', p_state: 'failed',
         p_error_code: 'TRANSIENT_FAILURE',
-        p_request_deadline_ms: expect.any(Number),
+        p_mutation_permit: expect.any(String),
       }, requestBoundary())
     } finally {
       vi.useRealTimers()
@@ -1121,13 +1228,16 @@ describe('CloudBase knowledge scheduled worker', () => {
     try {
       const bytes = Buffer.from('late completion source')
       const sha256 = createHash('sha256').update(bytes).digest('hex')
-      type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
       const workBoundaries: Array<Boundary | undefined> = []
       const storageBoundaries: Array<Boundary | undefined> = []
       let settlementBoundary: Boundary | undefined
-      let completionDeadline: number | undefined
+      let completionPermit: string | undefined
+      const workRemainingAtCall: number[] = []
+      const storageRemainingAtCall: number[] = []
+      let settlementRemainingAtCall: number | undefined
       let parserSignal: AbortSignal | undefined
       let lateCompletionSideEffects = 0
+      let permitValid = true
       let rejectCompletion: ((error: unknown) => void) | undefined
       let claims = 0
       const rpc = vi.fn((name: string, parameters: unknown, boundary?: Boundary) => {
@@ -1137,6 +1247,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         }
         if (name === 'autoforge_knowledge_get_upload_work') {
           workBoundaries.push(boundary)
+          workRemainingAtCall.push(boundary?.remainingMs() ?? -1)
           return Promise.resolve({
             ownerId: '1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
             versionId: 'version_1', generationId: 'generation_1', objectId: 'object_1',
@@ -1146,12 +1257,12 @@ describe('CloudBase knowledge scheduled worker', () => {
         }
         if (name === 'autoforge_knowledge_complete_upload_index') {
           workBoundaries.push(boundary)
-          completionDeadline = (parameters as { p_request_deadline_ms?: number })
-            .p_request_deadline_ms
+          workRemainingAtCall.push(boundary?.remainingMs() ?? -1)
+          completionPermit = (parameters as { p_mutation_permit?: string }).p_mutation_permit
           return new Promise((resolve, reject) => {
             rejectCompletion = reject
             setTimeout(() => {
-              if (!Number.isSafeInteger(completionDeadline) || Date.now() <= completionDeadline!) {
+              if (permitValid && completionPermit === 'permit_job_upload') {
                 lateCompletionSideEffects += 1
                 resolve({ completed: true, generationId: 'generation_1', embeddingJobId: null })
               } else {
@@ -1162,6 +1273,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         }
         if (name === 'autoforge_knowledge_complete_job') {
           settlementBoundary = boundary
+          settlementRemainingAtCall = boundary?.remainingMs()
           return Promise.resolve({ completed: true })
         }
         if (name === 'autoforge_knowledge_cleanup_retention') return Promise.resolve({
@@ -1175,6 +1287,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         storage: {
           readObject: vi.fn((_input: unknown, boundary?: Boundary) => {
             storageBoundaries.push(boundary)
+            storageRemainingAtCall.push(boundary?.remainingMs() ?? -1)
             return Promise.resolve(bytes)
           }),
           deleteObjects: vi.fn(),
@@ -1193,6 +1306,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         workerId: 'worker_1', id: () => 'lease_job_upload',
         jobTimeoutMs: 100, settlementReserveMs: 30,
         terminateJobExecution: vi.fn(async () => {
+          permitValid = false
           rejectCompletion?.({ code: 'TRANSIENT_FAILURE' })
         }),
       })
@@ -1203,14 +1317,15 @@ describe('CloudBase knowledge scheduled worker', () => {
 
       expect(workBoundaries).toHaveLength(2)
       expect(storageBoundaries).toHaveLength(1)
-      expect(workBoundaries.every(boundary => boundary?.deadlineAt === 70)).toBe(true)
-      expect(storageBoundaries[0]?.deadlineAt).toBe(70)
+      expect(workRemainingAtCall.every(remaining => remaining >= 0 && remaining <= 70)).toBe(true)
+      expect(storageRemainingAtCall[0]).toBeGreaterThanOrEqual(0)
+      expect(storageRemainingAtCall[0]).toBeLessThanOrEqual(70)
       expect(workBoundaries[0]?.signal).toBe(workBoundaries[1]?.signal)
       expect(storageBoundaries[0]?.signal).toBe(workBoundaries[0]?.signal)
       expect(parserSignal).toBe(workBoundaries[0]?.signal)
       expect(workBoundaries[1]?.signal.aborted).toBe(true)
-      expect(completionDeadline).toBe(70)
-      expect(settlementBoundary?.deadlineAt).toBeGreaterThan(70)
+      expect(completionPermit).toBe('permit_job_upload')
+      expect(settlementRemainingAtCall).toBeGreaterThan(0)
       expect(settlementBoundary?.signal.aborted).toBe(false)
 
       await vi.advanceTimersByTimeAsync(500)
@@ -1224,11 +1339,12 @@ describe('CloudBase knowledge scheduled worker', () => {
     vi.useFakeTimers()
     vi.setSystemTime(0)
     try {
-      type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
       let claims = 0
       let settlementBoundary: Boundary | undefined
-      let settlementDeadline: number | undefined
+      let settlementPermit: string | undefined
+      let settlementRemainingAtCall: number | undefined
       let lateSettlementSideEffects = 0
+      let permitValid = true
       let rejectSettlement: ((error: unknown) => void) | undefined
       const rpc = vi.fn((name: string, parameters: unknown, boundary?: Boundary) => {
         if (name === 'autoforge_knowledge_claim_job') {
@@ -1240,12 +1356,12 @@ describe('CloudBase knowledge scheduled worker', () => {
         }
         if (name === 'autoforge_knowledge_complete_job') {
           settlementBoundary = boundary
-          settlementDeadline = (parameters as { p_request_deadline_ms?: number })
-            .p_request_deadline_ms
+          settlementRemainingAtCall = boundary?.remainingMs()
+          settlementPermit = (parameters as { p_mutation_permit?: string }).p_mutation_permit
           return new Promise((resolve, reject) => {
             rejectSettlement = reject
             setTimeout(() => {
-              if (!Number.isSafeInteger(settlementDeadline) || Date.now() <= settlementDeadline!) {
+              if (permitValid && settlementPermit === 'permit_job_upload') {
                 lateSettlementSideEffects += 1
                 resolve({ completed: true })
               } else {
@@ -1266,6 +1382,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         parser: { parse: vi.fn() }, workerId: 'worker_1', id: () => 'lease_job_upload',
         jobTimeoutMs: 100, settlementReserveMs: 30,
         terminateJobExecution: vi.fn(async () => {
+          permitValid = false
           rejectSettlement?.({ code: 'TRANSIENT_FAILURE' })
         }),
       })
@@ -1273,8 +1390,9 @@ describe('CloudBase knowledge scheduled worker', () => {
       const run = worker.runOnce()
       await vi.advanceTimersByTimeAsync(100)
       await expect(run).resolves.toEqual({ claimed: 1, completed: 0, failed: 1 })
-      expect(settlementBoundary?.deadlineAt).toBe(90)
-      expect(settlementDeadline).toBe(90)
+      expect(settlementRemainingAtCall).toBeGreaterThan(0)
+      expect(settlementRemainingAtCall).toBeLessThanOrEqual(90)
+      expect(settlementPermit).toBe('permit_job_upload')
       expect(settlementBoundary?.signal.aborted).toBe(true)
 
       await vi.advanceTimersByTimeAsync(500)
@@ -1285,7 +1403,6 @@ describe('CloudBase knowledge scheduled worker', () => {
   })
 
   it('threads the claimed work boundary through purge and embedding-yield dependencies', async () => {
-    type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
     const purgeRpcBoundaries: Array<Boundary | undefined> = []
     const purgeStorageBoundaries: Array<Boundary | undefined> = []
     let purgeClaims = 0
@@ -1357,7 +1474,11 @@ describe('CloudBase knowledge scheduled worker', () => {
     for (const boundary of [...purgeRpcBoundaries, ...purgeStorageBoundaries,
       ...embeddingBoundaries, ...yieldBoundaries]) {
       expect(boundary).toEqual(expect.objectContaining({
-        signal: expect.any(AbortSignal), deadlineAt: expect.any(Number), timeoutMs: expect.any(Number),
+        signal: expect.any(AbortSignal), timeoutMs: expect.any(Number),
+        remainingMs: expect.any(Function), mutationAuthorization: expect.objectContaining({
+          capability: expect.any(String), workerId: 'worker_1',
+          jobId: expect.any(String), leaseToken: expect.any(String),
+        }),
       }))
     }
     expect(purgeRpcBoundaries[0]).toBe(purgeRpcBoundaries[1])
@@ -1660,6 +1781,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       let signal: AbortSignal | undefined
       const storage = createWorkerStorageClient({
         baseUrl: 'https://pg-storage.example/v1/storage', serviceKey: 'server-only',
+        mutationPermitPortVersion: 'db-job-v1',
         timeoutMs: 500,
         fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => {
           signal = init.signal
@@ -1673,8 +1795,12 @@ describe('CloudBase knowledge scheduled worker', () => {
         sha256: 'a'.repeat(64), mimeType: 'text/plain',
       }, {
         signal: new AbortController().signal,
-        deadlineAt: Date.now() + 50,
         timeoutMs: 500,
+        remainingMs: () => 50,
+        mutationAuthorization: {
+          capability: 'opaque_server_permit', workerId: 'worker_1',
+          jobId: 'job_upload', leaseToken: 'lease_job_upload',
+        },
       })
       const outcome = Promise.race([
         read.then(
@@ -1694,5 +1820,41 @@ describe('CloudBase knowledge scheduled worker', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('keeps the worker Storage mutation port closed without the DB permit contract', async () => {
+    expect(() => createWorkerStorageClient({
+      baseUrl: 'https://pg-storage.example/v1/storage', serviceKey: 'server-only',
+    })).toThrow('Worker Storage mutation permit port is not configured')
+
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 204,
+      headers: { get: vi.fn((name: string) => (
+        name === 'x-autoforge-mutation-permit-validated' ? 'db-job-v1' : null
+      )) },
+    })
+    const storage = createWorkerStorageClient({
+      baseUrl: 'https://pg-storage.example/v1/storage', serviceKey: 'server-only',
+      mutationPermitPortVersion: 'db-job-v1', fetchImpl,
+    })
+    const mutationAuthorization = {
+      capability: 'opaque_server_permit', workerId: 'worker_1',
+      jobId: 'job_purge', leaseToken: 'lease_job_purge',
+    }
+    await expect(storage.deleteObjects(['knowledge/1/kb_1/object_1'], {
+      signal: new AbortController().signal,
+      timeoutMs: 500,
+      remainingMs: () => 100,
+      mutationAuthorization,
+    })).resolves.toBeUndefined()
+    const request = fetchImpl.mock.calls[0]?.[1] as { headers: Record<string, string>; body: string }
+    expect(request.headers).toMatchObject({
+      'x-autoforge-mutation-permit-version': 'db-job-v1',
+    })
+    expect(JSON.parse(request.body)).toEqual({
+      storageReferences: ['knowledge/1/kb_1/object_1'],
+      mutationAuthorization,
+    })
   })
 })

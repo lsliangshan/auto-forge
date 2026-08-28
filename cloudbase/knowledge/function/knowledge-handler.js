@@ -1,4 +1,4 @@
-/* global AbortController, Buffer, clearTimeout, fetch, module, require, setTimeout, TextDecoder, URL */
+/* global AbortController, Buffer, clearTimeout, fetch, module, performance, require, setTimeout, TextDecoder, URL */
 
 const { createHash } = require('node:crypto')
 
@@ -29,7 +29,7 @@ const fixedEmbeddingConfiguration = Object.freeze({
 const uploadHeaderNames = [
   'content-length', 'content-type', 'x-content-sha256', 'x-upload-ticket',
 ]
-const mutationDeadlineRpcNames = new Set([
+const jobMutationRpcNames = new Set([
   'autoforge_knowledge_issue_embedding_dispatch_permit',
   'autoforge_knowledge_reserve_embedding_dispatch_attempt',
   'autoforge_knowledge_mark_embedding_dispatch_started',
@@ -84,6 +84,12 @@ function exactKeys(value, keys) {
   const actual = Object.keys(value).sort()
   const expected = [...keys].sort()
   return actual.length === expected.length && actual.every((key, index) => key === expected[index])
+}
+
+function validMutationAuthorization(value) {
+  return exactKeys(value, ['capability', 'workerId', 'jobId', 'leaseToken'])
+    && nonEmptyString(value.capability) && nonEmptyString(value.workerId)
+    && nonEmptyString(value.jobId) && nonEmptyString(value.leaseToken)
 }
 
 function safeSerializedSize(value) {
@@ -158,24 +164,32 @@ async function readBoundedJson(response, allowEmpty = false, signal) {
 }
 
 function validRequestBoundary(value) {
-  return exactKeys(value, ['signal', 'deadlineAt', 'timeoutMs'])
+  return exactKeys(value, [
+    'signal', 'timeoutMs', 'remainingMs', 'mutationAuthorization',
+  ])
     && isRecord(value.signal)
     && typeof value.signal.aborted === 'boolean'
     && typeof value.signal.addEventListener === 'function'
     && typeof value.signal.removeEventListener === 'function'
-    && Number.isSafeInteger(value.deadlineAt)
     && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0
+    && typeof value.remainingMs === 'function'
+    && (value.mutationAuthorization === null
+      || validMutationAuthorization(value.mutationAuthorization))
 }
 
 function effectiveRequestTimeout(timeoutMs, requestBoundary) {
   if (requestBoundary === undefined) return { timeoutMs }
   if (!validRequestBoundary(requestBoundary)) throw { code: 'INVALID_INPUT' }
-  const remaining = requestBoundary.deadlineAt - Date.now()
+  const remaining = requestBoundary.remainingMs()
   if (remaining <= 0 || requestBoundary.signal.aborted) throw { code: 'TRANSIENT_FAILURE' }
   return {
     timeoutMs: Math.max(1, Math.min(timeoutMs, requestBoundary.timeoutMs, remaining)),
     signal: requestBoundary.signal,
   }
+}
+
+async function acknowledgeTransportAbort(transport) {
+  try { await transport } catch { /* the original transport acknowledged abort */ }
 }
 
 function createNetworkDeadline(timeoutMs, parentSignal) {
@@ -221,7 +235,9 @@ async function boundedPost({
       }))
       response = await deadline.race(transport)
     } catch {
-      if (deadline.signal.aborted && transport) await Promise.allSettled([transport])
+      // Worker calls stay pending until the original transport acknowledges;
+      // the job containment terminates its process if acknowledgement stalls.
+      if (deadline.signal.aborted && transport) await acknowledgeTransportAbort(transport)
       throw { code: 'TRANSIENT_FAILURE' }
     }
     const result = await deadline.race(readBoundedJson(response, allowEmpty, deadline.signal))
@@ -453,7 +469,7 @@ function validDispatchPermit(value, purpose, requestId, attemptId, consentEpoch)
     && value.attemptId === attemptId
     && value.consentEpoch === consentEpoch
     && nonEmptyString(value.providerRequestKey)
-    && isIsoDate(value.expiresAt) && Date.parse(value.expiresAt) > Date.now()
+    && isIsoDate(value.expiresAt)
     && validEmbeddingConfiguration(value.embedding)
 }
 
@@ -477,10 +493,13 @@ function dispatchResultHash(result) {
 }
 
 function callRpc(rpc, name, parameters, requestBoundary) {
-  const boundedMutation = mutationDeadlineRpcNames.has(name)
+  const boundedMutation = jobMutationRpcNames.has(name)
   if (boundedMutation && !validRequestBoundary(requestBoundary)) throw { code: 'INVALID_INPUT' }
   const boundedParameters = boundedMutation
-    ? { ...parameters, p_request_deadline_ms: requestBoundary.deadlineAt }
+    ? {
+        ...parameters,
+        p_mutation_permit: requestBoundary.mutationAuthorization?.capability ?? null,
+      }
     : parameters
   return requestBoundary === undefined
     ? rpc(name, boundedParameters)
@@ -493,10 +512,12 @@ function operationBoundary(requestBoundary) {
     return requestBoundary
   }
   const timeoutMs = 10_000
+  const startedAt = performance.now()
   return Object.freeze({
     signal: new AbortController().signal,
-    deadlineAt: Date.now() + timeoutMs,
     timeoutMs,
+    remainingMs: () => Math.max(0, timeoutMs - (performance.now() - startedAt)),
+    mutationAuthorization: null,
   })
 }
 
@@ -701,6 +722,9 @@ async function dispatchEmbedding({
         region: fixedEmbeddingConfiguration.region,
         dispatchPermit: permit.permitId,
         idempotencyKey: permit.providerRequestKey,
+        mutationAuthorization: purpose === 'chunk'
+          ? activeBoundary.mutationAuthorization
+          : null,
       }, activeBoundary)
     } catch (error) {
       providerError = error
@@ -1198,6 +1222,12 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub, maximumChunksPerRun = 
         throw { code: 'INVALID_INPUT' }
       }
       const activeBoundary = operationBoundary(requestBoundary)
+      if (!validMutationAuthorization(activeBoundary.mutationAuthorization)
+        || activeBoundary.mutationAuthorization.workerId !== workerId
+        || activeBoundary.mutationAuthorization.jobId !== jobId
+        || activeBoundary.mutationAuthorization.leaseToken !== leaseToken) {
+        throw { code: 'INVALID_INPUT' }
+      }
       const batch = await callRpc(rpc, 'autoforge_knowledge_claim_embedding_batch', {
         p_worker_id: workerId, p_job_id: jobId, p_lease_token: leaseToken,
         p_limit: maximumChunksPerRun,
@@ -1351,12 +1381,18 @@ function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch, timeo
   }
 }
 
-function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch, timeoutMs = 10_000 }) {
+function createTokenHubClient({
+  endpoint, apiKey, fetchImpl = fetch, timeoutMs = 10_000,
+  requireMutationPermitPort = false, mutationPermitPortVersion,
+}) {
   let parsed
   try { parsed = new URL(endpoint) } catch { parsed = undefined }
   if (!parsed || parsed.protocol !== 'https:' || parsed.username || parsed.password
     || parsed.search || parsed.hash || !apiKey) {
     throw new Error('TokenHub is not configured')
+  }
+  if (requireMutationPermitPort && mutationPermitPortVersion !== 'db-job-v1') {
+    throw new Error('TokenHub mutation permit port is not configured')
   }
   const statusUrl = new URL(parsed.href)
   statusUrl.pathname = `${statusUrl.pathname.replace(/\/$/, '')}/status`
@@ -1371,11 +1407,16 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch, timeoutMs =
     async embed(input, requestBoundary) {
       if (!exactKeys(input, [
         'input', 'model', 'dimensions', 'configurationVersion', 'region', 'dispatchPermit',
-        'idempotencyKey',
+        'idempotencyKey', 'mutationAuthorization',
       ])
         || !nonEmptyString(input.input, 64 * 1024)
         || !nonEmptyString(input.dispatchPermit)
-        || !validAttemptIdentity(input)) {
+        || !validAttemptIdentity(input)
+        || !(input.mutationAuthorization === null
+          || validMutationAuthorization(input.mutationAuthorization))
+        || (requireMutationPermitPort && !validMutationAuthorization(
+          input.mutationAuthorization,
+        ))) {
         throw { code: 'INVALID_INPUT' }
       }
       const { response, result: body } = await boundedPost({
@@ -1383,15 +1424,22 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch, timeoutMs =
         headers: {
           authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
           'idempotency-key': input.idempotencyKey,
+          ...(input.mutationAuthorization ? {
+            'x-autoforge-mutation-permit-version': mutationPermitPortVersion,
+          } : {}),
         },
         body: input, fetchImpl, timeoutMs, requestBoundary,
       })
-      if (!response.ok || !exactKeys(body, ['model', 'dimensions', 'embedding'])
+      const responseKeys = input.mutationAuthorization
+        ? ['model', 'dimensions', 'embedding', 'mutationPermitValidated']
+        : ['model', 'dimensions', 'embedding']
+      if (!response.ok || !exactKeys(body, responseKeys)
         || body.model !== fixedEmbeddingConfiguration.model
         || body.dimensions !== fixedEmbeddingConfiguration.dimensions
         || !Array.isArray(body.embedding)
         || body.embedding.length !== fixedEmbeddingConfiguration.dimensions
-        || body.embedding.some(value => !Number.isFinite(value))) {
+        || body.embedding.some(value => !Number.isFinite(value))
+        || (input.mutationAuthorization && body.mutationPermitValidated !== true)) {
         throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
       }
       return body.embedding

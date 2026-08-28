@@ -17,6 +17,7 @@ let worker
 function configuredWorker() {
   if (worker) return worker
   const serviceKey = process.env.AUTOFORGE_PG_SERVICE_KEY
+  const mutationPermitPortVersion = process.env.AUTOFORGE_KNOWLEDGE_MUTATION_PERMIT_PORT_VERSION
   const rpc = createPostgresRpcClient({
     baseUrl: process.env.AUTOFORGE_PG_RPC_BASE_URL,
     serviceKey,
@@ -24,13 +25,17 @@ function configuredWorker() {
   const storage = createWorkerStorageClient({
     baseUrl: process.env.AUTOFORGE_PG_STORAGE_BASE_URL,
     serviceKey,
+    mutationPermitPortVersion,
   })
   const tokenHubEndpoint = process.env.AUTOFORGE_TOKENHUB_EMBEDDING_URL
   const tokenHubApiKey = process.env.AUTOFORGE_TOKENHUB_API_KEY
   const embeddingWorker = tokenHubEndpoint && tokenHubApiKey
     ? createEmbeddingGenerationWorker({
         rpc,
-        tokenHub: createTokenHubClient({ endpoint: tokenHubEndpoint, apiKey: tokenHubApiKey }),
+        tokenHub: createTokenHubClient({
+          endpoint: tokenHubEndpoint, apiKey: tokenHubApiKey,
+          requireMutationPermitPort: true, mutationPermitPortVersion,
+        }),
         maximumChunksPerRun: 2,
       })
     : undefined

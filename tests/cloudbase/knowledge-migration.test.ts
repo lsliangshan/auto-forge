@@ -649,10 +649,21 @@ describe('CloudBase personal knowledge migration', () => {
     expect(lease.state).toBe('completed')
   })
 
-  it('rejects late lease mutations with the caller deadline inside the transaction', async () => {
+  it('binds every worker mutation to a DB-owned job permit and deadline', async () => {
     const [sql, workerSql] = await Promise.all([
       readFile(canonicalUrl, 'utf8'), readFile(workerCanonicalUrl, 'utf8'),
     ])
+    expect(sql).toContain('mutation_permit varchar(128)')
+    expect(sql).toContain('mutation_deadline_at timestamptz')
+    const claim = functionDefinition(sql, 'autoforge_knowledge_claim_job')
+    expect(claim).toContain("mutation_deadline_at = clock_timestamp() + interval '120 seconds'")
+    expect(claim).toContain('mutation_permit = replace(gen_random_uuid()::text')
+    expect(claim).toContain('DECLARE job public.knowledge_jobs%ROWTYPE')
+    expect(claim).toContain("'mutationPermit', job.mutation_permit")
+    expect(claim).toContain("'mutationBudgetMs'")
+    expect(sql).not.toContain('p_request_deadline_ms')
+    expect(workerSql).not.toContain('p_request_deadline_ms')
+
     for (const [source, name] of [
       [sql, 'autoforge_knowledge_complete_job'],
       [sql, 'autoforge_knowledge_complete_base_purge'],
@@ -662,8 +673,9 @@ describe('CloudBase personal knowledge migration', () => {
     ] as const) {
       const definition = functionDefinition(source, name)
       const body = staticFunctionBodyFragment(source, name)
-      expect(definition).toContain('p_request_deadline_ms bigint')
-      expect(body).toContain('to_timestamp(p_request_deadline_ms / 1000.0)')
+      expect(definition).toContain('p_mutation_permit varchar')
+      expect(body).toContain('mutation_permit = p_mutation_permit')
+      expect(body).toContain('mutation_deadline_at > clock_timestamp()')
     }
     for (const name of [
       'autoforge_knowledge_complete_job',
@@ -690,7 +702,8 @@ describe('CloudBase personal knowledge migration', () => {
     expect(leaseWindow).toContain('worker_id = p_worker_id')
     expect(leaseWindow).toContain('lease_token = p_lease_token')
     expect(leaseWindow).toContain('lease_expires_at > clock_timestamp()')
-    expect(leaseWindow).toContain('to_timestamp(p_request_deadline_ms / 1000.0)')
+    expect(leaseWindow).toContain('mutation_permit = p_mutation_permit')
+    expect(leaseWindow).toContain('mutation_deadline_at > clock_timestamp()')
     for (const name of [
       'autoforge_knowledge_issue_embedding_dispatch_permit',
       'autoforge_knowledge_reserve_embedding_dispatch_attempt',
@@ -699,11 +712,41 @@ describe('CloudBase personal knowledge migration', () => {
       'autoforge_knowledge_settle_embedding_dispatch_attempt',
       'autoforge_knowledge_store_embedding',
     ]) {
-      expect(functionDefinition(sql, name)).toContain('p_request_deadline_ms bigint')
+      expect(functionDefinition(sql, name)).toContain('p_mutation_permit varchar')
       const body = staticFunctionBodyFragment(sql, name)
       const windowChecks = body.match(/autoforge_knowledge_assert_worker_mutation_window/g)
       expect(windowChecks?.length).toBeGreaterThanOrEqual(2)
     }
+
+    const validator = functionDefinition(
+      sql, 'autoforge_knowledge_validate_job_mutation_permit',
+    )
+    expect(validator).toContain("p_mutation_kind NOT IN ('storage_delete', 'tokenhub_embedding')")
+    expect(validator).toContain("p_mutation_kind = 'storage_delete' AND job.kind <> 'purge'")
+    expect(validator).toContain("p_mutation_kind = 'tokenhub_embedding' AND job.kind <> 'embedding'")
+    expect(validator).toContain('job.mutation_permit = p_mutation_permit')
+    expect(validator).toContain('job.mutation_deadline_at > clock_timestamp()')
+    expect(validator).toContain('DECLARE claimed_job public.knowledge_jobs%ROWTYPE')
+    expect(sql).toContain(
+      'GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_validate_job_mutation_permit',
+    )
+    const rollback = await readFile(rollbackUrl, 'utf8')
+    expect(rollback).toContain(
+      'DROP FUNCTION IF EXISTS public.autoforge_knowledge_validate_job_mutation_permit',
+    )
+
+    const job = {
+      workerId: 'worker-a', leaseToken: 'lease-a', permit: 'opaque-a',
+      leaseExpiresAt: 600_000, mutationDeadlineAt: 120_000,
+    }
+    const authorize = (databaseNow: number, clientClock: number) => {
+      void clientClock
+      return job.leaseExpiresAt > databaseNow && job.mutationDeadlineAt > databaseNow
+    }
+    expect(authorize(119_999, -8_640_000_000)).toBe(true)
+    expect(authorize(119_999, 8_640_000_000)).toBe(true)
+    expect(authorize(120_000, -8_640_000_000)).toBe(false)
+    expect(authorize(120_000, 8_640_000_000)).toBe(false)
   })
 
   it('statically requires payload purge after exact Storage deletion and models payload removal separately', async () => {

@@ -852,6 +852,15 @@ describe('CloudBase embedding consent and retrieval', () => {
     attemptId, consentEpoch: 2, expiresAt: futureExpiry,
     providerRequestKey: `embed_${requestId}_${attemptId}`, embedding,
   })
+  const workerBoundary = () => ({
+    signal: new AbortController().signal,
+    timeoutMs: 5_000,
+    remainingMs: () => 5_000,
+    mutationAuthorization: {
+      capability: 'opaque_server_permit', workerId: 'worker_1',
+      jobId: 'job_1', leaseToken: 'lease_1',
+    },
+  })
 
   it('uses a strict bounded TokenHub adapter without diagnostic content output', async () => {
     const vector = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0)
@@ -869,6 +878,7 @@ describe('CloudBase embedding consent and retrieval', () => {
       input: '合同条款', model: embedding.model, dimensions: 1024,
       configurationVersion: embedding.configurationVersion, region: 'guangzhou',
       dispatchPermit: 'permit_1', idempotencyKey: 'embed_attempt_1',
+      mutationAuthorization: null,
     })).resolves.toEqual(vector)
     await expect(tokenHub.recoverAttempt({
       model: embedding.model, dimensions: 1024,
@@ -917,6 +927,7 @@ describe('CloudBase embedding consent and retrieval', () => {
         input: '合同条款', model: embedding.model, dimensions: 1024,
         configurationVersion: embedding.configurationVersion, region: 'guangzhou',
         dispatchPermit: 'permit_1', idempotencyKey: 'embed_attempt_1',
+        mutationAuthorization: null,
       })
       const rejected = expect(request).rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
       await vi.advanceTimersByTimeAsync(50)
@@ -927,6 +938,46 @@ describe('CloudBase embedding consent and retrieval', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('keeps worker TokenHub mutations closed until the DB permit port is implemented', async () => {
+    expect(() => createTokenHubClient({
+      endpoint: 'https://tokenhub.example/v1/embeddings', apiKey: 'server-only',
+      requireMutationPermitPort: true,
+    })).toThrow('TokenHub mutation permit port is not configured')
+
+    const fetchImpl = vi.fn().mockResolvedValue(streamedResponse({
+      model: embedding.model,
+      dimensions: embedding.dimensions,
+      embedding: Array.from({ length: 1024 }, () => 0.25),
+      mutationPermitValidated: true,
+    }))
+    const tokenHub = createTokenHubClient({
+      endpoint: 'https://tokenhub.example/v1/embeddings', apiKey: 'server-only',
+      requireMutationPermitPort: true,
+      mutationPermitPortVersion: 'db-job-v1',
+      fetchImpl,
+    })
+    const mutationAuthorization = {
+      capability: 'opaque_server_permit', workerId: 'worker_1',
+      jobId: 'job_embedding', leaseToken: 'lease_job_embedding',
+    }
+    await expect(tokenHub.embed({
+      input: '合同条款', model: embedding.model, dimensions: 1024,
+      configurationVersion: embedding.configurationVersion, region: 'guangzhou',
+      dispatchPermit: 'permit_1', idempotencyKey: 'embed_attempt_1',
+      mutationAuthorization,
+    }, {
+      signal: new AbortController().signal,
+      timeoutMs: 500,
+      remainingMs: () => 100,
+      mutationAuthorization,
+    })).resolves.toHaveLength(1024)
+    const request = fetchImpl.mock.calls[0]?.[1] as { headers: Record<string, string>; body: string }
+    expect(request.headers).toMatchObject({
+      'x-autoforge-mutation-permit-version': 'db-job-v1',
+    })
+    expect(JSON.parse(request.body)).toMatchObject({ mutationAuthorization })
   })
 
   it('caps PostgreSQL RPC and TokenHub clients to the caller remaining deadline', async () => {
@@ -950,8 +1001,9 @@ describe('CloudBase embedding consent and retrieval', () => {
       })
       const boundary = {
         signal: new AbortController().signal,
-        deadlineAt: Date.now() + 50,
         timeoutMs: 500,
+        remainingMs: () => 50,
+        mutationAuthorization: null,
       }
       const requests = [
         rpc('autoforge_knowledge_get_entitlement', { p_caller_user_id: '1' }, boundary),
@@ -959,6 +1011,7 @@ describe('CloudBase embedding consent and retrieval', () => {
           input: '合同条款', model: embedding.model, dimensions: 1024,
           configurationVersion: embedding.configurationVersion, region: 'guangzhou',
           dispatchPermit: 'permit_1', idempotencyKey: 'embed_attempt_1',
+          mutationAuthorization: null,
         }, boundary),
       ]
       const earlyOutcomes = requests.map(request => Promise.race([
@@ -1093,8 +1146,10 @@ describe('CloudBase embedding consent and retrieval', () => {
       input: '合同条款', model: embedding.model, dimensions: 1024,
       configurationVersion: embedding.configurationVersion, region: 'guangzhou',
       dispatchPermit: 'permit_search_outage', idempotencyKey: 'embed_search_outage_1',
+      mutationAuthorization: null,
     }, expect.objectContaining({
-      signal: expect.any(AbortSignal), deadlineAt: expect.any(Number), timeoutMs: 10_000,
+      signal: expect.any(AbortSignal), timeoutMs: 10_000,
+      remainingMs: expect.any(Function), mutationAuthorization: null,
     }))
   })
 
@@ -1685,7 +1740,9 @@ describe('CloudBase embedding consent and retrieval', () => {
       throw new Error(`unexpected rpc ${name}`)
     })
     const worker = createEmbeddingGenerationWorker({ rpc, tokenHub })
-    const run = worker.run({ workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1' })
+    const run = worker.run(
+      { workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1' }, workerBoundary(),
+    )
     await vi.waitFor(() => expect(tokenHub.embed).toHaveBeenCalledOnce())
 
     const handler = createKnowledgeHandler({ rpc, tokenHub })
@@ -1748,7 +1805,9 @@ describe('CloudBase embedding consent and retrieval', () => {
       throw new Error(`unexpected rpc ${name}`)
     })
     const worker = createEmbeddingGenerationWorker({ rpc, tokenHub })
-    const run = worker.run({ workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1' })
+    const run = worker.run(
+      { workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1' }, workerBoundary(),
+    )
     await vi.waitFor(() => expect(rpc.mock.calls.some(
       ([name]) => name === 'autoforge_knowledge_mark_embedding_dispatch_started',
     )).toBe(true))
@@ -1797,7 +1856,9 @@ describe('CloudBase embedding consent and retrieval', () => {
     const worker = createEmbeddingGenerationWorker({
       rpc, tokenHub: { embed: vi.fn().mockResolvedValue([1, 2, 3]) },
     })
-    await expect(worker.run({ workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1' }))
+    await expect(worker.run(
+      { workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1' }, workerBoundary(),
+    ))
       .rejects.toEqual({ code: 'INVALID_EMBEDDING_RESPONSE' })
     expect(rpc.mock.calls.some(([name]) => name === 'autoforge_knowledge_store_embedding')).toBe(false)
   })
@@ -1840,10 +1901,15 @@ describe('CloudBase embedding consent and retrieval', () => {
     const worker = createEmbeddingGenerationWorker({
       rpc, tokenHub: { embed: vi.fn().mockResolvedValue(vector) },
     })
+    const mutationAuthorization = {
+      capability: 'opaque_server_permit', workerId: 'worker_1',
+      jobId: 'job_1', leaseToken: 'lease_1',
+    }
     const requestBoundary = {
       signal: new AbortController().signal,
-      deadlineAt: Date.now() + 5_000,
       timeoutMs: 5_000,
+      remainingMs: () => 5_000,
+      mutationAuthorization,
     }
     await expect(worker.run({
       workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1',
@@ -1865,7 +1931,7 @@ describe('CloudBase embedding consent and retrieval', () => {
     const mutationCalls = rpc.mock.calls.filter(([name]) => mutationNames.has(name))
     expect(new Set(mutationCalls.map(([name]) => name))).toEqual(mutationNames)
     expect(mutationCalls.every(([, parameters]) => (
-      parameters.p_request_deadline_ms === requestBoundary.deadlineAt
+      parameters.p_mutation_permit === mutationAuthorization.capability
     ))).toBe(true)
     expect(mutationCalls.every(([, parameters]) => (
       parameters.p_worker_id === 'worker_1'
@@ -1917,10 +1983,15 @@ describe('CloudBase embedding consent and retrieval', () => {
       rpc, tokenHub, maximumChunksPerRun: 2,
     })
 
+    const mutationAuthorization = {
+      capability: 'opaque_server_permit', workerId: 'worker_1',
+      jobId: 'job_1', leaseToken: 'lease_1',
+    }
     const requestBoundary = {
       signal: new AbortController().signal,
-      deadlineAt: Date.now() + 5_000,
       timeoutMs: 5_000,
+      remainingMs: () => 5_000,
+      mutationAuthorization,
     }
 
     await expect(worker.run({
