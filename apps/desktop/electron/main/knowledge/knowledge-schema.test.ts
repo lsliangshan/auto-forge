@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v10', () => {
+describe('knowledge schema v11', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(10)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(11)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -70,6 +70,13 @@ describe('knowledge schema v10', () => {
       'PRAGMA table_info(knowledge_cloud_deletion_receipts)',
     ).all() as Array<{ name: string }>).map(column => column.name)).toEqual([
       'knowledge_base_id', 'operation_id', 'request_id', 'deletion_job_id', 'completed_at',
+    ])
+    expect((database.prepare(
+      'PRAGMA table_info(cloud_pending_publications)',
+    ).all() as Array<{ name: string }>).map(column => column.name)).toEqual([
+      'knowledge_base_id', 'generation_id', 'document_id', 'version_id', 'object_id',
+      'upload_job_id', 'publish_request_id', 'updated_at', 'recovery_attempt',
+      'next_retry_at', 'last_error_code',
     ])
   })
 

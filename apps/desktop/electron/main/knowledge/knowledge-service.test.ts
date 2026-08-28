@@ -372,6 +372,189 @@ describe('local knowledge service', () => {
     `).get(base.id)).toEqual({ revision: 'remote_r1' })
   })
 
+  it('durably resumes a queued cloud generation after the third poll without duplicate upload', async () => {
+    const memory = memoryKnowledgeStore()
+    let observedAt = 1_000
+    let publicationSequence = 7
+    const selected = [{
+      name: 'recover.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('恢复发布条款'),
+    }]
+    const beginGeneration = vi.fn(async (input: {
+      knowledgeBaseId: string; generationId: string
+    }) => ({ ...input, status: 'staging' as const }))
+    const pushMutation = vi.fn(async input => ({
+      mutationId: input.mutationId, status: 'applied' as const,
+      sequence: 1, revision: input.mutationId,
+    }))
+    const uploadDocument = vi.fn().mockResolvedValue({
+      jobId: 'upload_job_late', storageReference: 'knowledge/1/base/object_late',
+    })
+    const getJob = vi.fn()
+      .mockResolvedValueOnce({ jobId: 'upload_job_late', state: 'running' as const, errorCode: null })
+      .mockResolvedValueOnce({ jobId: 'upload_job_late', state: 'running' as const, errorCode: null })
+      .mockResolvedValueOnce({ jobId: 'upload_job_late', state: 'running' as const, errorCode: null })
+      .mockResolvedValueOnce({ jobId: 'upload_job_late', state: 'completed' as const, errorCode: null })
+    const publishGeneration = vi.fn(async input => ({
+      generationId: input.generationId, previousGenerationId: null,
+      sequence: publicationSequence++,
+    }))
+    const remote = {
+      ...cloudRemote({ pushMutation, getJob, publishGeneration }),
+      beginGeneration,
+      uploadDocument,
+      search: vi.fn(),
+    }
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => selected.splice(0),
+      createParser: () => ({
+        parse: async () => parsedText('恢复发布条款'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => false,
+      now: () => observedAt,
+    })
+    service.configureCloudRemote!(remote)
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    memory.database.prepare(`
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+        accepted_key_generation, verified, explicit_free, max_observed_at
+      ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1)
+    `).run()
+    const base = await service.create(owner, 'Recovery')
+    const handle = (await service.pickImportFiles(owner))[0]!
+    await service.importDocument(owner, base.id, handle.id)
+
+    await vi.waitFor(() => expect(getJob).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(memory.database.prepare(`
+      SELECT recovery_attempt AS recoveryAttempt, next_retry_at AS nextRetryAt,
+        last_error_code AS lastErrorCode
+      FROM cloud_pending_publications WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual({
+      recoveryAttempt: 1, nextRetryAt: 2_000, lastErrorCode: 'GENERATION_NOT_READY',
+    }))
+
+    await service.list(owner)
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    expect(getJob).toHaveBeenCalledTimes(3)
+    observedAt = 2_000
+    await service.list(owner)
+    await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
+
+    expect(beginGeneration).toHaveBeenCalledOnce()
+    expect(pushMutation).toHaveBeenCalledOnce()
+    expect(uploadDocument).toHaveBeenCalledOnce()
+    expect(getJob).toHaveBeenCalledTimes(4)
+    expect(memory.database.prepare(
+      'SELECT 1 FROM cloud_pending_publications WHERE knowledge_base_id = ?',
+    ).get(base.id)).toBeUndefined()
+  })
+
+  it('recovers a due queued generation from persisted state on the first search after restart', async () => {
+    const memory = memoryKnowledgeStore()
+    memory.database.exec(`
+      INSERT INTO knowledge_bases(
+        id, name, created_at, updated_at, lifecycle_status, recycled_at
+      ) VALUES ('base_restart', 'Restart', 1, 1, 'ready', NULL);
+      INSERT INTO documents(
+        id, knowledge_base_id, name, mime_type, active_version_id, created_at, updated_at,
+        lifecycle_status, publication_generation, recycled_at
+      ) VALUES (
+        'document_restart', 'base_restart', 'restart.txt', 'text/plain', NULL,
+        1, 1, 'ready', 1, NULL
+      );
+      INSERT INTO document_versions(
+        id, document_id, version_number, status, content_hash, object_id, created_at,
+        publication_generation, name, mime_type
+      ) VALUES (
+        'version_restart', 'document_restart', 1, 'ready',
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        'object_restart', 1, 1, 'restart.txt', 'text/plain'
+      );
+      UPDATE documents SET active_version_id = 'version_restart' WHERE id = 'document_restart';
+      INSERT INTO cloud_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES ('base_restart', 'syncing', NULL, 1, 1);
+      INSERT INTO cloud_pending_publications(
+        knowledge_base_id, generation_id, document_id, version_id, object_id,
+        upload_job_id, publish_request_id, updated_at, recovery_attempt,
+        next_retry_at, last_error_code
+      ) VALUES (
+        'base_restart', 'generation_restart', 'document_restart', 'version_restart',
+        'object_restart', 'upload_job_restart', 'publish_restart', 1, 1, 1,
+        'GENERATION_NOT_READY'
+      );
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+        accepted_key_generation, verified, explicit_free, max_observed_at
+      ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1);
+    `)
+    const publishGeneration = vi.fn(async input => ({
+      generationId: input.generationId, previousGenerationId: null, sequence: 9,
+    }))
+    const remote = cloudRemote({
+      getJob: vi.fn(async input => ({
+        jobId: input.jobId, state: 'completed' as const, errorCode: null,
+      })),
+      publishGeneration,
+    })
+    const restarted = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({
+        parse: async () => parsedText('unused'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => false,
+      now: () => 2,
+    })
+    restarted.configureCloudRemote!(remote)
+    await restarted.bind('alice')
+
+    await restarted.searchSelected({ userId: 'alice' }, '恢复发布', ['base_restart'])
+    await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
+
+    expect(memory.database.prepare(`
+      SELECT mode, published_generation_id AS publishedGenerationId
+      FROM cloud_sync_states WHERE knowledge_base_id = 'base_restart'
+    `).get()).toEqual({ mode: 'synced', publishedGenerationId: 'generation_restart' })
+    await vi.waitFor(() => expect(memory.database.prepare(
+      "SELECT 1 FROM cloud_pending_publications WHERE knowledge_base_id = 'base_restart'",
+    ).get()).toBeUndefined())
+
+    memory.database.prepare(`
+      INSERT INTO cloud_pending_publications(
+        knowledge_base_id, generation_id, document_id, version_id, object_id,
+        upload_job_id, publish_request_id, updated_at, recovery_attempt,
+        next_retry_at, last_error_code
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'base_restart', 'generation_restart', 'document_restart', 'version_restart',
+      'object_restart', 'upload_job_restart', 'publish_restart', 2, 1, 2,
+      'GENERATION_NOT_READY',
+    )
+    vi.mocked(remote.getJob).mockClear()
+    publishGeneration.mockClear()
+    await restarted.list({ userId: 'alice' })
+    await vi.waitFor(() => expect(memory.database.prepare(
+      "SELECT 1 FROM cloud_pending_publications WHERE knowledge_base_id = 'base_restart'",
+    ).get()).toBeUndefined())
+    expect(remote.getJob).not.toHaveBeenCalled()
+    expect(publishGeneration).not.toHaveBeenCalled()
+  })
+
   it('keeps import and search local when the cloud kill switch is closed', async () => {
     const memory = memoryKnowledgeStore()
     const beginGeneration = vi.fn()

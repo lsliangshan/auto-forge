@@ -700,6 +700,9 @@ export function createLocalKnowledgeService(
     mimeType: string
     versionNumber: number
     contentHash: string
+    recoveryAttempt: number
+    nextRetryAt: number
+    lastErrorCode: string | null
   }
 
   const pendingCloudPublication = (
@@ -710,6 +713,8 @@ export function createLocalKnowledgeService(
       pending.generation_id AS generationId, pending.document_id AS documentId,
       pending.version_id AS versionId, pending.object_id AS objectId,
       pending.upload_job_id AS uploadJobId, pending.publish_request_id AS publishRequestId,
+      pending.recovery_attempt AS recoveryAttempt, pending.next_retry_at AS nextRetryAt,
+      pending.last_error_code AS lastErrorCode,
       base.name AS baseName, document.name AS documentName, version.mime_type AS mimeType,
       version.version_number AS versionNumber, version.content_hash AS contentHash
     FROM cloud_pending_publications AS pending
@@ -729,44 +734,55 @@ export function createLocalKnowledgeService(
     if (!remote || !ordinaryCloudAllowed(active)) return
     let pending = pendingCloudPublication(active, knowledgeBaseId)
     if (!pending) return
-    const revision = stableCloudId(
-      'revision', pending.documentId, pending.versionId, pending.contentHash,
-    )
-    await active.cloud.enableSync({
-      requestId: stableCloudId('begin', pending.knowledgeBaseId, pending.generationId),
-      knowledgeBaseId: pending.knowledgeBaseId,
-      name: pending.baseName,
-      revision,
-      generationId: pending.generationId,
-    })
-    assertCurrentBinding(active)
-    if (!ordinaryCloudAllowed(active)) return
-    const head = active.store.database.prepare(`
-      SELECT revision FROM cloud_entity_heads
-      WHERE knowledge_base_id = ? AND entity_kind = 'document' AND entity_id = ?
-    `).get(pending.knowledgeBaseId, pending.documentId) as { revision: string } | undefined
-    active.cloud.enqueue({
-      mutationId: stableCloudId('mutation', pending.documentId, pending.versionId),
-      knowledgeBaseId: pending.knowledgeBaseId,
-      entityKind: 'document',
-      entityId: pending.documentId,
-      operation: 'upsert',
-      baseRevision: head?.revision ?? null,
-      payload: {
-        name: pending.documentName,
-        mimeType: pending.mimeType,
-        versionId: pending.versionId,
-        versionNumber: pending.versionNumber,
-        contentHash: pending.contentHash,
-        generationId: pending.generationId,
-      },
-    })
-    const synchronization = await active.cloud.synchronize(pending.knowledgeBaseId) as {
-      status?: string
+    const published = active.store.database.prepare(`
+      SELECT published_generation_id AS publishedGenerationId
+      FROM cloud_sync_states WHERE knowledge_base_id = ?
+    `).get(pending.knowledgeBaseId) as { publishedGenerationId: string | null } | undefined
+    if (published?.publishedGenerationId === pending.generationId) {
+      active.store.database.prepare(`
+        DELETE FROM cloud_pending_publications
+        WHERE knowledge_base_id = ? AND generation_id = ?
+      `).run(pending.knowledgeBaseId, pending.generationId)
+      return
     }
-    assertCurrentBinding(active)
-    if (synchronization.status !== 'synced' || !ordinaryCloudAllowed(active)) return
     if (!pending.uploadJobId) {
+      const revision = stableCloudId(
+        'revision', pending.documentId, pending.versionId, pending.contentHash,
+      )
+      await active.cloud.enableSync({
+        requestId: stableCloudId('begin', pending.knowledgeBaseId, pending.generationId),
+        knowledgeBaseId: pending.knowledgeBaseId,
+        name: pending.baseName,
+        revision,
+        generationId: pending.generationId,
+      })
+      assertCurrentBinding(active)
+      if (!ordinaryCloudAllowed(active)) return
+      const head = active.store.database.prepare(`
+        SELECT revision FROM cloud_entity_heads
+        WHERE knowledge_base_id = ? AND entity_kind = 'document' AND entity_id = ?
+      `).get(pending.knowledgeBaseId, pending.documentId) as { revision: string } | undefined
+      active.cloud.enqueue({
+        mutationId: stableCloudId('mutation', pending.documentId, pending.versionId),
+        knowledgeBaseId: pending.knowledgeBaseId,
+        entityKind: 'document',
+        entityId: pending.documentId,
+        operation: 'upsert',
+        baseRevision: head?.revision ?? null,
+        payload: {
+          name: pending.documentName,
+          mimeType: pending.mimeType,
+          versionId: pending.versionId,
+          versionNumber: pending.versionNumber,
+          contentHash: pending.contentHash,
+          generationId: pending.generationId,
+        },
+      })
+      const synchronization = await active.cloud.synchronize(pending.knowledgeBaseId) as {
+        status?: string
+      }
+      assertCurrentBinding(active)
+      if (synchronization.status !== 'synced' || !ordinaryCloudAllowed(active)) return
       const bytes = await active.store.objects.read(pending.objectId)
       assertCurrentBinding(active)
       try {
@@ -783,7 +799,8 @@ export function createLocalKnowledgeService(
         assertCurrentBinding(active)
         if (!ordinaryCloudAllowed(active)) return
         const updated = active.store.database.prepare(`
-          UPDATE cloud_pending_publications SET upload_job_id = ?, updated_at = ?
+          UPDATE cloud_pending_publications SET upload_job_id = ?, recovery_attempt = 0,
+            next_retry_at = 0, last_error_code = NULL, updated_at = ?
           WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id IS NULL
         `).run(
           uploaded.jobId, now(), pending.knowledgeBaseId, pending.generationId,
@@ -796,6 +813,7 @@ export function createLocalKnowledgeService(
     }
     const uploadJobId = pending.uploadJobId
     if (!uploadJobId) return
+    if (pending.nextRetryAt > now()) return
     let completed = false
     for (let poll = 0; poll < 3; poll += 1) {
       const job = await remote.getJob({ jobId: uploadJobId })
@@ -807,7 +825,20 @@ export function createLocalKnowledgeService(
         fail('SERVICE_UNAVAILABLE')
       }
     }
-    if (!completed) return
+    if (!completed) {
+      const recoveryAttempt = pending.recoveryAttempt + 1
+      const retryDelay = Math.min(60_000, 1_000 * (2 ** Math.min(recoveryAttempt - 1, 6)))
+      active.store.database.prepare(`
+        UPDATE cloud_pending_publications
+        SET recovery_attempt = ?, next_retry_at = ?,
+          last_error_code = 'GENERATION_NOT_READY', updated_at = ?
+        WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
+      `).run(
+        recoveryAttempt, now() + retryDelay, now(), pending.knowledgeBaseId,
+        pending.generationId, uploadJobId,
+      )
+      return
+    }
     await active.cloud.publishGeneration({
       requestId: pending.publishRequestId,
       knowledgeBaseId: pending.knowledgeBaseId,
@@ -836,6 +867,24 @@ export function createLocalKnowledgeService(
       }
     }).catch(() => undefined)
     return task
+  }
+
+  const recoverDueCloudPublications = (active: Binding): void => {
+    if (!ordinaryCloudAllowed(active)) return
+    const rows = active.store.database.prepare(`
+      SELECT knowledge_base_id AS knowledgeBaseId
+      FROM cloud_pending_publications
+      WHERE next_retry_at <= ?
+      ORDER BY next_retry_at, updated_at, knowledge_base_id
+      LIMIT 8
+    `).all(now()) as Array<{ knowledgeBaseId: string }>
+    for (const row of rows) {
+      const recovery = serialCloudTask(
+        active, row.knowledgeBaseId,
+        () => processCloudPublication(active, row.knowledgeBaseId),
+      )
+      void recovery.catch(() => undefined)
+    }
   }
 
   const stageCloudPublication = (
@@ -948,6 +997,7 @@ export function createLocalKnowledgeService(
     if (kept && !kept.documentId) {
       return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
     }
+    recoverDueCloudPublications(active)
     const result = await new LocalKnowledgeRetriever(active.store.database).search(
       normalized,
       allowedBases,
@@ -1380,6 +1430,7 @@ export function createLocalKnowledgeService(
     list: async (owner) => {
       const active = current(owner)
       const state = entitlement(active)
+      recoverDueCloudPublications(active)
       const kept = retention(active, state)
       const member = state.tier === 'member' && state.status !== 'expired'
       const ids = active.store.database.prepare(
@@ -1393,6 +1444,7 @@ export function createLocalKnowledgeService(
     },
     captureSearchScope: async (owner, requestedBaseIds) => {
       const active = current(owner)
+      recoverDueCloudPublications(active)
       const unique = [...new Set(requestedBaseIds)]
       if (unique.length === 0 || unique.length > 32
         || unique.some(baseId => !baseId || baseId.length > 512)) fail('INVALID_INPUT')
@@ -1450,6 +1502,7 @@ export function createLocalKnowledgeService(
     },
     listDocuments: async (owner, baseId) => {
       const active = current(owner)
+      recoverDueCloudPublications(active)
       if (!baseSummary(active.store.database, baseId)) fail('NOT_FOUND')
       const state = entitlement(active)
       const kept = retention(active, state)
