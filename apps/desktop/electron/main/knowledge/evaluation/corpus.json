@@ -24,13 +24,17 @@
       { "id": "holdout-en-effective", "evidence": "The accord comes into force when both directors sign it.", "claim": "The contract becomes effective when both directors sign it." },
       { "id": "holdout-en-permission", "evidence": "The agreement authorizes early termination.", "claim": "The contract permits early termination." },
       { "id": "holdout-en-prohibition", "evidence": "The contract forbids external disclosure.", "claim": "The contract prohibits external disclosure." },
-      { "id": "holdout-copula-model", "evidence": "备用机型为 AF-LOCAL-9。", "claim": "备用机型是 AF-LOCAL-9。" }
+      { "id": "holdout-copula-model", "evidence": "备用机型为 AF-LOCAL-9。", "claim": "备用机型是 AF-LOCAL-9。" },
+      { "id": "holdout-same-clause-list", "evidence": "甲方设备可用颜色包括红色、蓝色、绿色。", "claim": "甲方设备可用颜色：红色、蓝色、绿色。" }
     ],
     "grounding": [
       { "id": "holdout-cross-color", "evidence": "甲方设备颜色为红色。乙方设备颜色为蓝色。", "claim": "甲方设备颜色为蓝色。" },
       { "id": "holdout-cross-location", "evidence": "晨光项目位于杭州市西湖区。星河项目位于上海市浦东新区。", "claim": "晨光项目地点是上海市浦东新区。" },
       { "id": "holdout-cross-product", "evidence": "甲产品为基础版本。乙产品为企业版本。", "claim": "甲产品是企业版本。" },
       { "id": "holdout-cross-publisher", "evidence": "甲报告由华南创新研究院发布。乙报告由华北创新研究院发布。", "claim": "甲报告由华北创新研究院发布。" },
+      { "id": "holdout-cross-color-colon", "evidence": "甲方设备颜色为红色。乙方设备颜色为蓝色。", "claim": "甲方设备颜色：蓝色。" },
+      { "id": "holdout-cross-color-comma", "evidence": "甲方设备颜色为红色。乙方设备颜色为蓝色。", "claim": "甲方设备颜色，蓝色。" },
+      { "id": "holdout-cross-color-list", "evidence": "甲方设备颜色为红色。乙方设备颜色为蓝色。", "claim": "设备颜色清单：甲方设备、蓝色。" },
       { "id": "holdout-project-substitution", "evidence": "该智慧园区重点改造项目将持续提升公共服务能力并按年度稳定运营。", "claim": "该智慧园区重点改造工程将持续提升公共服务能力并按年度稳定运营。" },
       { "id": "holdout-product-substitution", "evidence": "最终交付产品为星河知识管理平台企业版本并提供长期维护。", "claim": "最终交付产品为星海知识管理平台企业版本并提供长期维护。" },
       { "id": "holdout-color-substitution", "evidence": "核心设备外壳必须采用深红色防腐涂层并保持技术参数不变。", "claim": "核心设备外壳必须采用深蓝色防腐涂层并保持技术参数不变。" },

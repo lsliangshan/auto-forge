@@ -142,7 +142,7 @@ function restoreNumericPunctuation(value: string): string {
     .replaceAll(NUMERIC_CJK_COMMA, '，')
 }
 
-function splitKnowledgeClaims(answer: string): string[] {
+function splitKnowledgeClaimGroups(answer: string): string[][] {
   const sentences = protectNumericPunctuation(answer)
     .split(/(?<=[。！？.!?])|\n+/gu)
     .map(part => part.trim())
@@ -153,7 +153,7 @@ function splitKnowledgeClaims(answer: string): string[] {
       joinedMarkers[joinedMarkers.length - 1] += sentence
     } else joinedMarkers.push(sentence)
   }
-  return joinedMarkers.flatMap((sentence) => {
+  return joinedMarkers.map((sentence) => {
     const trailing = sentence.match(/((?:\s*\[\[kb:[^\]\r\n]{1,512}\]\])+\s*)([。！？.!?]?)$/u)
     const propagatedMarker = trailing?.[1]?.trim() ?? ''
     const withoutTrailing = trailing?.index === undefined
@@ -377,10 +377,12 @@ function clauseSupportsClaim(rawClaim: string, rawEvidence: string): boolean {
   return true
 }
 
-function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
+function supportingClauseIndexes(claim: string, evidence: KnowledgeEvidence): number[] {
   const rawClaim = claim.replace(KNOWLEDGE_MARKER, '').slice(0, 4_000)
   const rawEvidence = sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000)
-  return splitEvidenceClauses(rawEvidence).some(clause => clauseSupportsClaim(rawClaim, clause))
+  return splitEvidenceClauses(rawEvidence).flatMap((clause, index) => (
+    clauseSupportsClaim(rawClaim, clause) ? [index] : []
+  ))
 }
 
 export function formatValidatedKnowledgeAnswer(
@@ -414,21 +416,44 @@ export function validateKnowledgeAnswer(
       : { kind: 'insufficient', reason: 'invalid-citation' }
   }
   const evidenceById = new Map(evidence.map(item => [item.id, item]))
-  const claims = splitKnowledgeClaims(answer).map((claim) => {
-    const ids = [...claim.matchAll(KNOWLEDGE_MARKER)].map(match => match[1]!)
-    const supportingIds = ids.filter(id => {
+  const claimGroups = splitKnowledgeClaimGroups(answer).map((group) => {
+    const citedIds = group.flatMap(claim => [...claim.matchAll(KNOWLEDGE_MARKER)].map(match => match[1]!))
+      .filter((id, index, values) => values.indexOf(id) === index)
+    const commonSupportingIds = citedIds.filter((id) => {
       const item = evidenceById.get(id)
-      return item !== undefined && supportsClaim(claim, item)
-    }).filter((id, index, values) => values.indexOf(id) === index)
+      if (!item) return false
+      let common: Set<number> | undefined
+      for (const claim of group) {
+        const supported = new Set(supportingClauseIndexes(claim, item))
+        common = common === undefined
+          ? supported
+          : new Set([...common].filter(index => supported.has(index)))
+        if (common.size === 0) return false
+      }
+      return (common?.size ?? 0) > 0
+    })
+    const fragments = group.map((claim) => {
+      const ids = [...claim.matchAll(KNOWLEDGE_MARKER)].map(match => match[1]!)
+      return {
+        text: claim.replace(KNOWLEDGE_MARKER, '').trim(),
+        cited: ids.length > 0,
+      }
+    })
+    const groupSupported = commonSupportingIds.length > 0
     return {
-      text: claim.replace(KNOWLEDGE_MARKER, '').trim(),
-      citedEvidenceIds: supportingIds,
-      cited: ids.length > 0,
-      supported: supportingIds.length > 0,
+      cited: citedIds.length > 0,
+      supported: groupSupported,
+      claims: fragments.map(fragment => ({
+        ...fragment,
+        citedEvidenceIds: fragment.cited && groupSupported ? commonSupportingIds : [],
+        supported: fragment.cited && groupSupported,
+      })),
     }
   })
+  const claims = claimGroups.flatMap(group => group.claims)
   const hasUncitedMaterial = claims.some(claim => !claim.cited)
   const hasUnsupportedClaim = claims.some(claim => claim.cited && !claim.supported)
+    || claimGroups.some(group => group.cited && !group.supported)
   if (mode === 'strict') {
     if (evidence.length === 0) return { kind: 'insufficient', reason: 'no-evidence' }
     if (citedEvidenceIds.length === 0 || hasUncitedMaterial) {

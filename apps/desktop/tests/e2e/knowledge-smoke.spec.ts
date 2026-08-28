@@ -59,13 +59,6 @@ test('runs local knowledge, degradation, expiry, and Provider-switch paths throu
     expect(availability).toMatchObject({
       encryption: { available: true }, parser: { available: true }, cloud: { available: false },
     })
-    await expect(command(application, 'embeddingRefusal')).resolves.toMatchObject({
-      consent: { provider: 'openrouter', status: 'unknown' },
-      retrieval: { kind: 'results', evidenceCount: 1, route: 'local-keyword' },
-      vectorRequests: 0,
-      providerSnippetDisclosures: 0,
-    })
-
     await page.getByRole('link', { name: '聊天' }).click()
     await page.getByTestId('knowledge-selector').locator('summary').click()
     await page.getByTestId(/knowledge-select-/).check()
@@ -80,6 +73,22 @@ test('runs local knowledge, degradation, expiry, and Provider-switch paths throu
     await page.getByTestId('send-message').click()
     await expect(page.getByTestId('knowledge-citation')).toBeVisible()
     await expect(page.getByPlaceholder('描述你想完成的任务…')).toBeEditable()
+    const revoked = await command<{
+      provider: string
+      consent: { provider: string; status: string }
+      consentRequired: boolean
+      providerSnippetDisclosures: number
+      providerSnippetDisclosureDelta: number
+      terminalStatus: string
+    }>(application, 'providerSnippetConsentRevocation')
+    expect(revoked).toMatchObject({
+      provider: 'openrouter',
+      consent: { provider: 'openrouter', status: 'unknown' },
+      consentRequired: true,
+      providerSnippetDisclosureDelta: 0,
+      terminalStatus: 'completed',
+    })
+    expect(revoked.providerSnippetDisclosures).toBeGreaterThan(0)
 
     await expect(command(application, 'expireKnowledgeEntitlement')).resolves.toMatchObject({
       entitlement: {

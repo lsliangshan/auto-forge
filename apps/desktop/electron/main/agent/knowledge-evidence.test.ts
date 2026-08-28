@@ -126,7 +126,7 @@ describe('knowledge tool and answer validation', () => {
     })
   })
 
-  it('rejects unrelated cited claims and grounds mixed answers clause by clause', () => {
+  it('rejects unrelated cited claims and downgrades their whole mixed sentence group', () => {
     const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
     expect(validateKnowledgeAnswer(
       '月球由奶酪构成。[[kb:evidence:0]]', [contract], 'strict', 0,
@@ -139,8 +139,8 @@ describe('knowledge tool and answer validation', () => {
       '合同经双方签字后生效[[kb:evidence:0]]，但月球由奶酪构成[[kb:evidence:0]]。',
       [contract], 'mixed', 0,
     )).toEqual({
-      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
-      text: '【知识库依据】合同经双方签字后生效\n【一般信息】但月球由奶酪构成。',
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: '【一般信息】合同经双方签字后生效\n【一般信息】但月球由奶酪构成。',
     })
   })
 
@@ -261,6 +261,36 @@ describe('knowledge tool and answer validation', () => {
   })
 
   it.each([
+    '甲方设备颜色：蓝色。[[kb:evidence:0]]',
+    '甲方设备颜色，蓝色。[[kb:evidence:0]]',
+    '甲方设备颜色并且是蓝色。[[kb:evidence:0]]',
+  ])('does not let one model sentence combine material fragments from different evidence clauses: %s', (answer) => {
+    const splitFacts = evidence(0, { snippet: '甲方设备颜色为红色。乙方设备颜色为蓝色。' })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it('does not label cross-clause fragments as grounded in mixed mode', () => {
+    const splitFacts = evidence(0, { snippet: '甲方设备颜色为红色。乙方设备颜色为蓝色。' })
+    expect(validateKnowledgeAnswer(
+      '甲方设备颜色：蓝色。[[kb:evidence:0]]', [splitFacts], 'mixed', 1,
+    )).toMatchObject({
+      kind: 'valid',
+      generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it('accepts a material field/list when one evidence clause supports every model fragment', () => {
+    const list = evidence(0, { snippet: '甲方设备可用颜色包括红色、蓝色、绿色。' })
+    expect(validateKnowledgeAnswer(
+      '甲方设备可用颜色：红色、蓝色、绿色。[[kb:evidence:0]]',
+      [list], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
     ['该项目为国家级示范项目。', '该项目是国家级示范项目。'],
     ['数据中心位于北京市海淀区。', '数据中心地点是北京市海淀区。'],
     ['设备外壳颜色为深蓝色。', '设备外壳颜色是深蓝色。'],
@@ -321,14 +351,14 @@ describe('knowledge tool and answer validation', () => {
     })
   })
 
-  it('downgrades only the unsupported comma clause in mixed mode', () => {
+  it('downgrades every fragment when a mixed comma sentence has no common supporting clause', () => {
     const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
     expect(validateKnowledgeAnswer(
       '合同经双方签字后生效，月球由奶酪构成。[[kb:evidence:0]]',
       [contract], 'mixed', 0,
     )).toEqual({
-      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
-      text: '【知识库依据】合同经双方签字后生效\n【一般信息】月球由奶酪构成。',
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: '【一般信息】合同经双方签字后生效\n【一般信息】月球由奶酪构成。',
     })
   })
 

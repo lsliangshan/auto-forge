@@ -340,6 +340,63 @@ function seedLegacyData(): void {
   }
 }
 
+async function runStrictKnowledgeAsk(baseId: string, content: string): Promise<{
+  consentRequired: boolean
+  providerSnippetDisclosures: number
+  providerSnippetDisclosureDelta: number
+  terminalStatus: 'completed'
+}> {
+  if (!runtime) throw new Error('Cloud user-data E2E runtime is unavailable')
+  const conversation = await runtime.services.chat.createConversation()
+  const preferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
+  await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+    ...preferences,
+    knowledgeBaseIds: [baseId],
+    knowledgeMode: 'strict',
+  })
+  const beforeEvents = recordedChatEvents.length
+  const beforeDisclosure = knowledgeSnippetDisclosureCount
+  await runtime.services.chat.send({
+    conversationId: conversation.id,
+    content,
+    assetIds: [],
+    outputType: 'auto',
+    generation: {
+      image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      audio: { format: 'mp3' },
+      video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+    },
+  })
+  let terminalStatus: 'completed' | 'cancelled' | 'failed' | undefined
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const terminal = recordedChatEvents.slice(beforeEvents).find(event => (
+      event.type === 'status'
+      && event.conversationId === conversation.id
+      && ['completed', 'cancelled', 'failed'].includes(event.status)
+    ))
+    if (terminal?.type === 'status' && terminal.status !== 'running') {
+      terminalStatus = terminal.status
+      break
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  if (terminalStatus !== 'completed') {
+    throw new Error(`Knowledge consent ask did not complete: ${terminalStatus ?? 'timeout'}`)
+  }
+  const consentRequired = recordedChatEvents.slice(beforeEvents).some(event => (
+    (event.type === 'block' || event.type === 'block_update')
+    && event.conversationId === conversation.id
+    && event.block.type === 'knowledge_status'
+    && event.block.status === 'consent_required'
+  ))
+  return {
+    consentRequired,
+    providerSnippetDisclosures: knowledgeSnippetDisclosureCount,
+    providerSnippetDisclosureDelta: knowledgeSnippetDisclosureCount - beforeDisclosure,
+    terminalStatus,
+  }
+}
+
 async function dispatch(name: string, input: Record<string, unknown>): Promise<unknown> {
   if (!runtime) throw new Error('Cloud user-data E2E runtime is unavailable')
   if (name === 'grantCloudSync') {
@@ -392,29 +449,18 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     if (!session) throw new Error('Knowledge release smoke session is unavailable')
     return runtime.services.knowledge.getEntitlement({ userId: session.user.id })
   }
-  if (name === 'embeddingRefusal') {
+  if (name === 'providerSnippetConsentRevocation') {
     const session = await runtime.services.auth.getSession()
     if (!session) throw new Error('Knowledge release smoke session is unavailable')
     const owner = { userId: session.user.id }
     const knowledge = runtime.services.knowledge as LocalKnowledgeService
-    const bases = await knowledge.list(owner)
-    const beforeProviderDisclosure = knowledgeSnippetDisclosureCount
-    const beforeCloud = knowledgeCloudCallCount
+    const retainedBase = (await knowledge.list(owner)).find(base => base.readOnly !== true)
+    if (!retainedBase) throw new Error('Retained knowledge base is unavailable before consent revocation')
     const consent = await knowledge.revokeConsent(owner, 'openrouter')
-    const retrieval = await knowledge.searchSelected(
-      owner,
-      'AutoForge knowledge smoke',
-      bases.map(base => base.id),
-    )
     return {
+      provider: 'openrouter',
       consent,
-      retrieval: {
-        kind: retrieval.kind,
-        evidenceCount: retrieval.kind === 'results' ? retrieval.evidence.length : 0,
-        route: 'local-keyword',
-      },
-      vectorRequests: knowledgeCloudCallCount - beforeCloud,
-      providerSnippetDisclosures: knowledgeSnippetDisclosureCount - beforeProviderDisclosure,
+      ...await runStrictKnowledgeAsk(retainedBase.id, 'Ask after Provider snippet consent revoke'),
     }
   }
   if (name === 'expireKnowledgeEntitlement') {
@@ -494,55 +540,9 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     const bases = await runtime.services.knowledge.list({ userId: session.user.id })
     const retainedBase = bases.find(base => base.readOnly !== true)
     if (!retainedBase) throw new Error('Retained knowledge base is unavailable after Provider switch')
-    const conversation = await runtime.services.chat.createConversation()
-    const preferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
-    await runtime.services.chat.updateGenerationPreferences(conversation.id, {
-      ...preferences,
-      knowledgeBaseIds: [retainedBase.id],
-      knowledgeMode: 'strict',
-    })
-    const beforeEvents = recordedChatEvents.length
-    const beforeDisclosure = knowledgeSnippetDisclosureCount
-    await runtime.services.chat.send({
-      conversationId: conversation.id,
-      content: 'Ask after Provider switch',
-      assetIds: [],
-      outputType: 'auto',
-      generation: {
-        image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
-        audio: { format: 'mp3' },
-        video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
-      },
-    })
-    let terminalStatus: 'completed' | 'cancelled' | 'failed' | undefined
-    for (let attempt = 0; attempt < 500; attempt += 1) {
-      const terminal = recordedChatEvents.slice(beforeEvents).find(event => (
-        event.type === 'status'
-        && event.conversationId === conversation.id
-        && ['completed', 'cancelled', 'failed'].includes(event.status)
-      ))
-      if (terminal?.type === 'status' && terminal.status !== 'running') {
-        terminalStatus = terminal.status
-        break
-      }
-      await new Promise(resolve => setTimeout(resolve, 10))
-    }
-    if (terminalStatus !== 'completed') {
-      throw new Error(`Provider-switch knowledge ask did not complete: ${terminalStatus ?? 'timeout'}`)
-    }
-    const runEvents = recordedChatEvents.slice(beforeEvents)
-    const consentRequired = runEvents.some(event => (
-      (event.type === 'block' || event.type === 'block_update')
-      && event.conversationId === conversation.id
-      && event.block.type === 'knowledge_status'
-      && event.block.status === 'consent_required'
-    ))
     return {
       provider: settings.activeProvider,
-      providerSnippetDisclosures: knowledgeSnippetDisclosureCount,
-      providerSnippetDisclosureDelta: knowledgeSnippetDisclosureCount - beforeDisclosure,
-      consentRequired,
-      terminalStatus,
+      ...await runStrictKnowledgeAsk(retainedBase.id, 'Ask after Provider switch'),
     }
   }
   if (name === 'deepseekKnowledgeConsent') {

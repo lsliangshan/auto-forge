@@ -6,6 +6,10 @@
 
 本分支没有授权访问 staging，因此以下证据仍是“未验证”：上海 CloudBase/PostgreSQL 强制 RLS 与 GRANT、PG Storage 私有票据和先删字节顺序、跨设备并发、广州 TokenHub 实际请求与撤销、云检索 p95 不超过 2 秒。不得把本地模拟、回环 HTTP 或静态 SQL 检查写成这些边界已通过。
 
+Task 7 的 deterministic/local 撤销状态机测试只证明本地协议语义；它不等于真实广州
+TokenHub 的嵌入请求、撤销、在途结算、向量删除或云端执行证据。没有获批 staging
+记录时，这些子门禁必须逐项保持 `unverified`。
+
 ## 本地发布门禁
 
 在 macOS arm64、Electron 43、pnpm 11.15.0 的干净依赖状态运行：
@@ -29,7 +33,7 @@ git diff --check
   的 SQLite 作业提交 → 生产 `ParserSupervisor` 沙箱 `BrowserWindow` → blocks/FTS
   发布 → `ready` 后搜索。不得用直接 parser 调用、人工状态或 mock 数字代替。
 - Alice/Bob 交叉矩阵为零泄漏，数据库、WAL、journal、临时、恢复和对象产物中不得出现随机明文 sentinel。
-- 真实 Electron 流程必须经过 Renderer、生产 Preload、IPC、Application 和加密知识服务，覆盖本地创建、导入、ready、选择、授权、检索、引用；同一运行还要证明云关闭、嵌入拒绝退化、会员到期以及 Provider 切换后授权隔离。
+- 真实 Electron 流程必须经过 Renderer、生产 Preload、IPC、Application 和加密知识服务，覆盖本地创建、导入、ready、选择、授权、检索、引用；同一运行还要证明云关闭、聊天 Provider 片段授权撤销后实际 ask 拒绝且零新增披露、会员到期以及 Provider 切换后授权隔离。
 - macOS x64 和 Windows x64 在独立 native/打包证明前继续 fail closed。
 
 ## 隐私与数据处理核对

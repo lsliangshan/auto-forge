@@ -6,6 +6,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_PARSER_LIMITS, PARSER_RESPONSE_CHUNK_BYTES } from './parser-protocol.js'
 import {
   createElectronParserSupervisor,
+  evaluateParserMemorySample,
+  PARSER_MEMORY_BOOTSTRAP_GRACE_MS,
+  parserMemoryBootstrapGraceMs,
   parserProcessMemoryBytes,
   ParserSupervisor,
   type ParserRendererDependencies,
@@ -138,7 +141,38 @@ function success(request: { jobId: string; mediaType: string }) {
 }
 
 describe('sandbox parser supervisor', () => {
-  it('skips the renderer startup window before Electron process metrics become observable', () => {
+  it('bounds missing startup metrics by a grace shorter than the parser wall timeout', () => {
+    expect(PARSER_MEMORY_BOOTSTRAP_GRACE_MS).toBeLessThan(DEFAULT_PARSER_LIMITS.timeoutMs)
+    expect(parserMemoryBootstrapGraceMs(50)).toBe(49)
+    expect(parserMemoryBootstrapGraceMs(50)).toBeLessThan(50)
+    expect(evaluateParserMemorySample({
+      startedAt: 10,
+      observed: false,
+      now: 10 + PARSER_MEMORY_BOOTSTRAP_GRACE_MS - 1,
+      wallTimeoutMs: DEFAULT_PARSER_LIMITS.timeoutMs,
+      bytes: 0,
+    })).toEqual({ action: 'skip', observed: false })
+    expect(evaluateParserMemorySample({
+      startedAt: 10,
+      observed: false,
+      now: 10 + PARSER_MEMORY_BOOTSTRAP_GRACE_MS,
+      wallTimeoutMs: DEFAULT_PARSER_LIMITS.timeoutMs,
+      bytes: 0,
+    })).toEqual({ action: 'fail', observed: false })
+  })
+
+  it('latches the first process metric and fails closed if it later disappears', () => {
+    expect(evaluateParserMemorySample({
+      startedAt: 10, observed: false, now: 20,
+      wallTimeoutMs: DEFAULT_PARSER_LIMITS.timeoutMs, bytes: 27 * 1024,
+    })).toEqual({ action: 'observe', observed: true })
+    expect(evaluateParserMemorySample({
+      startedAt: 10, observed: true, now: 21,
+      wallTimeoutMs: DEFAULT_PARSER_LIMITS.timeoutMs, bytes: 0,
+    })).toEqual({ action: 'fail', observed: true })
+  })
+
+  it('treats a missing PID or metric as missing rather than a zero-byte observation', () => {
     expect(parserProcessMemoryBytes([], 0)).toBe(0)
     expect(parserProcessMemoryBytes([], 4321)).toBe(0)
     expect(parserProcessMemoryBytes([

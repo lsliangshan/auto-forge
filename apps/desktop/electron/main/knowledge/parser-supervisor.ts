@@ -20,6 +20,7 @@ import {
 const OBJECT_HANDLE_PATTERN = /^[0-9a-f]{32}$/
 const SNAPSHOT_MAGIC = Buffer.from('AFKBSNP1', 'ascii')
 const NONCE_BYTES = 12
+export const PARSER_MEMORY_BOOTSTRAP_GRACE_MS = 1_000
 
 interface ParserPort extends EventEmitter {
   start(): void
@@ -77,6 +78,25 @@ export class ParserFailure extends Error {
   constructor(readonly code: ParserErrorCode) {
     super(code)
   }
+}
+
+export function parserMemoryBootstrapGraceMs(wallTimeoutMs: number): number {
+  return Math.min(PARSER_MEMORY_BOOTSTRAP_GRACE_MS, Math.max(1, wallTimeoutMs - 1))
+}
+
+export function evaluateParserMemorySample(input: {
+  startedAt: number
+  observed: boolean
+  now: number
+  wallTimeoutMs: number
+  bytes: number
+}): { action: 'skip' | 'observe' | 'fail'; observed: boolean } {
+  if (input.bytes > 0) return { action: 'observe', observed: true }
+  if (input.observed) return { action: 'fail', observed: true }
+  const graceMs = parserMemoryBootstrapGraceMs(input.wallTimeoutMs)
+  return input.now - input.startedAt >= graceMs
+    ? { action: 'fail', observed: false }
+    : { action: 'skip', observed: false }
 }
 
 interface ActiveJob {
@@ -323,11 +343,25 @@ export class ParserSupervisor {
         const rejectCode = (code: ParserErrorCode) => settle(() => reject(new ParserFailure(code)))
         cancelResponse = rejectCode
         let checkingMemory = false
+        const memoryStartedAt = performance.now()
+        let memoryObserved = false
         memoryTimer = setInterval(() => {
           if (checkingMemory || settled || !parserWindow) return
           checkingMemory = true
           void Promise.resolve(this.dependencies.processMemoryBytes(parserWindow))
             .then((bytes) => {
+              const sample = evaluateParserMemorySample({
+                startedAt: memoryStartedAt,
+                observed: memoryObserved,
+                now: performance.now(),
+                wallTimeoutMs: limits.timeoutMs,
+                bytes,
+              })
+              memoryObserved = sample.observed
+              if (sample.action === 'fail') {
+                rejectCode('PARSER_INTERNAL_ERROR')
+                return
+              }
               if (bytes > limits.maxMemoryBytes) rejectCode('PARSER_LIMIT_EXCEEDED')
             })
             .catch(() => rejectCode('PARSER_INTERNAL_ERROR'))

@@ -142,11 +142,21 @@ describe('personal knowledge release evaluation corpus', () => {
     const retriever = new LocalKnowledgeRetriever(memory.database)
     const missed: string[] = []
     let queries = 0
+    let minimumDistractors = Number.POSITIVE_INFINITY
     expect(corpus.retrievalDocuments.length).toBeGreaterThan(8)
     for (const item of corpus.retrievalCases) {
       expect(item.queries.length).toBeGreaterThan(1)
+      const relevantDocuments = new Set(item.relevantDocumentIds.filter(id => (
+        corpus.retrievalDocuments.some(document => document.id === id)
+      )))
+      expect(relevantDocuments.size, `missing relevant document for ${item.id}`)
+        .toBe(new Set(item.relevantDocumentIds).size)
       for (const query of item.queries) {
         queries += 1
+        minimumDistractors = Math.min(
+          minimumDistractors,
+          corpus.retrievalDocuments.length - relevantDocuments.size,
+        )
         const literalMatches = corpus.retrievalDocuments.filter(document => document.body.includes(query))
         expect(literalMatches.length, `query must not be a unique body fingerprint: ${query}`).toBeGreaterThan(1)
         const result = await retriever.search(query, ['evaluation-base'])
@@ -160,11 +170,12 @@ describe('personal knowledge release evaluation corpus', () => {
       percent(queries - missed.length, queries),
       `Recall@8 misses: ${missed.join(', ')}`,
     ).toBeGreaterThanOrEqual(corpus.thresholds.recallAt8)
+    expect(minimumDistractors).toBe(20)
     reportGate('retrieval', {
       recallAt8: percent(queries - missed.length, queries),
       queries,
       documents: corpus.retrievalDocuments.length,
-      minimumDistractors: corpus.retrievalDocuments.length - 1,
+      minimumDistractors,
     })
   })
 
