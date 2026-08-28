@@ -31,6 +31,12 @@ import ChatView from '../../src/views/ChatView.vue'
 const scopeHash = 'a'.repeat(64)
 const buildHash = 'b'.repeat(64)
 
+function bindSettingsOwner(ownerId: string) {
+  const settings = useSettingsStore()
+  const attempt = settings.suspendAccountOperationAdmission()
+  expect(settings.bindAccountOwner(ownerId, attempt)).toBe('applied')
+}
+
 function workflowStatusBlock(
   status: Extract<ChatBlock, { type: 'workflow_status' }>['status'],
   overrides: Partial<Extract<ChatBlock, { type: 'workflow_status' }>> = {},
@@ -718,7 +724,7 @@ describe('conversation knowledge selection', () => {
     vi.mocked(api.chat.getGenerationPreferences).mockResolvedValue(generationPreferences())
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const chat = useChatStore()
-    useSettingsStore().bindAccountOwner('user_1')
+    bindSettingsOwner('user_1')
     await chat.createConversation()
 
     expect(chat.preferences).toMatchObject({ knowledgeBaseIds: [], knowledgeMode: 'mixed' })

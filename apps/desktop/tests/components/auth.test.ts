@@ -56,6 +56,14 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+function bindSettingsOwner(
+  settings: ReturnType<typeof useSettingsStore>,
+  ownerId: string | undefined,
+) {
+  const attempt = settings.suspendAccountOperationAdmission()
+  expect(settings.bindAccountOwner(ownerId, attempt)).toBe('applied')
+}
+
 function createApi(): DesktopAPI {
   return {
     auth: {
@@ -134,6 +142,49 @@ afterEach(() => {
 })
 
 describe('authentication store', () => {
+  it('allows only the latest account transition attempt to reopen admission', () => {
+    const settings = useSettingsStore()
+    const initialAttempt = settings.suspendAccountOperationAdmission()
+    expect(settings.bindAccountOwner(authSession.user.id, initialAttempt)).toBe('applied')
+
+    const firstAttempt = settings.suspendAccountOperationAdmission()
+    const secondAttempt = settings.suspendAccountOperationAdmission()
+
+    expect(settings.bindAccountOwner(bobSession.user.id, firstAttempt)).toBe('stale')
+    expect(settings.isAccountGenerationCurrent(settings.captureAccountGeneration())).toBe(false)
+    expect(settings.bindAccountOwner(bobSession.user.id, secondAttempt)).toBe('applied')
+    expect(settings.isAccountGenerationCurrent(settings.captureAccountGeneration())).toBe(true)
+  })
+
+  it('keeps admission suspended until rejected login recovery fails closed', async () => {
+    const api = createApi()
+    const rejectedLogin = deferred<AuthSession>()
+    const rejectedConsentLoad = deferred<PrivacyConsentState | null>()
+    vi.mocked(api.auth.loginWithPassword).mockReturnValue(rejectedLogin.promise)
+    vi.mocked(api.settings.getCloudSyncConsentState).mockReturnValue(rejectedConsentLoad.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const settings = useSettingsStore()
+    const initialAttempt = settings.suspendAccountOperationAdmission()
+    expect(settings.bindAccountOwner(authSession.user.id, initialAttempt)).toBe('applied')
+    auth.session = authSession
+    settings.cloudSyncConsentState = acceptedCloudConsent
+    const aliceGeneration = settings.captureAccountGeneration()
+
+    const loggingIn = auth.loginWithPassword({ account: 'Bob', password: 'password' })
+    expect(settings.isAccountGenerationCurrent(settings.captureAccountGeneration())).toBe(false)
+    rejectedLogin.reject(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
+    await vi.waitFor(() => expect(api.settings.getCloudSyncConsentState).toHaveBeenCalledOnce())
+    expect(settings.isAccountGenerationCurrent(settings.captureAccountGeneration())).toBe(false)
+
+    rejectedConsentLoad.reject(toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }))
+    await expect(loggingIn).resolves.toBeUndefined()
+
+    expect(settings.cloudSyncConsentState).toBeUndefined()
+    expect(settings.isAccountGenerationCurrent(aliceGeneration)).toBe(false)
+    expect(settings.isAccountGenerationCurrent(settings.captureAccountGeneration())).toBe(true)
+  })
+
   it.each(['restore', 'password', 'otp', 'logout'] as const)(
     'invalidates account work before the first %s identity IPC settles',
     async (flow) => {
@@ -142,7 +193,7 @@ describe('authentication store', () => {
       const auth = useAuthStore()
       const settings = useSettingsStore()
       auth.session = authSession
-      settings.bindAccountOwner(authSession.user.id)
+      bindSettingsOwner(settings, authSession.user.id)
       const aliceGeneration = settings.captureAccountGeneration()
       let operation: Promise<unknown>
       let settle: () => void
@@ -185,7 +236,7 @@ describe('authentication store', () => {
     const auth = useAuthStore()
     const settings = useSettingsStore()
     auth.session = authSession
-    settings.bindAccountOwner(authSession.user.id)
+    bindSettingsOwner(settings, authSession.user.id)
     settings.cloudSyncConsentState = acceptedCloudConsent
     const aliceGeneration = settings.captureAccountGeneration()
 
@@ -676,6 +727,7 @@ describe('authentication store', () => {
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
     auth.session = authSession
+    bindSettingsOwner(useSettingsStore(), authSession.user.id)
 
     await expect(auth.logout()).resolves.toBe(false)
 
@@ -691,6 +743,7 @@ describe('authentication store', () => {
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
     auth.session = authSession
+    bindSettingsOwner(useSettingsStore(), authSession.user.id)
 
     await expect(auth.logout()).resolves.toBe(false)
     expect(auth.session).toEqual(authSession)
@@ -709,6 +762,7 @@ describe('authentication store', () => {
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
     auth.session = authSession
+    bindSettingsOwner(useSettingsStore(), authSession.user.id)
 
     await expect(auth.logout()).resolves.toBe(false)
 
@@ -1586,6 +1640,7 @@ describe('workbench authentication entry', () => {
     const auth = useAuthStore(pinia)
     auth.session = authSession
     auth.initialized = true
+    bindSettingsOwner(useSettingsStore(pinia), authSession.user.id)
     const router = createRouter({
       history: createMemoryHistory(),
       routes: [
@@ -1619,6 +1674,7 @@ describe('workbench authentication entry', () => {
     const auth = useAuthStore(pinia)
     auth.session = authSession
     auth.initialized = true
+    bindSettingsOwner(useSettingsStore(pinia), authSession.user.id)
     const router = createRouter({
       history: createMemoryHistory(),
       routes: [

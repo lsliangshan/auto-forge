@@ -67,6 +67,14 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+function bindSettingsOwner(
+  settings: ReturnType<typeof useSettingsStore>,
+  ownerId: string | undefined,
+) {
+  const attempt = settings.suspendAccountOperationAdmission()
+  expect(settings.bindAccountOwner(ownerId, attempt)).toBe('applied')
+}
+
 function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']): ModelInfo {
   return {
     id,
@@ -396,7 +404,7 @@ describe('workbench', () => {
 
     await wrapper.get('[data-testid="revoke-cloud-sync-consent"]').trigger('click')
     await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
-    for (const owner of owners) settings.bindAccountOwner(owner)
+    for (const owner of owners) bindSettingsOwner(settings, owner)
     settings.cloudSyncConsentState = acceptedCloudConsent
     confirmation.resolve('confirm')
     await flushPromises()
@@ -432,6 +440,29 @@ describe('workbench', () => {
     await loggingIn
   })
 
+  it('does not start revoke after Bob password login IPC has begun', async () => {
+    const api = createApi()
+    const bobLogin = deferred<AuthSession>()
+    vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue(acceptedCloudConsent)
+    vi.mocked(api.auth.loginWithPassword).mockReturnValue(bobLogin.promise)
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const auth = useAuthStore(pinia)
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="revoke-cloud-sync-consent"]').exists())
+      .toBe(true))
+    success.mockClear()
+
+    const loggingIn = auth.loginWithPassword({ account: 'Bob', password: 'password' })
+    await wrapper.get('[data-testid="revoke-cloud-sync-consent"]').trigger('click')
+    await flushPromises()
+
+    expect(api.settings.revokeCloudSyncConsent).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    bobLogin.resolve(bobSession)
+    await loggingIn
+  })
+
   it.each(['resolve', 'reject'] as const)(
     'drops a late revoke RPC %s after an account switch',
     async (settlement) => {
@@ -449,7 +480,7 @@ describe('workbench', () => {
 
       await wrapper.get('[data-testid="revoke-cloud-sync-consent"]').trigger('click')
       await vi.waitFor(() => expect(api.settings.revokeCloudSyncConsent).toHaveBeenCalledOnce())
-      settings.bindAccountOwner('user_2')
+      bindSettingsOwner(settings, 'user_2')
       if (settlement === 'resolve') revoke.resolve(revokedCloudConsent)
       else revoke.reject({ code: 'AUTH_REQUIRED' })
       await flushPromises()
@@ -490,7 +521,7 @@ describe('workbench', () => {
 
     await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
     await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
-    settings.bindAccountOwner('user_2')
+    bindSettingsOwner(settings, 'user_2')
     confirmation.resolve('confirm')
     await flushPromises()
 
@@ -532,6 +563,32 @@ describe('workbench', () => {
     await loggingBackIn
   })
 
+  it('does not start legacy consent or import after Bob password login IPC has begun', async () => {
+    const api = createApi()
+    const bobLogin = deferred<AuthSession>()
+    vi.mocked(api.settings.previewLegacyImport).mockResolvedValue({
+      ownedCount: 1, unownedCount: 0, requiresUnownedConfirmation: false,
+    })
+    vi.mocked(api.auth.loginWithPassword).mockReturnValue(bobLogin.promise)
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const auth = useAuthStore(pinia)
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="legacy-import-button"]')
+      .attributes('disabled')).toBeUndefined())
+    success.mockClear()
+
+    const loggingIn = auth.loginWithPassword({ account: 'Bob', password: 'password' })
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await flushPromises()
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.settings.importLegacyData).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    bobLogin.resolve(bobSession)
+    await loggingIn
+  })
+
   it('drops the second deferred legacy confirmation after Alice to Bob to Alice ABA', async () => {
     const api = createApi()
     const unownedConfirmation = deferred<unknown>()
@@ -547,8 +604,8 @@ describe('workbench', () => {
 
     await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
     await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledTimes(2))
-    settings.bindAccountOwner('user_2')
-    settings.bindAccountOwner('user_1')
+    bindSettingsOwner(settings, 'user_2')
+    bindSettingsOwner(settings, 'user_1')
     unownedConfirmation.resolve('confirm')
     await flushPromises()
 
@@ -582,7 +639,7 @@ describe('workbench', () => {
 
     await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
     await vi.waitFor(() => expect(api.settings[stage]).toHaveBeenCalledOnce())
-    settings.bindAccountOwner('user_2')
+    bindSettingsOwner(settings, 'user_2')
     if (stage === 'recordPrivacyConsent') {
       if (settlement === 'resolve') recordConsent.resolve(undefined)
       else recordConsent.reject({ code: 'AUTH_REQUIRED' })
@@ -859,7 +916,7 @@ describe('workbench', () => {
     })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
-    useSettingsStore().bindAccountOwner(authSession.user.id)
+    bindSettingsOwner(useSettingsStore(), authSession.user.id)
     const loading = store.loadConversations()
     await store.createConversation()
     resolveList({ items: [{
@@ -883,7 +940,7 @@ describe('workbench', () => {
     const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValueOnce('confirm')
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
-    useSettingsStore().bindAccountOwner(authSession.user.id)
+    bindSettingsOwner(useSettingsStore(), authSession.user.id)
 
     await store.createConversation()
 
@@ -900,12 +957,33 @@ describe('workbench', () => {
     const { pinia } = await mountApp('/chat', api)
     const settings = useSettingsStore(pinia)
     const aliceGeneration = settings.captureAccountGeneration()
-    settings.bindAccountOwner(bobSession.user.id)
+    bindSettingsOwner(settings, bobSession.user.id)
 
     await expect(settings.recordPrivacyConsent(cloudSyncConsentInput, aliceGeneration))
       .resolves.toBe('stale')
 
     expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+  })
+
+  it('does not start conversation creation after Bob password login IPC has begun', async () => {
+    const api = createApi()
+    const bobLogin = deferred<AuthSession>()
+    vi.mocked(api.auth.loginWithPassword).mockReturnValue(bobLogin.promise)
+    vi.mocked(api.chat.createConversation).mockResolvedValue({
+      ...conversationSummary('bob_new', '2026-08-28T00:00:00.000Z', 'pending'),
+      title: 'Bob new',
+    })
+    const { pinia } = await mountApp('/chat', api)
+    const auth = useAuthStore(pinia)
+    const chat = useChatStore(pinia)
+
+    const loggingIn = auth.loginWithPassword({ account: 'Bob', password: 'password' })
+    await chat.createConversation()
+
+    expect(api.chat.createConversation).not.toHaveBeenCalled()
+    expect(chat.conversations).toEqual([])
+    bobLogin.resolve(bobSession)
+    await loggingIn
   })
 
   it.each([
@@ -926,7 +1004,7 @@ describe('workbench', () => {
     const creating = chat.createConversation()
     await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
     for (const owner of owners) {
-      settings.bindAccountOwner(owner)
+      bindSettingsOwner(settings, owner)
       chat.resetLocalData()
     }
     confirmation.resolve('confirm')
@@ -953,7 +1031,7 @@ describe('workbench', () => {
 
     const creating = chat.createConversation()
     await vi.waitFor(() => expect(api.system.getAppInfo).toHaveBeenCalledOnce())
-    settings.bindAccountOwner(bobSession.user.id)
+    bindSettingsOwner(settings, bobSession.user.id)
     chat.resetLocalData()
     appInfo.resolve({ version: '0.1.0', platform: 'darwin' })
     await creating
@@ -980,7 +1058,7 @@ describe('workbench', () => {
 
       const creating = chat.createConversation()
       await vi.waitFor(() => expect(api.settings.recordPrivacyConsent).toHaveBeenCalledOnce())
-      settings.bindAccountOwner(bobSession.user.id)
+      bindSettingsOwner(settings, bobSession.user.id)
       chat.resetLocalData()
       if (settlement === 'resolve') consent.resolve(undefined)
       else consent.reject({ code: 'AUTH_REQUIRED' })
@@ -1011,7 +1089,7 @@ describe('workbench', () => {
 
       const creating = chat.createConversation()
       await vi.waitFor(() => expect(api.chat.createConversation).toHaveBeenCalledTimes(2))
-      settings.bindAccountOwner(bobSession.user.id)
+      bindSettingsOwner(settings, bobSession.user.id)
       chat.resetLocalData()
       if (settlement === 'resolve') {
         retry.resolve({
@@ -1076,7 +1154,7 @@ describe('workbench', () => {
       const creating = chat.createConversation()
       await vi.waitFor(() => expect(api.chat.getGenerationPreferences)
         .toHaveBeenCalledWith('alice_new'))
-      settings.advanceAccountOperationGeneration()
+      settings.suspendAccountOperationAdmission()
       if (settlement === 'resolve') {
         preferences.resolve({
           outputType: 'auto',
@@ -1110,7 +1188,7 @@ describe('workbench', () => {
     vi.spyOn(ElMessageBox, 'confirm').mockRejectedValueOnce('cancel')
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
-    useSettingsStore().bindAccountOwner(authSession.user.id)
+    bindSettingsOwner(useSettingsStore(), authSession.user.id)
 
     await store.createConversation()
 
@@ -1694,6 +1772,7 @@ describe('workbench', () => {
     const chat = useChatStore(); chat.conversations = [{ id: 'c', title: '会话', createdAt: '2026-07-19T00:00:00.000Z', updatedAt: '2026-07-19T00:00:00.000Z' }]
     const executions = useExecutionStore(); executions.items = [{ id: 'e', workflowId: 'w', workflowVersion: '1.0.0', status: 'completed', createdAt: '2026-07-19T00:00:00.000Z' }]
     const settings = useSettingsStore()
+    bindSettingsOwner(settings, authSession.user.id)
     await settings.clearLocalData('all')
     expect(chat.conversations).toEqual([])
     expect(executions.items).toEqual([])
@@ -1711,6 +1790,7 @@ describe('workbench', () => {
       .mockRejectedValueOnce(new Error('billing unavailable'))
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useSettingsStore()
+    bindSettingsOwner(store, authSession.user.id)
 
     const first = store.loadTokenUsage()
     await store.loadTokenUsage()
@@ -1728,6 +1808,7 @@ describe('workbench', () => {
     const api = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useSettingsStore()
+    bindSettingsOwner(store, authSession.user.id)
 
     await store.clearLocalData('conversations')
     expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
