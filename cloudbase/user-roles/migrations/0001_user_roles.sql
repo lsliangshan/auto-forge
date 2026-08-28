@@ -10,24 +10,6 @@ CREATE TABLE IF NOT EXISTS public.app_user_roles (
   updated_by varchar(64)
 );
 
-ALTER TABLE public.app_user_roles
-  ADD COLUMN IF NOT EXISTS knowledge_entitlement jsonb;
-ALTER TABLE public.app_user_roles
-  DROP CONSTRAINT IF EXISTS app_user_roles_knowledge_entitlement_check;
-ALTER TABLE public.app_user_roles
-  ADD CONSTRAINT app_user_roles_knowledge_entitlement_check CHECK (
-    knowledge_entitlement IS NULL OR (
-      jsonb_typeof(knowledge_entitlement) = 'object'
-      AND jsonb_object_length(knowledge_entitlement) = 2
-      AND jsonb_typeof(knowledge_entitlement->'payload') = 'string'
-      AND jsonb_typeof(knowledge_entitlement->'signature') = 'string'
-      AND length(knowledge_entitlement->>'payload') BETWEEN 1 AND 8192
-      AND length(knowledge_entitlement->>'signature') BETWEEN 1 AND 256
-      AND knowledge_entitlement->>'payload' ~ '^[A-Za-z0-9_-]+$'
-      AND knowledge_entitlement->>'signature' ~ '^[A-Za-z0-9_-]+$'
-    )
-  );
-
 CREATE TABLE IF NOT EXISTS public.app_user_role_audit (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   request_id varchar(128) NOT NULL UNIQUE,
@@ -127,8 +109,7 @@ BEGIN
       ELSE '[]'::jsonb
     END,
     'version', role_row.version,
-    'updatedAt', to_char(role_row.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-    'knowledgeEntitlement', role_row.knowledge_entitlement
+    'updatedAt', to_char(role_row.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
   );
 END;
 $$;
