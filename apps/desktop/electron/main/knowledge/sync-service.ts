@@ -67,7 +67,10 @@ export type CloudSyncMode = 'local_only' | 'syncing' | 'synced' | 'paused' | 'co
 
 export interface KnowledgeSyncCommitGuard {
   readonly knowledgeBaseId: string
+  readonly projection: 'local' | 'remote'
   commit(write: () => void): void
+  commitSnapshot(sequence: number, write: () => void): void
+  commitIncremental(sequence: number, write: () => void): void
 }
 
 interface SyncServiceDependencies {
@@ -81,6 +84,7 @@ interface SyncServiceDependencies {
   replaceRemoteSnapshot(
     changes: CloudKnowledgeChange[],
     guard: KnowledgeSyncCommitGuard,
+    nextSequence: number,
   ): Promise<void>
 }
 
@@ -167,17 +171,23 @@ export class KnowledgeSyncService {
     this.entitlementEpoch += 1
     if (!allowed) {
       const now = this.dependencies.now()
-      this.database.prepare(`
-        INSERT INTO cloud_sync_states (
-          knowledge_base_id, mode, published_generation_id, epoch, updated_at
-        ) SELECT id, 'paused', NULL, 1, ? FROM knowledge_bases WHERE 1
-        ON CONFLICT(knowledge_base_id) DO UPDATE SET
-          mode = CASE WHEN cloud_sync_states.mode = 'converting'
-            THEN cloud_sync_states.mode ELSE 'paused' END,
-          epoch = CASE WHEN cloud_sync_states.mode = 'converting'
-            THEN cloud_sync_states.epoch ELSE cloud_sync_states.epoch + 1 END,
-          updated_at = excluded.updated_at
-      `).run(now)
+      this.database.transaction(() => {
+        this.database.prepare(`
+          INSERT INTO cloud_sync_states (
+            knowledge_base_id, mode, published_generation_id, epoch, updated_at
+          ) SELECT id, 'paused', NULL, 1, ? FROM knowledge_bases WHERE 1
+          ON CONFLICT(knowledge_base_id) DO UPDATE SET
+            mode = CASE WHEN cloud_sync_states.mode = 'converting'
+              THEN cloud_sync_states.mode ELSE 'paused' END,
+            epoch = CASE WHEN cloud_sync_states.mode = 'converting'
+              THEN cloud_sync_states.epoch ELSE cloud_sync_states.epoch + 1 END,
+            updated_at = excluded.updated_at
+        `).run(now)
+        this.database.prepare(`
+          UPDATE cloud_remote_sync_states
+          SET mode = 'paused', epoch = epoch + 1, updated_at = ?
+        `).run(now)
+      })()
     }
   }
 
@@ -250,33 +260,48 @@ export class KnowledgeSyncService {
   }
 
   synchronize(knowledgeBaseId: string): Promise<SyncResult> {
-    const active = this.activeSynchronizations.get(knowledgeBaseId)
+    return this.startSynchronization(knowledgeBaseId, false)
+  }
+
+  synchronizeRemoteProjection(knowledgeBaseId: string): Promise<SyncResult> {
+    return this.startSynchronization(knowledgeBaseId, true)
+  }
+
+  private startSynchronization(
+    knowledgeBaseId: string,
+    remoteProjection: boolean,
+  ): Promise<SyncResult> {
+    const key = `${remoteProjection ? 'remote' : 'local'}:${knowledgeBaseId}`
+    const active = this.activeSynchronizations.get(key)
     if (active) return active
-    const synchronization = this.runSynchronization(knowledgeBaseId)
-    this.activeSynchronizations.set(knowledgeBaseId, synchronization)
+    const synchronization = this.runSynchronization(knowledgeBaseId, remoteProjection)
+    this.activeSynchronizations.set(key, synchronization)
     const clear = () => {
-      if (this.activeSynchronizations.get(knowledgeBaseId) === synchronization) {
-        this.activeSynchronizations.delete(knowledgeBaseId)
+      if (this.activeSynchronizations.get(key) === synchronization) {
+        this.activeSynchronizations.delete(key)
       }
     }
     void synchronization.then(clear, clear)
     return synchronization
   }
 
-  private async runSynchronization(knowledgeBaseId: string): Promise<SyncResult> {
+  private async runSynchronization(
+    knowledgeBaseId: string,
+    remoteProjection: boolean,
+  ): Promise<SyncResult> {
     const entitlementEpoch = this.captureCloudAccess()
-    const state = this.getState(knowledgeBaseId)
-    if (state.mode === 'paused' || state.mode === 'converting') {
+    const state = this.getProjectionState(knowledgeBaseId, remoteProjection)
+    if (!remoteProjection && (state.mode === 'paused' || state.mode === 'converting')) {
       return { status: 'paused', processed: 0, conflicts: 0 }
     }
     if (!this.dependencies.isOnline()) {
       return { status: 'offline', processed: 0, conflicts: 0 }
     }
-    const epoch = this.setMode(knowledgeBaseId, 'syncing')
-    this.expireTerminalLeases(knowledgeBaseId)
+    const epoch = this.setProjectionMode(knowledgeBaseId, 'syncing', remoteProjection)
+    if (!remoteProjection) this.expireTerminalLeases(knowledgeBaseId)
     let processed = 0
     let conflicts = 0
-    while (true) {
+    while (!remoteProjection) {
       const mutation = this.claimMutation(knowledgeBaseId)
       if (!mutation) break
       try {
@@ -290,7 +315,7 @@ export class KnowledgeSyncService {
           payload: JSON.parse(mutation.payloadJson) as Record<string, unknown>,
         })
         this.assertCloudAccess(entitlementEpoch)
-        if (!this.isActive(knowledgeBaseId, epoch)) {
+        if (!this.isProjectionActive(knowledgeBaseId, epoch, remoteProjection)) {
           return { status: 'paused', processed, conflicts }
         }
         if (result.mutationId !== mutation.id) throw syncError('INTERNAL_ERROR')
@@ -301,27 +326,27 @@ export class KnowledgeSyncService {
         }
       } catch (error) {
         if (!this.isCloudAccessCurrent(entitlementEpoch)
-          || !this.isActive(knowledgeBaseId, epoch)) {
+          || !this.isProjectionActive(knowledgeBaseId, epoch, remoteProjection)) {
           return { status: 'paused', processed, conflicts }
         }
         this.failMutation(mutation, error)
       }
     }
 
-    await this.pull(knowledgeBaseId, epoch, entitlementEpoch)
-    if (!this.isActive(knowledgeBaseId, epoch)) {
+    await this.pull(knowledgeBaseId, epoch, entitlementEpoch, remoteProjection)
+    if (!this.isProjectionActive(knowledgeBaseId, epoch, remoteProjection)) {
       return { status: 'paused', processed, conflicts }
     }
     this.assertCloudAccess(entitlementEpoch)
-    const failures = this.database.prepare(`
+    const failures = remoteProjection ? { count: 0 } : this.database.prepare(`
       SELECT count(*) AS count FROM cloud_sync_mutations
       WHERE knowledge_base_id = ? AND state = 'failed'
     `).get(knowledgeBaseId) as { count: number }
     if (failures.count > 0) {
-      this.compareAndSetMode(knowledgeBaseId, epoch, 'failed')
+      this.compareAndSetProjectionMode(knowledgeBaseId, epoch, 'failed', remoteProjection)
       return { status: 'failed', processed, conflicts }
     }
-    this.compareAndSetMode(knowledgeBaseId, epoch, 'synced')
+    this.compareAndSetProjectionMode(knowledgeBaseId, epoch, 'synced', remoteProjection)
     return { status: 'synced', processed, conflicts }
   }
 
@@ -354,6 +379,10 @@ export class KnowledgeSyncService {
         ) SELECT id, 'paused', NULL, 1, ? FROM knowledge_bases WHERE 1
         ON CONFLICT(knowledge_base_id) DO UPDATE SET
           mode = 'paused', epoch = cloud_sync_states.epoch + 1, updated_at = excluded.updated_at
+      `).run(now)
+      this.database.prepare(`
+        UPDATE cloud_remote_sync_states
+        SET mode = 'paused', epoch = epoch + 1, updated_at = ?
       `).run(now)
       this.database.prepare(`
         UPDATE knowledge_cloud_retention SET epoch = epoch + 1, updated_at = ?
@@ -765,7 +794,15 @@ export class KnowledgeSyncService {
   }
 
   private isActive(knowledgeBaseId: string, epoch: number): boolean {
-    const state = this.getControl(knowledgeBaseId)
+    return this.isProjectionActive(knowledgeBaseId, epoch, false)
+  }
+
+  private isProjectionActive(
+    knowledgeBaseId: string,
+    epoch: number,
+    remoteProjection: boolean,
+  ): boolean {
+    const state = this.getProjectionControl(knowledgeBaseId, remoteProjection)
     return state.epoch === epoch && state.mode === 'syncing'
   }
 
@@ -778,31 +815,69 @@ export class KnowledgeSyncService {
     epoch: number,
     mode: Extract<CloudSyncMode, 'syncing' | 'converting'>,
     isOwnerCurrent: () => boolean,
+    remoteProjection = false,
   ): KnowledgeSyncCommitGuard {
     const isCurrent = () => {
-      const current = this.getControl(knowledgeBaseId)
+      const current = this.getProjectionControl(knowledgeBaseId, remoteProjection)
       return isOwnerCurrent()
         && current.epoch === epoch && current.mode === mode
     }
+    const commit = (write: () => void): void => {
+      if (!isCurrent()) throw syncError('CONFLICT')
+      let failed = false
+      let failure: unknown
+      try {
+        write()
+      } catch (error) {
+        failed = true
+        failure = error
+      }
+      if (!isCurrent()) throw syncError('CONFLICT')
+      if (failed) throw failure
+    }
+    const commitWithCursor = (
+      sequence: number,
+      replace: boolean,
+      write: () => void,
+    ): void => {
+      if (!Number.isSafeInteger(sequence) || sequence < 0) throw syncError('INTERNAL_ERROR')
+      this.database.transaction(() => commit(() => {
+        write()
+        this.writeProjectionCursor(
+          knowledgeBaseId, sequence, this.dependencies.now(), remoteProjection, replace,
+        )
+      }))()
+    }
     return Object.freeze({
       knowledgeBaseId,
-      commit: (write: () => void) => {
-        if (!isCurrent()) throw syncError('CONFLICT')
-        let failed = false
-        let failure: unknown
-        try {
-          write()
-        } catch (error) {
-          failed = true
-          failure = error
-        }
-        if (!isCurrent()) throw syncError('CONFLICT')
-        if (failed) throw failure
-      },
+      projection: remoteProjection ? 'remote' : 'local',
+      commit,
+      commitSnapshot: (sequence: number, write: () => void) => (
+        commitWithCursor(sequence, true, write)
+      ),
+      commitIncremental: (sequence: number, write: () => void) => (
+        commitWithCursor(sequence, false, write)
+      ),
     })
   }
 
   private compareAndSetMode(knowledgeBaseId: string, epoch: number, mode: CloudSyncMode): boolean {
+    return this.compareAndSetProjectionMode(knowledgeBaseId, epoch, mode, false)
+  }
+
+  private compareAndSetProjectionMode(
+    knowledgeBaseId: string,
+    epoch: number,
+    mode: CloudSyncMode,
+    remoteProjection: boolean,
+  ): boolean {
+    if (remoteProjection) {
+      const updated = this.database.prepare(`
+        UPDATE cloud_remote_sync_states SET mode = ?, epoch = epoch + 1, updated_at = ?
+        WHERE knowledge_base_id = ? AND epoch = ?
+      `).run(mode, this.dependencies.now(), knowledgeBaseId, epoch)
+      return updated.changes === 1
+    }
     const updated = this.database.prepare(`
       UPDATE cloud_sync_states SET mode = ?, epoch = epoch + 1, updated_at = ?
       WHERE knowledge_base_id = ? AND epoch = ?
@@ -824,6 +899,22 @@ export class KnowledgeSyncService {
       epoch: number
     } | undefined
     return row ?? { mode: 'local_only', publishedGenerationId: null, epoch: 0 }
+  }
+
+  private getProjectionControl(
+    knowledgeBaseId: string,
+    remoteProjection: boolean,
+  ): { mode: CloudSyncMode; publishedGenerationId: string | null; epoch: number } {
+    if (!remoteProjection) return this.getControl(knowledgeBaseId)
+    const row = this.database.prepare(`
+      SELECT mode, published_generation_id AS publishedGenerationId, epoch
+      FROM cloud_remote_sync_states WHERE knowledge_base_id = ?
+    `).get(knowledgeBaseId) as {
+      mode: Extract<CloudSyncMode, 'syncing' | 'synced' | 'paused' | 'failed'>
+      publishedGenerationId: string | null
+      epoch: number
+    } | undefined
+    return row ?? { mode: 'synced', publishedGenerationId: null, epoch: 0 }
   }
 
   async cancelMutation(mutationId: string): Promise<void> {
@@ -965,27 +1056,30 @@ export class KnowledgeSyncService {
     knowledgeBaseId: string,
     epoch: number,
     entitlementEpoch: number,
+    remoteProjection: boolean,
   ): Promise<void> {
-    const cursor = this.database.prepare(`
-      SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?
-    `).get(knowledgeBaseId) as { sequence: number } | undefined
+    const cursor = this.getProjectionCursor(knowledgeBaseId, remoteProjection)
     let afterSequence = cursor?.sequence ?? 0
     const isCurrent = () => this.isCloudAccessCurrent(entitlementEpoch)
-      && this.isActive(knowledgeBaseId, epoch)
+      && this.isProjectionActive(knowledgeBaseId, epoch, remoteProjection)
     const commitGuard = this.createCommitGuard(
       knowledgeBaseId, epoch, 'syncing', () => this.isCloudAccessCurrent(entitlementEpoch),
+      remoteProjection,
     )
     if (afterSequence === 0) {
       const snapshot = await this.remote.fullResync({ knowledgeBaseId })
       if (!isCurrent()) return
       try {
-        await this.dependencies.replaceRemoteSnapshot(snapshot.changes, commitGuard)
+        await this.dependencies.replaceRemoteSnapshot(
+          snapshot.changes, commitGuard, snapshot.nextSequence,
+        )
       } catch (error) {
         if (!isCurrent()) return
         throw error
       }
       if (!isCurrent()) return
-      this.replaceCursor(knowledgeBaseId, snapshot.nextSequence, this.dependencies.now())
+      if (this.getProjectionCursor(knowledgeBaseId, remoteProjection)?.sequence
+        !== snapshot.nextSequence) throw syncError('INTERNAL_ERROR')
       return
     }
     while (true) {
@@ -995,13 +1089,16 @@ export class KnowledgeSyncService {
         const snapshot = await this.remote.fullResync({ knowledgeBaseId })
         if (!isCurrent()) return
         try {
-          await this.dependencies.replaceRemoteSnapshot(snapshot.changes, commitGuard)
+          await this.dependencies.replaceRemoteSnapshot(
+            snapshot.changes, commitGuard, snapshot.nextSequence,
+          )
         } catch (error) {
           if (!isCurrent()) return
           throw error
         }
         if (!isCurrent()) return
-        this.replaceCursor(knowledgeBaseId, snapshot.nextSequence, this.dependencies.now())
+        if (this.getProjectionCursor(knowledgeBaseId, remoteProjection)?.sequence
+          !== snapshot.nextSequence) throw syncError('INTERNAL_ERROR')
         return
       }
       if (result.nextSequence < afterSequence
@@ -1022,12 +1119,39 @@ export class KnowledgeSyncService {
         }
         if (!isCurrent()) return
         afterSequence = change.sequence
+        if (this.getProjectionCursor(knowledgeBaseId, remoteProjection)?.sequence
+          !== afterSequence) throw syncError('INTERNAL_ERROR')
       }
       if (result.nextSequence !== afterSequence) throw syncError('INTERNAL_ERROR')
       if (!isCurrent()) return
-      this.upsertCursor(knowledgeBaseId, result.nextSequence, this.dependencies.now())
       if (!result.hasMore) return
     }
+  }
+
+  private getProjectionCursor(
+    knowledgeBaseId: string,
+    remoteProjection: boolean,
+  ): { sequence: number } | undefined {
+    return this.database.prepare(`
+      SELECT sequence FROM ${remoteProjection ? 'cloud_remote_sync_cursors' : 'sync_cursors'}
+      WHERE knowledge_base_id = ?
+    `).get(knowledgeBaseId) as { sequence: number } | undefined
+  }
+
+  private writeProjectionCursor(
+    knowledgeBaseId: string,
+    sequence: number,
+    now: number,
+    remoteProjection: boolean,
+    replace: boolean,
+  ): void {
+    const table = remoteProjection ? 'cloud_remote_sync_cursors' : 'sync_cursors'
+    this.database.prepare(`
+      INSERT INTO ${table} (knowledge_base_id, sequence, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(knowledge_base_id) DO UPDATE SET
+        sequence = ${replace ? 'excluded.sequence' : `max(${table}.sequence, excluded.sequence)`},
+        updated_at = excluded.updated_at
+    `).run(knowledgeBaseId, sequence, now)
   }
 
   private upsertCursor(knowledgeBaseId: string, sequence: number, now: number): void {
@@ -1047,7 +1171,38 @@ export class KnowledgeSyncService {
   }
 
   private setMode(knowledgeBaseId: string, mode: CloudSyncMode): number {
-    this.setState(knowledgeBaseId, mode, this.getState(knowledgeBaseId).publishedGenerationId)
+    return this.setProjectionMode(knowledgeBaseId, mode, false)
+  }
+
+  private getProjectionState(
+    knowledgeBaseId: string,
+    remoteProjection: boolean,
+  ): { mode: CloudSyncMode; publishedGenerationId: string | null } {
+    if (!remoteProjection) return this.getState(knowledgeBaseId)
+    const state = this.getProjectionControl(knowledgeBaseId, true)
+    return { mode: state.mode, publishedGenerationId: state.publishedGenerationId }
+  }
+
+  private setProjectionMode(
+    knowledgeBaseId: string,
+    mode: CloudSyncMode,
+    remoteProjection: boolean,
+  ): number {
+    const published = this.getProjectionState(
+      knowledgeBaseId, remoteProjection,
+    ).publishedGenerationId
+    if (remoteProjection) {
+      this.database.prepare(`
+        INSERT INTO cloud_remote_sync_states (
+          knowledge_base_id, mode, published_generation_id, epoch, updated_at
+        ) VALUES (?, ?, ?, 1, ?)
+        ON CONFLICT(knowledge_base_id) DO UPDATE SET
+          mode = excluded.mode, published_generation_id = excluded.published_generation_id,
+          epoch = cloud_remote_sync_states.epoch + 1, updated_at = excluded.updated_at
+      `).run(knowledgeBaseId, mode, published, this.dependencies.now())
+      return this.getProjectionControl(knowledgeBaseId, true).epoch
+    }
+    this.setState(knowledgeBaseId, mode, published)
     return this.getControl(knowledgeBaseId).epoch
   }
 

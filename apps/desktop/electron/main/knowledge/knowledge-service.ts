@@ -178,6 +178,7 @@ interface KnowledgeCloudLifecycle {
   }): Promise<void>
   enqueue(input: Parameters<KnowledgeSyncService['enqueue']>[0]): void
   synchronize(knowledgeBaseId: string): Promise<unknown>
+  synchronizeRemoteProjection(knowledgeBaseId: string): Promise<unknown>
   resume(knowledgeBaseId: string): void
   publishGeneration(input: {
     requestId: string
@@ -307,6 +308,7 @@ export function createLocalKnowledgeService(
     enableSync: async () => fail('SERVICE_UNAVAILABLE'),
     enqueue: () => fail('SERVICE_UNAVAILABLE'),
     synchronize: async () => fail('SERVICE_UNAVAILABLE'),
+    synchronizeRemoteProjection: async () => fail('SERVICE_UNAVAILABLE'),
     resume: () => fail('SERVICE_UNAVAILABLE'),
     publishGeneration: async () => fail('SERVICE_UNAVAILABLE'),
     beginCloudRetention: (knowledgeBaseId, boundaryAt) => {
@@ -372,14 +374,18 @@ export function createLocalKnowledgeService(
 
   const createCloudLifecycle = (store: LocalKnowledgeStore): KnowledgeCloudLifecycle => {
     if (!cloudRemote) return failClosedCloudLifecycle(store.database)
-    const applyChange = (
+    const writeHead = (
       change: CloudKnowledgeChange,
-      guard: { readonly knowledgeBaseId: string; commit(write: () => void): void },
-    ): void => guard.commit(() => {
+      guard: {
+        readonly knowledgeBaseId: string
+        readonly projection: 'local' | 'remote'
+      },
+    ): void => {
       const payloadJson = JSON.stringify(change.payload)
       if (Buffer.byteLength(payloadJson, 'utf8') > 64 * 1_024) fail('INVALID_INPUT')
       store.database.prepare(`
-        INSERT INTO cloud_entity_heads(
+        INSERT INTO ${guard.projection === 'remote'
+          ? 'cloud_remote_entity_heads' : 'cloud_entity_heads'}(
           knowledge_base_id, entity_kind, entity_id, revision, payload_json, deleted, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(knowledge_base_id, entity_kind, entity_id) DO UPDATE SET
@@ -389,32 +395,24 @@ export function createLocalKnowledgeService(
         guard.knowledgeBaseId, change.entityKind, change.entityId, change.revision,
         payloadJson, Number(change.operation === 'delete'), now(),
       )
-    })
+    }
     return new KnowledgeSyncService(store.database, cloudRemote, {
       now,
       id,
       isOnline: () => true,
-      applyRemoteChange: async (change, guard) => applyChange(change, guard),
-      replaceRemoteSnapshot: async (changes, guard) => guard.commit(() => {
-        store.database.transaction(() => {
-          store.database.prepare(
-            'DELETE FROM cloud_entity_heads WHERE knowledge_base_id = ?',
-          ).run(guard.knowledgeBaseId)
-          for (const change of changes) {
-            const payloadJson = JSON.stringify(change.payload)
-            if (Buffer.byteLength(payloadJson, 'utf8') > 64 * 1_024) fail('INVALID_INPUT')
-            store.database.prepare(`
-              INSERT INTO cloud_entity_heads(
-                knowledge_base_id, entity_kind, entity_id, revision,
-                payload_json, deleted, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            `).run(
-              guard.knowledgeBaseId, change.entityKind, change.entityId, change.revision,
-              payloadJson, Number(change.operation === 'delete'), now(),
-            )
-          }
-        })()
-      }),
+      applyRemoteChange: async (change, guard) => guard.commitIncremental(
+        change.sequence, () => writeHead(change, guard),
+      ),
+      replaceRemoteSnapshot: async (changes, guard, nextSequence) => (
+        guard.commitSnapshot(nextSequence, () => {
+          store.database.prepare(`
+            DELETE FROM ${guard.projection === 'remote'
+              ? 'cloud_remote_entity_heads' : 'cloud_entity_heads'}
+            WHERE knowledge_base_id = ?
+          `).run(guard.knowledgeBaseId)
+          for (const change of changes) writeHead(change, guard)
+        })
+      ),
     })
   }
 

@@ -47,9 +47,20 @@ function fixture(
     cleanupOrphans: vi.fn().mockResolvedValue({ removed: 0 }),
     ...overrides,
   }
-  const applyRemoteChange = vi.fn(localOverrides.applyRemoteChange ?? (async () => undefined))
+  const applyRemoteChange = vi.fn(localOverrides.applyRemoteChange ?? (async (...args: unknown[]) => {
+    const change = args[0] as { sequence: number }
+    const guard = args[1] as {
+      commitIncremental(sequence: number, write: () => void): void
+    }
+    guard.commitIncremental(change.sequence, () => undefined)
+  }))
   const replaceRemoteSnapshot = vi.fn(
-    localOverrides.replaceRemoteSnapshot ?? (async () => undefined),
+    localOverrides.replaceRemoteSnapshot ?? (async (...args: unknown[]) => {
+      const guard = args[1] as {
+        commitSnapshot(sequence: number, write: () => void): void
+      }
+      guard.commitSnapshot(args[2] as number, () => undefined)
+    }),
   )
   const service = new KnowledgeSyncService(database, remote, {
     now: () => 1_000,
@@ -344,12 +355,97 @@ describe('KnowledgeSyncService', () => {
     expect(fullResync).toHaveBeenCalledWith({ knowledgeBaseId: 'kb_1' })
     expect(replaceRemoteSnapshot).toHaveBeenCalledWith([
       { sequence: 42, entityKind: 'document', entityId: 'document_remote', operation: 'upsert', revision: 'r42', payload: {} },
-    ], expect.objectContaining({ knowledgeBaseId: 'kb_1', commit: expect.any(Function) }))
+    ], expect.objectContaining({
+      knowledgeBaseId: 'kb_1', projection: 'local', commit: expect.any(Function),
+      commitSnapshot: expect.any(Function), commitIncremental: expect.any(Function),
+    }), 42)
     expect(applyRemoteChange).not.toHaveBeenCalled()
     expect(pullChanges).not.toHaveBeenCalled()
     expect(database.prepare(
       'SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?',
     ).get('kb_1')).toEqual({ sequence: 42 })
+  })
+
+  it('uses independent durable state for a remote-only snapshot and commits its cursor atomically', async () => {
+    const replaceRemoteSnapshot = async (...args: unknown[]) => {
+      const changes = args[0] as Array<{ payload: Record<string, unknown> }>
+      const guard = args[1] as {
+        projection: 'remote'
+        commitSnapshot(sequence: number, write: () => void): void
+      }
+      expect(guard.projection).toBe('remote')
+      guard.commitSnapshot(args[2] as number, () => {
+        database.prepare(`
+          INSERT INTO cloud_base_projections(
+            id, name, status, published_generation_id, revision, updated_at
+          ) VALUES (?, ?, 'ready', NULL, 'remote_r7', 1)
+        `).run('remote_base', changes[0]!.payload.name)
+      })
+    }
+    const { database, service } = fixture({
+      fullResync: vi.fn().mockResolvedValue({
+        kind: 'snapshot', nextSequence: 7,
+        changes: [{
+          sequence: 7, entityKind: 'knowledge_base', entityId: 'remote_base',
+          operation: 'upsert', revision: 'remote_r7', payload: { name: 'Remote' },
+        }],
+      }),
+    }, true, { replaceRemoteSnapshot })
+
+    await expect(service.synchronizeRemoteProjection('remote_base')).resolves.toMatchObject({
+      status: 'synced', processed: 0, conflicts: 0,
+    })
+    expect(database.prepare(
+      "SELECT 1 AS present FROM knowledge_bases WHERE id = 'remote_base'",
+    ).get()).toBeUndefined()
+    expect(database.prepare(`
+      SELECT mode FROM cloud_remote_sync_states WHERE knowledge_base_id = 'remote_base'
+    `).get()).toEqual({ mode: 'synced' })
+    expect(database.prepare(`
+      SELECT sequence FROM cloud_remote_sync_cursors WHERE knowledge_base_id = 'remote_base'
+    `).get()).toEqual({ sequence: 7 })
+    expect(database.prepare(`
+      SELECT name FROM cloud_base_projections WHERE id = 'remote_base'
+    `).get()).toEqual({ name: 'Remote' })
+    expect(database.prepare(`
+      SELECT 1 AS present FROM cloud_sync_states WHERE knowledge_base_id = 'remote_base'
+    `).get()).toBeUndefined()
+  })
+
+  it('rolls back a remote-only snapshot projection when its cursor cannot commit', async () => {
+    let database!: Database.Database
+    const replaceRemoteSnapshot = async (...args: unknown[]) => {
+      const guard = args[1] as {
+        commitSnapshot(sequence: number, write: () => void): void
+      }
+      guard.commitSnapshot(args[2] as number, () => {
+        database.prepare(`
+          INSERT INTO cloud_base_projections(
+            id, name, status, published_generation_id, revision, updated_at
+          ) VALUES ('remote_base', 'Remote', 'ready', NULL, 'remote_r7', 1)
+        `).run()
+      })
+    }
+    const fixtureResult = fixture({
+      fullResync: vi.fn().mockResolvedValue({
+        kind: 'snapshot', nextSequence: 7, changes: [],
+      }),
+    }, true, { replaceRemoteSnapshot })
+    database = fixtureResult.database
+    database.exec(`
+      CREATE TRIGGER reject_remote_cursor
+      BEFORE INSERT ON cloud_remote_sync_cursors
+      BEGIN SELECT RAISE(ABORT, 'cursor rejected'); END;
+    `)
+
+    await expect(fixtureResult.service.synchronizeRemoteProjection('remote_base'))
+      .rejects.toThrow('cursor rejected')
+    expect(database.prepare(`
+      SELECT 1 AS present FROM cloud_base_projections WHERE id = 'remote_base'
+    `).get()).toBeUndefined()
+    expect(database.prepare(`
+      SELECT 1 AS present FROM cloud_remote_sync_cursors WHERE knowledge_base_id = 'remote_base'
+    `).get()).toBeUndefined()
   })
 
   it('rejects a held snapshot commit after cancellation and still releases callback resources', async () => {
