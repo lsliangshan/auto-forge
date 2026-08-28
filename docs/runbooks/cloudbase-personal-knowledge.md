@@ -41,8 +41,9 @@ Stop if the two forward migrations are not byte-identical.
    and key only from the server-side secret manager. Its private Storage adapter
    additionally requires `POST /objects/read` with an exact byte-size/SHA-256
    response contract. Preserve `worker/job-process.js`, `worker/job-child.js`,
-   `worker/parser-process.js`, `worker/parser-child.js`, and the version-aligned
-   parser dependencies in `worker/package.json`; run a
+   `worker/parser-process.js`, `worker/parser-child.js`,
+   `worker/settlement-process.js`, `worker/settlement-child.js`, and the
+   version-aligned parser dependencies in `worker/package.json`; run a
    package-resolution smoke with the release Node runtime before deployment.
    Do not set `AUTOFORGE_KNOWLEDGE_MUTATION_PERMIT_PORT_VERSION=db-job-v1`
    until both private services implement the reviewed `mutation-permit-port.js`
@@ -66,7 +67,11 @@ Stop if the two forward migrations are not byte-identical.
    prior published generation active; publication requires both the expected
    prior generation and a ready candidate.
    For every claim, verify the trusted parent scheduler launches one credentialed
-   job child and retains claim/failure-settlement authority. For every upload,
+   job child in its own POSIX session and retains claim/failure-settlement authority.
+   It must not settle until TERM/KILL of that process group leaves no nested parser;
+   completion and low-budget abandon each run in a separate killable settlement
+   process and confirm the exact job/worker/lease/permit receipt, including an
+   idempotent replay after a lost response. For every upload,
    verify that job child launches a fresh parser child whose environment contains
    no RPC, Storage, TokenHub, proxy, service-role,
    or provider credential and whose network APIs are denied. Exercise the exact
