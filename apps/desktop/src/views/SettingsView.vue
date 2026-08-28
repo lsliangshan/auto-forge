@@ -662,6 +662,7 @@ async function confirmLegacyImport() {
   const preview = settings.legacyImportPreview
   const clientVersion = settings.appInfo?.version
   if (!preview || !clientVersion || !hasLegacyData.value) return
+  const accountGeneration = settings.captureAccountGeneration()
   legacyImporting.value = true
   settings.cloudDataError = ''
   try {
@@ -670,12 +671,14 @@ async function confirmLegacyImport() {
       '开启账户云同步',
       { type: 'warning', confirmButtonText: '同意并继续', cancelButtonText: '取消' },
     )
+    if (!settings.isAccountGenerationCurrent(accountGeneration)) return
     if (preview.requiresUnownedConfirmation) {
       await ElMessageBox.confirm(
         '这些未归属的本机会话可能由其他本机使用者创建。确认后会将它们迁移到当前账户。',
         '确认迁移未归属会话',
         { type: 'warning', confirmButtonText: '确认迁移', cancelButtonText: '取消' },
       )
+      if (!settings.isAccountGenerationCurrent(accountGeneration)) return
     }
     const consentedAt = new Date().toISOString()
     const cloudSyncConsent = {
@@ -684,8 +687,7 @@ async function confirmLegacyImport() {
       consentedAt,
       clientVersion,
     }
-    await window.autoForge.settings.recordPrivacyConsent(cloudSyncConsent)
-    await window.autoForge.settings.importLegacyData({
+    const result = await settings.importLegacyData({
       includeUnowned: preview.requiresUnownedConfirmation,
       cloudSyncConsent,
       ...(preview.requiresUnownedConfirmation ? {
@@ -696,11 +698,14 @@ async function confirmLegacyImport() {
           clientVersion,
         },
       } : {}),
-    })
+    }, accountGeneration)
+    if (result !== 'applied' || !settings.isAccountGenerationCurrent(accountGeneration)) return
     ElMessage.success('历史会话迁移完成')
     await settings.loadCloudData()
   } catch (error) {
-    if (error !== 'cancel' && error !== 'close') {
+    if (error !== 'cancel' && error !== 'close'
+      && settings.isAccountGenerationCurrent(accountGeneration)
+      && !settings.cloudDataError) {
       settings.cloudDataError = `历史会话迁移失败：${displayError(error)}`
     }
   } finally {

@@ -5,6 +5,7 @@ import type {
   AppSettingsPatch,
   AccountDataPreferences,
   LegacyImportPreview,
+  LegacyImportRequest,
   ModelInfo,
   ModelProviderId,
   PermissionGrant,
@@ -123,12 +124,14 @@ export const useSettingsStore = defineStore('settings', {
         && token === this.captureAccountGeneration()
     },
     bindAccountOwner(ownerId: string | undefined) {
+      const ownerChanged = ownerId !== this._cloudDataOwnerId
+      const consentMutationPending = this._cloudConsentMutationPending
       this._accountGeneration += 1
       this._cloudDataReadVersion += 1
       this._cloudConsentMutationVersion += 1
       this._cloudConsentMutationPending = false
-      this.saving = false
-      if (ownerId === this._cloudDataOwnerId) return
+      if (ownerChanged || consentMutationPending) this.saving = false
+      if (!ownerChanged) return
       this._cloudDataOwnerId = ownerId
       this._tokenUsageVersion += 1
       this.tokenUsage = undefined
@@ -218,6 +221,25 @@ export const useSettingsStore = defineStore('settings', {
         if (ownerId === this._cloudDataOwnerId) {
           this.cloudDataError = displayError(error, '账户数据偏好保存失败')
         }
+      }
+    },
+    async importLegacyData(
+      input: LegacyImportRequest,
+      accountGeneration?: AccountGenerationToken,
+    ): Promise<AccountMutationResult> {
+      const capturedGeneration = accountGeneration ?? this.captureAccountGeneration()
+      if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
+      this.cloudDataError = ''
+      try {
+        await getDesktopApi().settings.recordPrivacyConsent(input.cloudSyncConsent)
+        if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
+        await getDesktopApi().settings.importLegacyData(input)
+        if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
+        return 'applied'
+      } catch (error) {
+        if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
+        this.cloudDataError = `历史会话迁移失败：${displayError(error)}`
+        throw error
       }
     },
     async revokeCloudSyncConsent(

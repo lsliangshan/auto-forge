@@ -436,6 +436,100 @@ describe('workbench', () => {
     expect(api.settings.importLegacyData).not.toHaveBeenCalled()
   })
 
+  it('drops the first deferred legacy confirmation after Alice switches to Bob', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.previewLegacyImport).mockResolvedValue({
+      ownedCount: 1, unownedCount: 0, requiresUnownedConfirmation: false,
+    })
+    const confirmation = deferred<unknown>()
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const settings = useSettingsStore(pinia)
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="legacy-import-button"]')
+      .attributes('disabled')).toBeUndefined())
+    success.mockClear()
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
+    settings.bindAccountOwner('user_2')
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.settings.importLegacyData).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    expect(settings.cloudDataError).toBe('')
+  })
+
+  it('drops the second deferred legacy confirmation after Alice to Bob to Alice ABA', async () => {
+    const api = createApi()
+    const unownedConfirmation = deferred<unknown>()
+    vi.spyOn(ElMessageBox, 'confirm')
+      .mockResolvedValueOnce('confirm')
+      .mockReturnValueOnce(unownedConfirmation.promise)
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const settings = useSettingsStore(pinia)
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="legacy-import-button"]')
+      .attributes('disabled')).toBeUndefined())
+    success.mockClear()
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledTimes(2))
+    settings.bindAccountOwner('user_2')
+    settings.bindAccountOwner('user_1')
+    unownedConfirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.settings.importLegacyData).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    expect(settings.cloudDataError).toBe('')
+  })
+
+  it.each([
+    ['recordPrivacyConsent', 'resolve'],
+    ['recordPrivacyConsent', 'reject'],
+    ['importLegacyData', 'resolve'],
+    ['importLegacyData', 'reject'],
+  ] as const)('drops a late legacy %s RPC %s after an account switch', async (stage, settlement) => {
+    const api = createApi()
+    const recordConsent = deferred<void>()
+    const importLegacy = deferred<Awaited<ReturnType<DesktopAPI['settings']['importLegacyData']>>>()
+    if (stage === 'recordPrivacyConsent') {
+      vi.mocked(api.settings.recordPrivacyConsent).mockReturnValue(recordConsent.promise)
+    } else {
+      vi.mocked(api.settings.importLegacyData).mockReturnValue(importLegacy.promise)
+    }
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const settings = useSettingsStore(pinia)
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="legacy-import-button"]')
+      .attributes('disabled')).toBeUndefined())
+    success.mockClear()
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings[stage]).toHaveBeenCalledOnce())
+    settings.bindAccountOwner('user_2')
+    if (stage === 'recordPrivacyConsent') {
+      if (settlement === 'resolve') recordConsent.resolve(undefined)
+      else recordConsent.reject({ code: 'AUTH_REQUIRED' })
+    } else if (settlement === 'resolve') {
+      importLegacy.resolve([{ batchId: 'batch_1-0', status: 'applied' }])
+    } else {
+      importLegacy.reject({ code: 'AUTH_REQUIRED' })
+    }
+    await flushPromises()
+
+    if (stage === 'recordPrivacyConsent') {
+      expect(api.settings.importLegacyData).not.toHaveBeenCalled()
+    }
+    expect(success).not.toHaveBeenCalled()
+    expect(settings.cloudDataError).toBe('')
+  })
+
   it('keeps account preferences and legacy migration usable when remote usage fails', async () => {
     const api = createApi()
     let preferences: Awaited<ReturnType<DesktopAPI['settings']['getAccountDataPreferences']>> = {
