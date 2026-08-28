@@ -480,6 +480,87 @@ describe('CloudBase knowledge scheduled worker', () => {
     }
   })
 
+  it.each([
+    ['upload-work RPC', 'rpc'],
+    ['Storage read', 'storage'],
+    ['upload completion RPC', 'post-rpc'],
+  ] as const)('shares a 120-second claim deadline with a never-settling %s', async (_name, stalled) => {
+    vi.useFakeTimers()
+    try {
+      const bytes = Buffer.from('claim deadline source')
+      const sha256 = createHash('sha256').update(bytes).digest('hex')
+      let claims = 0
+      const rpc = vi.fn().mockImplementation(async (name: string) => {
+        if (name === 'autoforge_knowledge_claim_job') {
+          claims += 1
+          return claims === 1 ? claim('job_upload', 'upload') : { job: null }
+        }
+        if (name === 'autoforge_knowledge_get_upload_work') {
+          if (stalled === 'rpc') return new Promise<never>(() => undefined)
+          return {
+            ownerId: '1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+            versionId: 'version_1', generationId: 'generation_1', objectId: 'object_1',
+            storageReference: 'knowledge/1/kb_1/object_1', byteSize: bytes.byteLength,
+            sha256, mimeType: 'text/plain', name: 'cloud.txt', versionNumber: 1,
+          }
+        }
+        if (name === 'autoforge_knowledge_complete_upload_index') {
+          if (stalled === 'post-rpc') return new Promise<never>(() => undefined)
+          return { completed: true, generationId: 'generation_1', embeddingJobId: null }
+        }
+        if (name === 'autoforge_knowledge_complete_job') return { completed: true }
+        if (name === 'autoforge_knowledge_cleanup_retention') return {
+          prunedChanges: 0, prunedTombstones: 0, prunedSnapshots: 0,
+          prunedGenerations: 0, prunedDispatchPermits: 0,
+        }
+        throw new Error(`unexpected rpc ${name}`)
+      })
+      const worker = createKnowledgeWorker({
+        rpc,
+        storage: {
+          readObject: stalled === 'storage'
+            ? vi.fn(() => new Promise<never>(() => undefined))
+            : vi.fn().mockResolvedValue(bytes),
+          deleteObjects: vi.fn(),
+        },
+        parser: { parse: vi.fn().mockResolvedValue({
+          parserVersion: 'cloud-parser-v1',
+          blocks: [{ id: 'block_1', ordinal: 0, kind: 'paragraph', body: 'claim deadline source',
+            coordinates: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 21 } }],
+          chunks: [{ id: 'chunk_1', blockId: 'block_1', ordinal: 0, body: 'claim deadline source',
+            coordinates: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 21 } }],
+        }) }, workerId: 'worker_1',
+        id: () => 'lease_job_upload', parserTimeoutMs: 120_000,
+      })
+
+      const outcome = Promise.race([
+        worker.runOnce().then(result => ({ kind: 'settled' as const, result })),
+        new Promise<{ kind: 'unsettled' }>(resolve => {
+          setTimeout(() => resolve({ kind: 'unsettled' }), 120_001)
+        }),
+      ])
+      await vi.advanceTimersByTimeAsync(120_001)
+
+      await expect(outcome).resolves.toEqual({
+        kind: 'settled', result: { claimed: 1, completed: 0, failed: 1 },
+      })
+      expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_complete_job', {
+        p_worker_id: 'worker_1', p_job_id: 'job_upload',
+        p_lease_token: 'lease_job_upload', p_state: 'failed',
+        p_error_code: 'TRANSIENT_FAILURE',
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects a parser timeout configuration beyond the 120-second claim budget', () => {
+    expect(() => createKnowledgeWorker({
+      rpc: vi.fn(), storage: { readObject: vi.fn(), deleteObjects: vi.fn() },
+      parser: { parse: vi.fn() }, workerId: 'worker_1', parserTimeoutMs: 120_001,
+    })).toThrow('Knowledge worker is not configured')
+  })
+
   it('parses bounded text into stable worker blocks and chunks', async () => {
     const parser = createKnowledgeParser()
     const input = {

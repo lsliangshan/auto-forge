@@ -6,7 +6,10 @@ const { inflateRawSync } = require('node:zlib')
 const MAX_JOBS_PER_RUN = 8
 const LEASE_SECONDS = 600
 const DEFAULT_PARSER_TIMEOUT_MS = 120_000
-const MAX_PARSER_TIMEOUT_MS = (LEASE_SECONDS * 1000) - 1_000
+const MAX_PARSER_TIMEOUT_MS = 120_000
+const DEFAULT_JOB_TIMEOUT_MS = 120_000
+const MAX_JOB_TIMEOUT_MS = 120_000
+const DEFAULT_SETTLEMENT_RESERVE_MS = 5_000
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024
 const MAX_INDEX_BYTES = 786_432
 const MAX_ITEMS = 10_000
@@ -106,21 +109,62 @@ function validParseResult(value) {
   return true
 }
 
+function createJobBoundary(timeoutMs, settlementReserveMs) {
+  const finalDeadline = Date.now() + timeoutMs
+  const workDeadline = finalDeadline - settlementReserveMs
+  const controller = new AbortController()
+
+  async function race(deadlineAt, operation, abortOnTimeout) {
+    const remaining = deadlineAt - Date.now()
+    if (remaining <= 0) {
+      if (abortOnTimeout) controller.abort()
+      throw { code: 'TRANSIENT_FAILURE' }
+    }
+    let timeoutId
+    const expired = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        if (abortOnTimeout) controller.abort()
+        reject({ code: 'TRANSIENT_FAILURE' })
+      }, remaining)
+    })
+    try {
+      return await Promise.race([Promise.resolve().then(operation), expired])
+    } finally {
+      clearTimeout(timeoutId)
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    work: operation => race(workDeadline, operation, true),
+    settle: operation => race(finalDeadline, operation, false),
+    dispose() { controller.abort() },
+  }
+}
+
 function createKnowledgeWorker({
   rpc, storage, parser, embeddingWorker, workerId, id = randomUUID,
   maxJobs = MAX_JOBS_PER_RUN, parserTimeoutMs = DEFAULT_PARSER_TIMEOUT_MS,
+  jobTimeoutMs = DEFAULT_JOB_TIMEOUT_MS,
+  settlementReserveMs = DEFAULT_SETTLEMENT_RESERVE_MS,
 }) {
   if (typeof rpc !== 'function' || !storage || typeof storage.readObject !== 'function'
     || typeof storage.deleteObjects !== 'function' || !parser || typeof parser.parse !== 'function'
     || !nonEmptyString(workerId) || !Number.isSafeInteger(maxJobs)
     || maxJobs < 1 || maxJobs > MAX_JOBS_PER_RUN
     || !Number.isSafeInteger(parserTimeoutMs)
-    || parserTimeoutMs < 1 || parserTimeoutMs > MAX_PARSER_TIMEOUT_MS) {
+    || parserTimeoutMs < 1 || parserTimeoutMs > MAX_PARSER_TIMEOUT_MS
+    || !Number.isSafeInteger(jobTimeoutMs)
+    || jobTimeoutMs < 2 || jobTimeoutMs > MAX_JOB_TIMEOUT_MS
+    || !Number.isSafeInteger(settlementReserveMs)
+    || settlementReserveMs < 1 || settlementReserveMs >= jobTimeoutMs) {
     throw new Error('Knowledge worker is not configured')
   }
 
-  async function parseUpload(input) {
+  async function parseUpload(input, boundary) {
     const controller = new AbortController()
+    const abortParser = () => controller.abort()
+    boundary.signal.addEventListener('abort', abortParser, { once: true })
     let timeoutId
     const timedOut = new Promise((_, reject) => {
       timeoutId = setTimeout(() => {
@@ -129,25 +173,35 @@ function createKnowledgeWorker({
       }, parserTimeoutMs)
     })
     try {
-      return await Promise.race([
+      return await boundary.work(() => Promise.race([
         Promise.resolve().then(() => parser.parse({ ...input, signal: controller.signal })),
         timedOut,
-      ])
+      ]))
     } finally {
       clearTimeout(timeoutId)
       controller.abort()
+      boundary.signal.removeEventListener('abort', abortParser)
     }
   }
 
-  async function processUpload(job) {
-    const work = await rpc('autoforge_knowledge_get_upload_work', {
+  async function processUpload(job, boundary) {
+    const work = await boundary.work(() => rpc('autoforge_knowledge_get_upload_work', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
-    })
+    }))
     if (!validUploadWork(work)) throw { code: 'INTERNAL_ERROR' }
-    const bytes = await storage.readObject({
+    const read = Promise.resolve().then(() => storage.readObject({
       storageReference: work.storageReference, byteSize: work.byteSize,
       sha256: work.sha256, mimeType: work.mimeType,
-    })
+    }))
+    let bytes
+    try {
+      bytes = await boundary.work(() => read)
+    } catch (error) {
+      void read.then((lateBytes) => {
+        if (Buffer.isBuffer(lateBytes)) lateBytes.fill(0)
+      }, () => undefined)
+      throw error
+    }
     if (!Buffer.isBuffer(bytes) || bytes.byteLength !== work.byteSize
       || createHash('sha256').update(bytes).digest('hex') !== work.sha256) {
       if (Buffer.isBuffer(bytes)) bytes.fill(0)
@@ -157,12 +211,12 @@ function createKnowledgeWorker({
     try {
       parsed = await parseUpload({
         bytes, mimeType: work.mimeType, versionId: work.versionId,
-      })
+      }, boundary)
     } finally {
       bytes.fill(0)
     }
     if (!validParseResult(parsed)) throw { code: 'PARSER_LIMIT_EXCEEDED' }
-    const completed = await rpc('autoforge_knowledge_complete_upload_index', {
+    const completed = await boundary.work(() => rpc('autoforge_knowledge_complete_upload_index', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
       p_owner_id: work.ownerId, p_knowledge_base_id: work.knowledgeBaseId,
       p_document_id: work.documentId, p_version_id: work.versionId,
@@ -171,7 +225,7 @@ function createKnowledgeWorker({
       p_version_number: work.versionNumber, p_content_hash: work.sha256,
       p_parser_version: parsed.parserVersion,
       p_blocks: parsed.blocks, p_chunks: parsed.chunks,
-    })
+    }))
     if (!exactKeys(completed, ['completed', 'generationId', 'embeddingJobId'])
       || completed.completed !== true || completed.generationId !== work.generationId
       || !(completed.embeddingJobId === null || nonEmptyString(completed.embeddingJobId))) {
@@ -179,34 +233,34 @@ function createKnowledgeWorker({
     }
   }
 
-  async function processPurge(job) {
-    const prepared = await rpc('autoforge_knowledge_prepare_base_purge', {
+  async function processPurge(job, boundary) {
+    const prepared = await boundary.work(() => rpc('autoforge_knowledge_prepare_base_purge', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
-    })
+    }))
     if (!exactKeys(prepared, ['jobId', 'storageReferences']) || prepared.jobId !== job.id
       || !Array.isArray(prepared.storageReferences)
       || prepared.storageReferences.length > MAX_ITEMS
       || prepared.storageReferences.some(reference => !validStorageReference(reference))) {
       throw { code: 'INTERNAL_ERROR' }
     }
-    await storage.deleteObjects(prepared.storageReferences)
-    const completed = await rpc('autoforge_knowledge_complete_base_purge', {
+    await boundary.work(() => storage.deleteObjects(prepared.storageReferences))
+    const completed = await boundary.work(() => rpc('autoforge_knowledge_complete_base_purge', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
       p_deleted_storage_references: prepared.storageReferences,
-    })
+    }))
     if (!exactKeys(completed, ['jobId', 'completed'])
       || completed.jobId !== job.id || completed.completed !== true) {
       throw { code: 'INTERNAL_ERROR' }
     }
   }
 
-  async function processEmbedding(job) {
+  async function processEmbedding(job, boundary) {
     if (!embeddingWorker || typeof embeddingWorker.run !== 'function') {
       throw { code: 'TRANSIENT_FAILURE' }
     }
-    const result = await embeddingWorker.run({
+    const result = await boundary.work(() => embeddingWorker.run({
       workerId, jobId: job.id, leaseToken: job.leaseToken,
-    })
+    }))
     if (!exactKeys(result, ['state', 'embedded'])
       || !['completed', 'partial', 'revoked'].includes(result.state)
       || !Number.isSafeInteger(result.embedded) || result.embedded < 0) {
@@ -214,9 +268,9 @@ function createKnowledgeWorker({
     }
     if (result.state === 'revoked') throw { code: 'FORBIDDEN' }
     if (result.state === 'partial') {
-      const yielded = await rpc('autoforge_knowledge_yield_job', {
+      const yielded = await boundary.work(() => rpc('autoforge_knowledge_yield_job', {
         p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
-      })
+      }))
       if (!exactKeys(yielded, ['yielded']) || yielded.yielded !== true) {
         throw { code: 'INTERNAL_ERROR' }
       }
@@ -240,25 +294,28 @@ function createKnowledgeWorker({
         if (!validClaim(result, leaseToken)) throw { code: 'INTERNAL_ERROR' }
         if (result.job === null) break
         const job = result.job
+        const boundary = createJobBoundary(jobTimeoutMs, settlementReserveMs)
         claimed += 1
         let stopAfterJob = false
         try {
-          if (job.kind === 'upload') await processUpload(job)
-          else if (job.kind === 'purge') await processPurge(job)
-          else stopAfterJob = await processEmbedding(job)
+          if (job.kind === 'upload') await processUpload(job, boundary)
+          else if (job.kind === 'purge') await processPurge(job, boundary)
+          else stopAfterJob = await processEmbedding(job, boundary)
           completed += 1
         } catch (error) {
           const code = safeCode(error)
           try {
-            await rpc('autoforge_knowledge_complete_job', {
+            await boundary.settle(() => rpc('autoforge_knowledge_complete_job', {
               p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
               p_state: 'failed', p_error_code: code,
-            })
+            }))
           } catch {
             // A lost/expired lease must never be settled under a different identity.
           }
           failed += 1
           stopAfterJob = code === 'TRANSIENT_FAILURE'
+        } finally {
+          boundary.dispose()
         }
         if (stopAfterJob) break
       }
