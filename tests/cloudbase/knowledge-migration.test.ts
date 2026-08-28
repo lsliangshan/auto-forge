@@ -141,6 +141,19 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain('kill_switch_enabled boolean NOT NULL DEFAULT true')
   })
 
+  it('keeps authenticated owner cleanup available independently of cloud feature gates', async () => {
+    const sql = await readFile(canonicalUrl, 'utf8')
+    const cleanupGuard = staticFunctionBodyFragment(sql, 'autoforge_knowledge_require_cleanup')
+    expect(cleanupGuard).toContain('FROM auth.users WHERE id = p_owner_id')
+    expect(cleanupGuard).not.toContain('knowledge_entitlements')
+    expect(cleanupGuard).not.toContain('kill_switch_enabled')
+    const deleteBase = staticFunctionBodyFragment(sql, 'autoforge_knowledge_delete_base')
+    expect(deleteBase).toContain('autoforge_knowledge_require_cleanup(owner)')
+    expect(deleteBase).not.toContain('autoforge_knowledge_require_cloud(owner)')
+    const revoke = staticFunctionBodyFragment(sql, 'autoforge_knowledge_set_embedding_consent')
+    expect(revoke).toContain('IF p_enabled THEN PERFORM public.autoforge_knowledge_require_cloud(owner); END IF')
+  })
+
   it('defines fixed consented embeddings, shadow isolation, atomic publication, and seven-day retention', async () => {
     const sql = await readFile(canonicalUrl, 'utf8')
     expect(sql).toContain("model varchar(128) NOT NULL DEFAULT 'kinfra-text-embedding-0.6b'")

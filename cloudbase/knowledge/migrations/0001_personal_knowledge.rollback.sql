@@ -79,6 +79,7 @@ DROP FUNCTION IF EXISTS public.autoforge_knowledge_verify_upload(varchar, varcha
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_upload(varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_require_cloud(bigint);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_require_cleanup(bigint);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_caller(varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_request_hash(jsonb);
 

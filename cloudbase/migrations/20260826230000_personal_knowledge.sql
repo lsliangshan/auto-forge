@@ -640,6 +640,19 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_require_cleanup(p_owner_id bigint)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM auth.users WHERE id = p_owner_id) THEN
+    RAISE EXCEPTION USING MESSAGE = 'AUTH_REQUIRED', ERRCODE = 'P0001';
+  END IF;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_begin_sync(
   p_caller_user_id varchar, p_request_id varchar, p_knowledge_base_id varchar,
   p_name varchar, p_revision varchar, p_generation_id varchar
@@ -1300,7 +1313,7 @@ DECLARE
   job_id varchar := 'job_' || md5(p_request_id || ':delete');
   next_sequence bigint;
 BEGIN
-  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  PERFORM public.autoforge_knowledge_require_cleanup(owner);
   PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
   SELECT * INTO request_row FROM public.knowledge_requests
     WHERE owner_id = owner AND request_id = p_request_id;
@@ -3075,6 +3088,7 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_generation_membership_lifecycl
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_request_hash(jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_caller(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_require_cloud(bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_require_cleanup(bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_upload(varchar, varchar) FROM PUBLIC, anon, authenticated;

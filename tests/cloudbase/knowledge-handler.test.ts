@@ -96,6 +96,25 @@ describe('CloudBase knowledge function', () => {
     expect(rpc).not.toHaveBeenCalled()
   })
 
+  it('rejects non-canonical base IDs before begin or upload SQL side effects', async () => {
+    const rpc = vi.fn()
+    const storage = {
+      createUploadAuthorization: vi.fn(), statObject: vi.fn(), deleteObjects: vi.fn(),
+    }
+    const handler = createKnowledgeHandler({ rpc, storage })
+    await expect(handler({
+      action: 'beginSync', requestId: 'sync_1', knowledgeBaseId: '../kb',
+      name: 'Contracts', revision: 'revision_1', generationId: 'generation_1',
+    }, context)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    await expect(handler({
+      action: 'authorizeUpload', requestId: 'upload_1', knowledgeBaseId: '../kb',
+      documentId: 'document_1', versionId: 'version_1', byteSize: 42,
+      sha256: 'a'.repeat(64), mimeType: 'text/plain',
+    }, context)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    expect(rpc).not.toHaveBeenCalled()
+    expect(storage.createUploadAuthorization).not.toHaveBeenCalled()
+  })
+
   it('forwards bounded pull budgets and snapshot page identity exactly', async () => {
     const rpc = vi.fn()
       .mockResolvedValueOnce({

@@ -138,9 +138,12 @@ function validStorageReference(value) {
   return nonEmptyString(value, 512) && value.startsWith('knowledge/') && !value.includes('..')
 }
 
+function validStorageSegment(value) {
+  return nonEmptyString(value) && /^[A-Za-z0-9_-]+$/.test(value)
+}
+
 function canonicalStorageReference(ownerId, knowledgeBaseId, objectId) {
-  if (![ownerId, knowledgeBaseId, objectId].every(value => nonEmptyString(value)
-    && /^[A-Za-z0-9_-]+$/.test(value))) return undefined
+  if (![ownerId, knowledgeBaseId, objectId].every(validStorageSegment)) return undefined
   return `knowledge/${ownerId}/${knowledgeBaseId}/${objectId}`
 }
 
@@ -619,7 +622,7 @@ function parseAction(event, uid) {
   switch (event.action) {
     case 'beginSync':
       if (!nonEmptyString(event.requestId)
-        || !nonEmptyString(event.knowledgeBaseId)
+        || !validStorageSegment(event.knowledgeBaseId)
         || !nonEmptyString(event.name, 200)
         || !nonEmptyString(event.revision)
         || !nonEmptyString(event.generationId)) return undefined
@@ -629,7 +632,7 @@ function parseAction(event, uid) {
       }]
     case 'authorizeUpload':
       if (!nonEmptyString(event.requestId)
-        || !nonEmptyString(event.knowledgeBaseId)
+        || !validStorageSegment(event.knowledgeBaseId)
         || !nonEmptyString(event.documentId)
         || !nonEmptyString(event.versionId)
         || !Number.isSafeInteger(event.byteSize) || event.byteSize <= 0 || event.byteSize > 512 * 1024 * 1024
