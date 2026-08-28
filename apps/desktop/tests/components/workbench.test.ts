@@ -1057,6 +1057,50 @@ describe('workbench', () => {
     },
   )
 
+  it.each(['resolve', 'reject'] as const)(
+    'drops late first-conversation preferences %s after account admission closes',
+    async (settlement) => {
+      const api = createApi()
+      const preferences = deferred<Awaited<ReturnType<
+        DesktopAPI['chat']['getGenerationPreferences']
+      >>>()
+      vi.mocked(api.chat.createConversation).mockResolvedValue({
+        ...conversationSummary('alice_new', '2026-08-28T00:00:00.000Z', 'pending'),
+        title: 'Alice new',
+      })
+      vi.mocked(api.chat.getGenerationPreferences).mockReturnValue(preferences.promise)
+      const { pinia } = await mountApp('/chat', api)
+      const chat = useChatStore(pinia)
+      const settings = useSettingsStore(pinia)
+
+      const creating = chat.createConversation()
+      await vi.waitFor(() => expect(api.chat.getGenerationPreferences)
+        .toHaveBeenCalledWith('alice_new'))
+      settings.advanceAccountOperationGeneration()
+      if (settlement === 'resolve') {
+        preferences.resolve({
+          outputType: 'auto',
+          models: {},
+          generation: {
+            image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+            audio: { format: 'mp3' },
+            video: {
+              durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false,
+            },
+          },
+          knowledgeBaseIds: ['alice_base'],
+          knowledgeMode: 'strict',
+        })
+      } else {
+        preferences.reject({ code: 'AUTH_REQUIRED' })
+      }
+      await creating
+
+      expect(chat.preferencesByConversation.alice_new).toBeUndefined()
+      expect(chat.error).toBe('')
+    },
+  )
+
   it('leaves the first conversation unwritten when cloud-sync consent is cancelled', async () => {
     const api = createApi()
     vi.mocked(api.chat.createConversation).mockRejectedValueOnce({

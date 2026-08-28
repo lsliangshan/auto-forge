@@ -520,7 +520,7 @@ export const useChatStore = defineStore('chat', {
         closedAdmissions(this).delete(conversation.id)
         this.selectedConversationId = conversation.id
         this._selectionVersion += 1
-        await this.loadGenerationPreferences(conversation.id)
+        await this.loadGenerationPreferences(conversation.id, operationIsCurrent)
         if (!operationIsCurrent()) return
       } catch (error) {
         if (operationIsCurrent()) this.error = displayError(error, '创建会话失败')
@@ -689,8 +689,11 @@ export const useChatStore = defineStore('chat', {
         }
       }
     },
-    async loadGenerationPreferences(conversationId: string) {
-      if (this._preferenceLoadRequests[conversationId]) return
+    async loadGenerationPreferences(
+      conversationId: string,
+      admissionIsCurrent: () => boolean = () => true,
+    ) {
+      if (!admissionIsCurrent() || this._preferenceLoadRequests[conversationId]) return
       const epoch = this._stateEpoch
       const version = (this._preferenceVersions[conversationId] ?? 0) + 1
       this._preferenceVersions[conversationId] = version
@@ -699,14 +702,16 @@ export const useChatStore = defineStore('chat', {
       this._preferenceLoadRequests[conversationId] = requestToken
       try {
         const preferences = await getDesktopApi().chat.getGenerationPreferences(conversationId)
-        if (dataGeneration !== this._dataGeneration
+        if (!admissionIsCurrent()
+          || dataGeneration !== this._dataGeneration
           || this._preferenceLoadRequests[conversationId] !== requestToken
           || epoch !== this._stateEpoch
           || this.selectedConversationId !== conversationId
           || version !== this._preferenceVersions[conversationId]) return
         this.preferencesByConversation[conversationId] = copyGenerationPreferences(preferences)
       } catch (error) {
-        if (dataGeneration === this._dataGeneration
+        if (admissionIsCurrent()
+          && dataGeneration === this._dataGeneration
           && this._preferenceLoadRequests[conversationId] === requestToken
           && epoch === this._stateEpoch
           && version === this._preferenceVersions[conversationId]
