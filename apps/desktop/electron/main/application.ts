@@ -1464,15 +1464,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const consent = await knowledge.getConsent({ userId: ownerId }, provider)
           return consent.status
         },
-        sourceAvailable: ({ ownerId, documentId, versionId, signal, scope }: {
+        sourceVerifiable: ({ ownerId, baseId, documentId, versionId, signal, scope }: {
           ownerId: string
+          baseId: string
           documentId: string
           versionId: string
           signal: AbortSignal
           scope?: KnowledgeSearchScope
-        }) => knowledge.sourceAvailable(
-          { userId: ownerId }, documentId, versionId, signal, scope,
-        ),
+        }) => scope === undefined || knowledge.sourceVerifiable === undefined
+          ? Promise.resolve(false)
+          : knowledge.sourceVerifiable(
+              { userId: ownerId }, baseId, documentId, versionId, signal, scope,
+            ),
         releaseSearchScope: (scope: KnowledgeSearchScope) => {
           knowledge.releaseSearchScope(scope)
         },

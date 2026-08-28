@@ -455,12 +455,20 @@ describe('local knowledge service', () => {
       versionId: 'cold_version_a', cloudGenerationId: 'cold_generation_a',
     })])
     await expect(service.sourceAvailable(
-      owner, 'cold_document_a', 'cold_version_a', undefined, scope,
+      owner, 'cold_document_a', 'cold_version_a', undefined,
     )).resolves.toBe(false)
+    await expect(service.sourceVerifiable!(
+      owner, 'cold_base_a', 'cold_document_a', 'cold_version_a', undefined, scope,
+    )).resolves.toBe(true)
     expect(memory.database.prepare(`
       SELECT local_object_available AS localObjectAvailable
       FROM cloud_version_projections WHERE id = 'cold_version_a'
     `).get()).toEqual({ localObjectAvailable: 0 })
+    service.setCloudSyncConsent!(owner.userId, false)
+    service.setCloudSyncConsent!(owner.userId, true)
+    await expect(service.sourceVerifiable!(
+      owner, 'cold_base_a', 'cold_document_a', 'cold_version_a', undefined, scope,
+    )).resolves.toBe(false)
   })
 
   it('does not discover or prune owner catalog projections without current cloud_sync consent', async () => {
@@ -625,20 +633,26 @@ describe('local knowledge service', () => {
       kind: 'results', evidence: [expect.objectContaining({ id: 'evidence:cloud:remote_chunk_1' })],
     })
     await expect(service.sourceAvailable(
-      owner, 'remote_document_1', 'remote_version_1', undefined, firstScope,
+      owner, 'remote_document_1', 'remote_version_1', undefined,
     )).resolves.toBe(false)
+    await expect(service.sourceVerifiable!(
+      owner, 'remote_base', 'remote_document_1', 'remote_version_1', undefined, firstScope,
+    )).resolves.toBe(true)
     await expect(service.exportBase(owner, 'remote_base')).rejects.toMatchObject({
       code: 'SERVICE_UNAVAILABLE',
     })
     expect(readObject).not.toHaveBeenCalled()
     expect(saveExport).not.toHaveBeenCalled()
-    service.releaseSearchScope(firstScope)
 
     const staleScope = await service.captureSearchScope(owner, ['remote_base'])
     expect(staleScope.entries).toEqual([expect.objectContaining({
       documentId: 'remote_document_2', versionId: 'remote_version_2',
       cloudGenerationId: 'remote_generation_2',
     })])
+    await expect(service.sourceVerifiable!(
+      owner, 'remote_base', 'remote_document_1', 'remote_version_1', undefined, firstScope,
+    )).resolves.toBe(false)
+    service.releaseSearchScope(firstScope)
     await expect(service.listDocuments(owner, 'remote_base')).resolves.toEqual([
       expect.objectContaining({ id: 'remote_document_2' }),
     ])

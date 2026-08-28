@@ -435,8 +435,9 @@ export interface AgentOrchestratorDependencies {
       scope?: KnowledgeSearchScope
     }): Promise<KnowledgeSearchResult>
     getProviderConsent(input: { ownerId: string; provider: ModelProviderId }): Promise<'granted' | 'denied' | 'unknown'>
-    sourceAvailable?(input: {
+    sourceVerifiable?(input: {
       ownerId: string
+      baseId: string
       documentId: string
       versionId: string
       signal: AbortSignal
@@ -2263,9 +2264,10 @@ export class AgentOrchestrator {
       const evidence = active.knowledgeEvidence.snapshot().find(item => item.id === evidenceId)
       if (!evidence) continue
       if (!this.isKnowledgeProviderConsentCurrent(active)) throw appFailure('CANCELLED')
-      const sourceAvailable = knowledge?.sourceAvailable
-        ? await knowledge.sourceAvailable({
+      const sourceAvailable = knowledge?.sourceVerifiable
+        ? await knowledge.sourceVerifiable({
             ownerId: active.userId,
+            baseId: evidence.baseId,
             documentId: evidence.documentId,
             versionId: evidence.versionId,
             signal: active.controller.signal,

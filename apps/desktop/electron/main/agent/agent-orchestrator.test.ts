@@ -6596,7 +6596,7 @@ describe('AgentOrchestrator knowledge grounding', () => {
       knowledge: {
         search,
         getProviderConsent: vi.fn(async () => options.consent ?? 'granted'),
-        sourceAvailable: vi.fn(async () => options.sourceAvailable ?? true),
+        sourceVerifiable: vi.fn(async () => options.sourceAvailable ?? true),
       },
     })
     if (!options.keepWorkflows) dependencies.workflows.list = async () => []
@@ -6631,6 +6631,59 @@ describe('AgentOrchestrator knowledge grounding', () => {
         documentId: 'document_1', versionId: 'version_1',
       }),
     ]))
+  })
+
+  it('keeps a strict cold-start remote citation when its immutable scope projection is verifiable', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cold_remote_search',
+        name: 'knowledge_search', arguments: { query: '合同何时生效' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const scope = Object.freeze({
+      scopeId: 'scope_cold_remote', ownerId: 'user_1', ownerEpoch: 7,
+      baseIds: Object.freeze(['base_selected']),
+      entries: Object.freeze([Object.freeze({
+        baseId: 'base_selected', documentId: 'document_1', versionId: 'version_1',
+        publicationGeneration: 0, cloudGenerationId: 'generation_remote_1',
+      })]),
+      cloudAllowed: true, cloudConsentEpoch: 3,
+    })
+    const sourceVerifiable = vi.fn(async (input: {
+      ownerId: string
+      baseId: string
+      documentId: string
+      versionId: string
+      scope?: typeof scope
+    }) => input.ownerId === scope.ownerId
+      && input.baseId === 'base_selected'
+      && input.documentId === 'document_1'
+      && input.versionId === 'version_1'
+      && input.scope === scope)
+    Object.assign(dependencies, {
+      knowledge: {
+        search: vi.fn(async () => ({
+          kind: 'results' as const, strategy: 'trigram' as const, evidence: [retrievedEvidence],
+        })),
+        getProviderConsent: vi.fn(async () => 'granted' as const),
+        sourceVerifiable,
+      },
+    })
+
+    await new AgentOrchestrator(dependencies).run({
+      ...knowledgeRunInput('合同何时生效？'), knowledgeSearchScope: scope,
+    })
+
+    expect(sourceVerifiable).toHaveBeenCalledWith(expect.objectContaining({
+      ownerId: 'user_1', baseId: 'base_selected', documentId: 'document_1',
+      versionId: 'version_1', scope,
+    }))
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('knowledge_citation')
   })
 
   it('keeps the admitted scope pinned through approval and releases it once after resumed knowledge search', async () => {
@@ -7005,7 +7058,7 @@ describe('AgentOrchestrator knowledge grounding', () => {
       knowledge: {
         search: vi.fn(() => pendingSearch.promise),
         getProviderConsent: vi.fn(async () => 'granted' as const),
-        sourceAvailable: vi.fn(async () => true),
+        sourceVerifiable: vi.fn(async () => true),
       },
     })
     const orchestrator = new AgentOrchestrator(dependencies)

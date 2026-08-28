@@ -124,7 +124,10 @@ export interface LocalKnowledgeService extends KnowledgeService {
   ): Promise<KnowledgeSearchResult>
   sourceAvailable(
     owner: KnowledgeOwner, documentId: string, versionId: string, signal?: AbortSignal,
-    scope?: KnowledgeSearchScope,
+  ): Promise<boolean>
+  sourceVerifiable?(
+    owner: KnowledgeOwner, baseId: string, documentId: string, versionId: string,
+    signal: AbortSignal | undefined, scope: KnowledgeSearchScope,
   ): Promise<boolean>
 }
 
@@ -2306,33 +2309,78 @@ export function createLocalKnowledgeService(
     searchSelected: async (owner, query, baseIds, signal, scope) => (
       searchBases(current(owner), query, baseIds, signal, scope)
     ),
-    sourceAvailable: async (owner, documentId, versionId, signal, scope) => {
+    sourceAvailable: async (owner, documentId, versionId, signal) => {
       if (signal?.aborted) fail('CANCELLED')
       const active = current(owner)
-      const captured = scope === undefined ? undefined : activeSearchScopes.get(scope.scopeId)
-      if (scope !== undefined && (captured !== scope || scope.ownerId !== active.ownerId
-        || scope.ownerEpoch !== active.epoch
-        || !scope.entries.some(entry => entry.documentId === documentId
-          && entry.versionId === versionId))) return false
-      const state = scope === undefined ? entitlement(active) : undefined
-      const kept = state === undefined ? undefined : retention(active, state)
-      if (scope === undefined && (state!.tier !== 'member' || state!.status === 'expired')
+      const state = entitlement(active)
+      const kept = retention(active, state)
+      if ((state.tier !== 'member' || state.status === 'expired')
         && kept?.documentId !== documentId) return false
       const row = active.store.database.prepare(`
-        SELECT 1 AS available
+        SELECT version.object_id AS objectId
         FROM documents AS document
         JOIN knowledge_bases AS base ON base.id = document.knowledge_base_id
         JOIN document_versions AS version
           ON version.id = ? AND version.document_id = document.id
         WHERE document.id = ?
-          ${scope === undefined ? `AND document.recycled_at IS NULL
+          AND document.recycled_at IS NULL
           AND base.recycled_at IS NULL
           AND document.active_version_id = version.id
-          AND version.status = 'ready'` : ''}
+          AND version.status = 'ready'
         LIMIT 1
-      `).get(versionId, documentId)
+      `).get(versionId, documentId) as { objectId: string } | undefined
+      if (!row) return false
+      try {
+        await active.store.objects.read(row.objectId)
+      } catch {
+        return false
+      }
+      assertCurrentBinding(active)
       if (signal?.aborted) fail('CANCELLED')
-      return row !== undefined
+      return true
+    },
+    sourceVerifiable: async (owner, baseId, documentId, versionId, signal, scope) => {
+      if (signal?.aborted) fail('CANCELLED')
+      const active = current(owner)
+      const captured = activeSearchScopes.get(scope.scopeId)
+      if (captured !== scope || scope.ownerId !== active.ownerId
+        || scope.ownerEpoch !== active.epoch) return false
+      const entry = scope.entries.find(candidate => candidate.baseId === baseId
+        && candidate.documentId === documentId && candidate.versionId === versionId)
+      if (!entry) return false
+      const local = active.store.database.prepare(`
+        SELECT 1 AS verifiable
+        FROM knowledge_bases AS base
+        JOIN documents AS document ON document.knowledge_base_id = base.id
+        JOIN document_versions AS version
+          ON version.document_id = document.id AND version.id = ?
+        WHERE base.id = ? AND document.id = ?
+          AND version.publication_generation = ?
+        LIMIT 1
+      `).get(versionId, baseId, documentId, entry.publicationGeneration)
+      if (local) return true
+      if (!entry.cloudGenerationId || !scope.cloudAllowed || !ordinaryCloudAllowed(active)
+        || scope.cloudConsentEpoch === undefined
+        || !isCloudConsentCurrent(active, scope.cloudConsentEpoch)) return false
+      const remote = active.store.database.prepare(`
+        SELECT 1 AS verifiable
+        FROM cloud_base_projections AS base
+        JOIN cloud_document_projections AS document
+          ON document.knowledge_base_id = base.id
+        JOIN cloud_version_projections AS version
+          ON version.document_id = document.id
+        WHERE base.id = ? AND base.published_generation_id = ?
+          AND document.id = ? AND document.status = 'ready'
+          AND document.active_version_id = ?
+          AND version.id = ? AND version.generation_id = ?
+          AND version.status = 'ready'
+        LIMIT 1
+      `).get(
+        baseId, entry.cloudGenerationId, documentId, versionId,
+        versionId, entry.cloudGenerationId,
+      )
+      if (signal?.aborted) fail('CANCELLED')
+      return remote !== undefined
     },
     getAvailability: async (owner): Promise<KnowledgeAvailability> => {
       const disabled = unavailable

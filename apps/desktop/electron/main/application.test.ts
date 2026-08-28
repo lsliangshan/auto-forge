@@ -1877,6 +1877,7 @@ describe('createApplicationRuntime', () => {
       releaseSearchScope,
       searchSelected,
       sourceAvailable: vi.fn(async () => true),
+      sourceVerifiable: vi.fn(async () => true),
       getConsent: vi.fn(async () => ({
         provider: 'openrouter' as const, status: 'granted' as const, updatedAt: '2026-08-28T00:00:00.000Z',
       })),
@@ -2178,7 +2179,8 @@ describe('createApplicationRuntime', () => {
     const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
       bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
       captureSearchScope: vi.fn(async () => admittedScope), releaseSearchScope: vi.fn(),
-      searchSelected, sourceAvailable: vi.fn(async () => true), getConsent, setConsent, revokeConsent,
+      searchSelected, sourceAvailable: vi.fn(async () => true),
+      sourceVerifiable: vi.fn(async () => true), getConsent, setConsent, revokeConsent,
     })
     let toolCall = 0
     const provider = snapshotProvider('openrouter', {
