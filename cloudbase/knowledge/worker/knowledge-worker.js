@@ -127,33 +127,92 @@ function validParseResult(value) {
 function createJobBoundary(timeoutMs, settlementReserveMs) {
   const finalDeadline = Date.now() + timeoutMs
   const workDeadline = finalDeadline - settlementReserveMs
-  const controller = new AbortController()
+  const drainSliceMs = Math.max(1, Math.floor(settlementReserveMs / 3))
+  const workDrainDeadline = Math.min(finalDeadline - 2, workDeadline + drainSliceMs)
+  const settlementDeadline = Math.max(workDrainDeadline + 1, finalDeadline - drainSliceMs)
+  const workController = new AbortController()
+  const settlementController = new AbortController()
+  const workContext = Object.freeze({
+    signal: workController.signal,
+    deadlineAt: workDeadline,
+    timeoutMs: Math.max(1, workDeadline - Date.now()),
+  })
+  const settlementContext = Object.freeze({
+    signal: settlementController.signal,
+    deadlineAt: settlementDeadline,
+    timeoutMs: Math.max(1, settlementDeadline - Date.now()),
+  })
+  const pendingWork = new Set()
+  const pendingSettlement = new Set()
 
-  async function race(deadlineAt, operation, abortOnTimeout) {
+  function track(pending, operation, context) {
+    const running = Promise.resolve().then(() => operation(context))
+    pending.add(running)
+    void running.then(
+      () => pending.delete(running),
+      () => pending.delete(running),
+    )
+    return running
+  }
+
+  async function drain(pending, deadlineAt) {
+    if (pending.size === 0) return
+    const remaining = deadlineAt - Date.now()
+    if (remaining <= 0) return
+    let timeoutId
+    await Promise.race([
+      Promise.allSettled([...pending]),
+      new Promise(resolve => { timeoutId = setTimeout(resolve, remaining) }),
+    ])
+    clearTimeout(timeoutId)
+  }
+
+  async function race({ deadlineAt, drainDeadline, controller, pending, context }, operation) {
     const remaining = deadlineAt - Date.now()
     if (remaining <= 0) {
-      if (abortOnTimeout) controller.abort()
+      controller.abort()
+      await drain(pending, drainDeadline)
       throw { code: 'TRANSIENT_FAILURE' }
     }
+    const running = track(pending, operation, context)
     let timeoutId
+    let timedOut = false
     const expired = new Promise((_, reject) => {
       timeoutId = setTimeout(() => {
-        if (abortOnTimeout) controller.abort()
+        timedOut = true
+        controller.abort()
         reject({ code: 'TRANSIENT_FAILURE' })
       }, remaining)
     })
     try {
-      return await Promise.race([Promise.resolve().then(operation), expired])
+      return await Promise.race([running, expired])
+    } catch (error) {
+      if (timedOut || controller.signal.aborted) await drain(pending, drainDeadline)
+      throw error
     } finally {
       clearTimeout(timeoutId)
     }
   }
 
   return {
-    signal: controller.signal,
-    work: operation => race(workDeadline, operation, true),
-    settle: operation => race(finalDeadline, operation, false),
-    dispose() { controller.abort() },
+    signal: workController.signal,
+    abortWork() { workController.abort() },
+    work: operation => race({
+      deadlineAt: workDeadline, drainDeadline: workDrainDeadline,
+      controller: workController, pending: pendingWork, context: workContext,
+    }, operation),
+    settle: operation => race({
+      deadlineAt: settlementDeadline, drainDeadline: finalDeadline,
+      controller: settlementController, pending: pendingSettlement, context: settlementContext,
+    }, operation),
+    async dispose() {
+      if (pendingWork.size > 0) workController.abort()
+      if (pendingSettlement.size > 0) settlementController.abort()
+      await Promise.all([
+        drain(pendingWork, finalDeadline),
+        drain(pendingSettlement, finalDeadline),
+      ])
+    },
   }
 }
 
@@ -177,42 +236,46 @@ function createKnowledgeWorker({
   }
 
   async function parseUpload(input, boundary) {
-    const controller = new AbortController()
-    const abortParser = () => controller.abort()
-    boundary.signal.addEventListener('abort', abortParser, { once: true })
-    let timeoutId
-    const timedOut = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => {
-        controller.abort()
-        reject({ code: 'TRANSIENT_FAILURE' })
-      }, parserTimeoutMs)
+    return await boundary.work(async (requestBoundary) => {
+      const remaining = requestBoundary.deadlineAt - Date.now()
+      if (remaining <= 0) throw { code: 'TRANSIENT_FAILURE' }
+      let timeoutId
+      const timedOut = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          boundary.abortWork()
+          reject({ code: 'TRANSIENT_FAILURE' })
+        }, Math.min(parserTimeoutMs, remaining))
+      })
+      try {
+        return await Promise.race([
+          Promise.resolve().then(() => parser.parse({
+            ...input, signal: requestBoundary.signal,
+          })),
+          timedOut,
+        ])
+      } finally {
+        clearTimeout(timeoutId)
+      }
     })
-    try {
-      return await boundary.work(() => Promise.race([
-        Promise.resolve().then(() => parser.parse({ ...input, signal: controller.signal })),
-        timedOut,
-      ]))
-    } finally {
-      clearTimeout(timeoutId)
-      controller.abort()
-      boundary.signal.removeEventListener('abort', abortParser)
-    }
   }
 
   async function processUpload(job, boundary) {
-    const work = await boundary.work(() => rpc('autoforge_knowledge_get_upload_work', {
+    const work = await boundary.work(requestBoundary => rpc('autoforge_knowledge_get_upload_work', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
-    }))
+    }, requestBoundary))
     if (!validUploadWork(work)) throw { code: 'INTERNAL_ERROR' }
-    const read = Promise.resolve().then(() => storage.readObject({
-      storageReference: work.storageReference, byteSize: work.byteSize,
-      sha256: work.sha256, mimeType: work.mimeType,
-    }))
+    let read
     let bytes
     try {
-      bytes = await boundary.work(() => read)
+      bytes = await boundary.work(requestBoundary => {
+        read = Promise.resolve().then(() => storage.readObject({
+          storageReference: work.storageReference, byteSize: work.byteSize,
+          sha256: work.sha256, mimeType: work.mimeType,
+        }, requestBoundary))
+        return read
+      })
     } catch (error) {
-      void read.then((lateBytes) => {
+      void read?.then((lateBytes) => {
         if (Buffer.isBuffer(lateBytes)) lateBytes.fill(0)
       }, () => undefined)
       throw error
@@ -231,7 +294,7 @@ function createKnowledgeWorker({
       bytes.fill(0)
     }
     if (!validParseResult(parsed)) throw { code: 'PARSER_LIMIT_EXCEEDED' }
-    const completed = await boundary.work(() => rpc('autoforge_knowledge_complete_upload_index', {
+    const completed = await boundary.work(requestBoundary => rpc('autoforge_knowledge_complete_upload_index', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
       p_owner_id: work.ownerId, p_knowledge_base_id: work.knowledgeBaseId,
       p_document_id: work.documentId, p_version_id: work.versionId,
@@ -240,7 +303,7 @@ function createKnowledgeWorker({
       p_version_number: work.versionNumber, p_content_hash: work.sha256,
       p_parser_version: parsed.parserVersion,
       p_blocks: parsed.blocks, p_chunks: parsed.chunks,
-    }))
+    }, requestBoundary))
     if (!exactKeys(completed, ['completed', 'generationId', 'embeddingJobId'])
       || completed.completed !== true || completed.generationId !== work.generationId
       || !(completed.embeddingJobId === null || nonEmptyString(completed.embeddingJobId))) {
@@ -249,20 +312,22 @@ function createKnowledgeWorker({
   }
 
   async function processPurge(job, boundary) {
-    const prepared = await boundary.work(() => rpc('autoforge_knowledge_prepare_base_purge', {
+    const prepared = await boundary.work(requestBoundary => rpc('autoforge_knowledge_prepare_base_purge', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
-    }))
+    }, requestBoundary))
     if (!exactKeys(prepared, ['jobId', 'storageReferences']) || prepared.jobId !== job.id
       || !Array.isArray(prepared.storageReferences)
       || prepared.storageReferences.length > MAX_ITEMS
       || prepared.storageReferences.some(reference => !validStorageReference(reference))) {
       throw { code: 'INTERNAL_ERROR' }
     }
-    await boundary.work(() => storage.deleteObjects(prepared.storageReferences))
-    const completed = await boundary.work(() => rpc('autoforge_knowledge_complete_base_purge', {
+    await boundary.work(requestBoundary => storage.deleteObjects(
+      prepared.storageReferences, requestBoundary,
+    ))
+    const completed = await boundary.work(requestBoundary => rpc('autoforge_knowledge_complete_base_purge', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
       p_deleted_storage_references: prepared.storageReferences,
-    }))
+    }, requestBoundary))
     if (!exactKeys(completed, ['jobId', 'completed'])
       || completed.jobId !== job.id || completed.completed !== true) {
       throw { code: 'INTERNAL_ERROR' }
@@ -273,9 +338,9 @@ function createKnowledgeWorker({
     if (!embeddingWorker || typeof embeddingWorker.run !== 'function') {
       throw { code: 'TRANSIENT_FAILURE' }
     }
-    const result = await boundary.work(() => embeddingWorker.run({
+    const result = await boundary.work(requestBoundary => embeddingWorker.run({
       workerId, jobId: job.id, leaseToken: job.leaseToken,
-    }))
+    }, requestBoundary))
     if (!exactKeys(result, ['state', 'embedded'])
       || !['completed', 'partial', 'revoked'].includes(result.state)
       || !Number.isSafeInteger(result.embedded) || result.embedded < 0) {
@@ -283,9 +348,9 @@ function createKnowledgeWorker({
     }
     if (result.state === 'revoked') throw { code: 'FORBIDDEN' }
     if (result.state === 'partial') {
-      const yielded = await boundary.work(() => rpc('autoforge_knowledge_yield_job', {
+      const yielded = await boundary.work(requestBoundary => rpc('autoforge_knowledge_yield_job', {
         p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
-      }))
+      }, requestBoundary))
       if (!exactKeys(yielded, ['yielded']) || yielded.yielded !== true) {
         throw { code: 'INTERNAL_ERROR' }
       }
@@ -320,17 +385,17 @@ function createKnowledgeWorker({
         } catch (error) {
           const code = safeCode(error)
           try {
-            await boundary.settle(() => rpc('autoforge_knowledge_complete_job', {
+            await boundary.settle(requestBoundary => rpc('autoforge_knowledge_complete_job', {
               p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
               p_state: 'failed', p_error_code: code,
-            }))
+            }, requestBoundary))
           } catch {
             // A lost/expired lease must never be settled under a different identity.
           }
           failed += 1
           stopAfterJob = code === 'TRANSIENT_FAILURE'
         } finally {
-          boundary.dispose()
+          await boundary.dispose()
         }
         if (stopAfterJob) break
       }
@@ -745,20 +810,53 @@ function createKnowledgeParser({
   }
 }
 
-function deadline(timeoutMs) {
+function validRequestBoundary(value) {
+  return exactKeys(value, ['signal', 'deadlineAt', 'timeoutMs'])
+    && isRecord(value.signal)
+    && typeof value.signal.aborted === 'boolean'
+    && typeof value.signal.addEventListener === 'function'
+    && typeof value.signal.removeEventListener === 'function'
+    && Number.isSafeInteger(value.deadlineAt)
+    && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0
+}
+
+function effectiveRequestTimeout(timeoutMs, requestBoundary) {
+  if (requestBoundary === undefined) return { timeoutMs }
+  if (!validRequestBoundary(requestBoundary)) throw { code: 'INVALID_INPUT' }
+  const remaining = requestBoundary.deadlineAt - Date.now()
+  if (remaining <= 0 || requestBoundary.signal.aborted) throw { code: 'TRANSIENT_FAILURE' }
+  return {
+    timeoutMs: Math.max(1, Math.min(timeoutMs, requestBoundary.timeoutMs, remaining)),
+    signal: requestBoundary.signal,
+  }
+}
+
+function deadline(timeoutMs, parentSignal) {
   const controller = new AbortController()
   const effective = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 10_000
   let timeoutId
+  let rejectExpired
+  let disposed = false
+  const expire = () => {
+    if (disposed) return
+    controller.abort()
+    rejectExpired?.({ code: 'TRANSIENT_FAILURE' })
+  }
   const expired = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      controller.abort()
-      reject({ code: 'TRANSIENT_FAILURE' })
-    }, effective)
+    rejectExpired = reject
+    timeoutId = setTimeout(expire, effective)
   })
+  if (parentSignal?.aborted) expire()
+  else parentSignal?.addEventListener('abort', expire, { once: true })
   return {
     signal: controller.signal,
     race: operation => Promise.race([operation, expired]),
-    dispose() { clearTimeout(timeoutId); controller.abort() },
+    dispose() {
+      disposed = true
+      clearTimeout(timeoutId)
+      parentSignal?.removeEventListener('abort', expire)
+      controller.abort()
+    },
   }
 }
 
@@ -815,8 +913,9 @@ function createWorkerStorageClient({
   }
   const normalizedBaseUrl = parsed.href.replace(/\/$/u, '')
 
-  async function request(path, body, allowBytes) {
-    const boundary = deadline(timeoutMs)
+  async function request(path, body, allowBytes, requestBoundary) {
+    const requestLimit = effectiveRequestTimeout(timeoutMs, requestBoundary)
+    const boundary = deadline(requestLimit.timeoutMs, requestLimit.signal)
     try {
       let response
       try {
@@ -840,14 +939,14 @@ function createWorkerStorageClient({
   }
 
   return {
-    async readObject(input) {
+    async readObject(input, requestBoundary) {
       if (!exactKeys(input, ['storageReference', 'byteSize', 'sha256', 'mimeType'])
         || !validStorageReference(input.storageReference)
         || !Number.isSafeInteger(input.byteSize) || input.byteSize < 1
         || input.byteSize > MAX_OBJECT_BYTES
         || typeof input.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(input.sha256)
         || !nonEmptyString(input.mimeType, 200)) throw { code: 'INVALID_INPUT' }
-      const bytes = await request('/objects/read', input, true)
+      const bytes = await request('/objects/read', input, true, requestBoundary)
       if (!Buffer.isBuffer(bytes) || bytes.byteLength !== input.byteSize
         || createHash('sha256').update(bytes).digest('hex') !== input.sha256) {
         if (Buffer.isBuffer(bytes)) bytes.fill(0)
@@ -855,12 +954,12 @@ function createWorkerStorageClient({
       }
       return bytes
     },
-    async deleteObjects(storageReferences) {
+    async deleteObjects(storageReferences, requestBoundary) {
       if (!Array.isArray(storageReferences) || storageReferences.length > MAX_ITEMS
         || storageReferences.some(reference => !validStorageReference(reference))) {
         throw { code: 'INVALID_INPUT' }
       }
-      await request('/objects/delete', { storageReferences }, false)
+      await request('/objects/delete', { storageReferences }, false, requestBoundary)
     },
   }
 }
