@@ -779,6 +779,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
         await knowledge?.bind(session.user.id)
+        await knowledge?.refreshEntitlement?.(
+          session.user.id,
+          session.authorization?.knowledgeEntitlement,
+          session.authorization?.confirmed === true,
+        )
         await bindUserMedia(session)
         activateUserReconciliation(runtimeRecovered)
         await activateVideoJobs(runtimeRecovered)
@@ -1664,11 +1669,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       refreshAuthorization: () => userDataAdmission.run(async () => {
         const session = await auth.refreshAuthorization()
         await bindUserData(session)
-        await knowledge?.refreshEntitlement?.(
-          session.user.id,
-          session.authorization?.knowledgeEntitlement,
-          session.authorization?.confirmed === true,
-        )
         return session
       }),
       sendOtp: (input) => auth.sendOtp(input),
@@ -1688,12 +1688,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const deadline = Date.now() + (options.logoutSyncTimeoutMs ?? 5_000)
         await beforeAuthIdentityChange(waitForActive, false)
         const flushed = await flushForLogout(Math.max(0, deadline - Date.now()))
-        if (!flushed) return { status: 'sync_timeout' as const }
+        if (!flushed) {
+          await bindUserData(session)
+          return { status: 'sync_timeout' as const }
+        }
         if (input && 'discardPending' in input) {
           await prepareUserDataDiscard()
         } else {
           const pendingCount = currentUserData().outbox.countPending()
           if (!input && pendingCount > 0) {
+            await bindUserData(session)
             return { status: 'pending_sync' as const, pendingCount }
           }
           await pauseUserData()

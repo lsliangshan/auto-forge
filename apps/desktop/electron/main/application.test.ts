@@ -1479,6 +1479,47 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('refreshes the knowledge entitlement projection on an authoritative same-UID getSession', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-session-refresh-'))
+    directories.push(root)
+    const before = { payload: 'YmVmb3Jl', signature: 'YmVmb3Jl' }
+    const after = { payload: 'YWZ0ZXI', signature: 'YWZ0ZXI' }
+    const refreshEntitlement = vi.fn(async () => undefined)
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined),
+      refreshEntitlement,
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        userId: 'test_user_sessionrefreshalice', role: 'user', capabilities: [], version: 1,
+        updatedAt: '2026-08-28T00:00:00.000Z', knowledgeEntitlement: before,
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        userId: 'test_user_sessionrefreshalice', role: 'user', capabilities: [], version: 2,
+        updatedAt: '2026-08-28T00:00:01.000Z', knowledgeEntitlement: after,
+      } } })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService,
+      roleService: new CloudBaseRoleService({ callFunction }),
+    }))
+    const session = await authenticate(runtime, 'SessionRefreshAlice')
+    refreshEntitlement.mockClear()
+
+    await expect(runtime.services.auth.getSession()).resolves.toMatchObject({
+      user: { id: session.user.id }, authorization: { version: 2, knowledgeEntitlement: after },
+    })
+
+    expect(refreshEntitlement).toHaveBeenCalledOnce()
+    expect(refreshEntitlement).toHaveBeenCalledWith(session.user.id, after, true)
+    await runtime.close()
+  })
+
   it('admits a signed member through the real role transport and preserves it across a refresh outage', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-real-role-entitlement-'))
     directories.push(root)
@@ -7841,8 +7882,20 @@ describe('createApplicationRuntime', () => {
     ]))
     const userDataRoot = join(root, 'user-caches')
     const userDataStores = new UserDataStoreManager(userDataRoot)
+    const knowledgeLifecycle: string[] = []
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => { knowledgeLifecycle.push('bind') }),
+      refreshEntitlement: vi.fn(async () => undefined),
+      invalidate: vi.fn(() => { knowledgeLifecycle.push('invalidate') }),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
+      knowledgeService,
       userDataSyncPort: {
         call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
       },
@@ -7860,6 +7913,7 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.auth.logout()).resolves.toEqual({
       status: 'pending_sync', pendingCount: 2,
     })
+    expect(knowledgeLifecycle.slice(-2)).toEqual(['invalidate', 'bind'])
     await expect(runtime.services.auth.requireSession()).resolves.toMatchObject({
       user: { account: 'LogoutPendingAlice' },
     })
@@ -7947,8 +8001,20 @@ describe('createApplicationRuntime', () => {
     let hangPull = false
     const userDataRoot = join(root, 'user-caches')
     const userDataStores = new UserDataStoreManager(userDataRoot)
+    const knowledgeLifecycle: string[] = []
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => { knowledgeLifecycle.push('bind') }),
+      refreshEntitlement: vi.fn(async () => undefined),
+      invalidate: vi.fn(() => { knowledgeLifecycle.push('invalidate') }),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
+      knowledgeService,
       userDataSyncPort: {
         call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
           if (input.action === 'syncPull') {
@@ -7983,6 +8049,7 @@ describe('createApplicationRuntime', () => {
       runtime.services.auth.logout(),
       new Promise((_, reject) => setTimeout(() => reject(new Error('logout remained hung')), 250)),
     ])).resolves.toEqual({ status: 'sync_timeout' })
+    expect(knowledgeLifecycle.slice(-2)).toEqual(['invalidate', 'bind'])
     await expect(runtime.services.auth.requireSession()).resolves.toMatchObject({
       user: { account: 'LogoutHungPullAlice' },
     })
