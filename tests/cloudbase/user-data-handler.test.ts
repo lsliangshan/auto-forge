@@ -26,6 +26,19 @@ const consentMutation = {
   payload: consent,
 }
 
+const consentRevokeMutation = {
+  id: 'mutation_revoke_1',
+  entityId: 'cloud_sync',
+  baseRevision: 1,
+  occurredAt: '2026-08-24T01:00:00.000Z',
+  kind: 'privacy.consent.revoke',
+  payload: {
+    purpose: 'cloud_sync',
+    revokedAt: '2026-08-24T01:00:00.000Z',
+    clientVersion: '2.0.0',
+  },
+}
+
 function messageMutation(blocks: unknown[]) {
   return {
     id: 'message_mutation_1',
@@ -100,6 +113,41 @@ function mockRpcResponse(
 }
 
 describe('CloudBase user data function', () => {
+  it('forwards a strict purpose-scoped consent revocation without renderer authority fields', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      results: [{ id: consentRevokeMutation.id, status: 'applied', revision: 2 }],
+      cursor: opaqueCursor,
+    })
+    const handler = createUserDataHandler({ rpc })
+
+    await expect(handler({
+      action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1',
+      mutations: [consentRevokeMutation],
+    }, authenticatedContext)).resolves.toMatchObject({
+      ok: true,
+      data: { results: [{ id: consentRevokeMutation.id, status: 'applied', revision: 2 }] },
+    })
+    expect(rpc).toHaveBeenCalledWith('autoforge_sync_push', {
+      p_caller_user_id: 'real_uid', p_protocol_version: 1,
+      p_device_id: 'dev_1', p_mutations: [consentRevokeMutation],
+    })
+
+    for (const mutation of [
+      { ...consentRevokeMutation, ownerUserId: 'forged' },
+      { ...consentRevokeMutation, revision: 2 },
+      { ...consentRevokeMutation, entityId: 'cloud-sync-2026-08' },
+      { ...consentRevokeMutation, payload: { ...consentRevokeMutation.payload, revision: 1 } },
+      { ...consentRevokeMutation, payload: { ...consentRevokeMutation.payload, revokedAt: 'today' } },
+    ]) {
+      await expect(handler({
+        action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [mutation],
+      }, authenticatedContext)).resolves.toEqual({
+        ok: false, error: { code: 'INVALID_INPUT' },
+      })
+    }
+    expect(rpc).toHaveBeenCalledOnce()
+  })
+
   it.each([
     { label: 'data object', envelope: (payload: unknown) => ({ data: payload }) },
     { label: 'body JSON', envelope: (payload: unknown) => ({ body: JSON.stringify(payload) }) },

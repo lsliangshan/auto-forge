@@ -224,6 +224,13 @@ function validateConsent(value, requiredPurpose) {
     && nonEmptyString(value.clientVersion, 64)
 }
 
+function validateConsentRevoke(value) {
+  return hasStrictShape(value, ['purpose', 'revokedAt', 'clientVersion'])
+    && consentPurposes.has(value.purpose)
+    && timestamp(value.revokedAt)
+    && nonEmptyString(value.clientVersion, 64)
+}
+
 function validatePreferences(value) {
   return hasStrictShape(value, ['timezone', 'displayCurrency'])
     && nonEmptyString(value.timezone, 128)
@@ -627,6 +634,8 @@ function validateMutationPayload(kind, payload) {
       return validateLegacyConfirm(payload)
     case 'privacy.consent':
       return validateConsent(payload)
+    case 'privacy.consent.revoke':
+      return validateConsentRevoke(payload)
     case 'preferences.update':
       return validatePreferences(payload)
     case 'usage.record':
@@ -640,6 +649,7 @@ function mutationEntityMatches(kind, entityId, payload) {
   if (['message.append', 'usage.record'].includes(kind)) return entityId === payload.id
   if (kind === 'legacy.import') return entityId === payload.batchId
   if (kind === 'privacy.consent') return entityId === payload.documentVersion
+  if (kind === 'privacy.consent.revoke') return entityId === payload.purpose
   return true
 }
 
@@ -1141,7 +1151,9 @@ function createUserDataHandler({ rpc }) {
         if (!protocolIsCurrent(event)) return upgradeRequired()
         if (!identifier(event.deviceId)
           || !validateMutation(event.mutation)
-          || event.mutation.kind !== 'privacy.consent') return invalid()
+          || !['privacy.consent', 'privacy.consent.revoke'].includes(event.mutation.kind)) {
+          return invalid()
+        }
         return { ok: true, data: await rpc('autoforge_sync_push', {
           p_caller_user_id: uid,
           p_protocol_version: event.protocolVersion,

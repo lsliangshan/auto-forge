@@ -449,6 +449,36 @@ describe('CloudBase user data migration', () => {
     expect(rollback).not.toMatch(/^\+/m)
   })
 
+  it('ships a mirrored additive consent-state migration with purpose OCC and data-preserving rollback', async () => {
+    const numbered = await readFile(new URL(
+      '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.sql', import.meta.url,
+    ), 'utf8')
+    const deployed = await readFile(new URL(
+      '../../cloudbase/migrations/20260828230000_privacy_consent_revocation.sql', import.meta.url,
+    ), 'utf8')
+    const rollback = await readFile(new URL(
+      '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.rollback.sql', import.meta.url,
+    ), 'utf8')
+
+    expect(numbered).toBe(deployed)
+    expect(numbered).toContain('CREATE TABLE IF NOT EXISTS app_privacy_consent_states')
+    expect(numbered).toContain('PRIMARY KEY (owner_user_id, purpose)')
+    expect(numbered).toContain("state varchar(16) NOT NULL CHECK (state IN ('accepted', 'revoked'))")
+    expect(numbered).toContain('revision bigint NOT NULL CHECK (revision > 0)')
+    expect(numbered).toContain('FROM app_privacy_consents')
+    expect(numbered).toContain("'privacy.consent.revoke'")
+    expect(numbered).toContain("p_owner_user_id::text || ':privacy-consent:' || consent_purpose")
+    expect(numbered).toContain('consent_state.revision <> p_base_revision')
+    expect(numbered).toContain('result_revision_value := base_revision_value + 1')
+    expect(numbered).toContain('PERFORM autoforge_record_consent')
+    expect(numbered).toContain('ALTER TABLE app_privacy_consent_states FORCE ROW LEVEL SECURITY')
+    expect(numbered).toContain(
+      'REVOKE ALL ON TABLE app_privacy_consent_states FROM PUBLIC, anon, authenticated, service_role',
+    )
+    expect(numbered).not.toMatch(/GRANT .* ON TABLE/i)
+    expect(rollback).not.toMatch(/DROP TABLE|TRUNCATE|DELETE FROM/i)
+  })
+
   it('replays a post-purge stale conflict verbatim after a lost response', async () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
     const syncPush = extractFunction(canonical, 'autoforge_sync_push')
