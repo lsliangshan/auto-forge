@@ -371,9 +371,11 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
   ): Promise<boolean> => {
     running.controller.abort()
     if (running.status !== 'verifying') {
-      if (!activeStatuses.has(running.status)) return false
-      const changed = move(running, target, { errorCode: code, endedAt: now() })
-      if (changed) publish(running.job.id, running.job.epoch, target)
+      let changed = false
+      if (activeStatuses.has(running.status)) {
+        changed = move(running, target, { errorCode: code, endedAt: now() })
+        if (changed) publish(running.job.id, running.job.epoch, target)
+      }
       await running.done
       return changed
     }
@@ -390,10 +392,11 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
 
   const terminalizePending = (
     jobId: string,
+    epoch: number,
     target: 'cancelled' | 'interrupted',
     code: 'CONVERSION_CANCELLED' | 'CONVERSION_INTERRUPTED',
   ): boolean => {
-    const index = pending.findIndex(({ job }) => job.id === jobId)
+    const index = pending.findIndex(({ job }) => job.id === jobId && job.epoch === epoch)
     if (index < 0) return false
     const [claimed] = pending.splice(index, 1)
     if (!claimed) return false
@@ -435,11 +438,14 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
     },
 
     async cancel(jobId) {
-      const running = active.get(jobId)
-      if (running !== undefined) return terminalizeActive(running, 'cancelled', 'CONVERSION_CANCELLED')
-      if (terminalizePending(jobId, 'cancelled', 'CONVERSION_CANCELLED')) return true
       const job = options.jobs.getOwned(jobId, options.ownerUserId)
-      if (!job || job.status !== 'queued') return false
+      if (!job) return false
+      const running = active.get(jobId)
+      if (running !== undefined && running.job.epoch === job.epoch && running.status === job.status) {
+        return terminalizeActive(running, 'cancelled', 'CONVERSION_CANCELLED')
+      }
+      if (terminalizePending(jobId, job.epoch, 'cancelled', 'CONVERSION_CANCELLED')) return true
+      if (job.status !== 'queued') return false
       const changed = cas(job.id, job.epoch, 'queued', {
         status: 'cancelled',
         errorCode: 'CONVERSION_CANCELLED',

@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { AppErrorCode, ConversionJobStatus } from '@autoforge/shared'
 import { openAppDatabase } from '../database/client.js'
+import { closeDesktopApplicationResources } from '../application-shutdown-completion.js'
 import type {
   ConversionArtifact,
   ConversionJob,
@@ -401,6 +402,36 @@ describe('conversion job runner', () => {
     database.close()
   })
 
+  it('cancels the current retry epoch while the previous active epoch is still draining', async () => {
+    const { database, runner, runtime } = fixture()
+    runner.start()
+    const submitted = runner.submit({
+      executionId: 'execution', sourceKind: 'artifact', sourceId: 'other-retry-cancel', targetFormat: 'png',
+    })
+    const oldKey = runtime.key(submitted.jobId, 0)
+    await waitFor(() => runtime.attempts.has(oldKey), 'old epoch conversion')
+
+    const cancellingOld = runner.cancel(submitted.jobId)
+    expect(database.conversionJobs.getOwned(submitted.jobId, 'alice')).toMatchObject({ epoch: 0, status: 'cancelled' })
+    expect(runner.retry(submitted.jobId)).toBe(true)
+    expect(database.conversionJobs.getOwned(submitted.jobId, 'alice')).toMatchObject({ epoch: 1, status: 'queued' })
+    const cancelledRetry = await runner.cancel(submitted.jobId)
+    runtime.attempts.get(oldKey)!.reject(conversionFailure('CONVERSION_CANCELLED'))
+    await cancellingOld
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+
+    const retryKey = runtime.key(submitted.jobId, 1)
+    const retryStarted = runtime.attempts.has(retryKey)
+    runtime.attempts.get(retryKey)?.reject(conversionFailure('CONVERSION_CANCELLED'))
+    await runner.idle()
+    const finalJob = database.conversionJobs.getOwned(submitted.jobId, 'alice')
+    database.close()
+
+    expect(cancelledRetry).toBe(true)
+    expect(retryStarted).toBe(false)
+    expect(finalJob).toMatchObject({ epoch: 1, status: 'cancelled', errorCode: 'CONVERSION_CANCELLED' })
+  })
+
   it('fails without an artifact when output verification rejects and releases the lease', async () => {
     const { database, runner, runtime } = fixture()
     runtime.writerModes.set('job-1:0', 'fail')
@@ -491,5 +522,42 @@ describe('conversion job runner', () => {
     expect(runtime.releases.get(`${first.jobId}:0`)).toBe(1)
     expect(runtime.releases.get(`${second.jobId}:0`)).toBe(1)
     database.close()
+  })
+
+  it('keeps shutdown pending when cancellation is terminal but its active resources have not drained', async () => {
+    const { database, runner, runtime } = fixture()
+    runner.start()
+    const submitted = runner.submit({
+      executionId: 'execution', sourceKind: 'artifact', sourceId: 'other-cancel-shutdown', targetFormat: 'png',
+    })
+    const key = runtime.key(submitted.jobId, 0)
+    await waitFor(() => runtime.attempts.has(key), 'cancelled shutdown conversion')
+
+    const cancelling = runner.cancel(submitted.jobId)
+    expect(database.conversionJobs.getOwned(submitted.jobId, 'alice')?.status).toBe('cancelled')
+    const order: string[] = []
+    let shutdownSettled = false
+    const shutdown = closeDesktopApplicationResources({
+      stopConversionJobs: () => runner.stop(),
+      closeApplication: async () => { order.push('application') },
+      resetUserDataStores: () => { order.push('reset-user-stores') },
+      closeUserDataStores: () => { order.push('close-user-stores') },
+    }).then(() => { shutdownSettled = true })
+
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    const settledBeforeDrain = shutdownSettled
+    const orderBeforeDrain = [...order]
+    runtime.attempts.get(key)!.reject(conversionFailure('CONVERSION_CANCELLED'))
+    await Promise.all([cancelling, shutdown])
+    const writerAborts = runtime.writers.get(key)?.aborts
+    const leaseReleases = runtime.releases.get(key)
+    const finalOrder = [...order]
+    database.close()
+
+    expect(settledBeforeDrain).toBe(false)
+    expect(orderBeforeDrain).toEqual([])
+    expect(writerAborts).toBe(1)
+    expect(leaseReleases).toBe(1)
+    expect(finalOrder).toEqual(['application', 'reset-user-stores', 'close-user-stores'])
   })
 })
