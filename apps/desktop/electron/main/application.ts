@@ -775,10 +775,21 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   knowledge?.configureCloudRemote?.(
     cloudBasePorts ? new CloudBaseKnowledgeClient(cloudBasePorts.functions) : undefined,
   )
+  const currentCloudSyncConsentAccepted = (): boolean => (
+    userDataStores.current()?.account.getConsent('cloud_sync')?.documentVersion
+      === CLOUD_SYNC_DOCUMENT_VERSION
+  )
+  const applyCurrentCloudSyncConsent = (ownerId: string): void => {
+    knowledge?.setCloudSyncConsent?.(ownerId, currentCloudSyncConsentAccepted())
+  }
+  const pullUserData = async (ownerId: string): Promise<void> => {
+    await userDataSync.pull()
+    applyCurrentCloudSyncConsent(ownerId)
+  }
   const bindUserData = (session: AuthSession): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
-        await knowledge?.bind(session.user.id)
+        await knowledge?.bind(session.user.id, currentCloudSyncConsentAccepted())
         await knowledge?.refreshEntitlement?.(
           session.user.id,
           session.authorization?.knowledgeEntitlement,
@@ -790,7 +801,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return
       }
       await userDataSync.start(session.user.id, deviceId)
-      await knowledge?.bind(session.user.id)
+      await knowledge?.bind(session.user.id, currentCloudSyncConsentAccepted())
       await knowledge?.refreshEntitlement?.(
         session.user.id,
         session.authorization?.knowledgeEntitlement,
@@ -802,7 +813,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       if (warningSince !== undefined) {
         notifySyncWarning(userDataSync.captureBinding(session.user.id), warningSince)
       }
-      await userDataSync.pull()
+      await pullUserData(session.user.id)
       activateUserReconciliation(runtimeRecovered)
       await activateVideoJobs(runtimeRecovered)
     })
@@ -1757,10 +1768,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     chat: {
       listConversations: async (input) => {
-        await requireAuthenticatedSession()
+        const session = await requireAuthenticatedSession()
         const page = currentUserData().conversations.listPage(input)
         const warningSince = userDataSync.status().warningSince
-        void userDataSync.pull().catch(() => undefined)
+        void pullUserData(session.user.id).catch(() => undefined)
         return {
           ...page,
           ...(warningSince === undefined ? {} : {
@@ -1772,7 +1783,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const session = await requireAuthenticatedSession()
         requireOwnedConversation(input.conversationId, session.user.id)
         const page = currentUserData().messages.listPage(input)
-        void userDataSync.pull().catch(() => undefined)
+        void pullUserData(session.user.id).catch(() => undefined)
         return page
       },
       createConversation: async () => {
@@ -2386,7 +2397,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
       },
       recordPrivacyConsent: async (input) => {
-        await requireAuthenticatedSession()
+        const session = await requireAuthenticatedSession()
         const consent = privacyConsentSchema.safeParse(input)
         if (!consent.success
           || consent.data.purpose !== 'cloud_sync'
@@ -2394,11 +2405,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           throw failure('INVALID_INPUT')
         }
         const store = currentUserData()
-        if (JSON.stringify(store.account.getConsent('cloud_sync')) === JSON.stringify(consent.data)) return
+        if (JSON.stringify(store.account.getConsent('cloud_sync')) === JSON.stringify(consent.data)) {
+          applyCurrentCloudSyncConsent(session.user.id)
+          return
+        }
         store.outbox.recordWithConsent({
           id: randomUUID(), kind: 'privacy.consent', entityId: consent.data.documentVersion,
           baseRevision: 0, occurredAt: consent.data.consentedAt, payload: consent.data,
         })
+        applyCurrentCloudSyncConsent(session.user.id)
         queueUserDataFlush()
       },
       previewLegacyImport: async () => {
@@ -2467,7 +2482,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           })
           throw error
         }
-        await userDataSync.pull()
+        await pullUserData(session.user.id)
         const pullStatus = userDataSync.status()
         // A prior background-sync quarantine must not turn a successful import into a false failure.
         const pullWasAlreadyQuarantined = syncStatusBeforeImport.state === 'quarantined'

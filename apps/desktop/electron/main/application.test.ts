@@ -1479,6 +1479,52 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('binds Knowledge with the authoritative current cloud_sync consent and advances it after acceptance', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-cloud-consent-'))
+    directories.push(root)
+    const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async (...args: [string, boolean?]) => { void args }),
+      setCloudSyncConsent: vi.fn(),
+      refreshEntitlement: vi.fn(async () => undefined),
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({
+        kind: 'results' as const, strategy: 'trigram' as const, evidence: [],
+      })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores, knowledgeService,
+    }))
+    const session = await authenticate(runtime, 'KnowledgeConsentAlice', false)
+
+    expect(knowledgeService.bind).toHaveBeenLastCalledWith(session.user.id, false)
+    userDataStores.current()!.outbox.recordWithConsent({
+      id: 'old-cloud-consent', kind: 'privacy.consent',
+      entityId: 'cloud-sync-2025-01', baseRevision: 0,
+      occurredAt: '2026-08-25T00:00:00.000Z',
+      payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2025-01',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    })
+    await runtime.services.auth.loginWithPassword({
+      account: 'KnowledgeConsentAlice', password: 'password',
+    })
+    expect(knowledgeService.bind).toHaveBeenLastCalledWith(session.user.id, false)
+
+    await runtime.services.settings.recordPrivacyConsent({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+    })
+    expect(knowledgeService.setCloudSyncConsent)
+      .toHaveBeenLastCalledWith(session.user.id, true)
+    await runtime.close()
+  })
+
   it('refreshes the knowledge entitlement projection on an authoritative same-UID getSession', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-session-refresh-'))
     directories.push(root)

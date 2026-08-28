@@ -91,6 +91,8 @@ interface Binding {
   cloudOwnerInvalidationFailure?: unknown
   cloudTasks: Set<Promise<unknown>>
   cloudPublications: Map<string, Promise<void>>
+  cloudSyncConsentAccepted: boolean
+  cloudConsentEpoch: number
 }
 
 interface UnavailableBinding {
@@ -101,7 +103,8 @@ interface UnavailableBinding {
 }
 
 export interface LocalKnowledgeService extends KnowledgeService {
-  bind(ownerId: string): Promise<void>
+  bind(ownerId: string, cloudSyncConsentAccepted?: boolean): Promise<void>
+  setCloudSyncConsent?(ownerId: string, accepted: boolean): void
   refreshEntitlement?(
     ownerId: string,
     snapshot?: SignedKnowledgeEntitlementSnapshot,
@@ -136,6 +139,7 @@ export interface KnowledgeSearchScope {
   readonly baseIds: readonly string[]
   readonly entries: readonly KnowledgeSearchScopeEntry[]
   readonly cloudAllowed: boolean
+  readonly cloudConsentEpoch?: number
 }
 
 interface RetentionSelection {
@@ -692,6 +696,7 @@ export function createLocalKnowledgeService(
       SELECT verified FROM knowledge_entitlement_projection WHERE singleton = 1
     `).get() as { verified: number } | undefined)?.verified === 1
     const allowed = productionCloudRemote(cloudRemote) !== undefined
+      && active.cloudSyncConsentAccepted
       && verified
       && state.cloudEnabled
       && state.betaEnabled === true
@@ -910,6 +915,7 @@ export function createLocalKnowledgeService(
   const ordinaryCloudAllowed = (active: Binding): boolean => {
     const state = entitlement(active)
     return productionCloudRemote(cloudRemote) !== undefined
+      && active.cloudSyncConsentAccepted
       && readProjection(active)?.verified === 1
       && state.tier === 'member'
       && (state.status === 'active' || state.status === 'offline_grace')
@@ -917,6 +923,10 @@ export function createLocalKnowledgeService(
       && state.cloudEnabled
       && dependencies.cloudKillSwitchEnabled?.() === false
   }
+
+  const isCloudConsentCurrent = (active: Binding, consentEpoch: number): boolean => (
+    active.cloudSyncConsentAccepted && active.cloudConsentEpoch === consentEpoch
+  )
 
   const assertCurrentBinding = (active: Binding): void => {
     if (binding !== active || active.epoch !== epoch) fail('CONFLICT')
@@ -970,9 +980,12 @@ export function createLocalKnowledgeService(
   const processCloudPublication = async (
     active: Binding,
     knowledgeBaseId: string,
+    consentEpoch: number,
   ): Promise<void> => {
     const remote = productionCloudRemote(cloudRemote)
-    if (!remote || !ordinaryCloudAllowed(active)) return
+    const cloudAllowed = () => ordinaryCloudAllowed(active)
+      && isCloudConsentCurrent(active, consentEpoch)
+    if (!remote || !cloudAllowed()) return
     let pending = pendingCloudPublication(active, knowledgeBaseId)
     if (!pending) return
     if (pending.nextRetryAt > now()) return
@@ -1018,7 +1031,7 @@ export function createLocalKnowledgeService(
         pending!.knowledgeBaseId,
       ) as { status?: string }
       assertCurrentBinding(active)
-      return synchronization.status === 'synced' && ordinaryCloudAllowed(active)
+      return synchronization.status === 'synced' && cloudAllowed()
     }
     const published = active.store.database.prepare(`
       SELECT published_generation_id AS publishedGenerationId
@@ -1029,7 +1042,7 @@ export function createLocalKnowledgeService(
         if (!await finalizePublishedHead()) return
       } catch {
         assertCurrentBinding(active)
-        if (ordinaryCloudAllowed(active)) deferPublication('TRANSIENT_FAILURE')
+        if (cloudAllowed()) deferPublication('TRANSIENT_FAILURE')
         return
       }
       active.store.database.prepare(`
@@ -1050,7 +1063,7 @@ export function createLocalKnowledgeService(
         generationId: pending.generationId,
       })
       assertCurrentBinding(active)
-      if (!ordinaryCloudAllowed(active)) return
+      if (!cloudAllowed()) return
       const head = active.store.database.prepare(`
         SELECT revision FROM cloud_entity_heads
         WHERE knowledge_base_id = ? AND entity_kind = 'document' AND entity_id = ?
@@ -1076,7 +1089,7 @@ export function createLocalKnowledgeService(
         status?: string
       }
       assertCurrentBinding(active)
-      if (synchronization.status !== 'synced' || !ordinaryCloudAllowed(active)) return
+      if (synchronization.status !== 'synced' || !cloudAllowed()) return
       const bytes = await active.store.objects.read(pending.objectId)
       assertCurrentBinding(active)
       try {
@@ -1091,7 +1104,7 @@ export function createLocalKnowledgeService(
           bytes,
         })
         assertCurrentBinding(active)
-        if (!ordinaryCloudAllowed(active)) return
+        if (!cloudAllowed()) return
         const updated = active.store.database.prepare(`
           UPDATE cloud_pending_publications SET upload_job_id = ?, recovery_attempt = 0,
             next_retry_at = 0, last_error_code = NULL, updated_at = ?
@@ -1113,7 +1126,7 @@ export function createLocalKnowledgeService(
     if (currentMode?.mode === 'paused') {
       active.cloud.resume(pending.knowledgeBaseId)
       assertCurrentBinding(active)
-      if (!ordinaryCloudAllowed(active)) return
+      if (!cloudAllowed()) return
     }
     let completed = false
     for (let poll = 0; poll < 3; poll += 1) {
@@ -1122,7 +1135,7 @@ export function createLocalKnowledgeService(
         job = await remote.getJob({ jobId: uploadJobId })
       } catch (error) {
         assertCurrentBinding(active)
-        if (!ordinaryCloudAllowed(active)) return
+        if (!cloudAllowed()) return
         const candidate = typeof error === 'object' && error !== null
           ? error as { code?: unknown; retryable?: unknown }
           : {}
@@ -1141,7 +1154,7 @@ export function createLocalKnowledgeService(
         return
       }
       assertCurrentBinding(active)
-      if (!ordinaryCloudAllowed(active)) return
+      if (!cloudAllowed()) return
       if (job.jobId !== uploadJobId) fail('INTERNAL_ERROR')
       if (job.state === 'completed') { completed = true; break }
       if (job.state === 'failed' || job.state === 'cancelled') {
@@ -1170,7 +1183,7 @@ export function createLocalKnowledgeService(
       if (!await finalizePublishedHead()) return
     } catch {
       assertCurrentBinding(active)
-      if (ordinaryCloudAllowed(active)) deferPublication('TRANSIENT_FAILURE')
+      if (cloudAllowed()) deferPublication('TRANSIENT_FAILURE')
       return
     }
     active.store.database.prepare(`
@@ -1199,6 +1212,7 @@ export function createLocalKnowledgeService(
 
   const recoverDueCloudPublications = (active: Binding): void => {
     if (!ordinaryCloudAllowed(active)) return
+    const consentEpoch = active.cloudConsentEpoch
     const rows = active.store.database.prepare(`
       SELECT knowledge_base_id AS knowledgeBaseId
       FROM cloud_pending_publications
@@ -1211,7 +1225,7 @@ export function createLocalKnowledgeService(
     for (const row of rows) {
       const recovery = serialCloudTask(
         active, row.knowledgeBaseId,
-        () => processCloudPublication(active, row.knowledgeBaseId),
+        () => processCloudPublication(active, row.knowledgeBaseId, consentEpoch),
       )
       void recovery.catch(() => undefined)
     }
@@ -1222,8 +1236,9 @@ export function createLocalKnowledgeService(
     knowledgeBaseId: string,
     documentId: string,
     publicationGeneration: number,
+    consentEpoch: number,
   ): void => {
-    if (!ordinaryCloudAllowed(active)) return
+    if (!ordinaryCloudAllowed(active) || !isCloudConsentCurrent(active, consentEpoch)) return
     const version = active.store.database.prepare(`
       SELECT version.id AS versionId, version.object_id AS objectId,
         version.content_hash AS contentHash
@@ -1337,7 +1352,11 @@ export function createLocalKnowledgeService(
     if (signal?.aborted) fail('CANCELLED')
     const remote = productionCloudRemote(cloudRemote)
     const liveCloudAllowed = ordinaryCloudAllowed(active)
-    if (!remote || !liveCloudAllowed || (admittedScope && !admittedScope.cloudAllowed)) {
+    const cloudConsentEpoch = admittedScope?.cloudConsentEpoch ?? active.cloudConsentEpoch
+    const cloudConsentCurrent = () => active.cloudSyncConsentAccepted
+      && active.cloudConsentEpoch === cloudConsentEpoch
+    if (!remote || !liveCloudAllowed || !cloudConsentCurrent()
+      || (admittedScope && !admittedScope.cloudAllowed)) {
       return result
     }
     if (!admittedScope) {
@@ -1349,7 +1368,7 @@ export function createLocalKnowledgeService(
         try {
           await active.cloud.synchronizeRemoteProjection(baseId)
           assertCurrentBinding(active)
-          if (!ordinaryCloudAllowed(active)) return result
+          if (!ordinaryCloudAllowed(active) || !cloudConsentCurrent()) return result
         } catch {
           assertCurrentBinding(active)
         }
@@ -1403,7 +1422,8 @@ export function createLocalKnowledgeService(
         ).get(baseId)
         if (local || !admittedScope) {
           await serialCloudTask(active, baseId, async () => {
-            if (local) await processCloudPublication(active, baseId)
+            if (local) await processCloudPublication(active, baseId, cloudConsentEpoch)
+            if (!cloudConsentCurrent()) fail('SERVICE_UNAVAILABLE')
             const synchronized = await (local
               ? active.cloud.synchronize(baseId)
               : active.cloud.synchronizeRemoteProjection(baseId)) as { status?: string }
@@ -1411,12 +1431,13 @@ export function createLocalKnowledgeService(
           })
         }
         assertCurrentBinding(active)
-        if (!ordinaryCloudAllowed(active)) return result
+        if (!ordinaryCloudAllowed(active) || !cloudConsentCurrent()) return result
       }
       const retrieved = await new CloudKnowledgeRetriever(remote).search(
         normalized, cloudBases, generations,
       )
       assertCurrentBinding(active)
+      if (!ordinaryCloudAllowed(active) || !cloudConsentCurrent()) return result
       if (signal?.aborted) fail('CANCELLED')
       const cloudEvidence = retrieved.evidence.flatMap((candidate, index): KnowledgeEvidence[] => {
         const admitted = cloudEntries.some(entry => entry.baseId === candidate.knowledgeBaseId
@@ -1576,6 +1597,20 @@ export function createLocalKnowledgeService(
     return active
   }
 
+  const applyCloudSyncConsent = (active: Binding, accepted: boolean): void => {
+    if (active.cloudSyncConsentAccepted === accepted) return
+    active.cloudSyncConsentAccepted = accepted
+    active.cloudConsentEpoch += 1
+    entitlement(active)
+    if (!accepted || !ordinaryCloudAllowed(active)) return
+    const paused = active.store.database.prepare(`
+      SELECT knowledge_base_id AS knowledgeBaseId FROM cloud_sync_states
+      WHERE mode = 'paused' ORDER BY knowledge_base_id
+    `).all() as Array<{ knowledgeBaseId: string }>
+    for (const row of paused) active.cloud.resume(row.knowledgeBaseId)
+    recoverDueCloudPublications(active)
+  }
+
   const emitDocument = (active: Binding, documentId: string): void => {
     if (binding !== active || active.epoch !== epoch) return
     const document = documentSummary(active.store.database, documentId)
@@ -1597,8 +1632,11 @@ export function createLocalKnowledgeService(
     }
   }
 
-  const bind = (ownerId: string): Promise<void> => {
-    if (binding?.ownerId === ownerId && binding.epoch === epoch) return Promise.resolve()
+  const bind = (ownerId: string, cloudSyncConsentAccepted = false): Promise<void> => {
+    if (binding?.ownerId === ownerId && binding.epoch === epoch) {
+      applyCloudSyncConsent(binding, cloudSyncConsentAccepted)
+      return Promise.resolve()
+    }
     if (unavailable?.ownerId === ownerId && unavailable.epoch === epoch) return Promise.resolve()
     invalidate()
     const bindEpoch = epoch
@@ -1656,6 +1694,7 @@ export function createLocalKnowledgeService(
         cloud: createCloudLifecycle(store), cloudOwnerInvalidated: false,
         cloudOwnerInvalidationFailed: false,
         cloudTasks: new Set(), cloudPublications: new Map(),
+        cloudSyncConsentAccepted, cloudConsentEpoch: 0,
       })
       if (bindEpoch !== epoch) {
         const cleanup = await settle([() => runner.drain(), () => store.close()])
@@ -1664,6 +1703,7 @@ export function createLocalKnowledgeService(
         fail('CONFLICT')
       }
       binding = active
+      active.cloud.setCloudAccess(false)
       void runner.recoverAndRun().catch(() => undefined)
     })
     lifecycleTail = operation.catch((error: unknown) => { rememberLifecycleFailure(error) })
@@ -1714,6 +1754,11 @@ export function createLocalKnowledgeService(
 
   return {
     bind,
+    setCloudSyncConsent: (ownerId, accepted) => {
+      const active = binding
+      if (!active || active.ownerId !== ownerId || active.epoch !== epoch) fail('AUTH_REQUIRED')
+      applyCloudSyncConsent(active, accepted)
+    },
     configureCloudRemote: (remote) => {
       if (binding && remote) fail('CONFLICT')
       if (binding) return
@@ -1884,6 +1929,7 @@ export function createLocalKnowledgeService(
         baseIds: Object.freeze([...allowed]),
         entries: Object.freeze(entries.map(entry => Object.freeze({ ...entry }))),
         cloudAllowed: ordinaryCloudAllowed(active),
+        cloudConsentEpoch: active.cloudConsentEpoch,
       })
       activeSearchScopes.set(scope.scopeId, scope)
       return scope
@@ -2034,11 +2080,12 @@ export function createLocalKnowledgeService(
       })()
       if (!isMember(active)) writeRetention(active, { baseId, documentId, confirmed: false })
       const parsing = active.runner.runQueued()
+      const cloudConsentEpoch = active.cloudConsentEpoch
       const cloud = serialCloudTask(active, baseId, async () => {
         await parsing
         assertCurrentBinding(active)
-        stageCloudPublication(active, baseId, documentId, 1)
-        await processCloudPublication(active, baseId)
+        stageCloudPublication(active, baseId, documentId, 1, cloudConsentEpoch)
+        await processCloudPublication(active, baseId, cloudConsentEpoch)
       })
       void cloud.catch(() => undefined)
       return documentSummary(active.store.database, documentId)
@@ -2069,13 +2116,15 @@ export function createLocalKnowledgeService(
       })()
       const publicationGeneration = document.publication_generation + 1
       const parsing = active.runner.runQueued()
+      const cloudConsentEpoch = active.cloudConsentEpoch
       const cloud = serialCloudTask(active, document.knowledge_base_id, async () => {
         await parsing
         assertCurrentBinding(active)
         stageCloudPublication(
           active, document.knowledge_base_id, documentId, publicationGeneration,
+          cloudConsentEpoch,
         )
-        await processCloudPublication(active, document.knowledge_base_id)
+        await processCloudPublication(active, document.knowledge_base_id, cloudConsentEpoch)
       })
       void cloud.catch(() => undefined)
       return documentSummary(active.store.database, documentId)
@@ -2300,7 +2349,8 @@ export function createLocalKnowledgeService(
         && (state.status === 'active' || state.status === 'offline_grace')
       const beta = verified && state.betaEnabled === true
       const cloudbase = cloudRemote !== undefined
-      const cloud = beta && state.cloudEnabled && productionCloudRemote(cloudRemote) !== undefined
+      const cloud = active.cloudSyncConsentAccepted
+        && beta && state.cloudEnabled && productionCloudRemote(cloudRemote) !== undefined
         && dependencies.cloudKillSwitchEnabled?.() === false
       return {
         encryption: { available: true },

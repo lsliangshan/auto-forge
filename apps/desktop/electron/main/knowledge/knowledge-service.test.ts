@@ -208,7 +208,7 @@ describe('local knowledge service', () => {
     first.configureCloudRemote!(cloudRemote())
     await expect(first.getAvailability({ userId: 'alice' }))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
-    await first.bind('alice')
+    await first.bind('alice', true)
     await first.refreshEntitlement!('alice', firstSigned, true)
     await expect(first.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({ tier: 'member' })
     await expect(first.getAvailability({ userId: 'alice' })).resolves.toMatchObject({
@@ -222,7 +222,7 @@ describe('local knowledge service', () => {
 
     const restarted = createService()
     restarted.configureCloudRemote!(cloudRemote())
-    await restarted.bind('alice')
+    await restarted.bind('alice', true)
     await restarted.refreshEntitlement!('alice', undefined, false)
     await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
       tier: 'member', status: 'active',
@@ -340,7 +340,7 @@ describe('local knowledge service', () => {
     })
     service.configureCloudRemote!(remote)
     const owner = { userId: 'alice' }
-    await service.bind(owner.userId)
+    await service.bind(owner.userId, true)
     memory.database.prepare(`
       INSERT INTO knowledge_entitlement_projection(
         singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
@@ -478,7 +478,7 @@ describe('local knowledge service', () => {
     })
     service.configureCloudRemote!(cloudRemote({ fullResync, pullChanges, search }))
     const owner = { userId: 'alice' }
-    await service.bind(owner.userId)
+    await service.bind(owner.userId, true)
     memory.database.prepare(`
       INSERT INTO knowledge_entitlement_projection(
         singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
@@ -596,7 +596,7 @@ describe('local knowledge service', () => {
     })
     service.configureCloudRemote!(remote)
     const owner = { userId: 'alice' }
-    await service.bind(owner.userId)
+    await service.bind(owner.userId, true)
     memory.database.prepare(`
       INSERT INTO knowledge_entitlement_projection(
         singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
@@ -697,7 +697,7 @@ describe('local knowledge service', () => {
       now: () => restartNow,
     })
     restarted.configureCloudRemote!(remote)
-    await restarted.bind('alice')
+    await restarted.bind('alice', true)
 
     await restarted.searchSelected({ userId: 'alice' }, '恢复发布', ['base_restart'])
     await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
@@ -804,6 +804,186 @@ describe('local knowledge service', () => {
     expect(beginGeneration).not.toHaveBeenCalled()
     expect(uploadDocument).not.toHaveBeenCalled()
     expect(search).not.toHaveBeenCalled()
+  })
+
+  it('requires current cloud_sync consent and fences old scopes across revoke and regrant', async () => {
+    const memory = memoryKnowledgeStore()
+    const selected = [{
+      name: 'consent.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('同意边界条款'),
+    }]
+    const beginGeneration = vi.fn()
+    const uploadDocument = vi.fn()
+    const heldSearch = deferred<Awaited<ReturnType<NonNullable<CloudKnowledgeRemote['search']>>>>()
+    let searchCalls = 0
+    let documentId = ''
+    let versionId = ''
+    const cloudResponse = () => ({
+      generationState: 'published',
+      generations: [{
+        knowledgeBaseId: 'consent_base', generationId: 'consent_generation',
+        previousGenerationId: null,
+      }],
+      strategy: 'keyword_only_consent' as const,
+      embedding: {
+        model: 'kinfra-text-embedding-0.6b' as const, dimensions: 1024 as const,
+        configurationVersion: 'autoforge-knowledge-embedding-v1' as const,
+        region: 'guangzhou' as const,
+      },
+      keywordCandidates: [{
+        id: 'consent_cloud_chunk', knowledgeBaseId: 'consent_base',
+        documentId, versionId, generationId: 'consent_generation', rank: 1,
+        body: '同意边界条款',
+        coordinates: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 6 },
+      }],
+      vectorCandidates: [], driftProbeRequired: false,
+    })
+    const search = vi.fn(async () => {
+      searchCalls += 1
+      return searchCalls === 1 ? heldSearch.promise : cloudResponse()
+    })
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => selected.splice(0),
+      createParser: () => ({
+        parse: async () => parsedText('同意边界条款'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => false,
+    })
+    service.configureCloudRemote!({
+      ...cloudRemote({ search }), beginGeneration, uploadDocument,
+    })
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId, false)
+    memory.database.prepare(`
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+        accepted_key_generation, verified, explicit_free, max_observed_at
+      ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1)
+    `).run()
+    const base = await service.create(owner, 'Consent')
+    expect(base.id).not.toBe('consent_base')
+    memory.database.prepare(
+      'UPDATE knowledge_bases SET id = ? WHERE id = ?',
+    ).run('consent_base', base.id)
+    const handle = (await service.pickImportFiles(owner))[0]!
+    const document = (await service.importDocument(owner, 'consent_base', handle.id))!
+    documentId = document.id
+    await vi.waitFor(async () => expect(await service.listDocuments(
+      owner, 'consent_base',
+    )).toEqual([expect.objectContaining({ status: 'ready' })]))
+    versionId = (memory.database.prepare(`
+      SELECT active_version_id AS versionId FROM documents WHERE id = ?
+    `).get(documentId) as { versionId: string }).versionId
+
+    await expect(service.getAvailability(owner)).resolves.toMatchObject({
+      cloud: { available: false, reason: 'cloud_disabled' },
+    })
+    expect(beginGeneration).not.toHaveBeenCalled()
+    expect(uploadDocument).not.toHaveBeenCalled()
+    expect(search).not.toHaveBeenCalled()
+    memory.database.prepare(`
+      INSERT INTO cloud_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES ('consent_base', 'synced', 'consent_generation', 1, 1)
+      ON CONFLICT(knowledge_base_id) DO UPDATE SET
+        mode = 'synced', published_generation_id = 'consent_generation', epoch = epoch + 1
+    `).run()
+
+    service.setCloudSyncConsent!(owner.userId, true)
+    await expect(service.getAvailability(owner)).resolves.toMatchObject({
+      cloud: { available: true },
+    })
+    const oldScope = await service.captureSearchScope(owner, ['consent_base'])
+    const oldSearch = service.searchSelected(
+      owner, '同意边界', ['consent_base'], undefined, oldScope,
+    )
+    await vi.waitFor(() => expect(search).toHaveBeenCalledOnce())
+    service.setCloudSyncConsent!(owner.userId, false)
+    expect(memory.database.prepare(`
+      SELECT mode FROM cloud_sync_states WHERE knowledge_base_id = 'consent_base'
+    `).get()).toEqual({ mode: 'paused' })
+    service.setCloudSyncConsent!(owner.userId, true)
+    heldSearch.resolve(cloudResponse())
+
+    const oldResult = await oldSearch
+    expect(oldResult).toMatchObject({ kind: 'results' })
+    expect(oldResult.kind === 'results'
+      ? oldResult.evidence.some(item => item.id === 'evidence:cloud:consent_cloud_chunk')
+      : true).toBe(false)
+    const newScope = await service.captureSearchScope(owner, ['consent_base'])
+    await expect(service.searchSelected(
+      owner, '同意边界', ['consent_base'], undefined, newScope,
+    )).resolves.toMatchObject({
+      kind: 'results',
+      evidence: [expect.objectContaining({ id: 'evidence:cloud:consent_cloud_chunk' })],
+    })
+    expect(beginGeneration).not.toHaveBeenCalled()
+    expect(uploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('does not let a publication task from an earlier consent epoch continue after regrant', async () => {
+    const memory = memoryKnowledgeStore()
+    const firstUpload = deferred<{ jobId: string; storageReference: string }>()
+    const secondUpload = deferred<{ jobId: string; storageReference: string }>()
+    const uploadDocument = vi.fn()
+      .mockImplementationOnce(async () => firstUpload.promise)
+      .mockImplementationOnce(async () => secondUpload.promise)
+    const getJob = vi.fn(async (input: { jobId: string }) => ({
+      jobId: input.jobId, state: 'completed' as const, errorCode: null,
+    }))
+    const publishGeneration = vi.fn(async (input: {
+      generationId: string
+    }) => ({
+      generationId: input.generationId, previousGenerationId: null, sequence: 7,
+    }))
+    const selected = [{
+      name: 'epoch.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('授权 epoch 条款'),
+    }]
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => selected.splice(0),
+      createParser: () => ({
+        parse: async () => parsedText('授权 epoch 条款'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => false,
+    })
+    service.configureCloudRemote!(cloudRemote({
+      uploadDocument, getJob, publishGeneration,
+    }))
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId, true)
+    memory.database.prepare(`
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+        accepted_key_generation, verified, explicit_free, max_observed_at
+      ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1)
+    `).run()
+    const base = await service.create(owner, 'Epoch')
+    const handle = (await service.pickImportFiles(owner))[0]!
+    await service.importDocument(owner, base.id, handle.id)
+    await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledOnce())
+
+    service.setCloudSyncConsent!(owner.userId, false)
+    service.setCloudSyncConsent!(owner.userId, true)
+    firstUpload.resolve({ jobId: 'upload_old_epoch', storageReference: 'knowledge/old' })
+
+    await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledTimes(2))
+    expect(getJob).not.toHaveBeenCalled()
+    expect(publishGeneration).not.toHaveBeenCalled()
+    secondUpload.resolve({ jobId: 'upload_new_epoch', storageReference: 'knowledge/new' })
+    await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
   })
 
   it('rejects entitlement key-generation rollback and same-generation key replacement across restart', async () => {
