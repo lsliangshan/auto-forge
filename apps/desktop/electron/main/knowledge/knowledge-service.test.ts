@@ -1048,17 +1048,25 @@ describe('local knowledge service', () => {
     const memory = memoryKnowledgeStore()
     const firstUpload = deferred<{ jobId: string; storageReference: string }>()
     const secondUpload = deferred<{ jobId: string; storageReference: string }>()
+    const firstPublish = deferred<{
+      generationId: string; previousGenerationId: string | null; sequence: number
+    }>()
+    const secondPublish = deferred<{
+      generationId: string; previousGenerationId: string | null; sequence: number
+    }>()
     const uploadDocument = vi.fn()
       .mockImplementationOnce(async () => firstUpload.promise)
       .mockImplementationOnce(async () => secondUpload.promise)
+    const pushMutation = vi.fn(async (input: Parameters<CloudKnowledgeRemote['pushMutation']>[0]) => ({
+      mutationId: input.mutationId, status: 'applied' as const,
+      sequence: 1, revision: input.mutationId,
+    }))
     const getJob = vi.fn(async (input: { jobId: string }) => ({
       jobId: input.jobId, state: 'completed' as const, errorCode: null,
     }))
-    const publishGeneration = vi.fn(async (input: {
-      generationId: string
-    }) => ({
-      generationId: input.generationId, previousGenerationId: null, sequence: 7,
-    }))
+    const publishGeneration = vi.fn()
+      .mockImplementationOnce(async () => firstPublish.promise)
+      .mockImplementationOnce(async () => secondPublish.promise)
     const selected = [{
       name: 'epoch.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('授权 epoch 条款'),
     }]
@@ -1077,7 +1085,7 @@ describe('local knowledge service', () => {
       cloudKillSwitchEnabled: () => false,
     })
     service.configureCloudRemote!(cloudRemote({
-      uploadDocument, getJob, publishGeneration,
+      uploadDocument, getJob, publishGeneration, pushMutation,
     }))
     const owner = { userId: 'alice' }
     await service.bind(owner.userId, true)
@@ -1101,6 +1109,16 @@ describe('local knowledge service', () => {
     expect(publishGeneration).not.toHaveBeenCalled()
     secondUpload.resolve({ jobId: 'upload_new_epoch', storageReference: 'knowledge/new' })
     await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
+
+    service.setCloudSyncConsent!(owner.userId, false)
+    service.setCloudSyncConsent!(owner.userId, true)
+    const generationId = publishGeneration.mock.calls[0]![0].generationId
+    firstPublish.resolve({ generationId, previousGenerationId: null, sequence: 7 })
+
+    await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledTimes(2))
+    expect(pushMutation).toHaveBeenCalledTimes(1)
+    secondPublish.resolve({ generationId, previousGenerationId: null, sequence: 8 })
+    await vi.waitFor(() => expect(pushMutation).toHaveBeenCalledTimes(2))
   })
 
   it('rejects entitlement key-generation rollback and same-generation key replacement across restart', async () => {

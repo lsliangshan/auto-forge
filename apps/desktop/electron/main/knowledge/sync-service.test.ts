@@ -141,6 +141,36 @@ describe('KnowledgeSyncService', () => {
     expect(() => service.resume('kb_1')).toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }))
   })
 
+  it('does not commit a held mutation result from an earlier access epoch after regrant', async () => {
+    const heldPush = deferred<{
+      mutationId: string; status: 'applied'; sequence: number; revision: string
+    }>()
+    const pushMutation = vi.fn(async () => heldPush.promise)
+    const { database, remote, service } = fixture({ pushMutation })
+    service.enqueue({
+      mutationId: 'mutation_consent_epoch', knowledgeBaseId: 'kb_1',
+      entityKind: 'document', entityId: 'document_1', operation: 'upsert',
+      baseRevision: null, payload: { versionId: 'version_1' },
+    })
+
+    const oldEpoch = service.synchronize('kb_1')
+    await vi.waitFor(() => expect(pushMutation).toHaveBeenCalledOnce())
+    service.setCloudAccess(false)
+    service.setCloudAccess(true)
+    service.resume('kb_1')
+    heldPush.resolve({
+      mutationId: 'mutation_consent_epoch', status: 'applied', sequence: 1, revision: 'r1',
+    })
+
+    await expect(oldEpoch).resolves.toEqual({
+      status: 'paused', processed: 0, conflicts: 0,
+    })
+    expect(remote.pullChanges).not.toHaveBeenCalled()
+    expect(database.prepare(`
+      SELECT state FROM cloud_sync_mutations WHERE id = 'mutation_consent_epoch'
+    `).get()).toEqual({ state: 'leased' })
+  })
+
   it('allows verified conversion during the download window after cloud access closes', async () => {
     const { remote, service } = fixture()
     service.beginCloudRetention('kb_1', 500)
