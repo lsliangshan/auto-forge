@@ -122,15 +122,15 @@ function isId3Header(bytes: Uint8Array): boolean {
   return bytes.subarray(6, 10).every((value) => value < 0x80)
 }
 
-function isSupportedOggAudio(bytes: Uint8Array): boolean {
+function supportedOggAudio(bytes: Uint8Array): 'opus' | 'ogg' | undefined {
   if (
     bytes.byteLength < 28
     || ascii(bytes, 0, 4) !== 'OggS'
     || bytes[4] !== 0
     || (bytes[5]! & ~0x07) !== 0
-  ) return false
+  ) return undefined
   const segmentCount = bytes[26]!
-  if (segmentCount === 0 || 27 + segmentCount > bytes.byteLength) return false
+  if (segmentCount === 0 || 27 + segmentCount > bytes.byteLength) return undefined
   let pageBodyBytes = 0
   let firstPacketBytes = 0
   let firstPacketComplete = false
@@ -143,14 +143,14 @@ function isSupportedOggAudio(bytes: Uint8Array): boolean {
     }
   }
   const bodyOffset = 27 + segmentCount
-  if (!firstPacketComplete || bodyOffset + pageBodyBytes > bytes.byteLength) return false
+  if (!firstPacketComplete || bodyOffset + pageBodyBytes > bytes.byteLength) return undefined
   const packet = bytes.subarray(bodyOffset, bodyOffset + firstPacketBytes)
+  if (ascii(packet, 0, 8) === 'OpusHead') return 'opus'
   return (
-    ascii(packet, 0, 8) === 'OpusHead'
-    || (packet[0] === 0x01 && ascii(packet, 1, 6) === 'vorbis')
+    (packet[0] === 0x01 && ascii(packet, 1, 6) === 'vorbis')
     || (packet[0] === 0x7f && ascii(packet, 1, 4) === 'FLAC')
     || ascii(packet, 0, 8) === 'Speex   '
-  )
+  ) ? 'ogg' : undefined
 }
 
 interface Vint {
@@ -239,7 +239,9 @@ export function detectMediaType(prefix: Uint8Array): DetectedMedia | undefined {
   if (ascii(bytes, 0, 4) === 'RIFF' && ascii(bytes, 8, 4) === 'WAVE') {
     return detected('audio', 'audio/wav', 'wav')
   }
-  if (isSupportedOggAudio(bytes)) return detected('audio', 'audio/ogg', 'ogg')
+  const oggAudio = supportedOggAudio(bytes)
+  if (oggAudio === 'opus') return detected('audio', 'audio/opus', 'opus')
+  if (oggAudio === 'ogg') return detected('audio', 'audio/ogg', 'ogg')
   if (ascii(bytes, 0, 4) === 'fLaC') return detected('audio', 'audio/flac', 'flac')
 
   if (isWebm(bytes)) return detected('video', 'video/webm', 'webm')
