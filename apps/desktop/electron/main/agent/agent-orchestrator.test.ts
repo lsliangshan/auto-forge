@@ -6873,6 +6873,52 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(JSON.stringify(strictDependencies.records.terminal.at(-1))).not.toContain('模型猜测')
   })
 
+  it.each([
+    ['complete forged marker', '一般合同知识 [[kb:evidence:forged]]'],
+    ['incomplete forged marker', '一般合同知识 [[kb:evidence:forged'],
+    ['malformed marker prefix', '一般合同知识 [[kb:'],
+  ])('sanitizes %s before labeling mixed no-evidence output', async (_name, answer) => {
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: answer },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const input = Object.assign(knowledgeRunInput('解释合同'), {
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
+      allowTools: false,
+    })
+
+    await new AgentOrchestrator(dependencies).run(input)
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('【一般信息】一般合同知识')
+    expect(terminal).not.toContain('[[kb:')
+    expect(terminal).not.toContain('forged')
+  })
+
+  it.each([
+    ['complete marker only', '[[kb:evidence:forged]]'],
+    ['incomplete marker only', '[[kb:evidence:forged'],
+    ['malformed prefix only', '[[kb:'],
+  ])('uses the bounded insufficient response when %s sanitizes to empty', async (_name, answer) => {
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: answer },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const input = Object.assign(knowledgeRunInput('解释合同'), {
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
+      allowTools: false,
+    })
+
+    await new AgentOrchestrator(dependencies).run(input)
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('所选个人知识库中的当前依据不足')
+    expect(terminal).not.toContain('[[kb:')
+    expect(terminal).not.toContain('forged')
+  })
+
   it('fails a strict knowledge-only request closed when the model skips retrieval', async () => {
     const dependencies = harness([[
       { type: 'text_delta', choiceIndex: 0, text: '模型直接猜测' },

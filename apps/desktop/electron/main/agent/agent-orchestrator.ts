@@ -2199,7 +2199,12 @@ export class AgentOrchestrator {
         const validation = validateKnowledgeAnswer(
           answer, [], active.knowledgeSelection.mode, active.knowledgeCitationRepairs,
         )
-        return { kind: 'answer', text: validation.kind === 'valid' ? validation.text : answer }
+        if (validation.kind === 'valid') return { kind: 'answer', text: validation.text }
+        if (active.knowledgeSelection.mode === 'mixed') {
+          this.setKnowledgeStatus(active, 'insufficient', 0)
+          return { kind: 'answer', text: KNOWLEDGE_INSUFFICIENT_TEXT }
+        }
+        return { kind: 'answer', text: answer }
       }
       this.setKnowledgeStatus(active, 'insufficient', 0)
       return { kind: 'answer', text: KNOWLEDGE_INSUFFICIENT_TEXT }

@@ -377,6 +377,41 @@ describe('knowledge tool and answer validation', () => {
 
   it.each([
     {
+      name: 'Chinese project hours borrowed from another subject',
+      snippet: 'A项目工时100小时，B项目工时200小时。',
+      answer: 'A项目工时，200小时。[[kb:evidence:0]]',
+    },
+    {
+      name: 'English project hours borrowed from another subject',
+      snippet: 'Project A effort 100 hours, Project B effort 200 hours.',
+      answer: 'Project A effort, 200 hours. [[kb:evidence:0]]',
+    },
+    {
+      name: 'same value attached to a different Chinese subject',
+      snippet: 'B项目工时100小时。',
+      answer: 'A项目工时，100小时。[[kb:evidence:0]]',
+    },
+    {
+      name: 'same value attached to a different English subject',
+      snippet: 'Project B effort 100 hours.',
+      answer: 'Project A effort, 100 hours. [[kb:evidence:0]]',
+    },
+  ])('fails structurally field-like comma claims closed: $name', ({ snippet, answer }) => {
+    const current = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it.each([
+    {
       name: 'standalone number from another party field',
       snippet: '乙方编号为 7。',
       answer: '7。[[kb:evidence:0]]',
@@ -429,6 +464,35 @@ describe('knowledge tool and answer validation', () => {
       [evidence(0, { snippet: '甲方支持红色、蓝色。' })],
       'strict', 1,
     )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
+    ['完成导入后，系统生成摘要。', '完成导入后，系统生成摘要。'],
+    ['系统运行稳定，日志记录完整。', '系统运行稳定，日志记录完整。'],
+  ])('keeps an ordinary or temporal comma sentence supported: %s', (snippet, claim) => {
+    expect(validateKnowledgeAnswer(
+      `${claim}[[kb:evidence:0]]`, [evidence(0, { snippet })], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
+    ['一般结论 [[kb:evidence:forged]]', '【一般信息】一般结论'],
+    ['一般结论 [[kb:evidence:forged', '【一般信息】一般结论'],
+    ['一般结论 [[kb:', '【一般信息】一般结论'],
+  ])('strips complete or malformed markers from mixed no-evidence output: %s', (answer, expected) => {
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: expected,
+    })
+  })
+
+  it.each([
+    '[[kb:evidence:forged]]',
+    '[[kb:evidence:forged',
+    '[[kb:',
+  ])('fails mixed no-evidence output closed when marker cleanup leaves no answer: %s', (answer) => {
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'insufficient', reason: 'no-evidence',
+    })
   })
 
   it.each([

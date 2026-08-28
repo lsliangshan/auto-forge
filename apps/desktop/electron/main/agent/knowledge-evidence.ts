@@ -121,6 +121,7 @@ export type KnowledgeAnswerValidation =
   | { kind: 'insufficient'; reason: 'no-evidence' | 'uncited' | 'invalid-citation' | 'unsupported-claim' }
 
 const KNOWLEDGE_MARKER = /\[\[kb:([^\]\r\n]{1,512})\]\]/gu
+const KNOWLEDGE_MARKER_MATERIAL = /\[\[kb:[^\r\n]*?(?:\]\]|$)/gimu
 const NUMERIC_DOT = '\u{e100}'
 const NUMERIC_COLON = '\u{e101}'
 const NUMERIC_COMMA = '\u{e102}'
@@ -241,7 +242,10 @@ function commaFieldTuple(value: string): FactTuple | undefined {
   if (!field) return undefined
   const subject = field[1]!.trim()
   const object = field[2]!.trim()
-  if (!subject || !object || /(?:之前|以后|之日起|之时|时起|[前后时])$/u.test(subject)) return undefined
+  if (!subject || !object) return undefined
+  const cjkClause = /^.{2,}(?:生效|起效|生成|完成|运行|记录|构成|发布|支付|提供|采用|执行|保持|持续|运营|进入|属于|包含|负责|承担|提升|开始|结束)/u
+  const englishClause = /^\S+(?:\s+\S+)*\s+(?:is|are|was|were|will|shall|must|does|did|has|have|becomes?|starts?|ends?)\b/iu
+  if (factTuple(subject) || cjkClause.test(object) || englishClause.test(object)) return undefined
   const effectiveDate = subject.match(/^(.{1,160}?)生效日期$/u)
   return {
     subject: normalizedTuplePart(effectiveDate?.[1] ?? subject),
@@ -572,19 +576,25 @@ export function validateKnowledgeAnswer(
   mode: KnowledgeSelection['mode'],
   repairAttempts: number,
 ): KnowledgeAnswerValidation {
+  const validatedAnswer = mode === 'mixed' && evidence.length === 0
+    ? answer.replace(KNOWLEDGE_MARKER_MATERIAL, '').trim()
+    : answer
+  if (mode === 'mixed' && evidence.length === 0 && !validatedAnswer) {
+    return { kind: 'insufficient', reason: 'no-evidence' }
+  }
   const admitted = new Set(evidence.map(item => item.id))
-  const citedEvidenceIds = [...answer.matchAll(KNOWLEDGE_MARKER)]
+  const citedEvidenceIds = [...validatedAnswer.matchAll(KNOWLEDGE_MARKER)]
     .map(match => match[1]!)
     .filter((id, index, values) => values.indexOf(id) === index)
   const invalidEvidenceIds = citedEvidenceIds.filter(id => !admitted.has(id))
-  if (invalidEvidenceIds.length > 0 || answer.includes('[[kb:') && citedEvidenceIds.length === 0) {
+  if (invalidEvidenceIds.length > 0 || validatedAnswer.includes('[[kb:') && citedEvidenceIds.length === 0) {
     const invalid = invalidEvidenceIds.length > 0 ? invalidEvidenceIds : ['malformed']
     return repairAttempts === 0
       ? { kind: 'repair', invalidEvidenceIds: invalid }
       : { kind: 'insufficient', reason: 'invalid-citation' }
   }
   const evidenceById = new Map(evidence.map(item => [item.id, item]))
-  const claimGroups = splitKnowledgeClaimGroups(answer).map((group) => {
+  const claimGroups = splitKnowledgeClaimGroups(validatedAnswer).map((group) => {
     const citedIds = group.fragments.flatMap(claim => [...claim.matchAll(KNOWLEDGE_MARKER)].map(match => match[1]!))
       .filter((id, index, values) => values.indexOf(id) === index)
     const commonSupportingIds = citedIds.filter((id) => {
