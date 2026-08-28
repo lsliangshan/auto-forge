@@ -29,6 +29,7 @@ describe('CloudBaseKnowledgeClient', () => {
     })
     expect(callFunction).toHaveBeenCalledWith({
       name: 'autoforge-knowledge',
+      signal: expect.any(AbortSignal),
       data: {
         action: 'pushMutation',
         mutationId: 'mutation_1',
@@ -71,6 +72,34 @@ describe('CloudBaseKnowledgeClient', () => {
     })
     await expect(regressed.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 5 }))
       .rejects.toMatchObject({ code: 'INTERNAL_ERROR', retryable: false })
+  })
+
+  it('aborts a never-settling function call at its deadline and clears the timer', async () => {
+    vi.useFakeTimers()
+    try {
+      let requestSignal: AbortSignal | undefined
+      const callFunction = vi.fn((options: { signal?: AbortSignal }) => {
+        requestSignal = options.signal
+        return new Promise<never>(() => undefined)
+      })
+      const client = new CloudBaseKnowledgeClient(
+        { callFunction },
+        'autoforge-knowledge',
+        { timeoutMs: 50 },
+      )
+
+      const request = client.getEntitlement()
+      const rejected = expect(request).rejects.toMatchObject({
+        code: 'TRANSIENT_FAILURE', retryable: true,
+      })
+      await vi.advanceTimersByTimeAsync(50)
+
+      await rejected
+      expect(requestSignal?.aborted).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps the previously published generation when publication fails', async () => {
@@ -144,7 +173,7 @@ describe('CloudBaseKnowledgeClient', () => {
       knowledgeBaseId: 'kb_1', generationId: 'generation_1', status: 'staging',
     })
     expect(callFunction).toHaveBeenCalledWith({
-      name: 'autoforge-knowledge', data: {
+      name: 'autoforge-knowledge', signal: expect.any(AbortSignal), data: {
         action: 'beginSync', requestId: 'begin_1', knowledgeBaseId: 'kb_1', name: 'Personal',
         revision: 'local_1', generationId: 'generation_1',
       },
@@ -166,7 +195,7 @@ describe('CloudBaseKnowledgeClient', () => {
     await expect(client.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 0 }))
       .resolves.toMatchObject({ nextSequence: 1000, hasMore: true })
     expect(callFunction).toHaveBeenNthCalledWith(1, {
-      name: 'autoforge-knowledge', data: {
+      name: 'autoforge-knowledge', signal: expect.any(AbortSignal), data: {
         action: 'pullChanges', knowledgeBaseId: 'kb_1', afterSequence: 0,
         limit: 512, maxBytes: 786_432,
       },
@@ -204,13 +233,13 @@ describe('CloudBaseKnowledgeClient', () => {
         ],
       })
     expect(callFunction).toHaveBeenNthCalledWith(1, {
-      name: 'autoforge-knowledge', data: {
+      name: 'autoforge-knowledge', signal: expect.any(AbortSignal), data: {
         action: 'fullResync', knowledgeBaseId: 'kb_1', snapshotId: null,
         afterOrdinal: 0, limit: 512, maxBytes: 786_432,
       },
     })
     expect(callFunction).toHaveBeenNthCalledWith(2, {
-      name: 'autoforge-knowledge', data: {
+      name: 'autoforge-knowledge', signal: expect.any(AbortSignal), data: {
         action: 'fullResync', knowledgeBaseId: 'kb_1', snapshotId: 'snapshot_1',
         afterOrdinal: 1, limit: 512, maxBytes: 786_432,
       },

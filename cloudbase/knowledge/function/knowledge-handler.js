@@ -1,4 +1,4 @@
-/* global Buffer, fetch, module, require, setTimeout, TextDecoder, URL */
+/* global AbortController, Buffer, clearTimeout, fetch, module, require, setTimeout, TextDecoder, URL */
 
 const { createHash } = require('node:crypto')
 
@@ -84,7 +84,7 @@ function boundedSuccess(data) {
   return envelope
 }
 
-async function readBoundedJson(response, allowEmpty = false) {
+async function readBoundedJson(response, allowEmpty = false, signal) {
   const contentLength = response?.headers?.get?.('content-length')
   if (contentLength !== undefined && contentLength !== null) {
     if (!/^\d+$/.test(contentLength) || Number(contentLength) > maximumResponseBytes) {
@@ -97,9 +97,16 @@ async function readBoundedJson(response, allowEmpty = false) {
     let bytes = 0
     let text = ''
     let complete = false
+    let abortListener
+    const aborted = new Promise((_, reject) => {
+      abortListener = () => reject({ code: 'TRANSIENT_FAILURE' })
+      if (!signal) return
+      if (signal.aborted) abortListener()
+      else signal.addEventListener('abort', abortListener, { once: true })
+    })
     try {
       while (true) {
-        const chunk = await reader.read()
+        const chunk = await (signal ? Promise.race([reader.read(), aborted]) : reader.read())
         if (!isRecord(chunk) || typeof chunk.done !== 'boolean') {
           throw { code: 'INTERNAL_ERROR' }
         }
@@ -117,8 +124,11 @@ async function readBoundedJson(response, allowEmpty = false) {
         && text.length === 0) return undefined
       return JSON.parse(text)
     } finally {
+      if (signal && abortListener) signal.removeEventListener('abort', abortListener)
       if (!complete && typeof reader.cancel === 'function') {
-        try { await reader.cancel() } catch { /* best-effort transport cleanup */ }
+        try { Promise.resolve(reader.cancel()).catch(() => undefined) } catch {
+          /* best-effort transport cleanup */
+        }
       }
       if (typeof reader.releaseLock === 'function') {
         try { reader.releaseLock() } catch { /* an already-closed reader is safe */ }
@@ -128,6 +138,44 @@ async function readBoundedJson(response, allowEmpty = false) {
   if (allowEmpty && (response?.status === 204 || response?.status === 205)
     && (!response?.body || typeof response.body.getReader !== 'function')) return undefined
   throw { code: 'INTERNAL_ERROR' }
+}
+
+function createNetworkDeadline(timeoutMs) {
+  const controller = new AbortController()
+  const effectiveTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 10_000
+  let timeoutId
+  const promise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort()
+      reject({ code: 'TRANSIENT_FAILURE' })
+    }, effectiveTimeoutMs)
+  })
+  return {
+    signal: controller.signal,
+    race: operation => Promise.race([operation, promise]),
+    dispose() {
+      clearTimeout(timeoutId)
+      controller.abort()
+    },
+  }
+}
+
+async function boundedPost({ url, headers, body, fetchImpl, timeoutMs, allowEmpty = false }) {
+  const deadline = createNetworkDeadline(timeoutMs)
+  try {
+    let response
+    try {
+      response = await deadline.race(fetchImpl(url, {
+        method: 'POST', headers, body: JSON.stringify(body), signal: deadline.signal,
+      }))
+    } catch {
+      throw { code: 'TRANSIENT_FAILURE' }
+    }
+    const result = await deadline.race(readBoundedJson(response, allowEmpty, deadline.signal))
+    return { response, result }
+  } finally {
+    deadline.dispose()
+  }
 }
 
 function isIsoDate(value) {
@@ -1086,24 +1134,18 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
 }
 
 function createPostgresStorageClient({
-  baseUrl, serviceKey, uploadUrlPrefix, fetchImpl = fetch,
+  baseUrl, serviceKey, uploadUrlPrefix, fetchImpl = fetch, timeoutMs = 10_000,
 }) {
   if (!baseUrl || !serviceKey || !uploadUrlPrefix) {
     throw new Error('CloudBase PostgreSQL Storage is not configured')
   }
   const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
   async function request(path, body, allowEmpty = false) {
-    let response
-    try {
-      response = await fetchImpl(`${normalizedBaseUrl}${path}`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-    } catch {
-      throw { code: 'TRANSIENT_FAILURE' }
-    }
-    const result = await readBoundedJson(response, allowEmpty)
+    const { response, result } = await boundedPost({
+      url: `${normalizedBaseUrl}${path}`,
+      headers: { authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json' },
+      body, fetchImpl, timeoutMs, allowEmpty,
+    })
     if (response.ok && (isRecord(result) || allowEmpty)) return result
     throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
   }
@@ -1124,21 +1166,15 @@ function createPostgresStorageClient({
   }
 }
 
-function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch }) {
+function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch, timeoutMs = 10_000 }) {
   if (!baseUrl || !serviceKey) throw new Error('CloudBase PostgreSQL RPC is not configured')
   const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
   return async (name, parameters) => {
-    let response
-    try {
-      response = await fetchImpl(`${normalizedBaseUrl}/rpc/${name}`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json' },
-        body: JSON.stringify(parameters),
-      })
-    } catch {
-      throw { code: 'TRANSIENT_FAILURE' }
-    }
-    const body = await readBoundedJson(response)
+    const { response, result: body } = await boundedPost({
+      url: `${normalizedBaseUrl}/rpc/${name}`,
+      headers: { authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json' },
+      body: parameters, fetchImpl, timeoutMs,
+    })
     if (response.ok && isRecord(body)) return body
     const code = safeErrorCode(body)
     if (code !== 'INTERNAL_ERROR') throw { code }
@@ -1146,7 +1182,7 @@ function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch }) {
   }
 }
 
-function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch }) {
+function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch, timeoutMs = 10_000 }) {
   let parsed
   try { parsed = new URL(endpoint) } catch { parsed = undefined }
   if (!parsed || parsed.protocol !== 'https:' || parsed.username || parsed.password
@@ -1173,20 +1209,14 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch }) {
         || !validAttemptIdentity(input)) {
         throw { code: 'INVALID_INPUT' }
       }
-      let response
-      try {
-        response = await fetchImpl(parsed.href, {
-          method: 'POST',
-          headers: {
-            authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
-            'idempotency-key': input.idempotencyKey,
-          },
-          body: JSON.stringify(input),
-        })
-      } catch {
-        throw { code: 'TRANSIENT_FAILURE' }
-      }
-      const body = await readBoundedJson(response)
+      const { response, result: body } = await boundedPost({
+        url: parsed.href,
+        headers: {
+          authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
+          'idempotency-key': input.idempotencyKey,
+        },
+        body: input, fetchImpl, timeoutMs,
+      })
       if (!response.ok || !exactKeys(body, ['model', 'dimensions', 'embedding'])
         || body.model !== fixedEmbeddingConfiguration.model
         || body.dimensions !== fixedEmbeddingConfiguration.dimensions
@@ -1201,20 +1231,14 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch }) {
       if (!exactKeys(input, [
         'model', 'dimensions', 'configurationVersion', 'region', 'idempotencyKey',
       ]) || !validAttemptIdentity(input)) throw { code: 'INVALID_INPUT' }
-      let response
-      try {
-        response = await fetchImpl(statusUrl.href, {
-          method: 'POST',
-          headers: {
-            authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
-            'idempotency-key': input.idempotencyKey,
-          },
-          body: JSON.stringify(input),
-        })
-      } catch {
-        throw { code: 'TRANSIENT_FAILURE' }
-      }
-      const body = await readBoundedJson(response)
+      const { response, result: body } = await boundedPost({
+        url: statusUrl.href,
+        headers: {
+          authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
+          'idempotency-key': input.idempotencyKey,
+        },
+        body: input, fetchImpl, timeoutMs,
+      })
       if (!response.ok || !isRecord(body)) {
         throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
       }

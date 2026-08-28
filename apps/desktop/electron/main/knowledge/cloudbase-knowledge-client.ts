@@ -1,7 +1,15 @@
 import { z } from 'zod'
 
 export interface CloudBaseFunctionPort {
-  callFunction(options: { name: string; data: Record<string, unknown> }): Promise<unknown>
+  callFunction(options: {
+    name: string
+    data: Record<string, unknown>
+    signal?: AbortSignal
+  }): Promise<unknown>
+}
+
+interface CloudBaseKnowledgeClientOptions {
+  timeoutMs?: number
 }
 
 export const cloudKnowledgeErrorCodes = [
@@ -174,6 +182,7 @@ export class CloudBaseKnowledgeClient {
   constructor(
     private readonly functions: CloudBaseFunctionPort,
     private readonly functionName = 'autoforge-knowledge',
+    private readonly options: CloudBaseKnowledgeClientOptions = {},
   ) {}
 
   async authorizeUpload(input: {
@@ -398,13 +407,31 @@ export class CloudBaseKnowledgeClient {
       throw new CloudKnowledgeError('INVALID_INPUT')
     }
     let response: unknown
+    const controller = new AbortController()
+    const timeoutMs = Number.isFinite(this.options.timeoutMs) && (this.options.timeoutMs ?? 0) > 0
+      ? this.options.timeoutMs as number
+      : 10_000
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort()
+        reject(new CloudKnowledgeError('TRANSIENT_FAILURE'))
+      }, timeoutMs)
+    })
     try {
-      response = await this.functions.callFunction({
-        name: this.functionName,
-        data: request,
-      })
+      response = await Promise.race([
+        this.functions.callFunction({
+          name: this.functionName,
+          data: request,
+          signal: controller.signal,
+        }),
+        deadline,
+      ])
     } catch {
       throw new CloudKnowledgeError('TRANSIENT_FAILURE')
+    } finally {
+      clearTimeout(timeoutId)
+      controller.abort()
     }
     if (wireBytes(response) > maximumKnowledgeWireBytes) {
       throw new CloudKnowledgeError('INTERNAL_ERROR')

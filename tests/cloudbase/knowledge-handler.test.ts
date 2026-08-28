@@ -240,6 +240,72 @@ describe('CloudBase knowledge function', () => {
     expect(parse).not.toHaveBeenCalled()
   })
 
+  it('aborts never-settling PostgreSQL RPC and Storage calls at their deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      const signals: AbortSignal[] = []
+      const fetchImpl = vi.fn((_url: string, init: { signal: AbortSignal }) => {
+        signals.push(init.signal)
+        return new Promise<never>(() => undefined)
+      })
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-only',
+        fetchImpl, timeoutMs: 50,
+      })
+      const storage = createPostgresStorageClient({
+        baseUrl: 'https://pg-storage.example/v1/storage', serviceKey: 'server-only',
+        uploadUrlPrefix: 'https://pg-storage.example/upload/', fetchImpl, timeoutMs: 50,
+      })
+
+      const rpcRequest = rpc('autoforge_knowledge_get_entitlement', { p_caller_user_id: '1' })
+      const storageRequest = storage.statObject('knowledge/1/kb_1/object_1')
+      const rpcRejected = expect(rpcRequest).rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
+      const storageRejected = expect(storageRequest).rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
+      await vi.advanceTimersByTimeAsync(50)
+
+      await rpcRejected
+      await storageRejected
+      expect(signals).toHaveLength(2)
+      expect(signals.every(signal => signal.aborted)).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('aborts and cancels a never-settling streamed response body', async () => {
+    vi.useFakeTimers()
+    try {
+      const cancel = vi.fn().mockResolvedValue(undefined)
+      const releaseLock = vi.fn()
+      let requestSignal: AbortSignal | undefined
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-only',
+        timeoutMs: 50,
+        fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => {
+          requestSignal = init.signal
+          return Promise.resolve({
+            ok: true, status: 200, headers: { get: vi.fn().mockReturnValue(null) },
+            body: { getReader: () => ({
+              read: vi.fn(() => new Promise<never>(() => undefined)), cancel, releaseLock,
+            }) },
+          })
+        }),
+      })
+      const request = rpc('autoforge_knowledge_get_entitlement', { p_caller_user_id: '1' })
+      const rejected = expect(request).rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
+      await vi.advanceTimersByTimeAsync(50)
+
+      await rejected
+      expect(requestSignal?.aborted).toBe(true)
+      expect(cancel).toHaveBeenCalledOnce()
+      expect(releaseLock).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('returns a consumable expiring PG Storage authorization and verifies uploaded bytes', async () => {
     const sha256 = 'a'.repeat(64)
     const objectId = expectedUploadObjectId()
@@ -555,6 +621,34 @@ describe('CloudBase embedding consent and retrieval', () => {
     })).toThrow('TokenHub is not configured')
   })
 
+  it('aborts a never-settling TokenHub request at its deadline and clears the timer', async () => {
+    vi.useFakeTimers()
+    try {
+      let requestSignal: AbortSignal | undefined
+      const tokenHub = createTokenHubClient({
+        endpoint: 'https://tokenhub.example/v1/embeddings', apiKey: 'server-only',
+        timeoutMs: 50,
+        fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => {
+          requestSignal = init.signal
+          return new Promise<never>(() => undefined)
+        }),
+      })
+      const request = tokenHub.embed({
+        input: '合同条款', model: embedding.model, dimensions: 1024,
+        configurationVersion: embedding.configurationVersion, region: 'guangzhou',
+        dispatchPermit: 'permit_1', idempotencyKey: 'embed_attempt_1',
+      })
+      const rejected = expect(request).rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
+      await vi.advanceTimersByTimeAsync(50)
+
+      await rejected
+      expect(requestSignal?.aborted).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('binds separate embedding consent to the trusted owner and deletes vectors on revocation', async () => {
     const rpc = vi.fn()
       .mockResolvedValueOnce({
@@ -716,6 +810,16 @@ describe('CloudBase embedding consent and retrieval', () => {
     expect(rpc.mock.calls.filter(([name]) => (
       name === 'autoforge_knowledge_issue_embedding_dispatch_permit'
     )).map(([, parameters]) => parameters.p_attempt_id)).toEqual([1, 2])
+    expect(rpc.mock.calls.filter(([name]) => (
+      name === 'autoforge_knowledge_record_embedding_dispatch_settlement_intent'
+    )).map(([, parameters]) => ({
+      attemptId: parameters.p_attempt_id,
+      outcome: parameters.p_outcome,
+      retryable: parameters.p_retryable,
+    }))).toEqual([
+      { attemptId: 1, outcome: 'failed', retryable: true },
+      { attemptId: 2, outcome: 'completed', retryable: false },
+    ])
   })
 
   it('recovers a durable completed attempt after the settle response is lost', async () => {
