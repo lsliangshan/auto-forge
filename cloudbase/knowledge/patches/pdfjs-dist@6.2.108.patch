@@ -1,0 +1,98 @@
+diff --git a/legacy/build/pdf.mjs b/legacy/build/pdf.mjs
+index 1529140e3b8a97c852c73a69802b331969447959..04fbabe874503b64a3585cd86a0d72468c952513 100644
+--- a/legacy/build/pdf.mjs
++++ b/legacy/build/pdf.mjs
+@@ -21564,6 +21564,7 @@ function getDocument(src = {}) {
+   const wasmUrl = getFactoryUrlProp(src.wasmUrl);
+   const ignoreErrors = src.stopAtErrors !== true;
+   const maxImageSize = Number.isInteger(src.maxImageSize) && src.maxImageSize > -1 ? src.maxImageSize : -1;
++  const maxDecodedStreamBytes = Number.isSafeInteger(src.maxDecodedStreamBytes) && src.maxDecodedStreamBytes > 0 ? src.maxDecodedStreamBytes : -1;
+   const isOffscreenCanvasSupported = typeof src.isOffscreenCanvasSupported === "boolean" ? src.isOffscreenCanvasSupported : !isNodeJS;
+   const isImageDecoderSupported = typeof src.isImageDecoderSupported === "boolean" ? src.isImageDecoderSupported : !isNodeJS;
+   const canvasMaxAreaInBytes = Number.isInteger(src.canvasMaxAreaInBytes) ? src.canvasMaxAreaInBytes : -1;
+@@ -21614,6 +21615,7 @@ function getDocument(src = {}) {
+     apiVersion: "6.2.108",
+     data,
+     password,
++    maxDecodedStreamBytes,
+     disableAutoFetch,
+     rangeChunkSize,
+     docBaseUrl,
+diff --git a/legacy/build/pdf.worker.mjs b/legacy/build/pdf.worker.mjs
+index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..6dcf222c8cdff261b808b46fc29b71675ec8757e 100644
+--- a/legacy/build/pdf.worker.mjs
++++ b/legacy/build/pdf.worker.mjs
+@@ -9373,4 +9373,16 @@ class ImageResizer {
+ const emptyBuffer = new Uint8Array(0);
++let maxDecodedStreamBytes = -1;
++let decodedStreamBytes = 0;
++function configureDecodedStreamBudget(value) {
++  maxDecodedStreamBytes = Number.isSafeInteger(value) && value > 0 ? value : -1;
++  decodedStreamBytes = 0;
++}
++function reserveDecodedStreamBytes(bytes) {
++  if (!Number.isSafeInteger(bytes) || bytes < 0 || maxDecodedStreamBytes > 0 && decodedStreamBytes + bytes > maxDecodedStreamBytes) {
++    throw new FormatError("PDF decoded stream limit exceeded");
++  }
++  decodedStreamBytes += bytes;
++}
+ class DecodeStream extends BaseStream {
+   buffer = emptyBuffer;
+   bufferLength = 0;
+@@ -9404,6 +9416,8 @@ class DecodeStream extends BaseStream {
+     while (size < requested) {
+       size *= 2;
+     }
++    const growth = size - buffer.byteLength;
++    reserveDecodedStreamBytes(growth);
+     const buffer2 = new Uint8Array(size);
+     buffer2.set(buffer);
+     return this.buffer = buffer2;
+@@ -9467,6 +9481,7 @@ class DecodeStream extends BaseStream {
+       const chunks = [];
+       let totalLength = 0;
+       for await (const chunk of readable) {
++        reserveDecodedStreamBytes(chunk.byteLength);
+         chunks.push(chunk);
+         totalLength += chunk.byteLength;
+       }
+@@ -9483,6 +9498,9 @@ class DecodeStream extends BaseStream {
+         compressed: bytes
+       };
+-    } catch {
++    } catch (error) {
++      if (error instanceof Error && error.message === "PDF decoded stream limit exceeded") {
++        throw error;
++      }
+       return {
+         decompressed: null,
+         compressed: bytes
+@@ -15001,6 +15019,7 @@ class BrotliStream extends DecodeStream {
+   readBlock() {
+     const bytes = this.stream.getBytes();
+     const decodedData = BrotliDecode(new Int8Array(bytes.buffer, bytes.byteOffset, bytes.length));
++    reserveDecodedStreamBytes(decodedData.length);
+     this.buffer = new Uint8Array(decodedData.buffer, decodedData.byteOffset, decodedData.length);
+     this.bufferLength = this.buffer.length;
+     this.eof = true;
+@@ -70364,6 +70383,7 @@ class WorkerMessageHandler {
+     handler.on("GetDocRequest", data => this.createDocumentHandler(data, port));
+   }
+   static createDocumentHandler(docParams, port) {
++    configureDecodedStreamBudget(docParams.maxDecodedStreamBytes);
+     let pdfManager;
+     let terminated = false;
+     let cancelXHRs = null;
+diff --git a/types/src/display/api.d.ts b/types/src/display/api.d.ts
+index f2d1391deca004617c8494118c3970c3bccaa588..2ca185eb06ef6bffeec18dda34bb04b8482094ef 100644
+--- a/types/src/display/api.d.ts
++++ b/types/src/display/api.d.ts
+@@ -121,6 +121,8 @@ export type DocumentInitParameters = {
+      * Use -1 for no limit, which is also the default value.
+      */
+     maxImageSize?: number | undefined;
++    /** Maximum cumulative decoded-stream buffer bytes before parsing fails closed. */
++    maxDecodedStreamBytes?: number | undefined;
+     /**
+      * - Determines if we can use
+      * `OffscreenCanvas` in the worker. Primarily used to improve performance of

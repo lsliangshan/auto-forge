@@ -1,9 +1,11 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { createSocket } from 'node:dgram'
+import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { deflateRawSync } from 'node:zlib'
+import { deflateRawSync, deflateSync } from 'node:zlib'
 import { describe, expect, it, vi } from 'vitest'
 import { createKnowledgeParserProcess } from '../../cloudbase/knowledge/worker/parser-process.js'
 import {
@@ -47,8 +49,12 @@ function docxDirectoryFixture(compressedBytes: number, expandedBytes: number): B
   return Buffer.concat([central, end])
 }
 
-function docxArchiveFixture(source: Buffer, declaredExpanded = source.byteLength): Buffer {
-  const name = Buffer.from('word/document.xml')
+function docxArchiveFixture(
+  source: Buffer,
+  declaredExpanded = source.byteLength,
+  entryName = 'word/document.xml',
+): Buffer {
+  const name = Buffer.from(entryName)
   const compressed = deflateRawSync(source)
   const local = Buffer.alloc(30 + name.byteLength)
   local.writeUInt32LE(0x04034b50, 0)
@@ -76,9 +82,43 @@ function docxArchiveFixture(source: Buffer, declaredExpanded = source.byteLength
   return Buffer.concat([local, compressed, central, end])
 }
 
+function pdfFixture(text: string, expandedPaddingBytes = 0): Buffer {
+  const content = Buffer.concat([
+    Buffer.alloc(expandedPaddingBytes, 0x20),
+    Buffer.from(`BT /F1 12 Tf 72 720 Td (${text.replace(/[()\\]/gu, '\\$&')}) Tj ET`, 'ascii'),
+  ])
+  const stream = deflateSync(content)
+  content.fill(0)
+  const objects = [
+    Buffer.from('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n', 'ascii'),
+    Buffer.from('2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n', 'ascii'),
+    Buffer.from('3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n', 'ascii'),
+    Buffer.from('4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n', 'ascii'),
+    Buffer.concat([
+      Buffer.from(`5 0 obj\n<< /Length ${stream.byteLength} /Filter /FlateDecode >>\nstream\n`, 'ascii'),
+      stream,
+      Buffer.from('\nendstream\nendobj\n', 'ascii'),
+    ]),
+  ]
+  const header = Buffer.from('%PDF-1.7\n%\xe2\xe3\xcf\xd3\n', 'latin1')
+  const offsets: number[] = []
+  let cursor = header.byteLength
+  for (const object of objects) {
+    offsets.push(cursor)
+    cursor += object.byteLength
+  }
+  const xrefOffset = cursor
+  const xref = Buffer.from([
+    'xref', '0 6', '0000000000 65535 f ',
+    ...offsets.map(offset => `${String(offset).padStart(10, '0')} 00000 n `),
+    'trailer', '<< /Size 6 /Root 1 0 R >>', 'startxref', String(xrefOffset), '%%EOF', '',
+  ].join('\n'), 'ascii')
+  return Buffer.concat([header, ...objects, xref])
+}
+
 describe('CloudBase knowledge scheduled worker', () => {
   it('ships a directly deployable CommonJS scheduled entry', async () => {
-    const [rootEntry, entry, childEntry, parserProcess, packageJson, childPackageJson]
+    const [rootEntry, entry, childEntry, parserProcess, packageJson, childPackageJson, deployLock]
       = await Promise.all([
       readFile(new URL('../../cloudbase/knowledge/index.js', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/worker/index.js', import.meta.url), 'utf8'),
@@ -86,12 +126,22 @@ describe('CloudBase knowledge scheduled worker', () => {
       readFile(new URL('../../cloudbase/knowledge/worker/parser-process.js', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/package.json', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/worker/package.json', import.meta.url), 'utf8'),
+      readFile(new URL('../../cloudbase/knowledge/pnpm-lock.yaml', import.meta.url), 'utf8'),
     ])
-    expect(JSON.parse(packageJson)).toMatchObject({ type: 'commonjs', main: 'index.js' })
-    expect(JSON.parse(childPackageJson)).toMatchObject({
-      type: 'commonjs', main: 'parser-child.js',
-      dependencies: { mammoth: '1.12.1', 'pdfjs-dist': '3.11.174' },
+    expect(JSON.parse(packageJson)).toMatchObject({
+      type: 'commonjs', main: 'index.js', engines: { node: '>=22.13.0 <27' },
+      packageManager: 'pnpm@11.15.0',
+      dependencies: { mammoth: '1.12.1', 'pdfjs-dist': '6.2.108' },
     })
+    expect(JSON.parse(childPackageJson)).toMatchObject({
+      type: 'commonjs', main: 'parser-child.js', engines: { node: '>=22.13.0 <27' },
+      dependencies: { mammoth: '1.12.1', 'pdfjs-dist': '6.2.108' },
+    })
+    expect(deployLock).toContain('lockfileVersion:')
+    expect(deployLock).toContain('pdfjs-dist@6.2.108')
+    expect(deployLock).toContain('patch_hash=')
+    expect(deployLock).toContain('mammoth@1.12.1')
+    expect(deployLock).not.toContain('pdfjs-dist@3.11.174')
     expect(JSON.parse(packageJson).dependencies).not.toEqual(expect.objectContaining({
       'autoforge-knowledge': expect.anything(),
     }))
@@ -134,11 +184,15 @@ describe('CloudBase knowledge scheduled worker', () => {
       expect(firstBytes.every(byte => byte === 0)).toBe(true)
       expect(secondBytes.every(byte => byte === 0)).toBe(true)
       expect(launches).toHaveLength(2)
-      expect(launches[0]?.command).toBe(process.execPath)
+      expect(launches[0]?.command).toBe('/usr/bin/sandbox-exec')
       expect(launches[0]?.args).toEqual(expect.arrayContaining([
+        '-p',
+        expect.stringContaining('(deny network*)'),
+        process.execPath,
+        '--permission',
+        '--no-addons',
         '--max-old-space-size=128',
         expect.stringMatching(/parser-child\.js$/u),
-        '--max-rss-bytes=201326592',
       ]))
       expect(launches[0]?.options).toMatchObject({
         env: { AUTOFORGE_PARSER_CHILD: '1' },
@@ -149,6 +203,148 @@ describe('CloudBase knowledge scheduled worker', () => {
       if (previousCredential === undefined) delete process.env.AUTOFORGE_PG_SERVICE_KEY
       else process.env.AUTOFORGE_PG_SERVICE_KEY = previousCredential
     }
+  })
+
+  it('fails closed before spawn when the runtime has no approved OS sandbox', () => {
+    const spawnImpl = vi.fn()
+    expect(() => createKnowledgeParserProcess({
+      runtimePlatform: 'linux', spawnImpl,
+    })).toThrow('Knowledge parser process is not configured')
+    expect(() => createKnowledgeParserProcess({
+      runtimeNodeVersion: '21.7.3', spawnImpl,
+    })).toThrow('Knowledge parser process is not configured')
+    expect(() => createKnowledgeParserProcess({
+      runtimeNodeVersion: '22.12.0', spawnImpl,
+    })).toThrow('Knowledge parser process is not configured')
+    expect(() => createKnowledgeParserProcess({
+      runtimeNodeVersion: '27.0.0', spawnImpl,
+    })).toThrow('Knowledge parser process is not configured')
+    expect(spawnImpl).not.toHaveBeenCalled()
+  })
+
+  it('denies real network, file, parent-process, child-process, and native-addon syscalls', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-parser-sandbox-secret-'))
+    const secretPath = join(directory, 'parent-secret.node')
+    await writeFile(secretPath, 'parent credential material', 'utf8')
+    const tcp = createServer(socket => socket.destroy())
+    const udp = createSocket('udp4')
+    let tcpConnections = 0
+    let udpPackets = 0
+    tcp.on('connection', () => { tcpConnections += 1 })
+    udp.on('message', () => { udpPackets += 1 })
+    await Promise.all([
+      new Promise<void>((resolve, reject) => {
+        tcp.once('error', reject)
+        tcp.listen(0, '127.0.0.1', resolve)
+      }),
+      new Promise<void>((resolve, reject) => {
+        udp.once('error', reject)
+        udp.bind(0, '127.0.0.1', resolve)
+      }),
+    ])
+    const tcpPort = (tcp.address() as { port: number }).port
+    const udpPort = (udp.address() as { port: number }).port
+    try {
+      await withParserChild(`
+        const fs = require('node:fs')
+        const net = require('node:net')
+        const http = require('node:http')
+        const { Resolver } = require('node:dns').promises
+        const childProcess = require('node:child_process')
+        const results = { scrubbedEnv: process.env.PARENT_PARSER_SECRET === undefined }
+        try { fs.readFileSync(${JSON.stringify(secretPath)}); results.fileDenied = false }
+        catch (error) { results.fileDenied = ['ERR_ACCESS_DENIED', 'EPERM', 'EACCES'].includes(error.code) }
+        try { fs.readFileSync('/proc/' + process.ppid + '/environ'); results.procDenied = false }
+        catch (error) { results.procDenied = ['ERR_ACCESS_DENIED', 'EPERM', 'EACCES', 'ENOENT'].includes(error.code) }
+        try { childProcess.spawnSync('/usr/bin/true'); results.childProcessDenied = false }
+        catch (error) { results.childProcessDenied = ['ERR_ACCESS_DENIED', 'EPERM', 'EACCES'].includes(error.code) }
+        try { process.kill(process.ppid, 0); results.parentSignalDenied = false }
+        catch (error) { results.parentSignalDenied = ['EPERM', 'EACCES'].includes(error.code) }
+        try { require(${JSON.stringify(secretPath)}); results.nativeAddonDenied = false }
+        catch (error) { results.nativeAddonDenied = ['ERR_ACCESS_DENIED', 'ERR_DLOPEN_DISABLED', 'EPERM', 'EACCES'].includes(error.code) }
+        const networkAttempt = (start) => new Promise(resolve => {
+          let settled = false
+          const finish = denied => { if (!settled) { settled = true; resolve(denied) } }
+          try { start(finish) } catch { finish(true) }
+          setTimeout(() => finish(false), 200)
+        })
+        async function main() {
+          results.netDenied = await networkAttempt(finish => {
+            const socket = new net.Socket()
+            socket.once('connect', () => { socket.destroy(); finish(false) })
+            socket.once('error', () => finish(true))
+            socket.connect(${tcpPort}, '127.0.0.1')
+          })
+          results.httpDenied = await networkAttempt(finish => {
+            const request = new http.ClientRequest({ host: '127.0.0.1', port: ${tcpPort}, path: '/' })
+            request.once('response', () => finish(false))
+            request.once('error', () => finish(true))
+            request.end()
+          })
+          results.dnsDenied = await networkAttempt(finish => {
+            const resolver = new Resolver()
+            resolver.setServers(['127.0.0.1:${udpPort}'])
+            resolver.resolve4('secret.invalid').then(() => finish(false), () => finish(true))
+          })
+          const body = Buffer.from(JSON.stringify({ ok: true, result: results }))
+          const prefix = Buffer.alloc(4); prefix.writeUInt32BE(body.length)
+          process.stdout.write(Buffer.concat([prefix, body]))
+        }
+        process.stdin.resume()
+        process.stdin.on('end', () => void main())
+      `, async (childEntry) => {
+        const previous = process.env.PARENT_PARSER_SECRET
+        process.env.PARENT_PARSER_SECRET = 'must-not-cross-boundary'
+        try {
+          const parser = createKnowledgeParserProcess({ childEntry, timeoutMs: 2_000 })
+          const result = await parser.parse({
+            bytes: Buffer.from('sandbox probe'),
+            mimeType: 'text/plain', versionId: 'sandbox_probe',
+          })
+          expect(result).toEqual({
+            scrubbedEnv: true,
+            fileDenied: true,
+            procDenied: true,
+            childProcessDenied: true,
+            parentSignalDenied: true,
+            nativeAddonDenied: true,
+            netDenied: true,
+            httpDenied: true,
+            dnsDenied: true,
+          })
+          expect(tcpConnections).toBe(0)
+          expect(udpPackets).toBe(0)
+        } finally {
+          if (previous === undefined) delete process.env.PARENT_PARSER_SECRET
+          else process.env.PARENT_PARSER_SECRET = previous
+        }
+      })
+    } finally {
+      await Promise.all([
+        new Promise<void>(resolve => tcp.close(() => resolve())),
+        new Promise<void>(resolve => udp.close(() => resolve())),
+      ])
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('kills a child whose external-memory RSS crosses the parent-owned ceiling', async () => {
+    await withParserChild(`
+      process.stdin.resume()
+      process.stdin.on('end', () => {
+        const external = Buffer.alloc(256 * 1024 * 1024, 1)
+        const until = Date.now() + 1_000
+        while (Date.now() < until) external[0] = (external[0] + 1) & 255
+        const body = Buffer.from(JSON.stringify({ ok: true, result: { escaped: true } }))
+        const prefix = Buffer.alloc(4); prefix.writeUInt32BE(body.length)
+        process.stdout.write(Buffer.concat([prefix, body]))
+      })
+    `, async (childEntry) => {
+      const parser = createKnowledgeParserProcess({ childEntry, timeoutMs: 3_000 })
+      await expect(parser.parse({
+        bytes: Buffer.from('memory probe'), mimeType: 'text/plain', versionId: 'memory_probe',
+      })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    })
   })
 
   it('rejects an oversized input before spawning and zeroes its source bytes', async () => {
@@ -607,6 +803,50 @@ describe('CloudBase knowledge scheduled worker', () => {
     expect(extractRawText).not.toHaveBeenCalled()
   })
 
+  it('rejects DOCX entity declarations before invoking Mammoth', async () => {
+    const extractRawText = vi.fn().mockResolvedValue({ value: 'must not parse' })
+    const parser = createKnowledgeParser({ loadMammoth: () => ({ extractRawText }) })
+
+    await expect(parser.parse({
+      bytes: docxArchiveFixture(Buffer.from(
+        '<!DOCTYPE w:document [<!ENTITY secret SYSTEM "file:///etc/passwd">]><w:document>&secret;</w:document>',
+      )),
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      versionId: 'version_docx_entity',
+    })).rejects.toEqual({ code: 'PARSER_FAILED' })
+    expect(extractRawText).not.toHaveBeenCalled()
+  })
+
+  it('rejects entity declarations in DOCX relationship XML before invoking Mammoth', async () => {
+    const extractRawText = vi.fn().mockResolvedValue({ value: 'must not parse' })
+    const parser = createKnowledgeParser({ loadMammoth: () => ({ extractRawText }) })
+
+    await expect(parser.parse({
+      bytes: docxArchiveFixture(Buffer.from(
+        '<!DOCTYPE Relationships [<!ENTITY secret SYSTEM "file:///etc/passwd">]><Relationships>&secret;</Relationships>',
+      ), undefined, '_rels/.rels'),
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      versionId: 'version_docx_relationship_entity',
+    })).rejects.toEqual({ code: 'PARSER_FAILED' })
+    expect(extractRawText).not.toHaveBeenCalled()
+  })
+
+  it('disables Mammoth external file access after bounded DOCX preflight', async () => {
+    const extractRawText = vi.fn().mockResolvedValue({ value: 'bounded text' })
+    const parser = createKnowledgeParser({ loadMammoth: () => ({ extractRawText }) })
+    const bytes = docxArchiveFixture(Buffer.from('<w:document><w:p><w:r><w:t>bounded text</w:t></w:r></w:p></w:document>'))
+
+    await expect(parser.parse({
+      bytes,
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      versionId: 'version_docx_bounded',
+    })).resolves.toMatchObject({ blocks: [expect.objectContaining({ body: 'bounded text' })] })
+    expect(extractRawText).toHaveBeenCalledWith(
+      { buffer: bytes },
+      { externalFileAccess: false },
+    )
+  })
+
   it('rejects an excessive PDF page count before loading the first page', async () => {
     const document = {
       numPages: 1001,
@@ -628,8 +868,22 @@ describe('CloudBase knowledge scheduled worker', () => {
 
   it('stops PDF text accumulation at its byte ceiling before reading another page', async () => {
     const body = 'a'.repeat(8 * 1024 * 1024)
+    const cancellations: Array<ReturnType<typeof vi.fn>> = []
+    const cleanups: Array<ReturnType<typeof vi.fn>> = []
     const getPage = vi.fn().mockImplementation(async () => ({
-      getTextContent: async () => ({ items: [{ str: body }] }),
+      streamTextContent: () => {
+        const cancel = vi.fn().mockResolvedValue(undefined)
+        cancellations.push(cancel)
+        let read = false
+        return { getReader: () => ({
+          read: vi.fn(async () => read
+            ? { done: true, value: undefined }
+            : (read = true, { done: false, value: { items: [{ str: body }] } })),
+          cancel,
+          releaseLock: vi.fn(),
+        }) }
+      },
+      cleanup: (() => { const cleanup = vi.fn(); cleanups.push(cleanup); return cleanup })(),
     }))
     const document = {
       numPages: 3,
@@ -646,7 +900,83 @@ describe('CloudBase knowledge scheduled worker', () => {
       bytes: Buffer.from('%PDF fixture'), mimeType: 'application/pdf', versionId: 'version_pdf',
     })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
     expect(getPage).toHaveBeenCalledTimes(2)
+    expect(cancellations[1]).toHaveBeenCalledOnce()
+    expect(cleanups.every(cleanup => cleanup.mock.calls.length === 1)).toBe(true)
     expect(document.destroy).toHaveBeenCalledOnce()
+  })
+
+  it('cleans up a loaded PDF page when its text stream is malformed', async () => {
+    const cleanup = vi.fn()
+    const document = {
+      numPages: 1,
+      getPage: vi.fn().mockResolvedValue({
+        streamTextContent: () => ({ malformed: true }), cleanup,
+      }),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    }
+    const parser = createKnowledgeParser({
+      loadPdfjs: () => ({ getDocument: () => ({ promise: Promise.resolve(document) }) }),
+    })
+
+    await expect(parser.parse({
+      bytes: Buffer.from('%PDF malformed stream'),
+      mimeType: 'application/pdf', versionId: 'version_pdf_malformed_stream',
+    })).rejects.toEqual({ code: 'PARSER_FAILED' })
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(document.destroy).toHaveBeenCalledOnce()
+  })
+
+  it('uses streamed PDF text with all active-content and external-resource features disabled', async () => {
+    const getDocument = vi.fn(() => ({ promise: Promise.resolve({
+      numPages: 1,
+      getPage: vi.fn(async () => ({
+        streamTextContent: () => ({ getReader: () => {
+          let read = false
+          return {
+            read: vi.fn(async () => read
+              ? { done: true, value: undefined }
+              : (read = true, { done: false, value: { items: [{ str: 'safe PDF text' }] } })),
+            cancel: vi.fn(), releaseLock: vi.fn(),
+          }
+        } }),
+        cleanup: vi.fn(),
+      })),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    }) }))
+    const parser = createKnowledgeParser({ loadPdfjs: () => ({ getDocument }) })
+
+    await expect(parser.parse({
+      bytes: Buffer.from('%PDF malicious fixture'),
+      mimeType: 'application/pdf', versionId: 'version_pdf_safe',
+    })).resolves.toMatchObject({ blocks: [expect.objectContaining({ body: 'safe PDF text' })] })
+    expect(getDocument).toHaveBeenCalledWith(expect.objectContaining({
+      maxDecodedStreamBytes: 64 * 1024 * 1024,
+      stopAtErrors: true,
+      maxImageSize: 0,
+      canvasMaxAreaInBytes: 0,
+      isEvalSupported: false,
+      disableFontFace: true,
+      enableXfa: false,
+      useWasm: false,
+      useWorkerFetch: false,
+      disableAutoFetch: true,
+      disableStream: true,
+      disableRange: true,
+    }))
+    expect(getDocument.mock.calls[0]?.[0]).not.toHaveProperty('url')
+    expect(getDocument.mock.calls[0]?.[0]).not.toHaveProperty('cMapUrl')
+    expect(getDocument.mock.calls[0]?.[0]).not.toHaveProperty('standardFontDataUrl')
+    expect(getDocument.mock.calls[0]?.[0]).not.toHaveProperty('wasmUrl')
+  })
+
+  it('rejects an actual one-page decoded-stream bomb under the patched PDF.js budget', async () => {
+    const parser = createKnowledgeParser()
+    const bytes = pdfFixture('must not escape', 64 * 1024 * 1024)
+    expect(bytes.byteLength).toBeLessThan(128 * 1024)
+
+    await expect(parser.parse({
+      bytes, mimeType: 'application/pdf', versionId: 'version_pdf_bomb',
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
   })
 
   it('bounds text blocks and serialized parser response while accumulating', async () => {

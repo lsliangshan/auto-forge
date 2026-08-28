@@ -1,6 +1,7 @@
-/* global AbortSignal, Buffer, __dirname, clearTimeout, module, process, require, setTimeout */
+/* global AbortSignal, Buffer, __dirname, clearInterval, clearTimeout, module, process, require, setInterval, setTimeout */
 
-const { spawn } = require('node:child_process')
+const { execFile, spawn } = require('node:child_process')
+const { existsSync, realpathSync, statSync } = require('node:fs')
 const { isAbsolute, resolve } = require('node:path')
 
 const MAX_INPUT_BYTES = 64 * 1024 * 1024
@@ -11,7 +12,11 @@ const DEFAULT_TIMEOUT_MS = 110_000
 const MAX_TIMEOUT_MS = 119_000
 const MAX_OLD_SPACE_MB = 128
 const MAX_RSS_BYTES = 192 * 1024 * 1024
-const childEntryDefault = resolve(__dirname, 'parser-child.js')
+const RSS_POLL_MS = 10
+const MAX_RSS_READ_FAILURES = 2
+const SANDBOX_EXECUTABLE = '/usr/bin/sandbox-exec'
+const PS_EXECUTABLE = '/bin/ps'
+const childEntryDefault = realpathSync(resolve(__dirname, 'parser-child.js'))
 const parserCodes = new Set([
   'INVALID_INPUT', 'PARSER_FAILED', 'PARSER_LIMIT_EXCEEDED',
   'PARSER_UNSUPPORTED_FORMAT', 'TRANSIENT_FAILURE',
@@ -45,6 +50,73 @@ function signalLike(value) {
       && typeof value.removeEventListener === 'function')
 }
 
+function executableFile(path) {
+  try {
+    return isAbsolute(path) && existsSync(path) && statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
+function supportedNodeVersion(value) {
+  if (typeof value !== 'string') return false
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[+-]|$)/u.exec(value)
+  if (!match) return false
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  return Number.isSafeInteger(major) && Number.isSafeInteger(minor)
+    && major >= 22 && major < 27 && (major !== 22 || minor >= 13)
+}
+
+function sandboxLiteral(value) {
+  return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
+}
+
+function sandboxProfile(nodeExecutable) {
+  return [
+    '(version 1)',
+    '(allow default)',
+    '(deny network*)',
+    '(deny process-fork)',
+    '(deny signal)',
+    `(deny process-exec (require-not (literal "${sandboxLiteral(nodeExecutable)}")))`,
+    '(deny file-write*)',
+  ].join(' ')
+}
+
+function permittedReadArguments(childEntry) {
+  const paths = [childEntry]
+  if (childEntry === childEntryDefault) {
+    paths.push(
+      resolve(__dirname, 'knowledge-worker.js'),
+      resolve(__dirname, 'package.json'),
+      resolve(__dirname, '..', 'package.json'),
+      resolve(__dirname, '..', 'node_modules'),
+    )
+  }
+  return paths.map(path => `--allow-fs-read=${path}`)
+}
+
+function residentBytes(pid) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(PS_EXECUTABLE, ['-o', 'rss=', '-p', String(pid)], {
+      env: {}, encoding: 'utf8', maxBuffer: 1_024, timeout: 1_000, windowsHide: true,
+    }, (error, stdout) => {
+      const value = typeof stdout === 'string' ? stdout.trim() : ''
+      if (error || !/^\d+$/u.test(value)) {
+        rejectPromise(error ?? new Error('Invalid RSS response'))
+        return
+      }
+      const kibibytes = Number(value)
+      if (!Number.isSafeInteger(kibibytes) || kibibytes < 1) {
+        rejectPromise(new Error('Invalid RSS response'))
+        return
+      }
+      resolvePromise(kibibytes * 1_024)
+    })
+  })
+}
+
 function decodeResponse(bytes, maximumResponseBytes) {
   if (!Buffer.isBuffer(bytes) || bytes.byteLength < 4) throw failure('PARSER_FAILED')
   const frameLength = bytes.readUInt32BE(0)
@@ -73,14 +145,26 @@ function createKnowledgeParserProcess({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   maximumInputBytes = MAX_INPUT_BYTES,
   maximumResponseBytes = MAX_RESPONSE_BYTES,
+  runtimePlatform = process.platform,
+  runtimeNodeVersion = process.versions.node,
 } = {}) {
+  const nodeExecutable = process.execPath
   if (!nonEmptyString(childEntry, 4_096) || !isAbsolute(childEntry)
     || typeof spawnImpl !== 'function'
+    || runtimePlatform !== 'darwin' || !supportedNodeVersion(runtimeNodeVersion)
+    || !executableFile(SANDBOX_EXECUTABLE) || !executableFile(PS_EXECUTABLE)
+    || !executableFile(nodeExecutable)
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS
     || !Number.isSafeInteger(maximumInputBytes)
     || maximumInputBytes < 1 || maximumInputBytes > MAX_INPUT_BYTES
     || !Number.isSafeInteger(maximumResponseBytes)
     || maximumResponseBytes < 32 || maximumResponseBytes > MAX_RESPONSE_BYTES) {
+    throw new Error('Knowledge parser process is not configured')
+  }
+  let canonicalChildEntry
+  try {
+    canonicalChildEntry = realpathSync(childEntry)
+  } catch {
     throw new Error('Knowledge parser process is not configured')
   }
 
@@ -121,11 +205,17 @@ function createKnowledgeParserProcess({
         try {
           const environment = { AUTOFORGE_PARSER_CHILD: '1' }
           if (process.versions.electron) environment.ELECTRON_RUN_AS_NODE = '1'
-          child = spawnImpl(process.execPath, [
+          child = spawnImpl(SANDBOX_EXECUTABLE, [
+            '-p', sandboxProfile(nodeExecutable),
+            nodeExecutable,
+            '--permission',
+            '--no-addons',
+            '--preserve-symlinks-main',
+            ...permittedReadArguments(canonicalChildEntry),
             `--max-old-space-size=${MAX_OLD_SPACE_MB}`,
-            childEntry,
-            `--max-rss-bytes=${MAX_RSS_BYTES}`,
+            canonicalChildEntry,
           ], {
+            cwd: __dirname,
             env: environment,
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
@@ -139,12 +229,17 @@ function createKnowledgeParserProcess({
         let settled = false
         let stopping
         let timeoutId
+        let rssTimer
+        let rssChecking = false
+        let rssReadFailures = 0
+        let childExited = false
         let responseLength = 0
         let stderrLength = 0
         const responseChunks = []
 
         const cleanup = () => {
           clearTimeout(timeoutId)
+          clearInterval(rssTimer)
           signal?.removeEventListener('abort', onAbort)
           bytes.fill(0)
           child.stdin?.destroy()
@@ -173,6 +268,39 @@ function createKnowledgeParserProcess({
         timeoutId = setTimeout(() => stop(failure('TRANSIENT_FAILURE')), timeoutMs)
         if (typeof timeoutId.unref === 'function') timeoutId.unref()
 
+        const childPid = child.pid
+        const checkRss = async () => {
+          if (settled || stopping || rssChecking) return
+          if (!Number.isSafeInteger(childPid) || childPid < 1) {
+            stop(failure('PARSER_FAILED'))
+            return
+          }
+          rssChecking = true
+          try {
+            const rss = await residentBytes(childPid)
+            rssReadFailures = 0
+            if (!settled && !stopping && rss > MAX_RSS_BYTES) {
+              stop(failure('PARSER_LIMIT_EXCEEDED'))
+            }
+          } catch {
+            if (settled || stopping || childExited
+              || child.exitCode !== null || child.signalCode !== null) return
+            try {
+              process.kill(childPid, 0)
+            } catch (error) {
+              if (error?.code === 'ESRCH') return
+            }
+            rssReadFailures += 1
+            if (rssReadFailures >= MAX_RSS_READ_FAILURES) stop(failure('PARSER_FAILED'))
+          } finally {
+            rssChecking = false
+          }
+        }
+        rssTimer = setInterval(() => void checkRss(), RSS_POLL_MS)
+        if (typeof rssTimer.unref === 'function') rssTimer.unref()
+        void checkRss()
+
+        child.once('exit', () => { childExited = true })
         child.once('error', () => {
           if (!stopping) stopping = failure('PARSER_FAILED')
           bytes.fill(0)

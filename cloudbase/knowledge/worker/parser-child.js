@@ -1,4 +1,4 @@
-/* global Buffer, clearInterval, process, require, setInterval */
+/* global Buffer, process, require */
 
 const { createKnowledgeParser } = require('./knowledge-worker.js')
 
@@ -35,18 +35,6 @@ function safeCode(error) {
   return isRecord(error) && parserCodes.has(error.code) ? error.code : 'PARSER_FAILED'
 }
 
-function configuredMaximumRss() {
-  const value = process.argv.find(argument => argument.startsWith('--max-rss-bytes='))
-  const encoded = value?.slice('--max-rss-bytes='.length) ?? ''
-  if (!/^\d+$/u.test(encoded)) throw failure('PARSER_FAILED')
-  const maximum = Number(encoded)
-  if (!Number.isSafeInteger(maximum)
-    || maximum < 64 * 1024 * 1024 || maximum > 512 * 1024 * 1024) {
-    throw failure('PARSER_FAILED')
-  }
-  return maximum
-}
-
 function assertScrubbedEnvironment() {
   if (process.env.AUTOFORGE_PARSER_CHILD !== '1') throw failure('PARSER_FAILED')
   for (const [key, value] of Object.entries(process.env)) {
@@ -57,29 +45,6 @@ function assertScrubbedEnvironment() {
     if (value !== undefined) {
       throw failure('PARSER_FAILED')
     }
-  }
-}
-
-function blockNetwork() {
-  const denied = () => { throw failure('PARSER_FAILED') }
-  const methods = new Map([
-    ['node:net', ['connect', 'createConnection', 'createServer']],
-    ['node:tls', ['connect', 'createServer']],
-    ['node:http', ['get', 'request', 'createServer']],
-    ['node:https', ['get', 'request', 'createServer']],
-    ['node:http2', ['connect', 'createServer', 'createSecureServer']],
-    ['node:dgram', ['createSocket']],
-    ['node:dns', ['lookup', 'resolve']],
-  ])
-  for (const [name, blocked] of methods) {
-    const module = require(name)
-    for (const method of blocked) {
-      if (typeof module[method] === 'function') module[method] = denied
-    }
-  }
-  globalThis.fetch = denied
-  globalThis.WebSocket = class DisabledWebSocket {
-    constructor() { denied() }
   }
 }
 
@@ -165,22 +130,10 @@ function writeEnvelope(envelope) {
 
 async function main() {
   let request
-  let memoryTimer
   try {
     assertScrubbedEnvironment()
-    blockNetwork()
-    const maximumRss = configuredMaximumRss()
-    const checkMemory = () => {
-      if (process.memoryUsage().rss > maximumRss) throw failure('PARSER_LIMIT_EXCEEDED')
-    }
-    memoryTimer = setInterval(() => {
-      if (process.memoryUsage().rss > maximumRss) process.exit(70)
-    }, 25)
-    if (typeof memoryTimer.unref === 'function') memoryTimer.unref()
     request = await readRequest()
-    checkMemory()
     const result = await createKnowledgeParser().parse(request)
-    checkMemory()
     await writeEnvelope({ ok: true, result })
   } catch (error) {
     try {
@@ -189,7 +142,6 @@ async function main() {
       process.exitCode = 1
     }
   } finally {
-    clearInterval(memoryTimer)
     request?.bytes.fill(0)
   }
 }

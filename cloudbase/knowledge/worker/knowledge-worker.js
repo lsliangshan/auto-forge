@@ -1,7 +1,7 @@
 /* global AbortController, Buffer, clearTimeout, fetch, module, require, setTimeout, TextDecoder, URL */
 
 const { createHash, randomUUID } = require('node:crypto')
-const { inflateRawSync } = require('node:zlib')
+const { createInflateRaw } = require('node:zlib')
 
 const MAX_JOBS_PER_RUN = 8
 const LEASE_SECONDS = 600
@@ -13,9 +13,10 @@ const DEFAULT_SETTLEMENT_RESERVE_MS = 5_000
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024
 const MAX_INDEX_BYTES = 786_432
 const MAX_ITEMS = 10_000
-const MAX_DOCX_EXPANDED_BYTES = 32 * 1024 * 1024
+const MAX_DOCX_EXPANDED_BYTES = 16 * 1024 * 1024
 const MAX_DOCX_COMPRESSION_RATIO = 100
 const MAX_PDF_PAGES = 1_000
+const MAX_PDF_TEXT_ITEMS = 100_000
 const MAX_TEXT_BYTES = 16 * 1024 * 1024
 const PARSER_VERSION = 'autoforge-cloud-parser-v1'
 const terminalCodes = new Set([
@@ -48,6 +49,20 @@ function safeCode(error) {
   const code = isRecord(error) && typeof error.code === 'string' ? error.code : ''
   if (code === 'TRANSIENT_FAILURE' || terminalCodes.has(code)) return code
   return 'INTERNAL_ERROR'
+}
+
+async function loadTextOnlyPdfjs() {
+  if (!globalThis.DOMMatrix) {
+    globalThis.DOMMatrix = class TextOnlyDOMMatrix {
+      constructor(value) {
+        if (value !== undefined) throw new Error('PDF rendering is disabled')
+        this.a = this.d = 1
+        this.b = this.c = this.e = this.f = 0
+        this.is2D = true
+      }
+    }
+  }
+  return await import('pdfjs-dist/legacy/build/pdf.mjs')
 }
 
 function validStorageReference(value) {
@@ -432,9 +447,17 @@ function docxArchiveEntries(bytes) {
         || expanded > compressed * MAX_DOCX_COMPRESSION_RATIO))) {
       throw { code: 'PARSER_LIMIT_EXCEEDED' }
     }
+    const name = bytes.subarray(cursor + 46, cursor + 46 + nameLength)
+    let decodedName
+    try { decodedName = new TextDecoder('utf-8', { fatal: true }).decode(name) } catch {
+      throw { code: 'PARSER_FAILED' }
+    }
+    if (!decodedName || decodedName.includes('\0') || decodedName.includes('\\')
+      || decodedName.startsWith('/') || decodedName.split('/').includes('..')) {
+      throw { code: 'PARSER_FAILED' }
+    }
     entries.push({
-      compressed, expanded, flags, localOffset, method,
-      name: bytes.subarray(cursor + 46, cursor + 46 + nameLength),
+      compressed, expanded, flags, localOffset, method, name, decodedName,
     })
     cursor = next
   }
@@ -442,7 +465,15 @@ function docxArchiveEntries(bytes) {
   return { centralOffset, entries }
 }
 
-function assertDocxArchiveLimits(bytes) {
+function assertNoXmlEntityDeclarations(scanner, chunk) {
+  const value = `${scanner.tail}${chunk.toString('latin1')}`.toUpperCase()
+  if (value.includes('<!DOCTYPE') || value.includes('<!ENTITY')) {
+    throw { code: 'PARSER_FAILED' }
+  }
+  scanner.tail = value.slice(-32)
+}
+
+async function assertDocxArchiveLimits(bytes) {
   const { centralOffset, entries } = docxArchiveEntries(bytes)
   let actualExpandedBytes = 0
   for (const entry of entries) {
@@ -462,34 +493,45 @@ function assertDocxArchiveLimits(bytes) {
       || !bytes.subarray(nameStart, nameStart + nameLength).equals(entry.name)) {
       throw { code: 'PARSER_FAILED' }
     }
+    const scanner = { tail: '' }
+    const inspectChunk = (raw) => {
+      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
+      actualExpandedBytes += chunk.byteLength
+      if (actualExpandedBytes > MAX_DOCX_EXPANDED_BYTES) {
+        throw { code: 'PARSER_LIMIT_EXCEEDED' }
+      }
+      const normalizedName = entry.decodedName.toLowerCase()
+      if (normalizedName.endsWith('.xml') || normalizedName.endsWith('.rels')) {
+        assertNoXmlEntityDeclarations(scanner, chunk)
+      }
+    }
+    let entryExpandedBytes = 0
     if (entry.method === 0) {
       if (entry.compressed !== entry.expanded) throw { code: 'PARSER_FAILED' }
-      actualExpandedBytes += entry.expanded
+      for (let offset = dataStart; offset < dataEnd; offset += 64 * 1024) {
+        const chunk = bytes.subarray(offset, Math.min(offset + (64 * 1024), dataEnd))
+        entryExpandedBytes += chunk.byteLength
+        inspectChunk(chunk)
+      }
     } else {
-      let expanded
+      const inflater = createInflateRaw()
       try {
-        expanded = inflateRawSync(bytes.subarray(dataStart, dataEnd), {
-          maxOutputLength: Math.max(1, Math.min(
-            entry.expanded + 1,
-            MAX_DOCX_EXPANDED_BYTES - actualExpandedBytes + 1,
-          )),
-        })
-      } catch (error) {
-        if (isRecord(error) && error.code === 'ERR_BUFFER_TOO_LARGE') {
-          throw { code: 'PARSER_LIMIT_EXCEEDED' }
+        inflater.end(bytes.subarray(dataStart, dataEnd))
+        for await (const raw of inflater) {
+          const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
+          entryExpandedBytes += chunk.byteLength
+          try {
+            if (entryExpandedBytes > entry.expanded) throw { code: 'PARSER_LIMIT_EXCEEDED' }
+            inspectChunk(chunk)
+          } finally { chunk.fill(0) }
         }
+      } catch (error) {
+        inflater.destroy()
+        if (safeCode(error) === 'PARSER_LIMIT_EXCEEDED') throw error
         throw { code: 'PARSER_FAILED' }
       }
-      try {
-        if (expanded.byteLength !== entry.expanded) throw { code: 'PARSER_FAILED' }
-        actualExpandedBytes += expanded.byteLength
-      } finally {
-        expanded.fill(0)
-      }
     }
-    if (actualExpandedBytes > MAX_DOCX_EXPANDED_BYTES) {
-      throw { code: 'PARSER_LIMIT_EXCEEDED' }
-    }
+    if (entryExpandedBytes !== entry.expanded) throw { code: 'PARSER_FAILED' }
   }
 }
 
@@ -508,12 +550,15 @@ async function extractedUnits(bytes, mimeType, { loadMammoth, loadPdfjs }) {
     return textUnits(text, mimeType)
   }
   if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-    assertDocxArchiveLimits(bytes)
+    await assertDocxArchiveLimits(bytes)
     const mammoth = loadMammoth()
     if (!isRecord(mammoth) || typeof mammoth.extractRawText !== 'function') {
       throw { code: 'PARSER_FAILED' }
     }
-    const result = await mammoth.extractRawText({ buffer: bytes })
+    const result = await mammoth.extractRawText(
+      { buffer: bytes },
+      { externalFileAccess: false },
+    )
     if (!isRecord(result) || typeof result.value !== 'string') throw { code: 'PARSER_FAILED' }
     assertTextLimit(result.value)
     return textUnits(result.value, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
@@ -522,17 +567,36 @@ async function extractedUnits(bytes, mimeType, { loadMammoth, loadPdfjs }) {
       }))
   }
   if (mimeType === 'application/pdf') {
-    const pdfjs = loadPdfjs()
+    const pdfjs = await loadPdfjs()
     if (!isRecord(pdfjs) || typeof pdfjs.getDocument !== 'function') {
       throw { code: 'PARSER_FAILED' }
     }
     const pdfBytes = Uint8Array.from(bytes)
-    const loadingTask = pdfjs.getDocument({ data: pdfBytes })
+    const loadingTask = pdfjs.getDocument({
+      data: pdfBytes,
+      maxDecodedStreamBytes: MAX_OBJECT_BYTES,
+      stopAtErrors: true,
+      maxImageSize: 0,
+      canvasMaxAreaInBytes: 0,
+      isEvalSupported: false,
+      disableFontFace: true,
+      enableXfa: false,
+      useWasm: false,
+      useWorkerFetch: false,
+      disableAutoFetch: true,
+      disableStream: true,
+      disableRange: true,
+      useSystemFonts: false,
+      isOffscreenCanvasSupported: false,
+      isImageDecoderSupported: false,
+      verbosity: 0,
+    })
     if (!isRecord(loadingTask) || !loadingTask.promise
       || typeof loadingTask.promise.then !== 'function') throw { code: 'PARSER_FAILED' }
     let document
     const units = []
     let textBytes = 0
+    let textItems = 0
     let parseError
     try {
       document = await loadingTask.promise
@@ -543,37 +607,76 @@ async function extractedUnits(bytes, mimeType, { loadMammoth, loadPdfjs }) {
       if (document.numPages > MAX_PDF_PAGES) throw { code: 'PARSER_LIMIT_EXCEEDED' }
       for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
         const page = await document.getPage(pageNumber)
-        if (!isRecord(page) || typeof page.getTextContent !== 'function') {
-          throw { code: 'PARSER_FAILED' }
-        }
-        const content = await page.getTextContent()
-        if (!isRecord(content) || !Array.isArray(content.items)) {
-          throw { code: 'PARSER_FAILED' }
-        }
-        const parts = []
-        for (const item of content.items) {
-          const value = isRecord(item) && typeof item.str === 'string' ? item.str : ''
-          if (!value) continue
-          const nextTextBytes = textBytes + (textBytes > 0 ? 1 : 0)
-            + Buffer.byteLength(value, 'utf8')
-          if (nextTextBytes > MAX_TEXT_BYTES) throw { code: 'PARSER_LIMIT_EXCEEDED' }
-          textBytes = nextTextBytes
-          parts.push(value)
-        }
-        const body = parts.join(' ').trim()
-        if (body) {
-          if (units.length >= MAX_ITEMS) throw { code: 'PARSER_LIMIT_EXCEEDED' }
-          units.push({
-            body, coordinates: {
-              kind: 'pdf', page: pageNumber, itemStart: 0, itemEnd: content.items.length,
-            },
+        try {
+          if (!isRecord(page) || typeof page.streamTextContent !== 'function') {
+            throw { code: 'PARSER_FAILED' }
+          }
+          const stream = page.streamTextContent({
+            includeMarkedContent: false,
+            disableNormalization: false,
           })
+          if (!isRecord(stream) || typeof stream.getReader !== 'function') {
+            throw { code: 'PARSER_FAILED' }
+          }
+          const reader = stream.getReader()
+          if (!isRecord(reader) || typeof reader.read !== 'function') {
+            throw { code: 'PARSER_FAILED' }
+          }
+          const parts = []
+          let complete = false
+          let pageItems = 0
+          try {
+            while (true) {
+              const chunk = await reader.read()
+              if (!isRecord(chunk) || typeof chunk.done !== 'boolean') {
+                throw { code: 'PARSER_FAILED' }
+              }
+              if (chunk.done) { complete = true; break }
+              if (!isRecord(chunk.value) || !Array.isArray(chunk.value.items)) {
+                throw { code: 'PARSER_FAILED' }
+              }
+              for (const item of chunk.value.items) {
+                textItems += 1
+                pageItems += 1
+                if (textItems > MAX_PDF_TEXT_ITEMS) throw { code: 'PARSER_LIMIT_EXCEEDED' }
+                const value = isRecord(item) && typeof item.str === 'string' ? item.str : ''
+                if (!value) continue
+                const nextTextBytes = textBytes + (textBytes > 0 ? 1 : 0)
+                  + Buffer.byteLength(value, 'utf8')
+                if (nextTextBytes > MAX_TEXT_BYTES) throw { code: 'PARSER_LIMIT_EXCEEDED' }
+                textBytes = nextTextBytes
+                parts.push(value)
+              }
+            }
+          } finally {
+            if (!complete && typeof reader.cancel === 'function') {
+              try { await reader.cancel() } catch { /* best effort */ }
+            }
+            if (typeof reader.releaseLock === 'function') {
+              try { reader.releaseLock() } catch { /* already released */ }
+            }
+          }
+          const body = parts.join(' ').trim()
+          if (body) {
+            if (units.length >= MAX_ITEMS) throw { code: 'PARSER_LIMIT_EXCEEDED' }
+            units.push({
+              body, coordinates: {
+                kind: 'pdf', page: pageNumber, itemStart: 0, itemEnd: pageItems,
+              },
+            })
+          }
+        } finally {
+          if (isRecord(page) && typeof page.cleanup === 'function') {
+            try { await page.cleanup() } catch { /* document destruction remains authoritative */ }
+          }
         }
       }
     } catch (error) {
-      parseError = error
+      parseError = isRecord(error) && error.message === 'PDF decoded stream limit exceeded'
+        ? { code: 'PARSER_LIMIT_EXCEEDED' }
+        : error
     }
-    pdfBytes.fill(0)
+    try { pdfBytes.fill(0) } catch { /* PDF.js may transfer and detach its private copy */ }
     try {
       if (document && typeof document.destroy === 'function') await document.destroy()
       else if (typeof loadingTask.destroy === 'function') await loadingTask.destroy()
@@ -588,7 +691,7 @@ async function extractedUnits(bytes, mimeType, { loadMammoth, loadPdfjs }) {
 
 function createKnowledgeParser({
   loadMammoth = () => require('mammoth'),
-  loadPdfjs = () => require('pdfjs-dist/legacy/build/pdf.js'),
+  loadPdfjs = loadTextOnlyPdfjs,
 } = {}) {
   if (typeof loadMammoth !== 'function' || typeof loadPdfjs !== 'function') {
     throw new Error('Knowledge parser is not configured')

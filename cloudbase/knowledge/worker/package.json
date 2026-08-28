@@ -4,9 +4,9 @@
   "private": true,
   "type": "commonjs",
   "main": "parser-child.js",
-  "engines": { "node": ">=18" },
+  "engines": { "node": ">=22.13.0 <27" },
   "dependencies": {
     "mammoth": "1.12.1",
-    "pdfjs-dist": "3.11.174"
+    "pdfjs-dist": "6.2.108"
   }
 }
