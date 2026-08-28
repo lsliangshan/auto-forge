@@ -442,6 +442,7 @@ export interface AgentOrchestratorDependencies {
       signal: AbortSignal
       scope?: KnowledgeSearchScope
     }): Promise<boolean>
+    releaseSearchScope?(scope: KnowledgeSearchScope): void
   }
   emit: (event: ChatEvent) => void
   id?: () => string
@@ -567,6 +568,7 @@ interface ActiveAgentRun {
   }
   knowledgeSelection: Readonly<KnowledgeSelection>
   knowledgeSearchScope?: KnowledgeSearchScope
+  knowledgeSearchScopeReleased: boolean
   knowledgeEvidence: CurrentTurnKnowledgeEvidence
   knowledgeSearches: number
   knowledgeCitationRepairs: number
@@ -874,9 +876,11 @@ export class AgentOrchestrator {
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const requestId = input.requestId ?? this.id()
     if (input.providerSnapshot.providerId !== input.provider) {
+      this.releaseKnowledgeSearchScope(input.knowledgeSearchScope)
       throw appFailure('CONFLICT')
     }
     if (this.activeByRequest.has(requestId) || this.activeByConversation.has(input.conversationId)) {
+      this.releaseKnowledgeSearchScope(input.knowledgeSearchScope)
       const error = appFailure('CONFLICT')
       this.safeEmit({
         type: 'status',
@@ -961,6 +965,7 @@ export class AgentOrchestrator {
         knowledgeSelection,
         ...(input.knowledgeSearchScope === undefined
           ? {} : { knowledgeSearchScope: input.knowledgeSearchScope }),
+        knowledgeSearchScopeReleased: false,
         knowledgeEvidence: new CurrentTurnKnowledgeEvidence(knowledgeSelection.baseIds),
         knowledgeSearches: 0,
         knowledgeCitationRepairs: 0,
@@ -1065,13 +1070,29 @@ export class AgentOrchestrator {
       return await this.driveExclusive(active)
     } catch (error) {
       if (error instanceof ProviderUsageConsistencyError) {
-        if (active && !active.terminal) await this.terminalize(active, 'failed', appFailure('INTERNAL_ERROR'))
+        if (active && !active.terminal) {
+          try {
+            await this.terminalize(active, 'failed', appFailure('INTERNAL_ERROR'))
+          } catch (terminalError) {
+            this.releaseActiveKnowledgeSearchScope(active)
+            throw terminalError
+          }
+        }
         else if (this.activeByConversation.get(input.conversationId) === requestId) {
           this.activeByConversation.delete(input.conversationId)
         }
+        if (!active) this.releaseKnowledgeSearchScope(input.knowledgeSearchScope)
         throw error
       }
-      if (active) return this.terminalize(active, 'failed', asAppError(error))
+      if (active) {
+        try {
+          return await this.terminalize(active, 'failed', asAppError(error))
+        } catch (terminalError) {
+          this.releaseActiveKnowledgeSearchScope(active)
+          throw terminalError
+        }
+      }
+      this.releaseKnowledgeSearchScope(input.knowledgeSearchScope)
       if (this.activeByConversation.get(input.conversationId) === requestId) {
         this.activeByConversation.delete(input.conversationId)
       }
@@ -2922,6 +2943,7 @@ export class AgentOrchestrator {
       ...(error ? { error } : {}),
     }
     active.terminal = result
+    this.releaseActiveKnowledgeSearchScope(active)
     this.activeByRequest.delete(active.requestId)
     this.activeByRun.delete(active.runId)
     if (this.activeByConversation.get(active.conversationId) === active.requestId) {
@@ -2941,6 +2963,17 @@ export class AgentOrchestrator {
       ...(error ? { error } : {}),
     })
     return result
+  }
+
+  private releaseKnowledgeSearchScope(scope: KnowledgeSearchScope | undefined): void {
+    if (!scope) return
+    try { this.dependencies.knowledge?.releaseSearchScope?.(scope) } catch { /* release is best effort */ }
+  }
+
+  private releaseActiveKnowledgeSearchScope(active: ActiveAgentRun): void {
+    if (active.knowledgeSearchScopeReleased) return
+    active.knowledgeSearchScopeReleased = true
+    this.releaseKnowledgeSearchScope(active.knowledgeSearchScope)
   }
 
   private safeEmit(event: ChatEvent): void {

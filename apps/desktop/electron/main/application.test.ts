@@ -1687,6 +1687,73 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('keeps a Main-captured knowledge scope pinned while approval waits and releases it during shutdown', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-approval-scope-'))
+    directories.push(root)
+    const emitted: ChatEvent[] = []
+    const admittedScope = Object.freeze({
+      scopeId: 'scope_shutdown', ownerId: 'test_user_testuser', ownerEpoch: 1,
+      cloudAllowed: false, baseIds: Object.freeze(['base_selected']), entries: Object.freeze([]),
+    })
+    const releaseSearchScope = vi.fn()
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => admittedScope),
+      releaseSearchScope,
+      searchSelected: vi.fn(async () => ({
+        kind: 'results' as const, strategy: 'trigram' as const, evidence: [],
+      })),
+      sourceAvailable: vi.fn(async () => false),
+      getConsent: vi.fn(async () => ({
+        provider: 'openrouter' as const, status: 'granted' as const,
+        updatedAt: '2026-08-28T00:00:00.000Z',
+      })),
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request: ModelStreamRequest) {
+        const workflowTool = request.tools?.find(tool => tool.function.name !== 'knowledge_search')
+        if (!workflowTool) throw new Error('Expected workflow tool')
+        yield {
+          type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'call_scope_shutdown',
+          name: workflowTool.function.name, arguments: { input: {} },
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService, modelProviders: { openrouter: provider },
+      emitChat: event => { emitted.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' }, openrouter: { text: 'openrouter/tools' },
+      },
+    })
+    await installApprovalWorkflow(runtime)
+    const conversation = await runtime.services.chat.createConversation()
+    const currentPreferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
+    await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+      ...currentPreferences, knowledgeBaseIds: ['base_selected'], knowledgeMode: 'strict',
+    })
+
+    await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+    await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+    })))
+
+    expect(releaseSearchScope).not.toHaveBeenCalled()
+    await runtime.close()
+    expect(releaseSearchScope).toHaveBeenCalledOnce()
+    expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
+  })
+
   it('records a stale bind cleanup failure retained by the real knowledge lifecycle tail', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-bind-failure-'))
     directories.push(root)

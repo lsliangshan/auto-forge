@@ -6633,6 +6633,102 @@ describe('AgentOrchestrator knowledge grounding', () => {
     ]))
   })
 
+  it('keeps the admitted scope pinned through approval and releases it once after resumed knowledge search', async () => {
+    const dependencies = harness([toolTurn, [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_after_approval',
+        name: 'knowledge_search', arguments: { query: '合同何时生效' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    requireChatApproval(dependencies)
+    const knowledge = attachKnowledge(dependencies, { keepWorkflows: true })
+    const releaseSearchScope = vi.fn()
+    Object.assign(dependencies.knowledge!, { releaseSearchScope })
+    const admittedScope = Object.freeze({
+      scopeId: 'scope_approval', ownerId: 'user_1', ownerEpoch: 7,
+      baseIds: Object.freeze(['base_selected']),
+      entries: Object.freeze([Object.freeze({
+        baseId: 'base_selected', documentId: 'document_1', versionId: 'version_1',
+        publicationGeneration: 1, cloudGenerationId: null,
+      })]),
+      cloudAllowed: false,
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    const pending = await orchestrator.run({
+      ...knowledgeRunInput('使用百度搜索，再根据合同库回答合同何时生效'),
+      knowledgeSearchScope: admittedScope,
+    })
+
+    expect(pending).toMatchObject({ status: 'awaiting_approval' })
+    expect(releaseSearchScope).not.toHaveBeenCalled()
+    expect(knowledge.search).not.toHaveBeenCalled()
+
+    const completed = await orchestrator.resumeApproval({
+      executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once',
+    })
+
+    expect(completed).toMatchObject({ status: 'completed' })
+    expect(knowledge.search).toHaveBeenCalledWith(expect.objectContaining({
+      scope: admittedScope,
+    }))
+    expect(releaseSearchScope).toHaveBeenCalledOnce()
+    expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
+    await orchestrator.cancel(completed.requestId)
+    expect(releaseSearchScope).toHaveBeenCalledOnce()
+  })
+
+  it.each(['denial', 'cancellation', 'provider failure'] as const)(
+    'releases an admitted scope once after %s',
+    async (outcome) => {
+      const dependencies = harness(outcome === 'provider failure' ? [] : [toolTurn, [
+        { type: 'text_delta', choiceIndex: 0, text: '已停止。' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ]])
+      const releaseSearchScope = vi.fn()
+      attachKnowledge(dependencies, { keepWorkflows: outcome !== 'provider failure' })
+      Object.assign(dependencies.knowledge!, { releaseSearchScope })
+      const admittedScope = Object.freeze({
+        scopeId: `scope_${outcome}`, ownerId: 'user_1', ownerEpoch: 7,
+        baseIds: Object.freeze(['base_selected']), entries: Object.freeze([]), cloudAllowed: false,
+      })
+      const orchestrator = new AgentOrchestrator(dependencies)
+      const input = {
+        ...knowledgeRunInput(outcome === 'provider failure' ? '根据合同库回答' : '使用百度搜索'),
+        requestId: `scope_cleanup_${outcome}`,
+        knowledgeSearchScope: admittedScope,
+      }
+
+      if (outcome === 'provider failure') {
+        dependencies.workflows.list = async () => []
+        dependencies.providerInstances.openrouter.stream = vi.fn(() => {
+          throw new Error('provider unavailable')
+        })
+        await expect(orchestrator.run(input)).resolves.toMatchObject({ status: 'failed' })
+      } else {
+        requireChatApproval(dependencies)
+        const pending = await orchestrator.run(input)
+        expect(releaseSearchScope).not.toHaveBeenCalled()
+        if (outcome === 'denial') {
+          await orchestrator.resumeApproval({
+            executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'deny',
+          })
+        } else {
+          await orchestrator.cancel(pending.requestId)
+        }
+      }
+
+      expect(releaseSearchScope).toHaveBeenCalledOnce()
+      expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
+      await orchestrator.cancel(input.requestId)
+      expect(releaseSearchScope).toHaveBeenCalledOnce()
+    },
+  )
+
   it('rejects model-controlled scope and sends no snippets when Provider consent is denied', async () => {
     const dependencies = harness([[
       {

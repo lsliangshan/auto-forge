@@ -1439,6 +1439,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         }) => knowledge.sourceAvailable(
           { userId: ownerId }, documentId, versionId, signal, scope,
         ),
+        releaseSearchScope: (scope: KnowledgeSearchScope) => {
+          knowledge.releaseSearchScope(scope)
+        },
       },
     }),
   })
@@ -1912,33 +1915,29 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 )
               : undefined
             trackChatWork(requestId, input.conversationId, async () => {
-              try {
-                return await agent.run({
-                  conversationId: input.conversationId,
-                  content: input.content,
-                  userBlocks,
-                  modelContent,
-                  assetIds: input.assetIds,
-                  currentMedia: resolved.assets.map(({ kind, durationMs }) => ({
-                    kind,
-                    ...(durationMs === undefined ? {} : { durationMs }),
-                  })),
-                  allowTools: route.supportsTools,
-                  supportsImageInput: route.supportsImageInput,
-                  userId: session.user.id,
-                  providerSnapshot,
-                  provider: route.provider,
-                  model: route.model,
-                  ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
-                  requestId,
-                  knowledgeSelection: knowledgeSelection
-                    ? { baseIds: [...knowledgeSelection.baseIds], mode: knowledgeSelection.mode }
-                    : undefined,
-                  ...(knowledgeSearchScope === undefined ? {} : { knowledgeSearchScope }),
-                })
-              } finally {
-                if (knowledgeSearchScope) knowledge?.releaseSearchScope(knowledgeSearchScope)
-              }
+              return agent.run({
+                conversationId: input.conversationId,
+                content: input.content,
+                userBlocks,
+                modelContent,
+                assetIds: input.assetIds,
+                currentMedia: resolved.assets.map(({ kind, durationMs }) => ({
+                  kind,
+                  ...(durationMs === undefined ? {} : { durationMs }),
+                })),
+                allowTools: route.supportsTools,
+                supportsImageInput: route.supportsImageInput,
+                userId: session.user.id,
+                providerSnapshot,
+                provider: route.provider,
+                model: route.model,
+                ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
+                requestId,
+                knowledgeSelection: knowledgeSelection
+                  ? { baseIds: [...knowledgeSelection.baseIds], mode: knowledgeSelection.mode }
+                  : undefined,
+                ...(knowledgeSearchScope === undefined ? {} : { knowledgeSearchScope }),
+              })
             })
           } else if (route.outputType === 'image') {
             trackChatWork(requestId, input.conversationId, async () => {
