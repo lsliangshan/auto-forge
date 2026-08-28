@@ -148,6 +148,13 @@ describe('resolveChatRoute', () => {
     }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
   })
 
+  it('rejects an authoritative PDF whose mapped filename suffix conflicts', () => {
+    expect(() => resolveChatRoute(input({
+      requestedOutput: 'text',
+      assets: [asset('file', { name: 'report.xlsx', mimeType: 'application/pdf' })],
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
   it.each(['image', 'audio', 'video'] as const)('never treats a file as a %s-generation reference', (requestedOutput) => {
     const modelGeneration: ModelInfo['generation'] = requestedOutput === 'image'
       ? { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } }

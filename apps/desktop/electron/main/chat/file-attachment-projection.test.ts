@@ -73,6 +73,14 @@ describe('projectAttachmentInputs', () => {
     })])).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
   })
 
+  it('rejects an authoritative PDF whose mapped filename suffix conflicts', () => {
+    expect(() => projectAttachmentInputs('openrouter', [input({
+      mimeType: 'application/pdf',
+      name: 'report.xlsx',
+      dataBase64: 'JVBERi0xLjc=',
+    })])).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
   it('rejects non-canonical text Base64', () => {
     expect(() => projectAttachmentInputs('deepseek', [input({ dataBase64: 'aGVsbG8' })]))
       .toThrow()

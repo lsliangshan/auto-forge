@@ -1000,11 +1000,17 @@ describe('cross-process contracts', () => {
 
   it.each([
     ['deepseek', 'notes.anything', 'text/plain', { mode: 'text' }],
+    ['openrouter', 'report.xlsx', 'text/plain', { mode: 'text' }],
     ['openrouter', 'report.pdf', 'application/octet-stream', { mode: 'provider-file', mimeType: 'application/pdf' }],
     ['openrouter', 'sheet.xlsx', 'application/octet-stream', { mode: 'provider-file', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }],
+    ['openrouter', 'report.pdf', 'application/pdf', { mode: 'provider-file', mimeType: 'application/pdf' }],
+    ['openrouter', 'sheet.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', { mode: 'provider-file', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }],
+    ['openrouter', 'report.xlsx', 'application/pdf', { mode: 'unsupported' }],
+    ['openrouter', 'report.bin', 'application/pdf', { mode: 'unsupported' }],
+    ['openrouter', 'report.pdf', 'application/zip', { mode: 'unsupported' }],
     ['openrouter', 'archive.zip', 'application/octet-stream', { mode: 'unsupported' }],
     ['deepseek', 'report.pdf', 'application/pdf', { mode: 'unsupported' }],
-  ] as const)('classifies %s %s', (provider, name, mimeType, expected) => {
+  ] as const)('classifies %s %s with %s', (provider, name, mimeType, expected) => {
     expect(chatFileSupport(provider, name, mimeType)).toEqual(expected)
   })
 

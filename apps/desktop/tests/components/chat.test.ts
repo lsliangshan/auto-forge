@@ -3749,6 +3749,27 @@ describe('chat interactions', () => {
     expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
   })
 
+  it('blocks an authoritative document MIME when its mapped filename suffix conflicts', () => {
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'text' })
+    store.draftsByConversation.conversation_1 = [fileAsset('report', 'report.xlsx', 'application/pdf')]
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        provider: 'openrouter',
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
+      .toContain('当前模型无法读取该附件格式')
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
+  })
+
   it('removes drafts through Main and allows the fifth attachment while blocking a sixth', async () => {
     const { api } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })

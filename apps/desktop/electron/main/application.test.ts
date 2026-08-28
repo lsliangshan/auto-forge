@@ -4724,10 +4724,12 @@ describe('createApplicationRuntime', () => {
     directories.push(root)
     const textSource = join(root, 'notes.unknown')
     const pdfSource = join(root, 'report.pdf')
+    const mismatchedPdfSource = join(root, 'report.xlsx')
     const textBytes = Buffer.from('hello\n世界')
     const pdfBytes = Buffer.from('%PDF-1.7\n')
     await writeFile(textSource, textBytes)
     await writeFile(pdfSource, pdfBytes)
+    await writeFile(mismatchedPdfSource, pdfBytes)
     let selectedFiles: string[] = []
     const emitChat = vi.fn()
     const providerResponse = () => new Response([
@@ -4864,6 +4866,21 @@ describe('createApplicationRuntime', () => {
         }]),
       }),
     ]))
+
+    selectedFiles = [mismatchedPdfSource]
+    const mismatchedPdfConversation = await runtime.services.chat.createConversation()
+    const [mismatchedPdfAsset] = await runtime.services.media.pickFiles({
+      conversationId: mismatchedPdfConversation.id,
+      existingAssetIds: [],
+    })
+    expect(mismatchedPdfAsset).toMatchObject({ name: 'report.xlsx', mimeType: 'application/pdf' })
+    openRouterFetch.mockClear()
+    await expect(runtime.services.chat.send({
+      ...chatInput(mismatchedPdfConversation.id, 'read mismatched PDF'),
+      assetIds: [mismatchedPdfAsset!.id],
+      outputType: 'text',
+    })).rejects.toMatchObject({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+    expect(openRouterFetch).not.toHaveBeenCalled()
 
     for (const [conversationId, asset, source, bytes] of [
       [openRouterTextConversation.id, openRouterTextAsset!, textSource, textBytes],

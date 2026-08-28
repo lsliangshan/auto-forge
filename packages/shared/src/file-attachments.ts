@@ -16,7 +16,11 @@ export function chatFileSupport(
   const suffixIndex = name.lastIndexOf('.')
   const suffix = suffixIndex === -1 ? undefined : name.slice(suffixIndex + 1).toLocaleLowerCase('en-US')
   const providerMimeType = suffix === undefined ? undefined : providerFileMimeTypes[suffix as keyof typeof providerFileMimeTypes]
-  if (provider === 'openrouter' && providerMimeType !== undefined) {
+  if (
+    provider === 'openrouter'
+    && providerMimeType !== undefined
+    && (mimeType === 'application/octet-stream' || mimeType === providerMimeType)
+  ) {
     return { mode: 'provider-file', mimeType: providerMimeType }
   }
   return { mode: 'unsupported' }
