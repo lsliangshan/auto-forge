@@ -232,16 +232,21 @@ function normalizedTuplePart(value: string): string {
   return canonicalSupportText(value).replace(/\s+/gu, '')
 }
 
+function normalizedTupleObject(value: string): string {
+  return canonicalSupportText(value).trim()
+}
+
 function commaFieldTuple(value: string): FactTuple | undefined {
   const field = value.match(/^([^，,]{1,160}?)[，,]\s*(.{1,240})$/u)
   if (!field) return undefined
   const subject = field[1]!.trim()
   const object = field[2]!.trim()
-  const clausePredicate = /(?:签订|签字|签署|生效|起效|发布|负责|构成|采用|保持|持续|运营|提升|支付|执行|提供|承担|要求|应当|必须|需要|位于|包括|支持|允许|禁止|适用|\b(?:is|are|was|were|signed?|effective|publishes?|requires?|supports?|permits?|allows?|prohibits?|forbids?)\b)/iu
-  if (!subject || !object || clausePredicate.test(subject) || clausePredicate.test(object)) return undefined
+  const attributeField = /(?:颜色|日期|时间|金额|编号|名称|型号|地点|位置|版本|状态|数量|期限|币种|color|date|time|amount|number|name|model|location|version|status|quantity|term|currency)$/iu
+  if (!subject || !object || !attributeField.test(subject)) return undefined
+  const effectiveDate = subject.match(/^(.{1,160}?)生效日期$/u)
   return {
-    subject: normalizedTuplePart(subject),
-    relation: 'attribute',
+    subject: normalizedTuplePart(effectiveDate?.[1] ?? subject),
+    relation: effectiveDate ? 'effective' : 'attribute',
     object,
   }
 }
@@ -484,7 +489,7 @@ function clauseSupportsClaim(rawClaim: string, rawEvidence: string): boolean {
 
   const cjkTokens = cjkMaterialTokens(normalizedClaim)
   const latinTokens = latinMaterialTokens(normalizedClaim)
-  if (cjkTokens.length === 0 && latinTokens.length === 0) return claimNumbers.length > 0
+  if (cjkTokens.length === 0 && latinTokens.length === 0) return false
   if (cjkTokens.length > 0) {
     const cjkEvidence = cjkMaterialText(normalizedEvidence)
     const matched = cjkTokens.filter(token => cjkEvidence.includes(token)).length
@@ -499,9 +504,35 @@ function factTupleSupports(claim: FactTuple, evidence: FactTuple): boolean {
   return claim.subject === evidence.subject
     && claim.relation === evidence.relation
     && (
-      canonicalSupportText(claim.object) === canonicalSupportText(evidence.object)
+      normalizedTupleObject(claim.object) === normalizedTupleObject(evidence.object)
       || clauseSupportsClaim(claim.object, evidence.object)
     )
+}
+
+function tupleObjectSupportingClauseIndexes(
+  rawClaim: string,
+  rawGroup: string,
+  evidence: KnowledgeEvidence,
+): number[] {
+  const claim = rawClaim.replace(KNOWLEDGE_MARKER, '')
+  const normalizedClaim = canonicalSupportText(claim)
+  if (
+    numericTokens(normalizedClaim).length === 0
+    || cjkMaterialTokens(normalizedClaim).length > 0
+    || latinMaterialTokens(normalizedClaim).length > 0
+  ) return []
+  const answerTuples = splitIndependentFacts(rawGroup.replace(KNOWLEDGE_MARKER, ''))
+    .map(factTuple)
+    .filter((tuple): tuple is FactTuple => (
+      tuple !== undefined
+      && normalizedTupleObject(tuple.object) === normalizedTupleObject(claim)
+    ))
+  if (answerTuples.length === 0) return []
+  return splitIndependentFacts(sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000))
+    .map(factTuple)
+    .flatMap((tuple, index) => (
+      tuple && answerTuples.some(claimTuple => factTupleSupports(claimTuple, tuple)) ? [index] : []
+    ))
 }
 
 function evidenceSupportsTupleGroup(rawGroup: string, evidence: KnowledgeEvidence): boolean {
@@ -563,7 +594,10 @@ export function validateKnowledgeAnswer(
       if (!evidenceSupportsTupleGroup(group.raw, item)) return false
       let common: Set<number> | undefined
       for (const claim of group.fragments) {
-        const supported = new Set(supportingClauseIndexes(claim, item))
+        const supported = new Set([
+          ...supportingClauseIndexes(claim, item),
+          ...tupleObjectSupportingClauseIndexes(claim, group.raw, item),
+        ])
         common = common === undefined
           ? supported
           : new Set([...common].filter(index => supported.has(index)))

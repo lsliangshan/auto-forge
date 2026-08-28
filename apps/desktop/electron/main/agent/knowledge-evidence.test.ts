@@ -346,6 +346,44 @@ describe('knowledge tool and answer validation', () => {
   })
 
   it.each([
+    {
+      name: 'standalone number from another party field',
+      snippet: '乙方编号为 7。',
+      answer: '7。[[kb:evidence:0]]',
+    },
+    {
+      name: 'report publication date comma field',
+      snippet: 'A报告发布日期为2026-01-01且B报告发布日期为2026-02-02。',
+      answer: 'A报告发布日期，2026-02-02。[[kb:evidence:0]]',
+    },
+    {
+      name: 'contract effective date comma field',
+      snippet: 'A合同生效日期为2026-01-01且B合同生效日期为2026-02-02。',
+      answer: 'A合同生效日期，2026-02-02。[[kb:evidence:0]]',
+    },
+    {
+      name: 'party payment amount comma field',
+      snippet: 'A方支付金额为100且B方支付金额为200。',
+      answer: 'A方支付金额，200。[[kb:evidence:0]]',
+    },
+  ])('rejects $name instead of borrowing a numeric value from cited evidence', ({ snippet, answer }) => {
+    const splitFacts = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      text: expect.not.stringContaining('[[kb:'),
+    })
+  })
+
+  it.each([
     ['会议时间为 12:30。', '会议时间：12:30。'],
     ['会议时间是 12:30。', '会议时间：12:30。'],
     ['Meeting time is 12:30.', 'Meeting time: 12:30.'],
