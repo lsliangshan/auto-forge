@@ -843,7 +843,7 @@ describe('CloudBase knowledge scheduled worker', () => {
               setTimeout(() => {
                 embeddingDrained = true
                 reject({ code: 'TRANSIENT_FAILURE' })
-              }, 35)
+              }, 5)
             }, { once: true })
           })
         )) },
@@ -852,9 +852,9 @@ describe('CloudBase knowledge scheduled worker', () => {
       const run = worker.runOnce()
       const beforeAck = Promise.race([
         run.then(() => 'settled' as const),
-        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 101)),
+        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 71)),
       ])
-      await vi.advanceTimersByTimeAsync(101)
+      await vi.advanceTimersByTimeAsync(71)
       await expect(beforeAck).resolves.toBe('unsettled')
       expect(embeddingDrained).toBe(false)
 
@@ -898,7 +898,7 @@ describe('CloudBase knowledge scheduled worker', () => {
                 setTimeout(() => {
                   storageDrained = true
                   reject({ code: 'TRANSIENT_FAILURE' })
-                }, 35)
+                }, 5)
               }, { once: true })
             })
           )),
@@ -910,9 +910,9 @@ describe('CloudBase knowledge scheduled worker', () => {
       const run = worker.runOnce()
       const beforeAck = Promise.race([
         run.then(() => 'settled' as const),
-        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 101)),
+        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 71)),
       ])
-      await vi.advanceTimersByTimeAsync(101)
+      await vi.advanceTimersByTimeAsync(71)
       await expect(beforeAck).resolves.toBe('unsettled')
       expect(storageDrained).toBe(false)
 
@@ -925,22 +925,138 @@ describe('CloudBase knowledge scheduled worker', () => {
   })
 
   it.each([
+    ['parser', 'upload'],
+    ['Storage', 'upload'],
+    ['embedding', 'embedding'],
+  ] as const)(
+    'terminates the current job containment when a never-settling %s ignores abort',
+    async (stalled, kind) => {
+      vi.useFakeTimers()
+      vi.setSystemTime(0)
+      try {
+        type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
+        const bytes = Buffer.from('contained source')
+        const sha256 = createHash('sha256').update(bytes).digest('hex')
+        let claims = 0
+        let ignoredSignal: AbortSignal | undefined
+        let rejectOriginal: ((error: unknown) => void) | undefined
+        let containmentTerminated = false
+        let lateSideEffects = 0
+        const neverSettling = (signal?: AbortSignal) => {
+          ignoredSignal = signal
+          setTimeout(() => {
+            if (!containmentTerminated) lateSideEffects += 1
+          }, 200)
+          return new Promise<never>((_resolve, reject) => {
+            rejectOriginal = reject
+          })
+        }
+        const rpc = vi.fn(async (name: string) => {
+          if (name === 'autoforge_knowledge_claim_job') {
+            claims += 1
+            return claims === 1 ? claim(`job_${kind}`, kind) : { job: null }
+          }
+          if (name === 'autoforge_knowledge_get_upload_work') return {
+            ownerId: '1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+            versionId: 'version_1', generationId: 'generation_1', objectId: 'object_1',
+            storageReference: 'knowledge/1/kb_1/object_1', byteSize: bytes.byteLength,
+            sha256, mimeType: 'text/plain', name: 'cloud.txt', versionNumber: 1,
+          }
+          if (name === 'autoforge_knowledge_complete_job') return { completed: true }
+          if (name === 'autoforge_knowledge_cleanup_retention') return {
+            prunedChanges: 0, prunedTombstones: 0, prunedSnapshots: 0,
+            prunedGenerations: 0, prunedDispatchPermits: 0,
+          }
+          throw new Error(`unexpected rpc ${name}`)
+        })
+        const terminateJobExecution = vi.fn(async () => {
+          containmentTerminated = true
+          rejectOriginal?.({ code: 'TRANSIENT_FAILURE' })
+        })
+        const worker = createKnowledgeWorker({
+          rpc,
+          storage: {
+            readObject: stalled === 'Storage'
+              ? vi.fn((_input: unknown, boundary?: Boundary) => neverSettling(boundary?.signal))
+              : vi.fn().mockResolvedValue(bytes),
+            deleteObjects: vi.fn(),
+          },
+          parser: {
+            parse: stalled === 'parser'
+              ? vi.fn(({ signal }: { signal?: AbortSignal }) => neverSettling(signal))
+              : vi.fn().mockResolvedValue({
+                  parserVersion: 'cloud-parser-v1',
+                  blocks: [{ id: 'block_1', ordinal: 0, kind: 'paragraph',
+                    body: 'contained source', coordinates: { kind: 'txt' } }],
+                  chunks: [{ id: 'chunk_1', blockId: 'block_1', ordinal: 0,
+                    body: 'contained source', coordinates: { kind: 'txt' } }],
+                }),
+          },
+          embeddingWorker: stalled === 'embedding'
+            ? { run: vi.fn((_input: unknown, boundary?: Boundary) => (
+                neverSettling(boundary?.signal)
+              )) }
+            : undefined,
+          workerId: 'worker_1', id: () => `lease_job_${kind}`,
+          jobTimeoutMs: 100, settlementReserveMs: 40,
+          terminateJobExecution,
+        })
+
+        const run = worker.runOnce()
+        const outcome = Promise.race([
+          run.then(result => ({ kind: 'settled' as const, result })),
+          new Promise<{ kind: 'unsettled' }>(resolve => {
+            setTimeout(() => resolve({ kind: 'unsettled' }), 101)
+          }),
+        ])
+        await vi.advanceTimersByTimeAsync(101)
+
+        await expect(outcome).resolves.toEqual({
+          kind: 'settled', result: { claimed: 1, completed: 0, failed: 1 },
+        })
+        expect(ignoredSignal?.aborted).toBe(true)
+        expect(terminateJobExecution).toHaveBeenCalledWith({
+          workerId: 'worker_1', jobId: `job_${kind}`, leaseToken: `lease_job_${kind}`,
+        })
+        expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_complete_job', {
+          p_worker_id: 'worker_1', p_job_id: `job_${kind}`,
+          p_lease_token: `lease_job_${kind}`, p_state: 'failed',
+          p_error_code: 'TRANSIENT_FAILURE', p_request_deadline_ms: expect.any(Number),
+        }, requestBoundary())
+
+        await vi.advanceTimersByTimeAsync(500)
+        expect(lateSideEffects).toBe(0)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it.each([
     ['upload-work RPC', 'rpc'],
     ['Storage read', 'storage'],
     ['upload completion RPC', 'post-rpc'],
   ] as const)('shares a 120-second claim deadline with a never-settling %s', async (_name, stalled) => {
     vi.useFakeTimers()
     try {
+      type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
       const bytes = Buffer.from('claim deadline source')
       const sha256 = createHash('sha256').update(bytes).digest('hex')
       let claims = 0
-      const rpc = vi.fn().mockImplementation(async (name: string) => {
+      const untilAbort = (boundary?: Boundary) => new Promise<never>((_resolve, reject) => {
+        boundary?.signal.addEventListener('abort', () => {
+          reject({ code: 'TRANSIENT_FAILURE' })
+        }, { once: true })
+      })
+      const rpc = vi.fn().mockImplementation(async (
+        name: string, _parameters: unknown, boundary?: Boundary,
+      ) => {
         if (name === 'autoforge_knowledge_claim_job') {
           claims += 1
           return claims === 1 ? claim('job_upload', 'upload') : { job: null }
         }
         if (name === 'autoforge_knowledge_get_upload_work') {
-          if (stalled === 'rpc') return new Promise<never>(() => undefined)
+          if (stalled === 'rpc') return untilAbort(boundary)
           return {
             ownerId: '1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
             versionId: 'version_1', generationId: 'generation_1', objectId: 'object_1',
@@ -949,7 +1065,7 @@ describe('CloudBase knowledge scheduled worker', () => {
           }
         }
         if (name === 'autoforge_knowledge_complete_upload_index') {
-          if (stalled === 'post-rpc') return new Promise<never>(() => undefined)
+          if (stalled === 'post-rpc') return untilAbort(boundary)
           return { completed: true, generationId: 'generation_1', embeddingJobId: null }
         }
         if (name === 'autoforge_knowledge_complete_job') return { completed: true }
@@ -963,7 +1079,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         rpc,
         storage: {
           readObject: stalled === 'storage'
-            ? vi.fn(() => new Promise<never>(() => undefined))
+            ? vi.fn((_input: unknown, boundary?: Boundary) => untilAbort(boundary))
             : vi.fn().mockResolvedValue(bytes),
           deleteObjects: vi.fn(),
         },
@@ -1012,6 +1128,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       let completionDeadline: number | undefined
       let parserSignal: AbortSignal | undefined
       let lateCompletionSideEffects = 0
+      let rejectCompletion: ((error: unknown) => void) | undefined
       let claims = 0
       const rpc = vi.fn((name: string, parameters: unknown, boundary?: Boundary) => {
         if (name === 'autoforge_knowledge_claim_job') {
@@ -1032,6 +1149,7 @@ describe('CloudBase knowledge scheduled worker', () => {
           completionDeadline = (parameters as { p_request_deadline_ms?: number })
             .p_request_deadline_ms
           return new Promise((resolve, reject) => {
+            rejectCompletion = reject
             setTimeout(() => {
               if (!Number.isSafeInteger(completionDeadline) || Date.now() <= completionDeadline!) {
                 lateCompletionSideEffects += 1
@@ -1074,6 +1192,9 @@ describe('CloudBase knowledge scheduled worker', () => {
         }) },
         workerId: 'worker_1', id: () => 'lease_job_upload',
         jobTimeoutMs: 100, settlementReserveMs: 30,
+        terminateJobExecution: vi.fn(async () => {
+          rejectCompletion?.({ code: 'TRANSIENT_FAILURE' })
+        }),
       })
 
       const run = worker.runOnce()
@@ -1108,6 +1229,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       let settlementBoundary: Boundary | undefined
       let settlementDeadline: number | undefined
       let lateSettlementSideEffects = 0
+      let rejectSettlement: ((error: unknown) => void) | undefined
       const rpc = vi.fn((name: string, parameters: unknown, boundary?: Boundary) => {
         if (name === 'autoforge_knowledge_claim_job') {
           claims += 1
@@ -1121,6 +1243,7 @@ describe('CloudBase knowledge scheduled worker', () => {
           settlementDeadline = (parameters as { p_request_deadline_ms?: number })
             .p_request_deadline_ms
           return new Promise((resolve, reject) => {
+            rejectSettlement = reject
             setTimeout(() => {
               if (!Number.isSafeInteger(settlementDeadline) || Date.now() <= settlementDeadline!) {
                 lateSettlementSideEffects += 1
@@ -1142,6 +1265,9 @@ describe('CloudBase knowledge scheduled worker', () => {
         storage: { readObject: vi.fn(), deleteObjects: vi.fn() },
         parser: { parse: vi.fn() }, workerId: 'worker_1', id: () => 'lease_job_upload',
         jobTimeoutMs: 100, settlementReserveMs: 30,
+        terminateJobExecution: vi.fn(async () => {
+          rejectSettlement?.({ code: 'TRANSIENT_FAILURE' })
+        }),
       })
 
       const run = worker.runOnce()

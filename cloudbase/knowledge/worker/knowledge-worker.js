@@ -1,4 +1,4 @@
-/* global AbortController, Buffer, clearTimeout, fetch, module, require, setTimeout, TextDecoder, URL */
+/* global AbortController, Buffer, clearTimeout, fetch, module, process, require, setTimeout, TextDecoder, URL */
 
 const { createHash, randomUUID } = require('node:crypto')
 const { createInflateRaw } = require('node:zlib')
@@ -124,11 +124,21 @@ function validParseResult(value) {
   return true
 }
 
-function createJobBoundary(timeoutMs, settlementReserveMs) {
+function terminateCurrentWorkerExecution() {
+  process.abort()
+  return new Promise(() => undefined)
+}
+
+function createJobBoundary(
+  timeoutMs, settlementReserveMs, jobIdentity, terminateJobExecution,
+) {
   const finalDeadline = Date.now() + timeoutMs
   const workDeadline = finalDeadline - settlementReserveMs
   const drainSliceMs = Math.max(1, Math.floor(settlementReserveMs / 3))
   const workDrainDeadline = Math.min(finalDeadline - 2, workDeadline + drainSliceMs)
+  const containmentDeadline = Math.max(
+    workDrainDeadline + 1, finalDeadline - drainSliceMs - 1,
+  )
   const settlementDeadline = Math.max(workDrainDeadline + 1, finalDeadline - drainSliceMs)
   const workController = new AbortController()
   const settlementController = new AbortController()
@@ -156,24 +166,36 @@ function createJobBoundary(timeoutMs, settlementReserveMs) {
   }
 
   async function drain(pending, deadlineAt) {
-    if (pending.size === 0) return
+    if (pending.size === 0) return true
     const remaining = deadlineAt - Date.now()
-    if (remaining <= 0) return
+    if (remaining <= 0) return pending.size === 0
     let timeoutId
     await Promise.race([
       Promise.allSettled([...pending]),
       new Promise(resolve => { timeoutId = setTimeout(resolve, remaining) }),
     ])
     clearTimeout(timeoutId)
+    return pending.size === 0
+  }
+
+  async function contain(pending, controller, gracefulDeadline, forcedDeadline) {
+    controller.abort()
+    if (await drain(pending, gracefulDeadline)) return
+    await terminateJobExecution(jobIdentity)
+    if (await drain(pending, forcedDeadline)) return
+    await terminateCurrentWorkerExecution()
   }
 
   async function race(
-    { deadlineAt, drainDeadline, controller, pending, context }, operation, requireDrain = false,
+    { deadlineAt, drainDeadline, forcedDeadline, controller, pending, context },
+    operation, operationTimeoutMs,
   ) {
-    const remaining = deadlineAt - Date.now()
+    const operationDeadline = operationTimeoutMs === undefined
+      ? deadlineAt
+      : Math.min(deadlineAt, Date.now() + operationTimeoutMs)
+    const remaining = operationDeadline - Date.now()
     if (remaining <= 0) {
-      controller.abort()
-      await drain(pending, drainDeadline)
+      await contain(pending, controller, drainDeadline, forcedDeadline)
       throw { code: 'TRANSIENT_FAILURE' }
     }
     const running = track(pending, operation, context)
@@ -190,8 +212,7 @@ function createJobBoundary(timeoutMs, settlementReserveMs) {
       return await Promise.race([running, expired])
     } catch (error) {
       if (timedOut || controller.signal.aborted) {
-        if (requireDrain) await Promise.allSettled([running])
-        else await drain(pending, drainDeadline)
+        await contain(pending, controller, drainDeadline, forcedDeadline)
       }
       throw error
     } finally {
@@ -204,23 +225,26 @@ function createJobBoundary(timeoutMs, settlementReserveMs) {
     abortWork() { workController.abort() },
     work: operation => race({
       deadlineAt: workDeadline, drainDeadline: workDrainDeadline,
+      forcedDeadline: containmentDeadline,
       controller: workController, pending: pendingWork, context: workContext,
     }, operation),
-    workAndDrain: operation => race({
+    workAndDrain: (operation, operationTimeoutMs) => race({
       deadlineAt: workDeadline, drainDeadline: workDrainDeadline,
+      forcedDeadline: containmentDeadline,
       controller: workController, pending: pendingWork, context: workContext,
-    }, operation, true),
+    }, operation, operationTimeoutMs),
     settle: operation => race({
-      deadlineAt: settlementDeadline, drainDeadline: finalDeadline,
+      deadlineAt: settlementDeadline, drainDeadline: finalDeadline - 1,
+      forcedDeadline: finalDeadline,
       controller: settlementController, pending: pendingSettlement, context: settlementContext,
     }, operation),
     async dispose() {
-      if (pendingWork.size > 0) workController.abort()
-      if (pendingSettlement.size > 0) settlementController.abort()
-      await Promise.all([
-        drain(pendingWork, finalDeadline),
-        drain(pendingSettlement, finalDeadline),
-      ])
+      if (pendingWork.size > 0) {
+        await contain(pendingWork, workController, containmentDeadline, finalDeadline)
+      }
+      if (pendingSettlement.size > 0) {
+        await contain(pendingSettlement, settlementController, finalDeadline, finalDeadline)
+      }
     },
   }
 }
@@ -230,6 +254,7 @@ function createKnowledgeWorker({
   maxJobs = MAX_JOBS_PER_RUN, parserTimeoutMs = DEFAULT_PARSER_TIMEOUT_MS,
   jobTimeoutMs = DEFAULT_JOB_TIMEOUT_MS,
   settlementReserveMs = DEFAULT_SETTLEMENT_RESERVE_MS,
+  terminateJobExecution = terminateCurrentWorkerExecution,
 }) {
   if (typeof rpc !== 'function' || !storage || typeof storage.readObject !== 'function'
     || typeof storage.deleteObjects !== 'function' || !parser || typeof parser.parse !== 'function'
@@ -240,33 +265,15 @@ function createKnowledgeWorker({
     || !Number.isSafeInteger(jobTimeoutMs)
     || jobTimeoutMs < 2 || jobTimeoutMs > MAX_JOB_TIMEOUT_MS
     || !Number.isSafeInteger(settlementReserveMs)
-    || settlementReserveMs < 1 || settlementReserveMs >= jobTimeoutMs) {
+    || settlementReserveMs < 1 || settlementReserveMs >= jobTimeoutMs
+    || typeof terminateJobExecution !== 'function') {
     throw new Error('Knowledge worker is not configured')
   }
 
   async function parseUpload(input, boundary) {
-    return await boundary.workAndDrain(async (requestBoundary) => {
-      const remaining = requestBoundary.deadlineAt - Date.now()
-      if (remaining <= 0) throw { code: 'TRANSIENT_FAILURE' }
-      let timeoutId
-      const timedOut = new Promise((_, reject) => {
-        timeoutId = setTimeout(() => {
-          boundary.abortWork()
-          reject({ code: 'TRANSIENT_FAILURE' })
-        }, Math.min(parserTimeoutMs, remaining))
-      })
-      const parsing = Promise.resolve().then(() => parser.parse({
+    return await boundary.workAndDrain(requestBoundary => parser.parse({
         ...input, signal: requestBoundary.signal,
-      }))
-      try {
-        return await Promise.race([parsing, timedOut])
-      } catch (error) {
-        if (requestBoundary.signal.aborted) await Promise.allSettled([parsing])
-        throw error
-      } finally {
-        clearTimeout(timeoutId)
-      }
-    })
+      }), parserTimeoutMs)
   }
 
   function mutationParameters(parameters, requestBoundary) {
@@ -388,7 +395,11 @@ function createKnowledgeWorker({
         if (!validClaim(result, leaseToken)) throw { code: 'INTERNAL_ERROR' }
         if (result.job === null) break
         const job = result.job
-        const boundary = createJobBoundary(jobTimeoutMs, settlementReserveMs)
+        const boundary = createJobBoundary(
+          jobTimeoutMs, settlementReserveMs,
+          { workerId, jobId: job.id, leaseToken: job.leaseToken },
+          terminateJobExecution,
+        )
         claimed += 1
         let stopAfterJob = false
         try {
