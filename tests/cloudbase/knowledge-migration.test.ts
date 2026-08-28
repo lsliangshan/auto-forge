@@ -749,6 +749,34 @@ describe('CloudBase personal knowledge migration', () => {
     expect(authorize(120_000, 8_640_000_000)).toBe(false)
   })
 
+  it('requeues only the exact current claim when activation has no settlement reserve', async () => {
+    const [canonical, feature, rollback] = await Promise.all([
+      readFile(canonicalUrl, 'utf8'),
+      readFile(featureUrl, 'utf8'),
+      readFile(rollbackUrl, 'utf8'),
+    ])
+    const name = 'autoforge_knowledge_abandon_claimed_job'
+    const definition = functionDefinition(canonical, name)
+    expect(definition).toContain(
+      'p_worker_id varchar, p_job_id varchar, p_lease_token varchar, p_mutation_permit varchar',
+    )
+    expect(definition).toContain("state = 'queued'")
+    expect(definition).toContain('attempt = greatest(attempt - 1, 0)')
+    expect(definition).toContain("state = 'running'")
+    expect(definition).toContain('worker_id = p_worker_id')
+    expect(definition).toContain('lease_token = p_lease_token')
+    expect(definition).toContain('mutation_permit = p_mutation_permit')
+    expect(definition).toContain('mutation_permit = NULL')
+    expect(definition).toContain('mutation_deadline_at = NULL')
+    expect(feature).toContain(definition)
+    expect(canonical).toContain(
+      `GRANT EXECUTE ON FUNCTION public.${name}(varchar, varchar, varchar, varchar)`,
+    )
+    expect(rollback).toContain(
+      `DROP FUNCTION IF EXISTS public.${name}(varchar, varchar, varchar, varchar)`,
+    )
+  })
+
   it('statically requires payload purge after exact Storage deletion and models payload removal separately', async () => {
     const sql = await readFile(canonicalUrl, 'utf8')
     expect(sql).toContain('autoforge_knowledge_prepare_base_purge')

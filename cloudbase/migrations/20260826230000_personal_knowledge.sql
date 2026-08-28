@@ -1775,6 +1775,41 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_abandon_claimed_job(
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar, p_mutation_permit varchar
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE changed integer;
+BEGIN
+  IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
+    OR p_job_id IS NULL OR btrim(p_job_id) = '' OR length(p_job_id) > 128
+    OR p_lease_token IS NULL OR btrim(p_lease_token) = ''
+    OR length(p_lease_token) > 128
+    OR p_mutation_permit IS NULL OR btrim(p_mutation_permit) = ''
+    OR length(p_mutation_permit) > 128 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  UPDATE public.knowledge_jobs SET state = 'queued',
+    attempt = greatest(attempt - 1, 0), error_code = NULL,
+    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+    mutation_permit = NULL, mutation_deadline_at = NULL,
+    updated_at = clock_timestamp()
+    WHERE id = p_job_id AND state = 'running' AND worker_id = p_worker_id
+      AND lease_token = p_lease_token
+      AND lease_expires_at > clock_timestamp()
+      AND mutation_permit = p_mutation_permit;
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  IF changed <> 1 THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('abandoned', true);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_job(
   p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
   p_state varchar, p_error_code varchar, p_mutation_permit varchar
@@ -3329,6 +3364,7 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_prepare_base_purge(varchar, va
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_base_purge(varchar, varchar, varchar, jsonb, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_abandon_claimed_job(varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
@@ -3392,6 +3428,7 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_prepare_base_purge(varchar,
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_base_purge(varchar, varchar, varchar, jsonb, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_abandon_claimed_job(varchar, varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(varchar, varchar, varchar, varchar, varchar) TO service_role;

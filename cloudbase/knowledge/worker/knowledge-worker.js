@@ -144,6 +144,7 @@ function terminateCurrentWorkerExecution() {
 function createJobBoundary(
   timeoutMs, settlementReserveMs, jobIdentity, mutationAuthorization,
   terminateJobExecution, monotonicNow,
+  terminateBoundaryExecution = terminateCurrentWorkerExecution,
 ) {
   const finalDeadline = monotonicNow() + timeoutMs
   const workDeadline = finalDeadline - settlementReserveMs
@@ -198,7 +199,8 @@ function createJobBoundary(
     if (await drain(pending, gracefulDeadline)) return
     await terminateJobExecution(jobIdentity)
     if (await drain(pending, forcedDeadline)) return
-    await terminateCurrentWorkerExecution()
+    await terminateBoundaryExecution(jobIdentity)
+    if (!(await drain(pending, forcedDeadline))) throw { code: 'TRANSIENT_FAILURE' }
   }
 
   async function race(
@@ -265,15 +267,24 @@ function createJobBoundary(
 }
 
 function createKnowledgeWorker({
-  rpc, storage, parser, embeddingWorker, workerId, id = randomUUID,
+  rpc, storage, parser, embeddingWorker, jobExecution, workerId, id = randomUUID,
   maxJobs = MAX_JOBS_PER_RUN, parserTimeoutMs = DEFAULT_PARSER_TIMEOUT_MS,
   jobTimeoutMs = DEFAULT_JOB_TIMEOUT_MS,
   settlementReserveMs = DEFAULT_SETTLEMENT_RESERVE_MS,
-  terminateJobExecution = terminateCurrentWorkerExecution,
+  terminateJobExecution,
   monotonicNow = () => performance.now(),
 }) {
-  if (typeof rpc !== 'function' || !storage || typeof storage.readObject !== 'function'
-    || typeof storage.deleteObjects !== 'function' || !parser || typeof parser.parse !== 'function'
+  const directExecution = !jobExecution && storage
+    && typeof storage.readObject === 'function'
+    && typeof storage.deleteObjects === 'function'
+    && parser && typeof parser.parse === 'function'
+  const containedExecution = jobExecution && typeof jobExecution.run === 'function'
+    && typeof jobExecution.terminate === 'function'
+  const terminateExecution = terminateJobExecution
+    ?? (containedExecution
+      ? identity => jobExecution.terminate(identity)
+      : terminateCurrentWorkerExecution)
+  if (typeof rpc !== 'function' || (!directExecution && !containedExecution)
     || !nonEmptyString(workerId) || !Number.isSafeInteger(maxJobs)
     || maxJobs < 1 || maxJobs > MAX_JOBS_PER_RUN
     || !Number.isSafeInteger(parserTimeoutMs)
@@ -282,7 +293,7 @@ function createKnowledgeWorker({
     || jobTimeoutMs < 2 || jobTimeoutMs > MAX_JOB_TIMEOUT_MS
     || !Number.isSafeInteger(settlementReserveMs)
     || settlementReserveMs < 1 || settlementReserveMs >= jobTimeoutMs
-    || typeof terminateJobExecution !== 'function' || typeof monotonicNow !== 'function') {
+    || typeof terminateExecution !== 'function' || typeof monotonicNow !== 'function') {
     throw new Error('Knowledge worker is not configured')
   }
 
@@ -399,7 +410,17 @@ function createKnowledgeWorker({
     return false
   }
 
+  async function runClaimedJob(job, boundary) {
+    if (!validClaim({ job }, job?.leaseToken)) throw { code: 'INVALID_INPUT' }
+    let stopAfterJob = false
+    if (job.kind === 'upload') await processUpload(job, boundary)
+    else if (job.kind === 'purge') await processPurge(job, boundary)
+    else stopAfterJob = await processEmbedding(job, boundary)
+    return { stopAfterJob }
+  }
+
   return {
+    runClaimedJob,
     async runOnce() {
       let claimed = 0
       let completed = 0
@@ -420,7 +441,16 @@ function createKnowledgeWorker({
         const localBudgetMs = Math.min(
           jobTimeoutMs, Math.max(0, job.mutationBudgetMs - claimElapsedMs),
         )
-        if (localBudgetMs <= settlementReserveMs) throw { code: 'TRANSIENT_FAILURE' }
+        if (localBudgetMs <= settlementReserveMs) {
+          const abandoned = await rpc('autoforge_knowledge_abandon_claimed_job', {
+            p_worker_id: workerId, p_job_id: job.id,
+            p_lease_token: job.leaseToken, p_mutation_permit: job.mutationPermit,
+          })
+          if (!exactKeys(abandoned, ['abandoned']) || abandoned.abandoned !== true) {
+            throw { code: 'INTERNAL_ERROR' }
+          }
+          throw { code: 'TRANSIENT_FAILURE' }
+        }
         const mutationAuthorization = Object.freeze({
           capability: job.mutationPermit, workerId,
           jobId: job.id, leaseToken: job.leaseToken,
@@ -428,14 +458,21 @@ function createKnowledgeWorker({
         const boundary = createJobBoundary(
           localBudgetMs, settlementReserveMs,
           { workerId, jobId: job.id, leaseToken: job.leaseToken },
-          mutationAuthorization, terminateJobExecution, monotonicNow,
+          mutationAuthorization, terminateExecution, monotonicNow,
+          containedExecution ? terminateExecution : undefined,
         )
         claimed += 1
-        let stopAfterJob = false
+        let stopAfterJob
         try {
-          if (job.kind === 'upload') await processUpload(job, boundary)
-          else if (job.kind === 'purge') await processPurge(job, boundary)
-          else stopAfterJob = await processEmbedding(job, boundary)
+          const outcome = containedExecution
+            ? await boundary.workAndDrain(requestBoundary => jobExecution.run({
+                workerId, job, timeoutMs: localBudgetMs,
+                settlementReserveMs, parserTimeoutMs,
+              }, requestBoundary))
+            : await runClaimedJob(job, boundary)
+          if (!exactKeys(outcome, ['stopAfterJob'])
+            || typeof outcome.stopAfterJob !== 'boolean') throw { code: 'INTERNAL_ERROR' }
+          stopAfterJob = outcome.stopAfterJob
           completed += 1
         } catch (error) {
           const code = safeCode(error)
@@ -1044,6 +1081,7 @@ function createWorkerStorageClient({
 }
 
 module.exports = {
+  createJobBoundary,
   createKnowledgeParser,
   createKnowledgeWorker,
   createWorkerStorageClient,

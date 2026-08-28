@@ -25,6 +25,7 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_search_vectors(varchar, varcha
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer, integer) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_abandon_claimed_job(varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
@@ -65,6 +66,7 @@ DROP FUNCTION IF EXISTS public.autoforge_knowledge_search_vectors(varchar, varch
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_cleanup_retention(varchar, integer, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_abandon_claimed_job(varchar, varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_claim_job(varchar, varchar, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_entitlement(varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_job(varchar, varchar);

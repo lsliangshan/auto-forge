@@ -40,8 +40,9 @@ Stop if the two forward migrations are not byte-identical.
    inject the PostgreSQL RPC/Storage service credentials plus TokenHub endpoint
    and key only from the server-side secret manager. Its private Storage adapter
    additionally requires `POST /objects/read` with an exact byte-size/SHA-256
-   response contract. Preserve `worker/parser-process.js`, `worker/parser-child.js`,
-   and the version-aligned parser dependencies in `worker/package.json`; run a
+   response contract. Preserve `worker/job-process.js`, `worker/job-child.js`,
+   `worker/parser-process.js`, `worker/parser-child.js`, and the version-aligned
+   parser dependencies in `worker/package.json`; run a
    package-resolution smoke with the release Node runtime before deployment.
    Do not set `AUTOFORGE_KNOWLEDGE_MUTATION_PERMIT_PORT_VERSION=db-job-v1`
    until both private services implement the reviewed `mutation-permit-port.js`
@@ -64,8 +65,10 @@ Stop if the two forward migrations are not byte-identical.
 5. Verify immutable staging generations: a failed parser/index job leaves the
    prior published generation active; publication requires both the expected
    prior generation and a ready candidate.
-   For every upload, verify the credentialed scheduler launches a fresh parser
-   child whose environment contains no RPC, Storage, TokenHub, proxy, service-role,
+   For every claim, verify the trusted parent scheduler launches one credentialed
+   job child and retains claim/failure-settlement authority. For every upload,
+   verify that job child launches a fresh parser child whose environment contains
+   no RPC, Storage, TokenHub, proxy, service-role,
    or provider credential and whose network APIs are denied. Exercise the exact
    parser ceilings before or during accumulation: 64 MiB input, 32 MiB expanded
    DOCX and 100x compression ratio, 1000 PDF pages, 16 MiB text, 10000 blocks or
@@ -88,7 +91,11 @@ Stop if the two forward migrations are not byte-identical.
    using only the stored DB deadline and lease, even when the worker wall clock is
    skewed both ahead and behind. Exercise acknowledged abort and an ignored-abort
    transport: the former must quiesce inside the reserve; the latter must terminate
-   the current scheduled execution containment with no later side effect. Only
+   and confirm exit of only the current job child, after which the surviving parent
+   performs exact job/worker/lease/permit CAS settlement with no later side effect.
+   A claim whose response leaves less than the settlement reserve must call
+   `autoforge_knowledge_abandon_claimed_job`, return that exact row to `queued`,
+   clear its lease/permit/deadline, and not consume an attempt. Only
    `TRANSIENT_FAILURE` may retry, at most three attempts; the third expired
    lease becomes terminal `failed`. A successful two-chunk embedding slice must
    persist its vectors, yield the exact live lease back to `queued`, and preserve

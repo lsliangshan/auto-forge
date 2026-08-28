@@ -1,15 +1,9 @@
 /* global exports, process, require */
 
 const { randomUUID } = require('node:crypto')
-const {
-  createEmbeddingGenerationWorker,
-  createPostgresRpcClient,
-  createTokenHubClient,
-} = require('../function/knowledge-handler.js')
-const {
-  createKnowledgeWorker,
-  createWorkerStorageClient,
-} = require('./knowledge-worker.js')
+const { createPostgresRpcClient, createTokenHubClient } = require('../function/knowledge-handler.js')
+const { createKnowledgeJobProcess } = require('./job-process.js')
+const { createKnowledgeWorker, createWorkerStorageClient } = require('./knowledge-worker.js')
 const { createKnowledgeParserProcess } = require('./parser-process.js')
 
 let worker
@@ -22,29 +16,26 @@ function configuredWorker() {
     baseUrl: process.env.AUTOFORGE_PG_RPC_BASE_URL,
     serviceKey,
   })
-  const storage = createWorkerStorageClient({
+  createWorkerStorageClient({
     baseUrl: process.env.AUTOFORGE_PG_STORAGE_BASE_URL,
     serviceKey,
     mutationPermitPortVersion,
   })
+  createKnowledgeParserProcess()
   const tokenHubEndpoint = process.env.AUTOFORGE_TOKENHUB_EMBEDDING_URL
   const tokenHubApiKey = process.env.AUTOFORGE_TOKENHUB_API_KEY
-  const embeddingWorker = tokenHubEndpoint && tokenHubApiKey
-    ? createEmbeddingGenerationWorker({
-        rpc,
-        tokenHub: createTokenHubClient({
-          endpoint: tokenHubEndpoint, apiKey: tokenHubApiKey,
-          requireMutationPermitPort: true, mutationPermitPortVersion,
-        }),
-        maximumChunksPerRun: 2,
-      })
-    : undefined
+  if (tokenHubEndpoint && tokenHubApiKey) {
+    createTokenHubClient({
+      endpoint: tokenHubEndpoint, apiKey: tokenHubApiKey,
+      requireMutationPermitPort: true, mutationPermitPortVersion,
+    })
+  }
   const configuredId = process.env.AUTOFORGE_KNOWLEDGE_WORKER_ID
   const workerId = configuredId && /^[A-Za-z0-9_-]{1,96}$/u.test(configuredId)
     ? configuredId
     : `worker_${randomUUID()}`
   worker = createKnowledgeWorker({
-    rpc, storage, parser: createKnowledgeParserProcess(), embeddingWorker, workerId,
+    rpc, jobExecution: createKnowledgeJobProcess(), workerId,
   })
   return worker
 }

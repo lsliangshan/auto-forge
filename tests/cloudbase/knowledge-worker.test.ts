@@ -2,9 +2,12 @@ import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createSocket } from 'node:dgram'
+import { createServer as createHttpsServer } from 'node:https'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { fileURLToPath } from 'node:url'
 import { brotliCompressSync, constants, deflateRawSync, deflateSync } from 'node:zlib'
 import { describe, expect, it, vi } from 'vitest'
 import { createKnowledgeParserProcess } from '../../cloudbase/knowledge/worker/parser-process.js'
@@ -146,10 +149,13 @@ function pdfFixture(text: string, expandedPaddingBytes = 0): Buffer {
 
 describe('CloudBase knowledge scheduled worker', () => {
   it('ships a directly deployable CommonJS scheduled entry', async () => {
-    const [rootEntry, entry, childEntry, parserProcess, packageJson, childPackageJson, deployLock]
+    const [rootEntry, entry, jobEntry, jobProcess, childEntry, parserProcess,
+      packageJson, childPackageJson, deployLock]
       = await Promise.all([
       readFile(new URL('../../cloudbase/knowledge/index.js', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/worker/index.js', import.meta.url), 'utf8'),
+      readFile(new URL('../../cloudbase/knowledge/worker/job-child.js', import.meta.url), 'utf8'),
+      readFile(new URL('../../cloudbase/knowledge/worker/job-process.js', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/worker/parser-child.js', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/worker/parser-process.js', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/package.json', import.meta.url), 'utf8'),
@@ -177,10 +183,13 @@ describe('CloudBase knowledge scheduled worker', () => {
     expect(rootEntry).toContain('exports.main = main')
     expect(entry).toContain("require('../function/knowledge-handler.js')")
     expect(entry).toContain('exports.main = main')
-    expect(entry).toContain('createEmbeddingGenerationWorker')
-    expect(entry).toContain('maximumChunksPerRun: 2')
+    expect(entry).toContain('createKnowledgeJobProcess')
     expect(entry).toContain('createKnowledgeParserProcess')
     expect(entry).not.toContain('createKnowledgeParser()')
+    expect(jobEntry).toContain('createEmbeddingGenerationWorker')
+    expect(jobEntry).toContain('maximumChunksPerRun: 2')
+    expect(jobEntry).toContain('createKnowledgeParserProcess')
+    expect(jobProcess).toContain("child.kill('SIGKILL')")
     expect(childEntry).not.toMatch(/knowledge-handler|TOKENHUB|PG_SERVICE|STORAGE_BASE|RPC_BASE/u)
     expect(parserProcess).not.toMatch(/knowledge-handler|TOKENHUB|PG_SERVICE|STORAGE_BASE|RPC_BASE/u)
     expect(entry).not.toMatch(/\bexport\s+(?:default|async|function|const|let|var|class)/)
@@ -582,6 +591,245 @@ describe('CloudBase knowledge scheduled worker', () => {
       expect(slow.every(byte => byte === 0)).toBe(true)
       expect(fast.every(byte => byte === 0)).toBe(true)
     })
+  })
+
+  it('keeps the production scheduler alive after forcibly terminating one job process', async () => {
+    const certificateUrl = new URL(
+      '../../apps/desktop/electron/main/media/test-fixtures/pinned-media-test-cert.pem',
+      import.meta.url,
+    )
+    const keyUrl = new URL(
+      '../../apps/desktop/electron/main/media/test-fixtures/pinned-media-test-key.pem',
+      import.meta.url,
+    )
+    const [certificate, key] = await Promise.all([
+      readFile(certificateUrl), readFile(keyUrl),
+    ])
+    const bytes = Buffer.from('contained source')
+    const sha256 = createHash('sha256').update(bytes).digest('hex')
+    let storageRequestStarted = false
+    const database = new DatabaseSync(':memory:')
+    database.exec(`
+        CREATE TABLE jobs (
+          id TEXT PRIMARY KEY,
+          state TEXT NOT NULL,
+          attempt INTEGER NOT NULL,
+          worker_id TEXT,
+          lease_token TEXT,
+          mutation_permit TEXT
+        );
+        INSERT INTO jobs(id, state, attempt)
+          VALUES ('job_upload', 'queued', 0);
+    `)
+    const server = createHttpsServer({ cert: certificate, key }, (request, response) => {
+      const chunks: Buffer[] = []
+      let length = 0
+      request.on('data', (raw) => {
+        const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
+        length += chunk.byteLength
+        if (length <= 16 * 1024) chunks.push(chunk)
+      })
+      request.on('end', () => {
+        let body: Record<string, unknown>
+        try {
+          body = JSON.parse(Buffer.concat(chunks, length).toString('utf8'))
+        } catch {
+          response.writeHead(400)
+          response.end()
+          return
+        }
+        const json = (value: unknown) => {
+          response.writeHead(200, { 'content-type': 'application/json' })
+          response.end(JSON.stringify(value))
+        }
+        if (request.url === '/rpc/autoforge_knowledge_claim_job') {
+          const changed = database.prepare(`
+              UPDATE jobs SET state = 'running', attempt = attempt + 1,
+                worker_id = ?, lease_token = ?, mutation_permit = ?
+              WHERE id = 'job_upload' AND state = 'queued'
+          `).run(body.p_worker_id, body.p_lease_token, 'permit_job_upload')
+          expect(changed.changes).toBe(1)
+          json({ job: {
+            id: 'job_upload', kind: 'upload', entityId: 'upload_entity',
+            leaseToken: body.p_lease_token, attempt: 1,
+            mutationPermit: 'permit_job_upload', mutationBudgetMs: 5_500,
+          } })
+          return
+        }
+        if (request.url === '/rpc/autoforge_knowledge_get_upload_work') {
+          json({
+            ownerId: '1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+            versionId: 'version_1', generationId: 'generation_1', objectId: 'object_1',
+            storageReference: 'knowledge/1/kb_1/object_1', byteSize: bytes.byteLength,
+            sha256, mimeType: 'text/plain', name: 'cloud.txt', versionNumber: 1,
+          })
+          return
+        }
+        if (request.url === '/objects/read') {
+          storageRequestStarted = true
+          return
+        }
+        if (request.url === '/rpc/autoforge_knowledge_complete_job') {
+          const changed = database.prepare(`
+              UPDATE jobs SET state = 'queued', worker_id = NULL,
+                lease_token = NULL, mutation_permit = NULL
+              WHERE id = ? AND state = 'running' AND worker_id = ?
+                AND lease_token = ? AND mutation_permit = ?
+          `).run(
+            body.p_job_id, body.p_worker_id, body.p_lease_token, body.p_mutation_permit,
+          )
+          expect(changed.changes).toBe(1)
+          json({ completed: true })
+          return
+        }
+        if (request.url === '/rpc/autoforge_knowledge_cleanup_retention') {
+          json({
+            prunedChanges: 0, prunedTombstones: 0, prunedSnapshots: 0,
+            prunedGenerations: 0, prunedDispatchPermits: 0,
+          })
+          return
+        }
+        response.writeHead(500)
+        response.end()
+      })
+    })
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      server.once('error', rejectPromise)
+      server.listen(0, '127.0.0.1', resolvePromise)
+    })
+    const address = server.address()
+    expect(address).not.toBeNull()
+    if (!address || typeof address === 'string') throw new Error('HTTPS fixture did not bind')
+
+    let scheduler: ReturnType<typeof spawn> | undefined
+    try {
+      const baseUrl = `https://127.0.0.1:${address.port}`
+      const entry = fileURLToPath(new URL(
+        '../../cloudbase/knowledge/index.js', import.meta.url,
+      ))
+      const runner = `const { main } = require(${JSON.stringify(entry)}); main().then(`
+        + `result => process.stdout.write(JSON.stringify({ pid: process.pid, result })), `
+        + `error => { process.stderr.write(String(error?.stack ?? error)); process.exitCode = 1 })`
+      scheduler = spawn(process.execPath, ['--no-addons', '-e', runner], {
+        env: {
+        AUTOFORGE_PG_RPC_BASE_URL: baseUrl,
+        AUTOFORGE_PG_STORAGE_BASE_URL: baseUrl,
+        AUTOFORGE_PG_SERVICE_KEY: 'test-service-key',
+        AUTOFORGE_KNOWLEDGE_MUTATION_PERMIT_PORT_VERSION: 'db-job-v1',
+        AUTOFORGE_KNOWLEDGE_WORKER_ID: 'worker_1',
+        NODE_EXTRA_CA_CERTS: fileURLToPath(certificateUrl),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+      let stdout = ''
+      let stderr = ''
+      scheduler.stdout?.setEncoding('utf8')
+      scheduler.stderr?.setEncoding('utf8')
+      scheduler.stdout?.on('data', chunk => { stdout += String(chunk) })
+      scheduler.stderr?.on('data', chunk => { stderr += String(chunk) })
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+        (resolvePromise, rejectPromise) => {
+          scheduler?.once('error', rejectPromise)
+          scheduler?.once('close', (code, signal) => resolvePromise({ code, signal }))
+        },
+      )
+      expect(exit).toEqual({ code: 0, signal: null })
+      expect(stderr).toBe('')
+      expect(JSON.parse(stdout)).toEqual({
+        pid: expect.any(Number),
+        result: { claimed: 1, completed: 0, failed: 1 },
+      })
+      expect(storageRequestStarted).toBe(true)
+      expect(database.prepare(`
+          SELECT state, attempt, worker_id, lease_token, mutation_permit
+          FROM jobs WHERE id = 'job_upload'
+      `).get()).toEqual({
+        state: 'queued', attempt: 1, worker_id: null,
+        lease_token: null, mutation_permit: null,
+      })
+    } finally {
+      if (scheduler && scheduler.exitCode === null && scheduler.signalCode === null) {
+        scheduler.kill('SIGKILL')
+      }
+      database.close()
+      server.closeAllConnections()
+      await new Promise<void>(resolvePromise => server.close(() => resolvePromise()))
+    }
+  }, 10_000)
+
+  it('abandons the exact DB claim when transit consumes the settlement reserve', async () => {
+    const database = new DatabaseSync(':memory:')
+    try {
+      database.exec(`
+        CREATE TABLE jobs (
+          id TEXT PRIMARY KEY,
+          state TEXT NOT NULL,
+          attempt INTEGER NOT NULL,
+          worker_id TEXT,
+          lease_token TEXT,
+          mutation_permit TEXT
+        );
+        INSERT INTO jobs(id, state, attempt)
+          VALUES ('job_upload', 'queued', 0);
+      `)
+      let monotonicTime = 0
+      const rpc = vi.fn(async (name: string, parameters: Record<string, unknown>) => {
+        if (name === 'autoforge_knowledge_claim_job') {
+          const changed = database.prepare(`
+            UPDATE jobs SET state = 'running', attempt = attempt + 1,
+              worker_id = ?, lease_token = ?, mutation_permit = ?
+            WHERE id = 'job_upload' AND state = 'queued'
+          `).run(
+            parameters.p_worker_id, parameters.p_lease_token, 'permit_job_upload',
+          )
+          expect(changed.changes).toBe(1)
+          monotonicTime = 90
+          return {
+            job: {
+              id: 'job_upload', kind: 'upload', entityId: 'upload_entity',
+              leaseToken: 'lease_job_upload', attempt: 1,
+              mutationPermit: 'permit_job_upload', mutationBudgetMs: 100,
+            },
+          }
+        }
+        if (name === 'autoforge_knowledge_abandon_claimed_job') {
+          const changed = database.prepare(`
+            UPDATE jobs SET state = 'queued', attempt = attempt - 1,
+              worker_id = NULL, lease_token = NULL, mutation_permit = NULL
+            WHERE id = ? AND state = 'running' AND worker_id = ?
+              AND lease_token = ? AND mutation_permit = ?
+          `).run(
+            parameters.p_job_id, parameters.p_worker_id,
+            parameters.p_lease_token, parameters.p_mutation_permit,
+          )
+          expect(changed.changes).toBe(1)
+          return { abandoned: true }
+        }
+        throw new Error(`unexpected rpc ${name}`)
+      })
+      const worker = createKnowledgeWorker({
+        rpc, storage: { readObject: vi.fn(), deleteObjects: vi.fn() },
+        parser: { parse: vi.fn() }, workerId: 'worker_1',
+        id: () => 'lease_job_upload', jobTimeoutMs: 100,
+        settlementReserveMs: 30, monotonicNow: () => monotonicTime,
+      })
+
+      await expect(worker.runOnce()).rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
+      expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_abandon_claimed_job', {
+        p_worker_id: 'worker_1', p_job_id: 'job_upload',
+        p_lease_token: 'lease_job_upload', p_mutation_permit: 'permit_job_upload',
+      })
+      expect(database.prepare(`
+        SELECT state, attempt, worker_id, lease_token, mutation_permit
+        FROM jobs WHERE id = 'job_upload'
+      `).get()).toEqual({
+        state: 'queued', attempt: 0, worker_id: null,
+        lease_token: null, mutation_permit: null,
+      })
+    } finally {
+      database.close()
+    }
   })
 
   it('reads verified Storage bytes, parses, and commits index readiness atomically', async () => {
