@@ -5,6 +5,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
 import type {
   AppSettings,
+  AuthSession,
   ConversationSummary,
   DesktopAPI,
   ModelInfo,
@@ -15,11 +16,17 @@ import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
 import { tokenColors } from '../../src/components/settings/token-usage-chart-options'
 import { routes } from '../../src/router/index'
 import { useExecutionStore } from '../../src/stores/execution'
+import { useAuthStore } from '../../src/stores/auth'
 import { useChatStore } from '../../src/stores/chat'
 import { useSettingsStore } from '../../src/stores/settings'
 import { useWorkflowStore } from '../../src/stores/workflow'
 
 const mountedAppWrappers: VueWrapper[] = []
+
+const authSession: AuthSession = {
+  user: { id: 'user_1', account: 'Alice' },
+  authenticatedAt: '2026-08-17T00:00:00.000Z',
+}
 
 function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']): ModelInfo {
   return {
@@ -117,7 +124,7 @@ function computedColor(value: string) {
 function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
   return {
     auth: {
-      getSession: vi.fn().mockResolvedValue(null), sendOtp: vi.fn(), verifyOtp: vi.fn(),
+      getSession: vi.fn().mockResolvedValue(authSession), sendOtp: vi.fn(), verifyOtp: vi.fn(),
       cancelOtp: vi.fn().mockResolvedValue(undefined), loginWithPassword: vi.fn(),
       logout: vi.fn().mockResolvedValue({ status: 'logged_out' }),
     },
@@ -189,6 +196,26 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
         lastSyncAt: '2026-08-25T00:00:00.000Z',
       }),
     },
+    knowledge: {
+      list: vi.fn().mockResolvedValue([]), create: vi.fn(),
+      listDocuments: vi.fn().mockResolvedValue([]), listVersions: vi.fn().mockResolvedValue([]),
+      pickImportFiles: vi.fn().mockResolvedValue([]), importDocument: vi.fn(),
+      replaceDocument: vi.fn(), recycleDocument: vi.fn(), restoreDocument: vi.fn(),
+      purgeDocument: vi.fn(), recycleBase: vi.fn(), restoreBase: vi.fn(), purgeBase: vi.fn(),
+      exportBase: vi.fn(), getSelection: vi.fn(), updateSelection: vi.fn(), search: vi.fn(),
+      getAvailability: vi.fn().mockResolvedValue({
+        encryption: { available: true }, parser: { available: true },
+        cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+        embedding: { available: false, reason: 'embedding_unavailable' },
+        entitlement: { available: true }, beta: { available: true },
+        cloud: { available: false, reason: 'cloud_disabled' },
+      }),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false,
+      }),
+      retainFreeAllowance: vi.fn(), getConsent: vi.fn(), setConsent: vi.fn(),
+      revokeConsent: vi.fn(), getSourcePreview: vi.fn(), onEvent: vi.fn(() => vi.fn()),
+    },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
   }
@@ -216,6 +243,7 @@ async function mountApp(path = '/chat', api = createApi()) {
   const router = createRouter({ history: createMemoryHistory(), routes })
   const pinia = createPinia()
   setActivePinia(pinia)
+  await useAuthStore(pinia).restore()
   await router.push(path)
   await router.isReady()
   const wrapper = mount(App, {
