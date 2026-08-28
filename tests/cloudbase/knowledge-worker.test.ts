@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createSocket } from 'node:dgram'
@@ -402,6 +402,52 @@ describe('CloudBase knowledge scheduled worker', () => {
           systemLibraryOpenDenied: true,
         })
       })
+  })
+
+  it('denies executable mapping for a real native addon inside the parser dependency tree', async () => {
+    const addonPath = await realpath(new URL([
+      '../../cloudbase/knowledge/node_modules/.pnpm/',
+      '@napi-rs+canvas-darwin-arm64@1.0.8/node_modules/',
+      '@napi-rs/canvas-darwin-arm64/skia.darwin-arm64.node',
+    ].join(''), import.meta.url))
+    await withParserChild(`
+      const denied = error => ['ERR_ACCESS_DENIED', 'EPERM', 'EACCES'].includes(error?.code)
+        || /(?:operation not permitted|permission denied|access denied|sandbox)/iu
+          .test(String(error?.message))
+      let nativeDependencyMapDenied
+      try {
+        require(${JSON.stringify(addonPath)})
+        nativeDependencyMapDenied = false
+      } catch (error) {
+        nativeDependencyMapDenied = denied(error)
+      }
+      const body = Buffer.from(JSON.stringify({ ok: true, result: {
+        nodePermissionDisabled: process.permission === undefined,
+        nativeDependencyMapDenied,
+      } }))
+      const prefix = Buffer.alloc(4); prefix.writeUInt32BE(body.length)
+      process.stdout.write(Buffer.concat([prefix, body]))
+    `, async (childEntry) => {
+      let profile = ''
+      const parser = createKnowledgeParserProcess({
+        childEntry, timeoutMs: 2_000,
+        spawnImpl: (command, args, options) => {
+          profile = args[1] ?? ''
+          return spawn(command, args.filter(argument => (
+            argument !== '--permission' && argument !== '--no-addons'
+              && !argument.startsWith('--allow-fs-read=')
+          )), options)
+        },
+      })
+      await expect(parser.parse({
+        bytes: Buffer.from('native dependency probe'),
+        mimeType: 'text/plain', versionId: 'native_dependency_probe',
+      })).resolves.toEqual({
+        nodePermissionDisabled: true,
+        nativeDependencyMapDenied: true,
+      })
+      expect(profile).toMatch(/\(deny file-map-executable\s+\(subpath "[^"]+\/node_modules"\)\)/u)
+    })
   })
 
   it('kills a child whose external-memory RSS crosses the parent-owned ceiling', async () => {

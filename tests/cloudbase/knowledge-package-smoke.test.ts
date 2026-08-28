@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { cp, mkdtemp, realpath, rm } from 'node:fs/promises'
+import { cp, mkdtemp, open, readdir, realpath, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { basename, join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -118,6 +118,37 @@ function run(command: string, args: string[], cwd: string): Promise<void> {
   })
 }
 
+async function nativeBinaries(root: string): Promise<string[]> {
+  const found: string[] = []
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) {
+        await visit(path)
+        continue
+      }
+      if (!entry.isFile()) continue
+      const handle = await open(path, 'r')
+      const prefix = Buffer.alloc(4)
+      try {
+        const { bytesRead } = await handle.read(prefix, 0, prefix.byteLength, 0)
+        if (bytesRead < prefix.byteLength) continue
+      } finally {
+        await handle.close()
+      }
+      const magic = prefix.toString('hex')
+      if (/\.(?:node|dylib|so|dll)$/iu.test(entry.name)
+        || ['7f454c46', 'feedface', 'feedfacf', 'cefaedfe', 'cffaedfe',
+          'cafebabe', 'bebafeca'].includes(magic)
+        || prefix.subarray(0, 2).toString('ascii') === 'MZ') {
+        found.push(path.slice(root.length + 1))
+      }
+    }
+  }
+  await visit(root)
+  return found.sort()
+}
+
 describe('CloudBase knowledge deploy package', () => {
   it.runIf(process.platform === 'darwin')(
     'frozen-installs offline and runs its entry plus real TXT, DOCX, and PDF children',
@@ -133,6 +164,7 @@ describe('CloudBase knowledge deploy package', () => {
         await run('pnpm', [
           'install', '--offline', '--frozen-lockfile', '--ignore-scripts', '--no-optional',
         ], deployRoot)
+        expect(await nativeBinaries(deployRoot)).toEqual([])
         const pdfManifest = join(deployRoot, 'node_modules', 'pdfjs-dist', 'package.json')
         expect(await realpath(pdfManifest)).toContain(deployRoot)
         expect(await realpath(join(

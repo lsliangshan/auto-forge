@@ -81,16 +81,19 @@ function sandboxLiteral(value) {
 }
 
 function parserReadPaths(childEntry) {
-  const paths = [childEntry]
+  const paths = [childEntry, realpathSync(resolve(__dirname, '..', 'node_modules'))]
   if (childEntry === childEntryDefault) {
     paths.push(
       realpathSync(resolve(__dirname, 'knowledge-worker.js')),
       realpathSync(resolve(__dirname, 'package.json')),
       realpathSync(resolve(__dirname, '..', 'package.json')),
-      realpathSync(resolve(__dirname, '..', 'node_modules')),
     )
   }
   return paths
+}
+
+function parserDependencyPath() {
+  return realpathSync(resolve(__dirname, '..', 'node_modules'))
 }
 
 function parserMetadataPaths(childEntry) {
@@ -117,6 +120,7 @@ function sandboxReadFilter(path) {
 
 function sandboxProfile(nodeExecutable, childEntry) {
   const parserReads = parserReadPaths(childEntry).map(sandboxReadFilter).join(' ')
+  const dependencyPath = parserDependencyPath()
   const runtimeReads = NODE_RUNTIME_FILES
     .map(path => `(literal "${sandboxLiteral(path)}")`).join(' ')
   const parserMetadata = parserMetadataPaths(childEntry)
@@ -138,16 +142,19 @@ function sandboxProfile(nodeExecutable, childEntry) {
       (literal "/dev/urandom")
       (literal "/dev/zero")
       (literal "${sandboxLiteral(nodeExecutable)}")
-      ${runtimeReads}
-      ${parserReads})`,
+      ${runtimeReads})`,
+    `(allow file-read-data file-read-metadata file-test-existence ${parserReads})`,
     `(allow file-map-executable
       (literal "${sandboxLiteral(nodeExecutable)}")
       ${runtimeReads})`,
+    dependencyPath
+      ? `(deny file-map-executable (subpath "${sandboxLiteral(dependencyPath)}"))`
+      : '',
     '(allow file-read-data file-test-existence file-write-data (literal "/dev/fd/0") (literal "/dev/fd/1") (literal "/dev/fd/2"))',
     '(allow file-read-data file-test-existence file-write-data (literal "/dev/null") (literal "/dev/zero"))',
     '(deny network*)',
     '(deny process-fork)',
-  ].join(' ')
+  ].filter(Boolean).join(' ')
 }
 
 function permittedReadArguments(childEntry) {
