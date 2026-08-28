@@ -7,10 +7,10 @@ const {
   createTokenHubClient,
 } = require('../function/knowledge-handler.js')
 const {
-  createKnowledgeParser,
   createKnowledgeWorker,
   createWorkerStorageClient,
 } = require('./knowledge-worker.js')
+const { createKnowledgeParserProcess } = require('./parser-process.js')
 
 let worker
 
@@ -39,7 +39,7 @@ function configuredWorker() {
     ? configuredId
     : `worker_${randomUUID()}`
   worker = createKnowledgeWorker({
-    rpc, storage, parser: createKnowledgeParser(), embeddingWorker, workerId,
+    rpc, storage, parser: createKnowledgeParserProcess(), embeddingWorker, workerId,
   })
   return worker
 }

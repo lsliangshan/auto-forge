@@ -1,6 +1,11 @@
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { deflateRawSync } from 'node:zlib'
 import { describe, expect, it, vi } from 'vitest'
+import { createKnowledgeParserProcess } from '../../cloudbase/knowledge/worker/parser-process.js'
 import {
   createKnowledgeParser,
   createKnowledgeWorker,
@@ -11,14 +16,82 @@ const claim = (id: string, kind: 'upload' | 'embedding' | 'purge', attempt = 1) 
   job: { id, kind, entityId: `${kind}_entity`, leaseToken: `lease_${id}`, attempt },
 })
 
+async function withParserChild<T>(source: string, run: (path: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), 'autoforge-parser-child-'))
+  const path = join(directory, 'child.cjs')
+  await writeFile(path, source, 'utf8')
+  try {
+    return await run(path)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+}
+
+function docxDirectoryFixture(compressedBytes: number, expandedBytes: number): Buffer {
+  const name = Buffer.from('word/document.xml')
+  const central = Buffer.alloc(46 + name.byteLength)
+  central.writeUInt32LE(0x02014b50, 0)
+  central.writeUInt16LE(20, 4)
+  central.writeUInt16LE(20, 6)
+  central.writeUInt16LE(8, 10)
+  central.writeUInt32LE(compressedBytes, 20)
+  central.writeUInt32LE(expandedBytes, 24)
+  central.writeUInt16LE(name.byteLength, 28)
+  name.copy(central, 46)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(1, 8)
+  end.writeUInt16LE(1, 10)
+  end.writeUInt32LE(central.byteLength, 12)
+  end.writeUInt32LE(0, 16)
+  return Buffer.concat([central, end])
+}
+
+function docxArchiveFixture(source: Buffer, declaredExpanded = source.byteLength): Buffer {
+  const name = Buffer.from('word/document.xml')
+  const compressed = deflateRawSync(source)
+  const local = Buffer.alloc(30 + name.byteLength)
+  local.writeUInt32LE(0x04034b50, 0)
+  local.writeUInt16LE(20, 4)
+  local.writeUInt16LE(8, 8)
+  local.writeUInt32LE(compressed.byteLength, 18)
+  local.writeUInt32LE(declaredExpanded, 22)
+  local.writeUInt16LE(name.byteLength, 26)
+  name.copy(local, 30)
+  const central = Buffer.alloc(46 + name.byteLength)
+  central.writeUInt32LE(0x02014b50, 0)
+  central.writeUInt16LE(20, 4)
+  central.writeUInt16LE(20, 6)
+  central.writeUInt16LE(8, 10)
+  central.writeUInt32LE(compressed.byteLength, 20)
+  central.writeUInt32LE(declaredExpanded, 24)
+  central.writeUInt16LE(name.byteLength, 28)
+  name.copy(central, 46)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(1, 8)
+  end.writeUInt16LE(1, 10)
+  end.writeUInt32LE(central.byteLength, 12)
+  end.writeUInt32LE(local.byteLength + compressed.byteLength, 16)
+  return Buffer.concat([local, compressed, central, end])
+}
+
 describe('CloudBase knowledge scheduled worker', () => {
   it('ships a directly deployable CommonJS scheduled entry', async () => {
-    const [rootEntry, entry, packageJson] = await Promise.all([
+    const [rootEntry, entry, childEntry, parserProcess, packageJson, childPackageJson]
+      = await Promise.all([
       readFile(new URL('../../cloudbase/knowledge/index.js', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/worker/index.js', import.meta.url), 'utf8'),
+      readFile(new URL('../../cloudbase/knowledge/worker/parser-child.js', import.meta.url), 'utf8'),
+      readFile(new URL('../../cloudbase/knowledge/worker/parser-process.js', import.meta.url), 'utf8'),
       readFile(new URL('../../cloudbase/knowledge/package.json', import.meta.url), 'utf8'),
+      readFile(new URL('../../cloudbase/knowledge/worker/package.json', import.meta.url), 'utf8'),
     ])
     expect(JSON.parse(packageJson)).toMatchObject({ type: 'commonjs', main: 'index.js' })
+    expect(JSON.parse(childPackageJson)).toMatchObject({
+      type: 'commonjs', main: 'parser-child.js',
+      dependencies: { mammoth: '1.12.1', 'pdfjs-dist': '3.11.174' },
+    })
     expect(JSON.parse(packageJson).dependencies).not.toEqual(expect.objectContaining({
       'autoforge-knowledge': expect.anything(),
     }))
@@ -28,7 +101,153 @@ describe('CloudBase knowledge scheduled worker', () => {
     expect(entry).toContain('exports.main = main')
     expect(entry).toContain('createEmbeddingGenerationWorker')
     expect(entry).toContain('maximumChunksPerRun: 2')
+    expect(entry).toContain('createKnowledgeParserProcess')
+    expect(entry).not.toContain('createKnowledgeParser()')
+    expect(childEntry).not.toMatch(/knowledge-handler|TOKENHUB|PG_SERVICE|STORAGE_BASE|RPC_BASE/u)
+    expect(parserProcess).not.toMatch(/knowledge-handler|TOKENHUB|PG_SERVICE|STORAGE_BASE|RPC_BASE/u)
     expect(entry).not.toMatch(/\bexport\s+(?:default|async|function|const|let|var|class)/)
+  })
+
+  it('parses each request in a fresh memory-bounded child with a scrubbed environment', async () => {
+    const launches: Array<{ command: string, args: readonly string[], options: Record<string, unknown> }> = []
+    const parser = createKnowledgeParserProcess({
+      timeoutMs: 2_000,
+      spawnImpl: (command, args, options) => {
+        launches.push({ command, args, options })
+        return spawn(command, args, options)
+      },
+    })
+    const previousCredential = process.env.AUTOFORGE_PG_SERVICE_KEY
+    process.env.AUTOFORGE_PG_SERVICE_KEY = 'must-not-enter-parser-child'
+    try {
+      const firstBytes = Buffer.from('第一条\n\n第二条')
+      const secondBytes = Buffer.from('第三条')
+      const first = await parser.parse({
+        bytes: firstBytes, mimeType: 'text/plain', versionId: 'version_1',
+      })
+      const second = await parser.parse({
+        bytes: secondBytes, mimeType: 'text/plain', versionId: 'version_2',
+      })
+
+      expect(first.blocks.map(({ body }: { body: string }) => body)).toEqual(['第一条', '第二条'])
+      expect(second.blocks.map(({ body }: { body: string }) => body)).toEqual(['第三条'])
+      expect(firstBytes.every(byte => byte === 0)).toBe(true)
+      expect(secondBytes.every(byte => byte === 0)).toBe(true)
+      expect(launches).toHaveLength(2)
+      expect(launches[0]?.command).toBe(process.execPath)
+      expect(launches[0]?.args).toEqual(expect.arrayContaining([
+        '--max-old-space-size=128',
+        expect.stringMatching(/parser-child\.js$/u),
+        '--max-rss-bytes=201326592',
+      ]))
+      expect(launches[0]?.options).toMatchObject({
+        env: { AUTOFORGE_PARSER_CHILD: '1' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      expect(JSON.stringify(launches)).not.toContain('must-not-enter-parser-child')
+    } finally {
+      if (previousCredential === undefined) delete process.env.AUTOFORGE_PG_SERVICE_KEY
+      else process.env.AUTOFORGE_PG_SERVICE_KEY = previousCredential
+    }
+  })
+
+  it('rejects an oversized input before spawning and zeroes its source bytes', async () => {
+    const spawnImpl = vi.fn()
+    const parser = createKnowledgeParserProcess({ maximumInputBytes: 4, spawnImpl })
+    const bytes = Buffer.from('12345')
+
+    await expect(parser.parse({ bytes, mimeType: 'text/plain', versionId: 'version_1' }))
+      .rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(spawnImpl).not.toHaveBeenCalled()
+    expect(bytes.every(byte => byte === 0)).toBe(true)
+  })
+
+  it('kills and closes a parser child when its request is cancelled', async () => {
+    await withParserChild(`
+      process.stdin.resume()
+      process.stdin.on('end', () => setTimeout(() => undefined, 10_000))
+    `, async (childEntry) => {
+      let kill: ReturnType<typeof vi.spyOn> | undefined
+      const parser = createKnowledgeParserProcess({
+        childEntry, timeoutMs: 2_000,
+        spawnImpl: (command, args, options) => {
+          const child = spawn(command, args, options)
+          kill = vi.spyOn(child, 'kill')
+          return child
+        },
+      })
+      const controller = new AbortController()
+      const bytes = Buffer.from('cancel me')
+      const parsing = parser.parse({
+        bytes, mimeType: 'text/plain', versionId: 'version_cancel',
+        signal: controller.signal,
+      })
+      const rejected = expect(parsing).rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
+      await vi.waitFor(() => expect(kill).toBeDefined())
+      controller.abort()
+
+      await rejected
+      expect(kill).toHaveBeenCalledWith('SIGKILL')
+      expect(bytes.every(byte => byte === 0)).toBe(true)
+    })
+  })
+
+  it.each([
+    ['crash', 'process.exit(7)', 'PARSER_FAILED'],
+    ['malformed frame', 'process.stdout.write(Buffer.from([0, 0, 0, 2, 123, 125]))', 'PARSER_FAILED'],
+    ['oversized frame', 'process.stdout.write(Buffer.alloc(256, 97))', 'PARSER_LIMIT_EXCEEDED'],
+    ['duplicate frame', `
+      const body = Buffer.from(JSON.stringify({ ok: false, error: { code: 'PARSER_FAILED' } }))
+      const prefix = Buffer.alloc(4); prefix.writeUInt32BE(body.length)
+      process.stdout.write(Buffer.concat([prefix, body, prefix, body]))
+    `, 'PARSER_FAILED'],
+  ] as const)('fails closed for a parser child %s', async (_name, source, expectedCode) => {
+    await withParserChild(source, async (childEntry) => {
+      const parser = createKnowledgeParserProcess({
+        childEntry, timeoutMs: 2_000, maximumResponseBytes: 128,
+      })
+      const bytes = Buffer.from('untrusted source')
+
+      await expect(parser.parse({ bytes, mimeType: 'text/plain', versionId: 'version_1' }))
+        .rejects.toEqual({ code: expectedCode })
+      expect(bytes.every(byte => byte === 0)).toBe(true)
+    })
+  })
+
+  it('cannot apply a late timed-out frame to a later parser request', async () => {
+    await withParserChild(`
+      const chunks = []
+      process.stdin.on('data', chunk => chunks.push(chunk))
+      process.stdin.on('end', () => {
+        const input = Buffer.concat(chunks)
+        const headerLength = input.readUInt32BE(0)
+        const header = JSON.parse(input.subarray(4, 4 + headerLength).toString('utf8'))
+        const result = {
+          parserVersion: 'fixture-v1',
+          blocks: [{ id: 'block_1', ordinal: 0, kind: 'paragraph', body: header.versionId,
+            coordinates: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 1 } }],
+          chunks: [{ id: 'chunk_1', blockId: 'block_1', ordinal: 0, body: header.versionId,
+            coordinates: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 1 } }],
+        }
+        const body = Buffer.from(JSON.stringify({ ok: true, result }))
+        const prefix = Buffer.alloc(4); prefix.writeUInt32BE(body.length)
+        setTimeout(() => process.stdout.write(Buffer.concat([prefix, body])),
+          header.versionId === 'slow' ? 500 : 0)
+      })
+    `, async (childEntry) => {
+      const parser = createKnowledgeParserProcess({ childEntry, timeoutMs: 250 })
+      const slow = Buffer.from('slow')
+      await expect(parser.parse({ bytes: slow, mimeType: 'text/plain', versionId: 'slow' }))
+        .rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
+      const fast = Buffer.from('fast')
+      const parsed = await parser.parse({
+        bytes: fast, mimeType: 'text/plain', versionId: 'fast',
+      })
+
+      expect(parsed.blocks[0]?.body).toBe('fast')
+      expect(slow.every(byte => byte === 0)).toBe(true)
+      expect(fast.every(byte => byte === 0)).toBe(true)
+    })
   })
 
   it('reads verified Storage bytes, parses, and commits index readiness atomically', async () => {
@@ -276,6 +495,91 @@ describe('CloudBase knowledge scheduled worker', () => {
     expect(first.chunks.map(({ ordinal, body }) => ({ ordinal, body }))).toEqual([
       { ordinal: 0, body: '第一条' }, { ordinal: 1, body: '第二条' },
     ])
+  })
+
+  it.each([
+    ['expanded-byte ceiling', 1024, (32 * 1024 * 1024) + 1],
+    ['compression-ratio ceiling', 1, 101],
+  ] as const)('rejects a DOCX %s before invoking Mammoth', async (_name, compressed, expanded) => {
+    const extractRawText = vi.fn()
+    const parser = createKnowledgeParser({
+      loadMammoth: () => ({ extractRawText }),
+    })
+
+    await expect(parser.parse({
+      bytes: docxDirectoryFixture(compressed, expanded),
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      versionId: 'version_docx',
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(extractRawText).not.toHaveBeenCalled()
+  })
+
+  it('checks actual DOCX expansion before invoking Mammoth', async () => {
+    const extractRawText = vi.fn()
+    const parser = createKnowledgeParser({ loadMammoth: () => ({ extractRawText }) })
+
+    await expect(parser.parse({
+      bytes: docxArchiveFixture(Buffer.from('a'.repeat(1_024)), 16),
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      versionId: 'version_docx',
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(extractRawText).not.toHaveBeenCalled()
+  })
+
+  it('rejects an excessive PDF page count before loading the first page', async () => {
+    const document = {
+      numPages: 1001,
+      getPage: vi.fn(),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    }
+    const parser = createKnowledgeParser({
+      loadPdfjs: () => ({
+        getDocument: () => ({ promise: Promise.resolve(document) }),
+      }),
+    })
+
+    await expect(parser.parse({
+      bytes: Buffer.from('%PDF fixture'), mimeType: 'application/pdf', versionId: 'version_pdf',
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(document.getPage).not.toHaveBeenCalled()
+    expect(document.destroy).toHaveBeenCalledOnce()
+  })
+
+  it('stops PDF text accumulation at its byte ceiling before reading another page', async () => {
+    const body = 'a'.repeat(8 * 1024 * 1024)
+    const getPage = vi.fn().mockImplementation(async () => ({
+      getTextContent: async () => ({ items: [{ str: body }] }),
+    }))
+    const document = {
+      numPages: 3,
+      getPage,
+      destroy: vi.fn().mockResolvedValue(undefined),
+    }
+    const parser = createKnowledgeParser({
+      loadPdfjs: () => ({
+        getDocument: () => ({ promise: Promise.resolve(document) }),
+      }),
+    })
+
+    await expect(parser.parse({
+      bytes: Buffer.from('%PDF fixture'), mimeType: 'application/pdf', versionId: 'version_pdf',
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(getPage).toHaveBeenCalledTimes(2)
+    expect(document.destroy).toHaveBeenCalledOnce()
+  })
+
+  it('bounds text blocks and serialized parser response while accumulating', async () => {
+    const parser = createKnowledgeParser()
+    const tooManyBlocks = Buffer.from(Array.from(
+      { length: 10_001 }, (_, index) => `paragraph ${index}`,
+    ).join('\n\n'))
+    await expect(parser.parse({
+      bytes: tooManyBlocks, mimeType: 'text/plain', versionId: 'version_blocks',
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    await expect(parser.parse({
+      bytes: Buffer.from('x'.repeat(800_000)),
+      mimeType: 'text/plain', versionId: 'version_response',
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
   })
 
   it('aborts a never-settling private Storage read at its deadline', async () => {

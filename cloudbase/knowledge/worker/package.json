@@ -1,0 +1,12 @@
+{
+  "name": "autoforge-knowledge-parser-child",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "parser-child.js",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "mammoth": "1.12.1",
+    "pdfjs-dist": "3.11.174"
+  }
+}
