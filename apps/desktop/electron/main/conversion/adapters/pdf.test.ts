@@ -43,6 +43,10 @@ describe('PDF conversion adapter', () => {
           "TMPDIR": "/work",
         },
         "executable": "/packs/pdf/bin/autoforge-pdf-raster",
+        "outputContract": {
+          "count": 3,
+          "kind": "pdf-pages",
+        },
         "outputPaths": [
           "/work/page-001.png",
           "/work/page-002.png",

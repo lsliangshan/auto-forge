@@ -28,6 +28,7 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
 
 class FakeProcess implements ConversionProcessHandle {
   readonly pid = 4321
+  readonly processGroupId = 4321
   readonly stdout = new PassThrough()
   readonly stderr = new PassThrough()
   private readonly exit = deferred<ConversionProcessExit>()
@@ -37,9 +38,17 @@ class FakeProcess implements ConversionProcessHandle {
   }
 
   finish(code: number | null, signal: NodeJS.Signals | null = null): void {
+    this.exitOnly(code, signal)
+    this.closeOutput()
+  }
+
+  exitOnly(code: number | null, signal: NodeJS.Signals | null = null): void {
+    this.exit.resolve({ code, signal })
+  }
+
+  closeOutput(): void {
     this.stdout.end()
     this.stderr.end()
-    this.exit.resolve({ code, signal })
   }
 }
 
@@ -99,6 +108,7 @@ async function fixture(): Promise<{
       cwd: work,
       env: createConversionEnvironment(executable, work),
       timeoutMs: CONVERSION_TIMEOUTS.image,
+      outputContract: Object.freeze({ kind: 'single' }),
       outputPaths: Object.freeze([join(work, 'result.png')]),
       outputs: Object.freeze([{ path: join(work, 'result.png'), format: 'png' }]),
     },
@@ -184,6 +194,56 @@ describe('conversion process runner', () => {
     expect(tree.spawns).toHaveLength(0)
   })
 
+  it('allows 256 outputs only for a trusted icon-representation contract', async () => {
+    const { lease, plan, work } = await fixture()
+    const tree = new FakeProcessTree()
+    const outputs = Array.from({ length: 256 }, (_, index) => ({
+      path: join(work, `representation-${String(index + 1).padStart(3, '0')}.png`),
+      format: 'png' as const,
+    }))
+    const running = createConversionProcessRunner({ processTree: tree }).run({
+      ...plan,
+      outputContract: { kind: 'icon-representations', count: 256 },
+      outputPaths: outputs.map((output) => output.path),
+      outputs,
+    }, lease)
+    await vi.waitFor(() => expect(tree.spawns).toHaveLength(1))
+    tree.child.finish(0)
+
+    await expect(running).resolves.toMatchObject({ exitCode: 0 })
+  })
+
+  it('keeps the typed PDF page contract capped at 100 outputs', async () => {
+    const { lease, plan, work } = await fixture()
+    const tree = new FakeProcessTree()
+    const outputs = Array.from({ length: 101 }, (_, index) => ({
+      path: join(work, `page-${String(index + 1).padStart(3, '0')}.png`),
+      format: 'png' as const,
+      metadata: { pdfPage: index + 1 },
+    }))
+
+    await expect(createConversionProcessRunner({ processTree: tree }).run({
+      ...plan,
+      outputContract: { kind: 'pdf-pages', count: 101 },
+      outputPaths: outputs.map((output) => output.path),
+      outputs,
+    }, lease)).rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    expect(tree.spawns).toHaveLength(0)
+  })
+
+  it('rejects output counts that do not match the typed trusted operation', async () => {
+    const { lease, plan, work } = await fixture()
+    const tree = new FakeProcessTree()
+    const second = { path: join(work, 'second.png'), format: 'png' as const }
+
+    await expect(createConversionProcessRunner({ processTree: tree }).run({
+      ...plan,
+      outputPaths: [...plan.outputPaths, second.path],
+      outputs: [...plan.outputs, second],
+    }, lease)).rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    expect(tree.spawns).toHaveLength(0)
+  })
+
   it('bounds stdout and stderr retained in memory', async () => {
     const { lease, plan } = await fixture()
     const tree = new FakeProcessTree()
@@ -216,6 +276,41 @@ describe('conversion process runner', () => {
     expect((error as ConversionProcessError).stderrSummary).not.toContain('super-secret')
     expect((error as ConversionProcessError).stderrSummary).not.toContain('credential')
     expect(Buffer.byteLength((error as ConversionProcessError).stderrSummary)).toBeLessThanOrEqual(CONVERSION_OUTPUT_CAPTURE_BYTES)
+  })
+
+  it('redacts authorization schemes and credential-shaped prefixed names from engine errors', async () => {
+    const { lease, plan } = await fixture()
+    const tree = new FakeProcessTree()
+    const rawValues = [
+      'basic-value-123',
+      'bearer-value-456',
+      'openai-value-789',
+      'service-token-abc',
+      'build-secret-def',
+      'database-password-ghi',
+      'client-credential-jkl',
+      'header-api-key-mno',
+    ]
+    const running = createConversionProcessRunner({ processTree: tree }).run(plan, lease)
+      .catch((error: unknown) => error)
+    tree.child.stderr.write([
+      `Authorization: Basic ${rawValues[0]}`,
+      `authorization=Bearer ${rawValues[1]}`,
+      `OPENAI_API_KEY=${rawValues[2]}`,
+      `SERVICE_TOKEN: ${rawValues[3]}`,
+      `BUILD_SECRET=${rawValues[4]}`,
+      `DB_PASSWORD: ${rawValues[5]}`,
+      `clientCredential=${rawValues[6]}`,
+      `X-Api-Key: ${rawValues[7]}`,
+    ].join('\n'))
+    tree.child.finish(9)
+
+    const error = await running
+    expect(error).toBeInstanceOf(ConversionProcessError)
+    expect(error).toMatchObject({ code: 'CONVERSION_INPUT_INVALID', exitCode: 9 })
+    for (const rawValue of rawValues) {
+      expect((error as ConversionProcessError).stderrSummary).not.toContain(rawValue)
+    }
   })
 
   it('maps process output stream failures to a stable error without leaking the raw stream error', async () => {
@@ -275,10 +370,80 @@ describe('conversion process runner', () => {
 
     await expect(running).resolves.toMatchObject({ code: 'CONVERSION_TIMEOUT' })
   })
+
+  it('bounds lingering descendant pipes after normal root exit and terminates the retained tree', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { lease, plan } = await fixture()
+    const tree = new FakeProcessTree()
+    let settled = false
+    const running = createConversionProcessRunner({ processTree: tree }).run(plan, lease)
+      .catch((error: unknown) => error)
+      .finally(() => { settled = true })
+    await vi.waitFor(() => expect(tree.spawns).toHaveLength(1), { interval: 1, timeout: 100 })
+
+    tree.child.exitOnly(0)
+    await vi.advanceTimersByTimeAsync(1_001)
+    const settledAtBound = settled
+    tree.child.closeOutput()
+    const result = await running
+
+    expect(settledAtBound).toBe(true)
+    expect(tree.terminations).toEqual([tree.child])
+    expect(result).toMatchObject({ code: 'CONVERSION_INTERRUPTED', exitCode: 0 })
+  })
+
+  it('settles cancellation after tree termination when descendants retain inherited pipes', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { lease, plan } = await fixture()
+    const tree = new FakeProcessTree()
+    tree.terminate = async () => { tree.child.exitOnly(null, 'SIGTERM') }
+    const abort = new AbortController()
+    let settled = false
+    const running = createConversionProcessRunner({ processTree: tree }).run(plan, lease, { signal: abort.signal })
+      .catch((error: unknown) => error)
+      .finally(() => { settled = true })
+    await vi.waitFor(() => expect(tree.spawns).toHaveLength(1), { interval: 1, timeout: 100 })
+
+    abort.abort()
+    await vi.waitFor(() => expect(tree.terminations).toEqual([tree.child]), { interval: 1, timeout: 100 })
+    await vi.advanceTimersByTimeAsync(1_001)
+    const settledAtBound = settled
+    tree.child.closeOutput()
+    const result = await running
+
+    expect(settledAtBound).toBe(true)
+    expect(result).toMatchObject({ code: 'CONVERSION_CANCELLED', exitCode: null })
+  })
+
+  it('settles timeout after tree termination when descendants retain inherited pipes', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { lease, plan } = await fixture()
+    const tree = new FakeProcessTree()
+    tree.terminate = async () => { tree.child.exitOnly(null, 'SIGKILL') }
+    let settled = false
+    const running = createConversionProcessRunner({ processTree: tree }).run(plan, lease)
+      .catch((error: unknown) => error)
+      .finally(() => { settled = true })
+    await vi.waitFor(() => expect(tree.spawns).toHaveLength(1), { interval: 1, timeout: 100 })
+
+    await vi.advanceTimersByTimeAsync(CONVERSION_TIMEOUTS.image - Date.now())
+    await vi.waitFor(() => expect(tree.terminations).toEqual([tree.child]), { interval: 1, timeout: 100 })
+    await vi.advanceTimersByTimeAsync(1_001)
+    const settledAtBound = settled
+    tree.child.closeOutput()
+    const result = await running
+
+    expect(settledAtBound).toBe(true)
+    expect(result).toMatchObject({ code: 'CONVERSION_TIMEOUT', exitCode: null })
+  })
 })
 
 describe('platform process-tree port', () => {
   it('spawns a detached Darwin process group and terminates the negative group id before waiting for exit', async () => {
+    vi.useFakeTimers()
     const child = new EventEmitter() as EventEmitter & {
       pid: number
       stdout: PassThrough
@@ -307,10 +472,13 @@ describe('platform process-tree port', () => {
         detached: true, stdio: ['ignore', 'pipe', 'pipe'],
       },
     ]])
+    expect(handle.processGroupId).toBe(9876)
 
     const terminating = port.terminateTree(handle)
     expect(kills).toEqual([[-9876, 'SIGTERM']])
     child.emit('close', null, 'SIGTERM')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(kills).toEqual([[-9876, 'SIGTERM'], [-9876, 'SIGKILL']])
     await expect(terminating).resolves.toBeUndefined()
   })
 

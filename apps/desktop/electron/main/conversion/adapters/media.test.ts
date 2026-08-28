@@ -65,6 +65,9 @@ describe('media conversion adapter', () => {
           "TMPDIR": "/work",
         },
         "executable": "/packs/media/bin/ffmpeg",
+        "outputContract": {
+          "kind": "single",
+        },
         "outputPaths": [
           "/work/output.mp4",
         ],
@@ -189,7 +192,7 @@ describe('media conversion adapter', () => {
     }
   })
 
-  it('allows approved video-to-audio and animated-image-to-video routes only', () => {
+  it('allows approved video-to-audio and animated WebP-to-video routes only', () => {
     const extracted = mediaAdapter.plan(video, { inputPath: '/input/movie.mp4', targetFormat: 'mp3' }, lease, '/work')
     expect(extracted.args).toContain('-vn')
     expect(extracted.timeoutMs).toBe(1_800_000)
@@ -198,5 +201,18 @@ describe('media conversion adapter', () => {
     }
     expect(mediaAdapter.supports(animated, 'mp4')).toBe(true)
     expect(mediaAdapter.supports({ ...animated, frameCount: 1 }, 'mp4')).toBe(false)
+  })
+
+  it.each([1, 4])('owns GIF to GIF and MP4 routes for a %i-frame trusted GIF', (frameCount) => {
+    const gif: ProbedConversionInput = {
+      format: 'gif', mimeType: 'image/gif', kind: 'image', byteSize: 100, width: 10, height: 10, frameCount,
+    }
+
+    expect(mediaAdapter.supports(gif, 'gif')).toBe(true)
+    expect(mediaAdapter.supports(gif, 'mp4')).toBe(true)
+    expect(mediaAdapter.plan(gif, { inputPath: '/input/image.gif', targetFormat: 'gif' }, lease, '/work').outputs)
+      .toEqual([{ path: '/work/output.gif', format: 'gif' }])
+    expect(mediaAdapter.plan(gif, { inputPath: '/input/image.gif', targetFormat: 'mp4' }, lease, '/work').outputs)
+      .toEqual([{ path: '/work/output.mp4', format: 'mp4' }])
   })
 })

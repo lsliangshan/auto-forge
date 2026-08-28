@@ -47,6 +47,9 @@ describe('document conversion adapter', () => {
           "TMPDIR": "/work",
         },
         "executable": "/packs/document/program/soffice",
+        "outputContract": {
+          "kind": "single",
+        },
         "outputPaths": [
           "/work/- report "quoted"
       line.pdf",

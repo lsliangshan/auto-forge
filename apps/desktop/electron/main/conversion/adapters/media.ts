@@ -19,14 +19,15 @@ function executable(lease: ConverterPackLease): string {
   return requireLeaseExecutable(lease, executableEntry[lease.platform])
 }
 
-function animatedImage(input: ProbedConversionInput): boolean {
-  return input.kind === 'image' && input.frameCount > 1 && (input.format === 'gif' || input.format === 'webp')
+function mediaImage(input: ProbedConversionInput): boolean {
+  return input.kind === 'image'
+    && (input.format === 'gif' || (input.format === 'webp' && input.frameCount > 1))
 }
 
 function ownedRoute(input: ProbedConversionInput, target: ConversionTargetFormat): boolean {
   if (input.kind === 'audio') return audioTargets.has(target)
   if (input.kind === 'video') return audioTargets.has(target) || videoTargets.has(target)
-  return animatedImage(input) && (target === 'mp4' || target === 'gif')
+  return mediaImage(input) && (target === 'mp4' || target === 'gif')
 }
 
 function audioCodec(target: ConversionTargetFormat): readonly string[] {
@@ -84,6 +85,7 @@ export const mediaAdapter: ConverterAdapter = {
       cwd: outputRoot,
       env: createConversionEnvironment(selected, outputRoot),
       timeoutMs: input.kind === 'audio' ? CONVERSION_TIMEOUTS.audio : CONVERSION_TIMEOUTS.video,
+      outputContract: { kind: 'single' },
       outputPaths: [outputPath],
       outputs: [{ path: outputPath, format: request.targetFormat }],
     }

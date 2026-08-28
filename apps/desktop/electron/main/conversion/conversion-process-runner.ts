@@ -20,6 +20,7 @@ export const CONVERSION_TIMEOUTS = Object.freeze({
 })
 
 export const CONVERSION_OUTPUT_CAPTURE_BYTES = 64 * 1024
+export const CONVERSION_POST_EXIT_DRAIN_MS = 1_000
 const truncatedMarker = Buffer.from('\n[truncated]', 'utf8')
 const allowedTimeouts = new Set<number>(Object.values(CONVERSION_TIMEOUTS))
 const allowedEnvironmentKeys = ['LANG', 'LC_ALL', 'PATH', 'TEMP', 'TMP', 'TMPDIR'] as const
@@ -34,7 +35,20 @@ export interface ConversionExpectedOutput {
   readonly path: string
   readonly format: ConversionTargetFormat
   readonly metadata?: ConversionArtifactMetadata
+  readonly iconSlots?: readonly ConversionIcnsSlot[]
 }
+
+export interface ConversionIcnsSlot {
+  readonly type: 'icp4' | 'ic11' | 'icp5' | 'ic12' | 'ic07' | 'ic13' | 'ic08' | 'ic14' | 'ic09' | 'ic10'
+  readonly logicalSize: 16 | 32 | 128 | 256 | 512
+  readonly scale: 1 | 2
+  readonly pixelSize: 16 | 32 | 64 | 128 | 256 | 512 | 1024
+}
+
+export type ConversionOutputContract =
+  | { readonly kind: 'single' }
+  | { readonly kind: 'pdf-pages'; readonly count: number }
+  | { readonly kind: 'icon-representations'; readonly count: number }
 
 export interface ConversionProcessPlan {
   readonly executable: string
@@ -42,6 +56,7 @@ export interface ConversionProcessPlan {
   readonly cwd: string
   readonly env: Readonly<Record<string, string>>
   readonly timeoutMs: number
+  readonly outputContract: ConversionOutputContract
   readonly outputPaths: readonly string[]
   readonly outputs: readonly ConversionExpectedOutput[]
 }
@@ -71,6 +86,7 @@ export interface ConversionProcessExit {
 
 export interface ConversionProcessHandle {
   readonly pid: number | undefined
+  readonly processGroupId?: number
   readonly stdout: AsyncIterable<Uint8Array | string>
   readonly stderr: AsyncIterable<Uint8Array | string>
   waitForExit(): Promise<ConversionProcessExit>
@@ -177,9 +193,25 @@ function validatePlanShape(plan: ConversionProcessPlan): void {
     || !allowedTimeouts.has(plan.timeoutMs)
     || !Array.isArray(plan.outputPaths)
     || plan.outputPaths.length === 0
-    || plan.outputPaths.length > 100
     || !Array.isArray(plan.outputs)
     || plan.outputs.length !== plan.outputPaths.length
+  ) throw failure('CONVERSION_INPUT_INVALID')
+  const contract = plan.outputContract
+  if (typeof contract !== 'object' || contract === null || Array.isArray(contract)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  if (contract.kind === 'single') {
+    if (Object.keys(contract).length !== 1 || plan.outputPaths.length !== 1) throw failure('CONVERSION_INPUT_INVALID')
+    return
+  }
+  if (
+    (contract.kind !== 'pdf-pages' && contract.kind !== 'icon-representations')
+    || Object.keys(contract).length !== 2
+    || !Number.isSafeInteger(contract.count)
+    || contract.count !== plan.outputPaths.length
+    || contract.count < 1
+    || (contract.kind === 'pdf-pages' && contract.count > 100)
+    || (contract.kind === 'icon-representations' && contract.count > 256)
   ) throw failure('CONVERSION_INPUT_INVALID')
 }
 
@@ -228,6 +260,9 @@ function validateOutputs(plan: ConversionProcessPlan, cwd: string): void {
       || output === undefined
       || output.path !== path
     ) throw failure('CONVERSION_INPUT_INVALID')
+    if (plan.outputContract.kind === 'pdf-pages' && output.metadata?.pdfPage !== index + 1) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
     seen.add(path)
   }
 }
@@ -237,14 +272,28 @@ interface CapturedProcessOutput {
   readonly streamFailed: boolean
 }
 
-async function collectBounded(stream: AsyncIterable<Uint8Array | string>): Promise<CapturedProcessOutput> {
+async function collectBounded(
+  stream: AsyncIterable<Uint8Array | string>,
+  stop: Promise<void>,
+): Promise<CapturedProcessOutput> {
   const retainedLimit = CONVERSION_OUTPUT_CAPTURE_BYTES - truncatedMarker.byteLength
   const chunks: Buffer[] = []
   let retained = 0
   let truncated = false
   let streamFailed = false
+  const iterator = stream[Symbol.asyncIterator]()
   try {
-    for await (const chunk of stream) {
+    while (true) {
+      const next = await Promise.race([
+        iterator.next().then((result) => ({ kind: 'chunk' as const, result })),
+        stop.then(() => ({ kind: 'stop' as const })),
+      ])
+      if (next.kind === 'stop') {
+        void Promise.resolve(iterator.return?.()).catch(() => undefined)
+        break
+      }
+      if (next.result.done === true) break
+      const chunk = next.result.value
       const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
       const available = retainedLimit - retained
       if (available > 0) {
@@ -271,8 +320,11 @@ function sanitize(text: string, paths: readonly string[]): string {
     if (path.length > 0) safe = safe.replace(new RegExp(escapeRegExp(path), 'gu'), '<path>')
   }
   safe = safe
-    .replace(/\b(Bearer)\s+[^\s]+/giu, '$1 <redacted>')
-    .replace(/\b(api[-_]?key|token|secret|password|credential|authorization)\s*[:=]\s*[^\s]+/giu, '$1=<redacted>')
+    .replace(
+      /\b([A-Za-z0-9_-]*(?:api[-_]?key|token|secret|passwords?|credentials?|authorization)[A-Za-z0-9_-]*)\s*[:=]\s*(?:(?:Basic|Bearer)\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/giu,
+      '$1=<redacted>',
+    )
+    .replace(/\b(Basic|Bearer)\s+[^\s,;]+/giu, '$1 <redacted>')
     .replace(/[A-Za-z]:\\(?:[^\s\\]+\\)+[^\s\\]*/gu, '<path>')
     .replace(/\/(?:[^\s/]+\/)+[^\s/]*/gu, '<path>')
   const bytes = Buffer.from(safe, 'utf8')
@@ -313,43 +365,94 @@ export function createConversionProcessRunner(options: { processTree: Conversion
         throw failure('CONVERSION_COMPONENT_UNAVAILABLE')
       }
 
-      const stdoutTask = collectBounded(process.stdout)
-      const stderrTask = collectBounded(process.stderr)
+      const stopCapture = deferred<void>()
+      const stdoutTask = collectBounded(process.stdout, stopCapture.promise)
+      const stderrTask = collectBounded(process.stderr, stopCapture.promise)
+      const captureTask = Promise.all([stdoutTask, stderrTask])
       const exitTask = process.waitForExit()
       const termination = deferred<'cancelled' | 'timeout'>()
       const onAbort = () => termination.resolve('cancelled')
       runOptions.signal?.addEventListener('abort', onAbort, { once: true })
       const timer = setTimeout(() => termination.resolve('timeout'), plan.timeoutMs)
-      const winner = await Promise.race([
-        exitTask.then((exit) => ({ kind: 'exit' as const, exit })),
-        termination.promise.then((reason) => ({ kind: 'termination' as const, reason })),
-      ])
-      clearTimeout(timer)
-      runOptions.signal?.removeEventListener('abort', onAbort)
+      const waitForBoundedCapture = async (): Promise<readonly [CapturedProcessOutput, CapturedProcessOutput]> => {
+        let drainTimer: ReturnType<typeof setTimeout> | undefined
+        const drained = await Promise.race([
+          captureTask.then(() => true),
+          new Promise<false>((resolve) => {
+            drainTimer = setTimeout(() => resolve(false), CONVERSION_POST_EXIT_DRAIN_MS)
+          }),
+        ])
+        if (drainTimer !== undefined) clearTimeout(drainTimer)
+        if (!drained) stopCapture.resolve(undefined)
+        return captureTask
+      }
+      const terminateTree = async (): Promise<void> => {
+        try {
+          await options.processTree.terminateTree(process)
+        } catch (error) {
+          stopCapture.resolve(undefined)
+          await captureTask
+          if (error instanceof ConversionProcessError) throw error
+          throw failure('CONVERSION_INTERRUPTED')
+        }
+      }
+      try {
+        const winner = await Promise.race([
+          exitTask.then((exit) => ({ kind: 'exit' as const, exit })),
+          termination.promise.then((reason) => ({ kind: 'termination' as const, reason })),
+        ])
 
-      let exit: ConversionProcessExit
-      if (winner.kind === 'termination') {
-        await options.processTree.terminateTree(process)
-        exit = await exitTask
-      } else {
-        exit = winner.exit
-      }
-      const [capturedStdout, capturedStderr] = await Promise.all([stdoutTask, stderrTask])
-      const sensitivePaths = [verified.root, verified.executable, verified.cwd, ...plan.args.filter(isAbsolute), ...plan.outputPaths]
-      const stdout = sanitize(capturedStdout.text, sensitivePaths)
-      const stderr = sanitize(capturedStderr.text, sensitivePaths)
+        let exit: ConversionProcessExit
+        let captured: readonly [CapturedProcessOutput, CapturedProcessOutput]
+        let terminationReason: 'cancelled' | 'timeout' | undefined
+        let lingeringAfterExit = false
+        if (winner.kind === 'termination') {
+          terminationReason = winner.reason
+          await terminateTree()
+          exit = await exitTask
+          captured = await waitForBoundedCapture()
+        } else {
+          exit = winner.exit
+          let lingeringTimer: ReturnType<typeof setTimeout> | undefined
+          const afterExit = await Promise.race([
+            captureTask.then((value) => ({ kind: 'captured' as const, value })),
+            termination.promise.then((reason) => ({ kind: 'termination' as const, reason })),
+            new Promise<{ readonly kind: 'lingering' }>((resolve) => {
+              lingeringTimer = setTimeout(() => resolve({ kind: 'lingering' }), CONVERSION_POST_EXIT_DRAIN_MS)
+            }),
+          ])
+          if (lingeringTimer !== undefined) clearTimeout(lingeringTimer)
+          if (afterExit.kind === 'captured') {
+            captured = afterExit.value
+          } else {
+            terminationReason = afterExit.kind === 'termination' ? afterExit.reason : undefined
+            lingeringAfterExit = afterExit.kind === 'lingering'
+            await terminateTree()
+            if (lingeringAfterExit) stopCapture.resolve(undefined)
+            captured = lingeringAfterExit ? await captureTask : await waitForBoundedCapture()
+          }
+        }
+        const [capturedStdout, capturedStderr] = captured
+        const sensitivePaths = [verified.root, verified.executable, verified.cwd, ...plan.args.filter(isAbsolute), ...plan.outputPaths]
+        const stdout = sanitize(capturedStdout.text, sensitivePaths)
+        const stderr = sanitize(capturedStderr.text, sensitivePaths)
 
-      if (winner.kind === 'termination') {
-        throw failure(winner.reason === 'cancelled' ? 'CONVERSION_CANCELLED' : 'CONVERSION_TIMEOUT', exit.code, stderr)
+        if (terminationReason !== undefined) {
+          throw failure(terminationReason === 'cancelled' ? 'CONVERSION_CANCELLED' : 'CONVERSION_TIMEOUT', exit.code, stderr)
+        }
+        if (lingeringAfterExit || capturedStdout.streamFailed || capturedStderr.streamFailed) {
+          throw failure('CONVERSION_INTERRUPTED', exit.code, stderr)
+        }
+        if (exit.error !== undefined) throw failure('CONVERSION_COMPONENT_UNAVAILABLE', exit.code, stderr)
+        if (exit.code !== 0) {
+          throw failure(exit.signal === null ? 'CONVERSION_INPUT_INVALID' : 'CONVERSION_INTERRUPTED', exit.code, stderr)
+        }
+        return { exitCode: 0, stdout, stderr }
+      } finally {
+        clearTimeout(timer)
+        runOptions.signal?.removeEventListener('abort', onAbort)
+        stopCapture.resolve(undefined)
       }
-      if (capturedStdout.streamFailed || capturedStderr.streamFailed) {
-        throw failure('CONVERSION_INTERRUPTED', exit.code, stderr)
-      }
-      if (exit.error !== undefined) throw failure('CONVERSION_COMPONENT_UNAVAILABLE', exit.code, stderr)
-      if (exit.code !== 0) {
-        throw failure(exit.signal === null ? 'CONVERSION_INPUT_INVALID' : 'CONVERSION_INTERRUPTED', exit.code, stderr)
-      }
-      return { exitCode: 0, stdout, stderr }
     },
   }
 }
@@ -400,6 +503,7 @@ export function createNodeConversionProcessTreePort(options: NodeProcessTreeOpti
       })
       const handle: ConversionProcessHandle = {
         pid: child.pid,
+        processGroupId: child.pid,
         stdout: child.stdout,
         stderr: child.stderr,
         waitForExit: () => exit.promise,
@@ -408,22 +512,17 @@ export function createNodeConversionProcessTreePort(options: NodeProcessTreeOpti
       return handle
     },
     async terminateTree(handle) {
-      if (handle.pid === undefined || !children.has(handle)) throw failure('CONVERSION_INTERRUPTED')
+      if (handle.processGroupId === undefined || !children.has(handle)) throw failure('CONVERSION_INTERRUPTED')
       try {
-        kill(-handle.pid, 'SIGTERM')
+        kill(-handle.processGroupId, 'SIGTERM')
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw failure('CONVERSION_INTERRUPTED')
       }
-      const exited = await Promise.race([
-        handle.waitForExit().then(() => true),
-        new Promise<false>((resolve) => setTimeout(() => resolve(false), graceMs)),
-      ])
-      if (!exited) {
-        try {
-          kill(-handle.pid, 'SIGKILL')
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw failure('CONVERSION_INTERRUPTED')
-        }
+      await new Promise<void>((resolve) => setTimeout(resolve, graceMs))
+      try {
+        kill(-handle.processGroupId, 'SIGKILL')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw failure('CONVERSION_INTERRUPTED')
       }
       await handle.waitForExit()
     },

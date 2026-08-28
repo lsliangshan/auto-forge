@@ -224,6 +224,13 @@ function ico(): Buffer {
   return Buffer.concat([bytes, image])
 }
 
+function icoHeader(count: number): Buffer {
+  const bytes = Buffer.alloc(6 + count * 16)
+  bytes.writeUInt16LE(1, 2)
+  bytes.writeUInt16LE(count, 4)
+  return bytes
+}
+
 function icns(): Buffer {
   const image = png(16, 16)
   const header = Buffer.alloc(16)
@@ -352,6 +359,12 @@ describe('conversion catalog input probing', () => {
 
   it('rejects a PDF with 101 pages rather than truncating it', () => {
     expect(() => probe(pdf(101), 'large.pdf', 'application/pdf')).toThrowError(
+      expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }),
+    )
+  })
+
+  it('rejects 257 ICO representations at the structural probe boundary', () => {
+    expect(() => probe(icoHeader(257), 'large.ico', 'image/vnd.microsoft.icon')).toThrowError(
       expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }),
     )
   })

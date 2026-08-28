@@ -54,6 +54,9 @@ describe('image/icon conversion adapter', () => {
           "TMPDIR": "/work",
         },
         "executable": "/packs/image-icon/bin/autoforge-image-converter",
+        "outputContract": {
+          "kind": "single",
+        },
         "outputPaths": [
           "/work/output.ico",
         ],
@@ -80,15 +83,33 @@ describe('image/icon conversion adapter', () => {
     `)
   })
 
-  it('uses only 16/32/48 for favicon and the 16-1024 Retina set for ICNS', () => {
+  it('uses only 16/32/48 for favicon and scale-specific 1x/2x slots for ICNS', () => {
     const favicon = imageIconAdapter.plan(image(), request('ico', 'favicon'), lease, '/work')
     const icns = imageIconAdapter.plan(image(), request('icns', 'app-icon'), lease, '/work')
     expect(favicon.args).toContain('16,32,48')
     expect(favicon.outputs[0]?.metadata).toEqual({ iconRepresentations: [16, 32, 48], transparentPadding: true })
-    expect(icns.args).toContain('16,32,64,128,256,512,1024')
-    expect(icns.outputs[0]?.metadata).toEqual({
-      iconRepresentations: [16, 32, 64, 128, 256, 512, 1024],
-      transparentPadding: true,
+    expect(icns.args).toEqual([
+      'create-icon', '--format', 'icns', '--representations',
+      'icp4=16@1x,ic11=16@2x,icp5=32@1x,ic12=32@2x,ic07=128@1x,ic13=128@2x,ic08=256@1x,ic14=256@2x,ic09=512@1x,ic10=512@2x',
+      '--fit', 'contain', '--canvas', 'square', '--background', 'transparent', '--crop', 'never',
+      '--output', '/work/output.icns', '--', specialInput,
+    ])
+    expect(icns.outputs[0]).toEqual({
+      path: '/work/output.icns',
+      format: 'icns',
+      metadata: { iconRepresentations: [16, 32, 64, 128, 256, 512, 1024], transparentPadding: true },
+      iconSlots: [
+        { type: 'icp4', logicalSize: 16, scale: 1, pixelSize: 16 },
+        { type: 'ic11', logicalSize: 16, scale: 2, pixelSize: 32 },
+        { type: 'icp5', logicalSize: 32, scale: 1, pixelSize: 32 },
+        { type: 'ic12', logicalSize: 32, scale: 2, pixelSize: 64 },
+        { type: 'ic07', logicalSize: 128, scale: 1, pixelSize: 128 },
+        { type: 'ic13', logicalSize: 128, scale: 2, pixelSize: 256 },
+        { type: 'ic08', logicalSize: 256, scale: 1, pixelSize: 256 },
+        { type: 'ic14', logicalSize: 256, scale: 2, pixelSize: 512 },
+        { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 },
+        { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 },
+      ],
     })
   })
 
@@ -105,6 +126,24 @@ describe('image/icon conversion adapter', () => {
       { path: '/work/representation-002.png', format: 'png' },
       { path: '/work/representation-003.png', format: 'png' },
     ])
+  })
+
+  it.each([101, 256])('exports all %i trusted ICO representations without the PDF page cap', (frameCount) => {
+    const plan = imageIconAdapter.plan(image({
+      format: 'ico', mimeType: 'image/vnd.microsoft.icon', frameCount,
+    }), { inputPath: '/input/icon.ico', targetFormat: 'png' }, lease, '/work')
+
+    expect(plan.outputContract).toEqual({ kind: 'icon-representations', count: frameCount })
+    expect(plan.outputs).toHaveLength(frameCount)
+    expect(plan.outputs.at(-1)?.path).toBe(`/work/representation-${String(frameCount).padStart(3, '0')}.png`)
+  })
+
+  it('rejects 257 forged ICO representations at the adapter boundary', () => {
+    expect(() => imageIconAdapter.plan(image({
+      format: 'ico', mimeType: 'image/vnd.microsoft.icon', frameCount: 257,
+    }), { inputPath: '/input/icon.ico', targetFormat: 'png' }, lease, '/work')).toThrowError(
+      expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }),
+    )
   })
 
   it('selects only the first frame and records metadata for animated-to-static output', () => {

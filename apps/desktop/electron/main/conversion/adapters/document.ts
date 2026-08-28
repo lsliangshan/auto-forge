@@ -57,6 +57,7 @@ export const documentAdapter: ConverterAdapter = {
       cwd: outputRoot,
       env: createConversionEnvironment(selected, outputRoot),
       timeoutMs: CONVERSION_TIMEOUTS.document,
+      outputContract: { kind: 'single' },
       outputPaths: [outputPath],
       outputs: [{ path: outputPath, format: request.targetFormat }],
     }

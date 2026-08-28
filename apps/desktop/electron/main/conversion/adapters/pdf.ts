@@ -55,6 +55,7 @@ export const pdfAdapter: ConverterAdapter = {
       cwd: outputRoot,
       env: createConversionEnvironment(selected, outputRoot),
       timeoutMs: CONVERSION_TIMEOUTS.pdf,
+      outputContract: { kind: 'pdf-pages', count: input.pageCount },
       outputPaths: outputs.map((output) => output.path),
       outputs,
     }

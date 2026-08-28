@@ -8,6 +8,8 @@ import {
   createConversionEnvironment,
   requireLeaseExecutable,
   type ConversionExpectedOutput,
+  type ConversionIcnsSlot,
+  type ConversionOutputContract,
   type ConversionProcessPlan,
   type ConverterAdapter,
 } from '../conversion-process-runner.js'
@@ -22,6 +24,18 @@ const iconRepresentations = {
   favicon: [16, 32, 48],
   icns: [16, 32, 64, 128, 256, 512, 1024],
 } as const
+const icnsSlots = [
+  { type: 'icp4', logicalSize: 16, scale: 1, pixelSize: 16 },
+  { type: 'ic11', logicalSize: 16, scale: 2, pixelSize: 32 },
+  { type: 'icp5', logicalSize: 32, scale: 1, pixelSize: 32 },
+  { type: 'ic12', logicalSize: 32, scale: 2, pixelSize: 64 },
+  { type: 'ic07', logicalSize: 128, scale: 1, pixelSize: 128 },
+  { type: 'ic13', logicalSize: 128, scale: 2, pixelSize: 256 },
+  { type: 'ic08', logicalSize: 256, scale: 1, pixelSize: 256 },
+  { type: 'ic14', logicalSize: 256, scale: 2, pixelSize: 512 },
+  { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 },
+  { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 },
+] as const satisfies readonly ConversionIcnsSlot[]
 
 function ownedRoute(input: ProbedConversionInput, target: ConversionTargetFormat): boolean {
   if (target === 'ico' || target === 'icns') return input.kind === 'image' && input.format !== 'ico' && input.format !== 'icns'
@@ -39,6 +53,7 @@ function planResult(
   outputRoot: string,
   args: readonly string[],
   outputs: readonly ConversionExpectedOutput[],
+  outputContract: ConversionOutputContract = { kind: 'single' },
 ): ConversionProcessPlan {
   const selected = executable(lease)
   return {
@@ -47,6 +62,7 @@ function planResult(
     cwd: outputRoot,
     env: createConversionEnvironment(selected, outputRoot),
     timeoutMs: CONVERSION_TIMEOUTS.image,
+    outputContract,
     outputPaths: outputs.map((output) => output.path),
     outputs,
   }
@@ -81,13 +97,17 @@ export const imageIconAdapter: ConverterAdapter = {
       const frameSelection = input.frameCount > 1 ? 'first' as const : undefined
       const outputPath = join(outputRoot, `output.${request.targetFormat}`)
       return planResult(lease, outputRoot, [
-        'create-icon', '--format', request.targetFormat, '--sizes', sizes.join(','),
+        'create-icon', '--format', request.targetFormat,
+        ...(request.targetFormat === 'icns'
+          ? ['--representations', icnsSlots.map((slot) => `${slot.type}=${slot.logicalSize}@${slot.scale}x`).join(',')]
+          : ['--sizes', sizes.join(',')]),
         '--fit', 'contain', '--canvas', 'square', '--background', 'transparent', '--crop', 'never',
         ...(frameSelection === undefined ? [] : ['--frame', frameSelection]),
         '--output', outputPath, '--', request.inputPath,
       ], [{
         path: outputPath,
         format: request.targetFormat,
+        ...(request.targetFormat === 'icns' ? { iconSlots: icnsSlots } : {}),
         metadata: {
           iconRepresentations: [...sizes],
           ...(frameSelection === undefined ? {} : { frameSelection }),
@@ -97,7 +117,7 @@ export const imageIconAdapter: ConverterAdapter = {
     }
 
     if (input.format === 'ico' || input.format === 'icns') {
-      if (!Number.isSafeInteger(input.frameCount) || input.frameCount < 1 || input.frameCount > 100) {
+      if (!Number.isSafeInteger(input.frameCount) || input.frameCount < 1 || input.frameCount > 256) {
         throw new ConversionProcessError('CONVERSION_INPUT_INVALID')
       }
       const pattern = join(outputRoot, `representation-%03d.${request.targetFormat}`)
@@ -108,7 +128,7 @@ export const imageIconAdapter: ConverterAdapter = {
       return planResult(lease, outputRoot, [
         'extract-icon', '--input-format', input.format, '--output-format', request.targetFormat,
         '--all-representations', '--output-pattern', pattern, '--', request.inputPath,
-      ], outputs)
+      ], outputs, { kind: 'icon-representations', count: input.frameCount })
     }
 
     const outputPath = join(outputRoot, `output.${request.targetFormat}`)
