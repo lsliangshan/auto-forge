@@ -923,14 +923,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     issuedDataClearTokens.delete(token)
     if (!binding || !userDataAdmission.isCurrent(binding.generation)) return undefined
     const session = await auth.getSession()
-    return session?.user.id === binding.userId ? binding : undefined
+    return userDataAdmission.isCurrent(binding.generation)
+      && session?.user.id === binding.userId
+      ? binding
+      : undefined
   }
   const dataClearBindingIsCurrent = async (
     binding: { userId: string; generation: number },
   ): Promise<boolean> => {
     if (!userDataAdmission.isCurrent(binding.generation)) return false
     const session = await auth.getSession().catch(() => null)
-    return session?.user.id === binding.userId
+    return userDataAdmission.isCurrent(binding.generation)
+      && session?.user.id === binding.userId
   }
   const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
@@ -2685,7 +2689,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       clearLocalData: async (scope, token) => {
         const binding = await consumeCurrentDataClearToken(token)
         if (!binding) return 'stale' as const
-        await maintenance.runExclusive(
+        const cleared = await maintenance.runExclusive(
           () => activeRequests.size > 0
             || activeChatWork.size > 0
             || activeConversationTitleWork.size > 0
@@ -2696,20 +2700,23 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || executions.hasActiveExecutions()
             || browser.hasActiveContexts(),
           async () => {
+            if (!await dataClearBindingIsCurrent(binding)) return false
             if (scope === 'conversations' || scope === 'all') {
               await currentMediaLifecycle().clearConversations()
             }
             if (scope === 'executions' || scope === 'all') {
               database.clearLocalData('executions')
             }
+            return true
           },
         )
+        if (!cleared) return 'stale' as const
         return await dataClearBindingIsCurrent(binding) ? 'applied' as const : 'stale' as const
       },
       clearBrowserData: async (token) => {
         const binding = await consumeCurrentDataClearToken(token)
         if (!binding) return 'stale' as const
-        await maintenance.runExclusive(
+        const cleared = await maintenance.runExclusive(
           () => activeRequests.size > 0
             || activeChatWork.size > 0
             || activeExecutions.size > 0
@@ -2718,10 +2725,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || executions.hasActiveExecutions()
             || browser.hasActiveContexts(),
           async () => {
+            if (!await dataClearBindingIsCurrent(binding)) return false
             await browserContinuations.revokeUser(binding.userId, 'CANCELLED')
             await options.browserWorkspace.clearUserData(binding.userId)
+            return true
           },
         )
+        if (!cleared) return 'stale' as const
         return await dataClearBindingIsCurrent(binding) ? 'applied' as const : 'stale' as const
       },
     },

@@ -370,6 +370,36 @@ function createTestAuthService(): AuthService {
   }
 }
 
+function createGatedGetSessionAuth(
+  shouldPause: (call: number, session: AuthSession | null) => boolean,
+) {
+  const delegate = createTestAuthService()
+  const started = deferred<AuthSession | null>()
+  const release = deferred<void>()
+  let armed = false
+  let calls = 0
+  return {
+    authService: {
+      ...delegate,
+      async getSession() {
+        const session = await delegate.getSession()
+        if (armed && shouldPause(++calls, session)) {
+          armed = false
+          started.resolve(session)
+          await release.promise
+        }
+        return session
+      },
+    } satisfies AuthService,
+    arm() {
+      calls = 0
+      armed = true
+    },
+    started: started.promise,
+    release: () => release.resolve(),
+  }
+}
+
 function snapshotProvider(
   providerId: 'openrouter' | 'deepseek',
   provider: ModelProvider,
@@ -8386,6 +8416,118 @@ describe('createApplicationRuntime', () => {
 
     await expect(clearing).resolves.toBe('stale')
     await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_clearracebobby' } })
+    expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
+    await runtime.close()
+  })
+
+  it('does not enter destructive browser clear after its authoritative session check crosses an owner transition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-session-race-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const gatedAuth = createGatedGetSessionAuth((call) => call === 1)
+    const runtime = createApplicationRuntime(options(root, {
+      authService: gatedAuth.authService,
+      browserWorkspace: workspace,
+    }))
+    await authenticate(runtime, 'ClearSessionAlice')
+    await authenticate(runtime, 'ClearSessionBobby')
+    await runtime.services.auth.loginWithPassword({
+      account: 'ClearSessionAlice', password: 'password',
+    })
+    const token = await runtime.services.settings.captureDataClearToken()
+    gatedAuth.arm()
+
+    const clearing = runtime.services.settings.clearBrowserData(token)
+    await expect(gatedAuth.started).resolves.toMatchObject({
+      user: { id: 'test_user_clearsessionalice' },
+    })
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'ClearSessionBobby', password: 'password',
+    })
+    await Promise.resolve()
+    gatedAuth.release()
+
+    await expect(clearing).resolves.toBe('stale')
+    await expect(switching).resolves.toMatchObject({
+      user: { id: 'test_user_clearsessionbobby' },
+    })
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('revalidates a clear token at maintenance entry across owner switch, UID ABA, and replay', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-entry-race-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const gatedAuth = createGatedGetSessionAuth((call) => call === 2)
+    const runtime = createApplicationRuntime(options(root, {
+      authService: gatedAuth.authService,
+      browserWorkspace: workspace,
+    }))
+    await authenticate(runtime, 'ClearEntryAlice')
+    await authenticate(runtime, 'ClearEntryBobby')
+    await runtime.services.auth.loginWithPassword({
+      account: 'ClearEntryAlice', password: 'password',
+    })
+    const token = await runtime.services.settings.captureDataClearToken()
+    gatedAuth.arm()
+
+    const clearing = runtime.services.settings.clearBrowserData(token)
+    await expect(gatedAuth.started).resolves.toMatchObject({
+      user: { id: 'test_user_clearentryalice' },
+    })
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'ClearEntryBobby', password: 'password',
+    })
+    await Promise.resolve()
+    gatedAuth.release()
+
+    await expect(clearing).resolves.toBe('stale')
+    await expect(switching).resolves.toMatchObject({
+      user: { id: 'test_user_clearentrybobby' },
+    })
+    await runtime.services.auth.loginWithPassword({
+      account: 'ClearEntryAlice', password: 'password',
+    })
+    await expect(runtime.services.settings.clearBrowserData(token)).resolves.toBe('stale')
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('settles a completed clear as stale when its final authoritative session check crosses an owner transition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-settle-race-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const gatedAuth = createGatedGetSessionAuth(() => (
+      vi.mocked(workspace.clearUserData).mock.calls.length > 0
+    ))
+    const runtime = createApplicationRuntime(options(root, {
+      authService: gatedAuth.authService,
+      browserWorkspace: workspace,
+    }))
+    const alice = await authenticate(runtime, 'ClearSettleAlice')
+    await authenticate(runtime, 'ClearSettleBobby')
+    await runtime.services.auth.loginWithPassword({
+      account: 'ClearSettleAlice', password: 'password',
+    })
+    const token = await runtime.services.settings.captureDataClearToken()
+    gatedAuth.arm()
+
+    const clearing = runtime.services.settings.clearBrowserData(token)
+    await expect(gatedAuth.started).resolves.toMatchObject({
+      user: { id: alice.user.id },
+    })
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'ClearSettleBobby', password: 'password',
+    })
+    await Promise.resolve()
+    gatedAuth.release()
+
+    await expect(clearing).resolves.toBe('stale')
+    await expect(switching).resolves.toMatchObject({
+      user: { id: 'test_user_clearsettlebobby' },
+    })
+    expect(workspace.clearUserData).toHaveBeenCalledOnce()
     expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
     await runtime.close()
   })
