@@ -216,6 +216,20 @@ function productionCloudRemote(
     : undefined
 }
 
+function classifyPublicationFailure(error: unknown): { code: string; retryable: boolean } {
+  const candidate = typeof error === 'object' && error !== null
+    ? error as { code?: unknown; retryable?: unknown }
+    : {}
+  const code = typeof candidate.code === 'string'
+    && /^[A-Z][A-Z0-9_]{0,63}$/u.test(candidate.code)
+    ? candidate.code
+    : 'INTERNAL_ERROR'
+  return {
+    code,
+    retryable: code === 'TRANSIENT_FAILURE' && candidate.retryable === true,
+  }
+}
+
 function fail(code: AppError['code']): never {
   throw toSafeAppError({ code })
 }
@@ -1008,6 +1022,21 @@ export function createLocalKnowledgeService(
         pending!.knowledgeBaseId, pending!.generationId,
       )
     }
+    const terminalPublication = (errorCode: string): void => {
+      const observedAt = now()
+      active.store.database.prepare(`
+        UPDATE cloud_pending_publications
+        SET recovery_attempt = 0, next_retry_at = 0, last_error_code = ?, updated_at = ?
+        WHERE knowledge_base_id = ? AND generation_id = ?
+      `).run(
+        errorCode, observedAt, pending!.knowledgeBaseId, pending!.generationId,
+      )
+    }
+    const recordPublicationFailure = (error: unknown): void => {
+      const failure = classifyPublicationFailure(error)
+      if (failure.retryable) deferPublication(failure.code)
+      else terminalPublication(failure.code)
+    }
     const finalizePublishedHead = async (): Promise<boolean> => {
       const currentMode = active.store.database.prepare(`
         SELECT mode FROM cloud_sync_states WHERE knowledge_base_id = ?
@@ -1037,7 +1066,13 @@ export function createLocalKnowledgeService(
         pending!.knowledgeBaseId,
       ) as { status?: string }
       assertCurrentBinding(active)
-      return synchronization.status === 'synced' && cloudAllowed()
+      if (!cloudAllowed()) return false
+      if (synchronization.status !== 'synced') {
+        throw Object.assign(new Error('SYNC_FAILED'), {
+          code: 'SYNC_FAILED', retryable: false as const,
+        })
+      }
+      return true
     }
     const published = active.store.database.prepare(`
       SELECT published_generation_id AS publishedGenerationId
@@ -1046,9 +1081,9 @@ export function createLocalKnowledgeService(
     if (published?.publishedGenerationId === pending.generationId) {
       try {
         if (!await finalizePublishedHead()) return
-      } catch {
+      } catch (error) {
         assertCurrentBinding(active)
-        if (cloudAllowed()) deferPublication('TRANSIENT_FAILURE')
+        if (cloudAllowed()) recordPublicationFailure(error)
         return
       }
       active.store.database.prepare(`
@@ -1061,42 +1096,66 @@ export function createLocalKnowledgeService(
       const revision = stableCloudId(
         'revision', pending.documentId, pending.versionId, pending.contentHash,
       )
-      await active.cloud.enableSync({
-        requestId: stableCloudId('begin', pending.knowledgeBaseId, pending.generationId),
-        knowledgeBaseId: pending.knowledgeBaseId,
-        name: pending.baseName,
-        revision,
-        generationId: pending.generationId,
-      })
+      try {
+        await active.cloud.enableSync({
+          requestId: stableCloudId('begin', pending.knowledgeBaseId, pending.generationId),
+          knowledgeBaseId: pending.knowledgeBaseId,
+          name: pending.baseName,
+          revision,
+          generationId: pending.generationId,
+        })
+      } catch (error) {
+        assertCurrentBinding(active)
+        if (cloudAllowed()) recordPublicationFailure(error)
+        return
+      }
       assertCurrentBinding(active)
       if (!cloudAllowed()) return
       const head = active.store.database.prepare(`
         SELECT revision FROM cloud_entity_heads
         WHERE knowledge_base_id = ? AND entity_kind = 'document' AND entity_id = ?
       `).get(pending.knowledgeBaseId, pending.documentId) as { revision: string } | undefined
-      active.cloud.enqueue({
-        mutationId: stableCloudId('mutation', pending.documentId, pending.versionId),
-        knowledgeBaseId: pending.knowledgeBaseId,
-        entityKind: 'document',
-        entityId: pending.documentId,
-        operation: 'upsert',
-        baseRevision: head?.revision ?? null,
-        payload: {
-          name: pending.documentName,
-          mimeType: pending.mimeType,
-          versionId: pending.versionId,
-          versionNumber: pending.versionNumber,
-          contentHash: pending.contentHash,
-          generationId: pending.generationId,
-          createdAt: pending.createdAt,
-        },
-      })
-      const synchronization = await active.cloud.synchronize(pending.knowledgeBaseId) as {
-        status?: string
+      let synchronization: { status?: string }
+      try {
+        active.cloud.enqueue({
+          mutationId: stableCloudId('mutation', pending.documentId, pending.versionId),
+          knowledgeBaseId: pending.knowledgeBaseId,
+          entityKind: 'document',
+          entityId: pending.documentId,
+          operation: 'upsert',
+          baseRevision: head?.revision ?? null,
+          payload: {
+            name: pending.documentName,
+            mimeType: pending.mimeType,
+            versionId: pending.versionId,
+            versionNumber: pending.versionNumber,
+            contentHash: pending.contentHash,
+            generationId: pending.generationId,
+            createdAt: pending.createdAt,
+          },
+        })
+        synchronization = await active.cloud.synchronize(pending.knowledgeBaseId) as {
+          status?: string
+        }
+      } catch (error) {
+        assertCurrentBinding(active)
+        if (cloudAllowed()) recordPublicationFailure(error)
+        return
       }
       assertCurrentBinding(active)
-      if (synchronization.status !== 'synced' || !cloudAllowed()) return
-      const bytes = await active.store.objects.read(pending.objectId)
+      if (!cloudAllowed()) return
+      if (synchronization.status !== 'synced') {
+        terminalPublication('SYNC_FAILED')
+        return
+      }
+      let bytes: Buffer
+      try {
+        bytes = await active.store.objects.read(pending.objectId)
+      } catch (error) {
+        assertCurrentBinding(active)
+        if (cloudAllowed()) recordPublicationFailure(error)
+        return
+      }
       assertCurrentBinding(active)
       try {
         const uploaded = await remote.uploadDocument({
@@ -1120,6 +1179,10 @@ export function createLocalKnowledgeService(
         )
         if (updated.changes !== 1) fail('CONFLICT')
         pending = { ...pending, uploadJobId: uploaded.jobId }
+      } catch (error) {
+        assertCurrentBinding(active)
+        if (cloudAllowed()) recordPublicationFailure(error)
+        return
       } finally {
         bytes.fill(0)
       }
@@ -1130,7 +1193,13 @@ export function createLocalKnowledgeService(
       SELECT mode FROM cloud_sync_states WHERE knowledge_base_id = ?
     `).get(pending.knowledgeBaseId) as { mode: string } | undefined
     if (currentMode?.mode === 'paused') {
-      active.cloud.resume(pending.knowledgeBaseId)
+      try {
+        active.cloud.resume(pending.knowledgeBaseId)
+      } catch (error) {
+        assertCurrentBinding(active)
+        if (cloudAllowed()) recordPublicationFailure(error)
+        return
+      }
       assertCurrentBinding(active)
       if (!cloudAllowed()) return
     }
@@ -1142,21 +1211,7 @@ export function createLocalKnowledgeService(
       } catch (error) {
         assertCurrentBinding(active)
         if (!cloudAllowed()) return
-        const candidate = typeof error === 'object' && error !== null
-          ? error as { code?: unknown; retryable?: unknown }
-          : {}
-        if (candidate.code === 'TRANSIENT_FAILURE' && candidate.retryable === true) {
-          deferPublication('TRANSIENT_FAILURE')
-        } else {
-          active.store.database.prepare(`
-            UPDATE cloud_pending_publications
-            SET last_error_code = ?, updated_at = ?
-            WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
-          `).run(
-            typeof candidate.code === 'string' ? candidate.code : 'INTERNAL_ERROR', now(),
-            pending.knowledgeBaseId, pending.generationId, uploadJobId,
-          )
-        }
+        recordPublicationFailure(error)
         return
       }
       assertCurrentBinding(active)
@@ -1164,14 +1219,10 @@ export function createLocalKnowledgeService(
       if (job.jobId !== uploadJobId) fail('INTERNAL_ERROR')
       if (job.state === 'completed') { completed = true; break }
       if (job.state === 'failed' || job.state === 'cancelled') {
-        active.store.database.prepare(`
-          UPDATE cloud_pending_publications
-          SET last_error_code = ?, updated_at = ?
-          WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
-        `).run(
-          job.errorCode ?? (job.state === 'failed' ? 'SERVICE_UNAVAILABLE' : 'CANCELLED'),
-          now(), pending.knowledgeBaseId, pending.generationId, uploadJobId,
-        )
+        recordPublicationFailure(Object.assign(new Error(job.state), {
+          code: job.errorCode ?? (job.state === 'failed' ? 'SERVICE_UNAVAILABLE' : 'CANCELLED'),
+          retryable: false as const,
+        }))
         return
       }
     }
@@ -1179,17 +1230,24 @@ export function createLocalKnowledgeService(
       deferPublication('GENERATION_NOT_READY')
       return
     }
-    await active.cloud.publishGeneration({
-      requestId: pending.publishRequestId,
-      knowledgeBaseId: pending.knowledgeBaseId,
-      generationId: pending.generationId,
-    })
+    try {
+      await active.cloud.publishGeneration({
+        requestId: pending.publishRequestId,
+        knowledgeBaseId: pending.knowledgeBaseId,
+        generationId: pending.generationId,
+      })
+    } catch (error) {
+      assertCurrentBinding(active)
+      if (cloudAllowed()) recordPublicationFailure(error)
+      return
+    }
     assertCurrentBinding(active)
+    if (!cloudAllowed()) return
     try {
       if (!await finalizePublishedHead()) return
-    } catch {
+    } catch (error) {
       assertCurrentBinding(active)
-      if (cloudAllowed()) deferPublication('TRANSIENT_FAILURE')
+      if (cloudAllowed()) recordPublicationFailure(error)
       return
     }
     active.store.database.prepare(`
@@ -1224,7 +1282,8 @@ export function createLocalKnowledgeService(
       FROM cloud_pending_publications
       WHERE next_retry_at <= ?
         AND (last_error_code IS NULL
-          OR last_error_code IN ('GENERATION_NOT_READY', 'TRANSIENT_FAILURE'))
+          OR (last_error_code IN ('GENERATION_NOT_READY', 'TRANSIENT_FAILURE')
+            AND recovery_attempt > 0))
       ORDER BY next_retry_at, updated_at, knowledge_base_id
       LIMIT 8
     `).all(now()) as Array<{ knowledgeBaseId: string }>

@@ -63,6 +63,96 @@ function cloudRemote(overrides: Partial<CloudKnowledgeRemote> = {}): CloudKnowle
   }
 }
 
+type PublicationFailurePhase = 'enable' | 'sync' | 'upload' | 'publish' | 'finalize'
+
+async function failingPublication(
+  phase: PublicationFailurePhase,
+  failure: Error,
+) {
+  const memory = memoryKnowledgeStore()
+  let observedAt = 1_000
+  let published = false
+  const beginGeneration = vi.fn(async (input: {
+    knowledgeBaseId: string
+    generationId: string
+  }) => {
+    if (phase === 'enable') throw failure
+    return { ...input, status: 'staging' as const }
+  })
+  const fullResync = vi.fn(async () => {
+    if (phase === 'sync') throw failure
+    return { kind: 'snapshot' as const, nextSequence: 0, changes: [] }
+  })
+  const pullChanges = vi.fn(async (input: { afterSequence: number }) => {
+    if (phase === 'finalize' && published) throw failure
+    return {
+      kind: 'incremental' as const, nextSequence: input.afterSequence,
+      hasMore: false, changes: [],
+    }
+  })
+  const uploadDocument = vi.fn(async () => {
+    if (phase === 'upload') throw failure
+    return { jobId: 'phase_upload_job', storageReference: 'knowledge/phase/object' }
+  })
+  const publishGeneration = vi.fn(async (input: { generationId: string }) => {
+    if (phase === 'publish') throw failure
+    published = true
+    return { generationId: input.generationId, previousGenerationId: null, sequence: 9 }
+  })
+  const remote = cloudRemote({
+    beginGeneration,
+    fullResync,
+    pullChanges,
+    uploadDocument,
+    publishGeneration,
+    pushMutation: vi.fn(async input => ({
+      mutationId: input.mutationId, status: 'applied' as const,
+      sequence: 1, revision: input.mutationId,
+    })),
+    getJob: vi.fn(async input => ({
+      jobId: input.jobId, state: 'completed' as const, errorCode: null,
+    })),
+  })
+  const service = createLocalKnowledgeService({
+    openStore: async () => memory.store,
+    selectImportFiles: async () => [{
+      name: 'phase.txt', mimeType: 'text/plain', bytes: Buffer.from('发布阶段分类'),
+    }],
+    createParser: () => ({
+      parse: async () => parsedText('发布阶段分类'), terminateAll: async () => undefined,
+    }),
+    saveExport: async () => undefined,
+    isMember: () => true,
+    entitlement: () => ({
+      tier: 'member', status: 'active', localEnabled: true,
+      betaEnabled: true, cloudEnabled: true,
+    }),
+    cloudKillSwitchEnabled: () => false,
+    now: () => observedAt,
+  })
+  service.configureCloudRemote!(remote)
+  const owner = { userId: 'alice' }
+  await service.bind(owner.userId, true)
+  memory.database.prepare(`
+    INSERT INTO knowledge_entitlement_projection(
+      singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+      accepted_key_generation, verified, explicit_free, max_observed_at
+    ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1)
+  `).run()
+  const base = await service.create(owner, `Phase ${phase}`)
+  const handle = (await service.pickImportFiles(owner))[0]!
+  await service.importDocument(owner, base.id, handle.id)
+  const phaseCall = phase === 'enable' ? beginGeneration
+    : phase === 'sync' ? fullResync
+      : phase === 'upload' ? uploadDocument
+        : phase === 'publish' ? publishGeneration : pullChanges
+  await vi.waitFor(() => expect(phaseCall).toHaveBeenCalled())
+  return {
+    memory, service, owner, baseId: base.id, phaseCall,
+    setNow: (value: number) => { observedAt = value },
+  }
+}
+
 describe('local knowledge service', () => {
   it('keeps only the Main-selected free allowance writable/searchable after membership expiry', async () => {
     const memory = memoryKnowledgeStore()
@@ -761,6 +851,51 @@ describe('local knowledge service', () => {
     expect(memory.database.prepare(
       'SELECT 1 FROM cloud_pending_publications WHERE knowledge_base_id = ?',
     ).get(base.id)).toBeUndefined()
+  })
+
+  it.each<PublicationFailurePhase>([
+    'enable', 'sync', 'upload', 'publish', 'finalize',
+  ])('backs off an explicitly retryable transient %s publication failure', async (phase) => {
+    const transient = Object.assign(new Error(`transient ${phase}`), {
+      code: 'TRANSIENT_FAILURE', retryable: true,
+    })
+    const fixture = await failingPublication(phase, transient)
+    await vi.waitFor(() => expect(fixture.memory.database.prepare(`
+      SELECT recovery_attempt AS recoveryAttempt, next_retry_at AS nextRetryAt,
+        last_error_code AS lastErrorCode
+      FROM cloud_pending_publications WHERE knowledge_base_id = ?
+    `).get(fixture.baseId)).toEqual({
+      recoveryAttempt: 1, nextRetryAt: 2_000, lastErrorCode: 'TRANSIENT_FAILURE',
+    }))
+    const callsBeforeDue = fixture.phaseCall.mock.calls.length
+    await fixture.service.list(fixture.owner)
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    expect(fixture.phaseCall).toHaveBeenCalledTimes(callsBeforeDue)
+
+    fixture.setNow(2_000)
+    await fixture.service.list(fixture.owner)
+    await vi.waitFor(() => expect(fixture.phaseCall.mock.calls.length).toBeGreaterThan(callsBeforeDue))
+  })
+
+  it.each<PublicationFailurePhase>([
+    'enable', 'sync', 'upload', 'publish', 'finalize',
+  ])('makes a non-transient %s publication failure durably terminal', async (phase) => {
+    const terminal = Object.assign(new Error(`terminal ${phase}`), {
+      code: 'FORBIDDEN', retryable: true,
+    })
+    const fixture = await failingPublication(phase, terminal)
+    await vi.waitFor(() => expect(fixture.memory.database.prepare(`
+      SELECT recovery_attempt AS recoveryAttempt, next_retry_at AS nextRetryAt,
+        last_error_code AS lastErrorCode
+      FROM cloud_pending_publications WHERE knowledge_base_id = ?
+    `).get(fixture.baseId)).toEqual({
+      recoveryAttempt: 0, nextRetryAt: 0, lastErrorCode: 'FORBIDDEN',
+    }))
+    const terminalCalls = fixture.phaseCall.mock.calls.length
+    fixture.setNow(60_000)
+    await fixture.service.list(fixture.owner)
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    expect(fixture.phaseCall).toHaveBeenCalledTimes(terminalCalls)
   })
 
   it('recovers a due queued generation from persisted state on the first search after restart', async () => {
