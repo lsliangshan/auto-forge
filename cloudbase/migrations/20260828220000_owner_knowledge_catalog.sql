@@ -1,5 +1,77 @@
 BEGIN;
 
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_require_cloud(p_owner_id bigint)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  entitlement public.knowledge_entitlements%ROWTYPE;
+  consent_purpose constant varchar := 'cloud_sync';
+  consent_state varchar;
+  consent_revision bigint;
+  consent_document_version varchar;
+BEGIN
+  SELECT * INTO entitlement FROM public.knowledge_entitlements WHERE owner_id = p_owner_id;
+  IF NOT FOUND OR entitlement.kill_switch_enabled THEN
+    RAISE EXCEPTION USING MESSAGE = 'KILL_SWITCH_ENABLED', ERRCODE = 'P0001';
+  END IF;
+  IF entitlement.tier <> 'member' OR NOT entitlement.cloud_enabled
+    OR entitlement.status NOT IN ('active', 'offline_grace') THEN
+    RAISE EXCEPTION USING MESSAGE = 'ENTITLEMENT_REQUIRED', ERRCODE = 'P0001';
+  END IF;
+  IF to_regclass('public.app_privacy_consent_states') IS NULL THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+  EXECUTE $query$
+    SELECT state, revision, document_version
+    FROM public.app_privacy_consent_states
+    WHERE owner_user_id = $1 AND purpose = $2
+  $query$
+  INTO consent_state, consent_revision, consent_document_version
+  USING p_owner_id, consent_purpose;
+  IF consent_state IS DISTINCT FROM 'accepted'
+    OR consent_revision IS NULL OR consent_revision < 1
+    OR consent_document_version IS DISTINCT FROM 'cloud-sync-2026-08' THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_assert_cloud_sync_consent(
+  p_caller_user_id varchar
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  consent_purpose constant varchar := 'cloud_sync';
+  consent_revision bigint;
+  consent_document_version varchar;
+BEGIN
+  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  EXECUTE $query$
+    SELECT revision, document_version
+    FROM public.app_privacy_consent_states
+    WHERE owner_user_id = $1 AND purpose = $2 AND state = 'accepted'
+  $query$
+  INTO consent_revision, consent_document_version
+  USING owner, consent_purpose;
+  IF consent_revision IS NULL
+    OR consent_document_version IS DISTINCT FROM 'cloud-sync-2026-08' THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object(
+    'state', 'accepted', 'revision', consent_revision,
+    'documentVersion', consent_document_version
+  );
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS public.knowledge_owner_catalog_snapshots (
   id varchar(128) NOT NULL,
   owner_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
@@ -190,7 +262,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.knowledge_owner_catalog_ite
 
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_list_bases(varchar, varchar, integer, integer, integer) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_owner_catalog(varchar, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_assert_cloud_sync_consent(varchar) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_list_bases(varchar, varchar, integer, integer, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cleanup_owner_catalog(varchar, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_assert_cloud_sync_consent(varchar) TO service_role;
 
 COMMIT;

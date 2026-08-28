@@ -165,6 +165,23 @@ describe('CloudBase personal knowledge migration', () => {
     expect(list).toContain('sum(item.response_bytes) OVER')
     expect(list).toContain("'totalCount', catalog_snapshot.item_count")
     expect(list).toContain("'knowledgeBaseIds', knowledge_base_ids")
+    const requireCloud = staticFunctionBodyFragment(
+      featureCatalog, 'autoforge_knowledge_require_cloud',
+    )
+    expect(requireCloud).toContain("to_regclass('public.app_privacy_consent_states')")
+    expect(requireCloud).toContain("consent_purpose constant varchar := 'cloud_sync'")
+    expect(requireCloud).toContain("consent_state IS DISTINCT FROM 'accepted'")
+    expect(requireCloud).toContain(
+      "consent_document_version IS DISTINCT FROM 'cloud-sync-2026-08'",
+    )
+    const assertCloudConsent = staticFunctionBodyFragment(
+      featureCatalog, 'autoforge_knowledge_assert_cloud_sync_consent',
+    )
+    expect(assertCloudConsent).toContain(
+      'PERFORM public.autoforge_knowledge_require_cloud(owner)',
+    )
+    expect(assertCloudConsent).toContain("'state', 'accepted'")
+    expect(assertCloudConsent).toContain("consent_purpose constant varchar := 'cloud_sync'")
     const cleanup = staticFunctionBodyFragment(
       featureCatalog, 'autoforge_knowledge_cleanup_owner_catalog',
     )
@@ -173,6 +190,7 @@ describe('CloudBase personal knowledge migration', () => {
     expect(cleanup).toContain('LIMIT p_limit')
     expect(cleanup).toContain('snapshot.expires_at <= clock_timestamp()')
     for (const signature of [
+      'autoforge_knowledge_assert_cloud_sync_consent(varchar)',
       'autoforge_knowledge_list_bases(varchar, varchar, integer, integer, integer)',
       'autoforge_knowledge_cleanup_owner_catalog(varchar, integer)',
     ]) {
@@ -184,6 +202,14 @@ describe('CloudBase personal knowledge migration', () => {
       )
       expect(rollbackCatalog).toContain(`DROP FUNCTION IF EXISTS public.${signature}`)
     }
+    expect(rollbackCatalog).toContain(
+      'CREATE OR REPLACE FUNCTION public.autoforge_knowledge_require_cloud(p_owner_id bigint)',
+    )
+    const rollbackRequireCloud = staticFunctionBodyFragment(
+      rollbackCatalog, 'autoforge_knowledge_require_cloud',
+    )
+    expect(rollbackRequireCloud).not.toContain('app_privacy_consent_states')
+    expect(rollbackRequireCloud).toContain('knowledge_entitlements')
     expect(featureCatalog).not.toMatch(
       /GRANT\s+(?:ALL|SELECT|INSERT|UPDATE|DELETE|EXECUTE)[^;]*\bTO\s+(?:PUBLIC|anon|authenticated)\b/i,
     )

@@ -52,6 +52,12 @@ const actionKeys = {
     'expectedPublishedGenerationId',
   ],
 }
+const cloudSyncConsentActions = new Set([
+  'beginSync', 'beginGeneration', 'authorizeUpload', 'completeUpload',
+  'pushMutation', 'pullChanges', 'fullResync', 'listKnowledgeBases',
+  'publishGeneration', 'getJob', 'searchKnowledge', 'beginEmbeddingDriftProbe',
+])
+const currentCloudSyncDocumentVersion = 'cloud-sync-2026-08'
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -678,6 +684,25 @@ function safeErrorCode(error) {
   return 'INTERNAL_ERROR'
 }
 
+async function assertCloudSyncConsent(rpc, uid) {
+  const consent = await rpc('autoforge_knowledge_assert_cloud_sync_consent', {
+    p_caller_user_id: uid,
+  })
+  if (safeSerializedSize(consent) > maximumResponseBytes || !exactKeys(consent, [
+    'state', 'revision', 'documentVersion',
+  ]) || consent.state !== 'accepted'
+    || !Number.isSafeInteger(consent.revision) || consent.revision < 1
+    || consent.documentVersion !== currentCloudSyncDocumentVersion) {
+    throw { code: 'INTERNAL_ERROR' }
+  }
+  return consent
+}
+
+function requiresCloudSyncConsent(event) {
+  return cloudSyncConsentActions.has(event.action)
+    || (event.action === 'setEmbeddingConsent' && event.enabled === true)
+}
+
 function parseAction(event, uid) {
   if (typeof event.action !== 'string' || !Object.hasOwn(actionKeys, event.action)) return undefined
   const keys = actionKeys[event.action]
@@ -842,6 +867,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
     try { parsed = parseAction(event, uid) } catch { parsed = undefined }
     if (!parsed) return { ok: false, error: { code: 'INVALID_INPUT' } }
     try {
+      if (requiresCloudSyncConsent(event)) await assertCloudSyncConsent(rpc, uid)
       const data = await rpc(parsed[0], parsed[1])
       if (event.action === 'setEmbeddingConsent' && event.enabled === false
         && isRecord(data) && data.state === 'revoking') {
@@ -978,6 +1004,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
         }, uploadUrlPrefix)) {
           throw { code: 'INTERNAL_ERROR' }
         }
+        await assertCloudSyncConsent(rpc, uid)
         return boundedSuccess({ ...data, uploadAuthorization })
       }
       if (event.action === 'completeUpload') {
@@ -998,6 +1025,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           || observed.byteSize !== data.expectedByteSize
           || observed.sha256 !== data.expectedSha256
           || observed.mimeType !== data.expectedMimeType) throw { code: 'INTERNAL_ERROR' }
+        await assertCloudSyncConsent(rpc, uid)
         const verified = await rpc('autoforge_knowledge_verify_upload', {
           p_caller_user_id: uid, p_upload_ticket: event.uploadTicket,
           p_knowledge_base_id: data.knowledgeBaseId, p_object_id: data.objectId,
@@ -1017,6 +1045,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           || verified.byteSize !== data.expectedByteSize
           || verified.sha256 !== data.expectedSha256
           || verified.mimeType !== data.expectedMimeType) throw { code: 'INTERNAL_ERROR' }
+        await assertCloudSyncConsent(rpc, uid)
         return boundedSuccess({
           objectId: verified.objectId,
           storageReference: verified.storageReference,

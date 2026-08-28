@@ -4,7 +4,7 @@
 
 ## 发布前置条件
 
-1. 在隔离的 CloudBase PostgreSQL 预发布环境依次应用 `migrations/0001_personal_knowledge.sql`、additive `migrations/0002_personal_knowledge_workers.sql` 和 `migrations/0003_owner_knowledge_catalog.sql`，执行跨用户 RLS、并发发布、游标过期、owner catalog 分页、作业租约和回滚演练。
+1. 在隔离的 CloudBase PostgreSQL 预发布环境依次应用 `migrations/0001_personal_knowledge.sql` 和 additive `migrations/0002_personal_knowledge_workers.sql`，确保 user-data foundation 到 `0003_privacy_consent_revocation.sql` 的完整链已应用，再应用 `migrations/0003_owner_knowledge_catalog.sql`；执行跨用户 RLS、authoritative `cloud_sync` revoke/regrant、并发发布、游标过期、owner catalog 分页、作业租约和回滚演练。若 consent current-state 表或当前 `cloud-sync-2026-08` acceptance 不存在，普通 Knowledge RPC 必须 fail closed。
 2. 建立私有 PG Storage 空间，并只允许 `autoforge-knowledge` 云函数和 `autoforge-knowledge-worker` 根据数据库中的 `storage_reference` 执行数据面操作。上传使用可消费、15 分钟过期的 PG Storage 授权；Electron 不配置 COS 密钥、Service Role 密钥或永久对象 URL。
 3. 为云函数配置 `AUTOFORGE_PG_RPC_BASE_URL`、`AUTOFORGE_PG_STORAGE_BASE_URL`、精确 HTTPS 上传路径前缀 `AUTOFORGE_PG_STORAGE_UPLOAD_URL_PREFIX` 和 `AUTOFORGE_PG_SERVICE_KEY`。上传授权只允许该前缀下绑定 ticket 的 URL，以及 `content-type`、`content-length`、`x-content-sha256`、`x-upload-ticket` 四个客户端头；禁止返回 Authorization、Cookie 或服务凭据。Storage 适配器需要提供幂等的 `POST /upload-authorizations`、`POST /objects/stat` 与 `POST /objects/delete` 私有服务端接口，然后部署 CommonJS 入口：
 
@@ -27,6 +27,7 @@
 ## 生命周期边界
 
 - 上传授权、对象元数据校验、同步变更、原子发布、删除、取消和孤儿清理由云函数/RPC 执行。孤儿清理先幂等删除私有 Storage 字节，再提交数据库删除。
+- 普通知识 RPC 在可信 UID 边界读取 `app_privacy_consent_states` 的当前 `cloud_sync` revision/document version；事件体中的 consent boolean 或 owner 永不参与授权。删除、取消、孤儿清理和 embedding revoke 保留为隐私安全的 cleanup 路径。
 - `knowledge_versions` 和 `knowledge_index_generations` 是不可变生成；仅 ready 生成可原子切换为 published。
 - 作业使用绑定 worker ID 的 token、过期租约、CAS 与幂等 request/mutation id；仅瞬时错误最多重试三次。
 - 增量游标基于单调 sequence；每页同时受 512 行和 768 KiB 预算约束，`nextSequence` 只能等于该页最后一条，`hasMore` 驱动继续拉取。新客户端先完整取得稳定 owner catalog，再逐库使用同一事务物化的稳定 snapshot；任一 catalog 页或知识库同步失败都不能据此裁剪本地 remote-only projection。墓碑与 change 的清理下限持久保留。
@@ -34,4 +35,4 @@
 
 ## 回滚
 
-先保持桌面 Cloud kill switch 关闭并停止 worker/云函数，依次执行 `migrations/0003_owner_knowledge_catalog.rollback.sql`、`migrations/0002_personal_knowledge_workers.rollback.sql` 和 `migrations/0001_personal_knowledge.rollback.sql`。回滚只撤销服务角色权限和 RPC 函数；owner catalog rollback 也保留 snapshot/item 表及其审计数据。所有已接收的表、行、RLS、复合外键与不可变约束继续供审计、对账和后续恢复；禁止把删表、截断或删除数据当作回滚。
+先保持桌面 Cloud kill switch 关闭并停止 worker/云函数，依次执行 `migrations/0003_owner_knowledge_catalog.rollback.sql`、user-data `0003_privacy_consent_revocation.rollback.sql`、`migrations/0002_personal_knowledge_workers.rollback.sql` 和 `migrations/0001_personal_knowledge.rollback.sql`。Knowledge 0003 rollback 先撤销 current-consent assertion RPC 并恢复 entitlement-only 的旧 `require_cloud` 定义；user-data rollback 随后禁用 revoke mutation surface。回滚只撤销服务角色权限和 RPC 函数；owner catalog rollback 也保留 snapshot/item 表及其审计数据。所有已接收的表、行、RLS、复合外键与不可变约束继续供审计、对账和后续恢复；禁止把删表、截断或删除数据当作回滚。

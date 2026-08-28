@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import {
   createEmbeddingGenerationWorker,
-  createKnowledgeHandler,
+  createKnowledgeHandler as createProductionKnowledgeHandler,
   createPostgresRpcClient,
   createPostgresStorageClient,
   createTokenHubClient,
@@ -11,6 +11,23 @@ import {
 
 const context = { auth: { uid: '2089908515857502208' } }
 const futureExpiry = new Date(Date.now() + 15 * 60_000).toISOString()
+const currentCloudSyncConsent = {
+  state: 'accepted', revision: 1, documentVersion: 'cloud-sync-2026-08',
+}
+
+function createKnowledgeHandler(
+  options: Parameters<typeof createProductionKnowledgeHandler>[0],
+) {
+  const rpc = options.rpc
+  return createProductionKnowledgeHandler({
+    ...options,
+    rpc: async (name: string, parameters: Record<string, unknown>) => (
+      name === 'autoforge_knowledge_assert_cloud_sync_consent'
+        ? currentCloudSyncConsent
+        : rpc(name, parameters)
+    ),
+  })
+}
 
 function expectedUploadObjectId(requestId = 'upload_1', versionId = 'version_1') {
   return `object_${createHash('md5').update(`${requestId}:${versionId}`).digest('hex')}`
@@ -40,6 +57,105 @@ function streamedResponse(value: unknown, status = 200) {
 }
 
 describe('CloudBase knowledge function', () => {
+  it('authorizes ordinary RPCs only from authoritative current cloud-sync consent', async () => {
+    let consent: 'accepted' | 'revoked' = 'revoked'
+    let revision = 2
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_assert_cloud_sync_consent') {
+        if (consent === 'revoked') throw { code: 'FORBIDDEN' }
+        return {
+          state: 'accepted', revision, documentVersion: 'cloud-sync-2026-08',
+        }
+      }
+      if (name === 'autoforge_knowledge_begin_sync') return {
+        knowledgeBaseId: 'kb_1', generationId: 'generation_1', status: 'staging',
+      }
+      throw new Error(`unexpected RPC ${name}`)
+    })
+    const handler = createProductionKnowledgeHandler({ rpc })
+    const request = {
+      action: 'beginSync', requestId: 'sync_1', knowledgeBaseId: 'kb_1',
+      name: 'Contracts', revision: 'revision_1', generationId: 'generation_1',
+    }
+
+    await expect(handler(request, context)).resolves.toEqual({
+      ok: false, error: { code: 'FORBIDDEN' },
+    })
+    expect(rpc).toHaveBeenCalledTimes(1)
+
+    consent = 'accepted'
+    revision = 3
+    await expect(handler(request, context)).resolves.toMatchObject({ ok: true })
+    expect(rpc).toHaveBeenNthCalledWith(2, 'autoforge_knowledge_assert_cloud_sync_consent', {
+      p_caller_user_id: context.auth.uid,
+    })
+    expect(rpc).toHaveBeenNthCalledWith(3, 'autoforge_knowledge_begin_sync', {
+      p_caller_user_id: context.auth.uid, p_request_id: 'sync_1',
+      p_knowledge_base_id: 'kb_1', p_name: 'Contracts', p_revision: 'revision_1',
+      p_generation_id: 'generation_1',
+    })
+
+    consent = 'revoked'
+    revision = 4
+    await expect(handler(request, context)).resolves.toEqual({
+      ok: false, error: { code: 'FORBIDDEN' },
+    })
+    expect(rpc).toHaveBeenCalledTimes(4)
+  })
+
+  it('rejects caller-supplied cloud-sync authorization before the server gate', async () => {
+    const rpc = vi.fn()
+    const handler = createProductionKnowledgeHandler({ rpc })
+
+    await expect(handler({
+      action: 'beginSync', requestId: 'sync_1', knowledgeBaseId: 'kb_1',
+      name: 'Contracts', revision: 'revision_1', generationId: 'generation_1',
+      cloudSyncConsent: true,
+    }, context)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    expect(rpc).not.toHaveBeenCalled()
+  })
+
+  it('fails every ordinary knowledge action closed while cloud-sync is revoked', async () => {
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_assert_cloud_sync_consent') {
+        throw { code: 'FORBIDDEN' }
+      }
+      return {}
+    })
+    const storage = {
+      createUploadAuthorization: vi.fn(), statObject: vi.fn(), deleteObjects: vi.fn(),
+    }
+    const handler = createProductionKnowledgeHandler({ rpc, storage })
+    const sha256 = 'a'.repeat(64)
+    const requests = [
+      { action: 'beginSync', requestId: 'r1', knowledgeBaseId: 'kb', name: 'n', revision: 'v', generationId: 'g' },
+      { action: 'beginGeneration', requestId: 'r2', knowledgeBaseId: 'kb', name: 'n', revision: 'v', generationId: 'g' },
+      { action: 'authorizeUpload', requestId: 'r3', knowledgeBaseId: 'kb', documentId: 'd', versionId: 'v', byteSize: 1, sha256, mimeType: 'text/plain' },
+      { action: 'completeUpload', uploadTicket: 'ticket' },
+      { action: 'pushMutation', mutationId: 'm', knowledgeBaseId: 'kb', entityKind: 'document', entityId: 'd', operation: 'upsert', baseRevision: null, payload: {} },
+      { action: 'pullChanges', knowledgeBaseId: 'kb', afterSequence: 0, limit: 1, maxBytes: 65_536 },
+      { action: 'fullResync', knowledgeBaseId: 'kb', snapshotId: null, afterOrdinal: 0, limit: 1, maxBytes: 65_536 },
+      { action: 'listKnowledgeBases', snapshotId: null, afterOrdinal: 0, limit: 1, maxBytes: 65_536 },
+      { action: 'publishGeneration', requestId: 'r4', knowledgeBaseId: 'kb', generationId: 'g', expectedPublishedGenerationId: null },
+      { action: 'getJob', jobId: 'job' },
+      { action: 'setEmbeddingConsent', requestId: 'r5', enabled: true },
+      { action: 'searchKnowledge', requestId: 'r6', query: '合同', knowledgeBaseIds: ['kb'], limit: 1 },
+      { action: 'beginEmbeddingDriftProbe', requestId: 'r7', knowledgeBaseId: 'kb', generationId: 'g2', expectedPublishedGenerationId: 'g1' },
+    ]
+
+    for (const request of requests) {
+      await expect(handler(request, context)).resolves.toEqual({
+        ok: false, error: { code: 'FORBIDDEN' },
+      })
+    }
+    expect(rpc).toHaveBeenCalledTimes(requests.length)
+    expect(rpc.mock.calls.every(([name]) => (
+      name === 'autoforge_knowledge_assert_cloud_sync_consent'
+    ))).toBe(true)
+    expect(storage.createUploadAuthorization).not.toHaveBeenCalled()
+    expect(storage.statObject).not.toHaveBeenCalled()
+  })
+
   it('uses the CloudBase CommonJS index.main deployment contract', async () => {
     const packageJson = JSON.parse(await readFile(
       new URL('../../cloudbase/knowledge/function/package.json', import.meta.url), 'utf8',
