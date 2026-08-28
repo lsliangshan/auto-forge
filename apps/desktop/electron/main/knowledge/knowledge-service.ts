@@ -86,6 +86,7 @@ interface Binding {
   runner: ImportJobRunner
   handles: Map<string, ImportHandleRecord>
   cloud: KnowledgeCloudLifecycle
+  cloudOwnerInvalidated: boolean
   cloudTasks: Set<Promise<unknown>>
   cloudPublications: Map<string, Promise<void>>
 }
@@ -1057,9 +1058,16 @@ export function createLocalKnowledgeService(
     return recorded
   }
 
-  const retire = (current: Binding): void => {
+  const invalidateBinding = (current: Binding): void => {
+    if (!current.cloudOwnerInvalidated) {
+      current.cloud.invalidateOwner()
+      current.cloudOwnerInvalidated = true
+    }
     current.runner.invalidate()
-    current.cloud.invalidateOwner()
+  }
+
+  const retire = (current: Binding): void => {
+    invalidateBinding(current)
     const closing = (async () => {
       const failures: PromiseSettledResult<unknown>[] = []
       failures.push(...await settle([
@@ -1119,8 +1127,8 @@ export function createLocalKnowledgeService(
     refreshedEntitlement = undefined
     activeSearchScopes.clear()
     if (current) {
-      current.runner.invalidate()
       pendingRetirements.add(current)
+      invalidateBinding(current)
     }
   }
 
@@ -1213,7 +1221,8 @@ export function createLocalKnowledgeService(
       })
       Object.assign(active, {
         ownerId, epoch: bindEpoch, store, parser, runner, handles: new Map(),
-        cloud: createCloudLifecycle(store), cloudTasks: new Set(), cloudPublications: new Map(),
+        cloud: createCloudLifecycle(store), cloudOwnerInvalidated: false,
+        cloudTasks: new Set(), cloudPublications: new Map(),
       })
       if (bindEpoch !== epoch) {
         const cleanup = await settle([() => runner.drain(), () => store.close()])

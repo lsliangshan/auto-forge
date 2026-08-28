@@ -634,6 +634,82 @@ describe('local knowledge service', () => {
     })
   })
 
+  it('fences a held cloud purge synchronously through public owner invalidation and drains it', async () => {
+    const memory = memoryKnowledgeStore()
+    const deleteResult = deferred<{ deletionJobId: string }>()
+    const deleteKnowledgeBase = vi.fn(() => deleteResult.promise)
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({
+        parse: async () => parsedText('unused'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+    })
+    service.configureCloudRemote!(cloudRemote({ deleteKnowledgeBase }))
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    const base = await service.create(owner, '待删除云端库')
+    memory.database.prepare(`
+      INSERT INTO cloud_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES (?, 'synced', 'generation_held', 1, 1)
+    `).run(base.id)
+    memory.database.prepare(`
+      INSERT INTO knowledge_cloud_retention(
+        knowledge_base_id, stage, download_until, recycle_until,
+        operation_id, request_id, deletion_job_id, epoch, updated_at
+      ) VALUES (?, 'download_window', 10000, 20000, 'operation_held', 'request_held', NULL, 1, 1)
+    `).run(base.id)
+    await service.recycleBase(owner, base.id)
+
+    const purging = service.purgeBase(owner, base.id)
+    await vi.waitFor(() => expect(deleteKnowledgeBase).toHaveBeenCalledOnce())
+    const claimed = memory.database.prepare(`
+      SELECT epoch FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(base.id) as { epoch: number }
+    expect(claimed.epoch).toBe(2)
+
+    service.invalidate()
+    const immediate = {
+      retention: memory.database.prepare(`
+        SELECT epoch, stage, deletion_job_id AS deletionJobId
+        FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+      `).get(base.id),
+      sync: memory.database.prepare(`
+        SELECT mode, epoch FROM cloud_sync_states WHERE knowledge_base_id = ?
+      `).get(base.id),
+    }
+    let drained = false
+    const draining = service.drain().then(() => { drained = true })
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    expect(drained).toBe(false)
+
+    deleteResult.resolve({ deletionJobId: 'delete_late' })
+    await expect(purging).rejects.toMatchObject({ code: 'CONFLICT' })
+    await draining
+
+    expect(immediate).toEqual({
+      retention: { epoch: 3, stage: 'download_window', deletionJobId: null },
+      sync: { mode: 'paused', epoch: 2 },
+    })
+    expect(memory.database.prepare(`
+      SELECT 1 FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = ?
+    `).get(base.id)).toBeUndefined()
+    expect(memory.database.prepare(`
+      SELECT lifecycle_status AS status FROM knowledge_bases WHERE id = ?
+    `).get(base.id)).toEqual({ status: 'recycled' })
+    expect(memory.database.prepare(`
+      SELECT epoch, stage, deletion_job_id AS deletionJobId
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual({ epoch: 3, stage: 'download_window', deletionJobId: null })
+    expect(memory.database.prepare(`
+      SELECT mode, epoch FROM cloud_sync_states WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual({ mode: 'paused', epoch: 2 })
+    expect(memory.closes()).toBe(1)
+  })
+
   it('purges a local-only recycled base without a remote deletion operation', async () => {
     const memory = memoryKnowledgeStore()
     const remote = cloudRemote()
