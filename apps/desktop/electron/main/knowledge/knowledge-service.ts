@@ -277,6 +277,77 @@ function documentSummary(
   }
 }
 
+function remoteBaseSummary(
+  database: Database.Database,
+  baseId: string,
+): KnowledgeBaseSummary | undefined {
+  const row = database.prepare(`
+    SELECT base.id, base.name, base.updated_at,
+      count(document.id) AS document_count,
+      max(CASE WHEN version.id IS NOT NULL THEN 1 ELSE 0 END) AS searchable
+    FROM cloud_base_projections AS base
+    LEFT JOIN cloud_document_projections AS document
+      ON document.knowledge_base_id = base.id AND document.status = 'ready'
+    LEFT JOIN cloud_version_projections AS version
+      ON version.id = document.active_version_id
+      AND version.document_id = document.id
+      AND version.generation_id = base.published_generation_id
+      AND version.local_object_available = 0
+    WHERE base.id = ?
+    GROUP BY base.id
+  `).get(baseId) as {
+    id: string
+    name: string
+    updated_at: number
+    document_count: number
+    searchable: number
+  } | undefined
+  if (!row) return undefined
+  return {
+    id: row.id,
+    name: row.name,
+    kind: 'cloud',
+    status: 'read_only',
+    searchable: row.searchable === 1,
+    documentCount: row.document_count,
+    updatedAt: timestamp(row.updated_at),
+    readOnly: true,
+  }
+}
+
+function remoteDocumentSummary(
+  database: Database.Database,
+  documentId: string,
+): KnowledgeDocumentSummary | undefined {
+  const row = database.prepare(`
+    SELECT document.id, document.knowledge_base_id, document.name, document.mime_type,
+      document.status, document.updated_at, count(version.id) AS version_count
+    FROM cloud_document_projections AS document
+    LEFT JOIN cloud_version_projections AS version ON version.document_id = document.id
+    WHERE document.id = ?
+    GROUP BY document.id
+  `).get(documentId) as {
+    id: string
+    knowledge_base_id: string
+    name: string
+    mime_type: string
+    status: KnowledgeDocumentSummary['status']
+    updated_at: number
+    version_count: number
+  } | undefined
+  if (!row) return undefined
+  return {
+    id: row.id,
+    baseId: row.knowledge_base_id,
+    name: row.name,
+    mimeType: row.mime_type,
+    status: row.status,
+    versionCount: row.version_count,
+    updatedAt: timestamp(row.updated_at),
+    readOnly: true,
+  }
+}
+
 export function createLocalKnowledgeService(
   dependencies: LocalKnowledgeServiceDependencies,
 ): LocalKnowledgeService {
@@ -374,6 +445,155 @@ export function createLocalKnowledgeService(
 
   const createCloudLifecycle = (store: LocalKnowledgeStore): KnowledgeCloudLifecycle => {
     if (!cloudRemote) return failClosedCloudLifecycle(store.database)
+    type RemoteBasePayload = {
+      name?: string
+      publishedGenerationId?: string | null
+    }
+    type RemoteDocumentPayload = {
+      name: string
+      mimeType: string
+      versionId: string
+      versionNumber: number
+      contentHash: string
+      generationId: string
+      createdAt: number
+    }
+    const isRecord = (value: unknown): value is Record<string, unknown> => (
+      typeof value === 'object' && value !== null && !Array.isArray(value)
+    )
+    const exactKeys = (value: Record<string, unknown>, allowed: readonly string[]): boolean => {
+      const expected = new Set(allowed)
+      return Object.keys(value).every(key => expected.has(key))
+    }
+    const identifier = (value: unknown): value is string => (
+      typeof value === 'string' && value.length > 0 && value.length <= 128
+      && value.trim() === value
+    )
+    const basePayload = (value: unknown): RemoteBasePayload | undefined => {
+      if (!isRecord(value) || !exactKeys(value, ['name', 'publishedGenerationId'])) {
+        return undefined
+      }
+      if (!Object.hasOwn(value, 'name') && !Object.hasOwn(value, 'publishedGenerationId')) {
+        return undefined
+      }
+      if (Object.hasOwn(value, 'name')
+        && (typeof value.name !== 'string' || value.name.length === 0
+          || value.name.length > 200 || value.name.trim() !== value.name)) return undefined
+      if (Object.hasOwn(value, 'publishedGenerationId')
+        && value.publishedGenerationId !== null
+        && !identifier(value.publishedGenerationId)) return undefined
+      return value as RemoteBasePayload
+    }
+    const documentPayload = (value: unknown): RemoteDocumentPayload | undefined => {
+      if (!isRecord(value) || !exactKeys(value, [
+        'name', 'mimeType', 'versionId', 'versionNumber', 'contentHash',
+        'generationId', 'createdAt',
+      ]) || Object.keys(value).length !== 7
+        || typeof value.name !== 'string' || value.name.length === 0
+        || value.name.length > 500 || value.name.trim() !== value.name
+        || typeof value.mimeType !== 'string' || !mediaTypes.has(value.mimeType)
+        || !identifier(value.versionId) || !identifier(value.generationId)
+        || !Number.isSafeInteger(value.versionNumber) || Number(value.versionNumber) <= 0
+        || typeof value.contentHash !== 'string'
+        || !/^[a-f0-9]{64}$/u.test(value.contentHash)
+        || !Number.isSafeInteger(value.createdAt) || Number(value.createdAt) < 0) {
+        return undefined
+      }
+      return value as unknown as RemoteDocumentPayload
+    }
+    const storedHeadPayload = (
+      knowledgeBaseId: string,
+      entityKind: CloudKnowledgeChange['entityKind'],
+      entityId: string,
+    ): Record<string, unknown> | undefined => {
+      const row = store.database.prepare(`
+        SELECT payload_json AS payloadJson FROM cloud_remote_entity_heads
+        WHERE knowledge_base_id = ? AND entity_kind = ? AND entity_id = ? AND deleted = 0
+      `).get(knowledgeBaseId, entityKind, entityId) as { payloadJson: string } | undefined
+      if (!row) return undefined
+      try {
+        const parsed: unknown = JSON.parse(row.payloadJson)
+        return isRecord(parsed) ? parsed : undefined
+      } catch {
+        return undefined
+      }
+    }
+    const rebuildRemoteProjection = (knowledgeBaseId: string): void => {
+      store.database.prepare(
+        'DELETE FROM cloud_base_projections WHERE id = ?',
+      ).run(knowledgeBaseId)
+      const baseHead = store.database.prepare(`
+        SELECT revision, payload_json AS payloadJson, updated_at AS updatedAt
+        FROM cloud_remote_entity_heads
+        WHERE knowledge_base_id = ? AND entity_kind = 'knowledge_base'
+          AND entity_id = ? AND deleted = 0
+      `).get(knowledgeBaseId, knowledgeBaseId) as {
+        revision: string
+        payloadJson: string
+        updatedAt: number
+      } | undefined
+      if (!baseHead) return
+      let parsedBase: unknown
+      try { parsedBase = JSON.parse(baseHead.payloadJson) } catch { fail('INVALID_INPUT') }
+      const base = basePayload(parsedBase)
+      if (!base || typeof base.name !== 'string'
+        || !Object.hasOwn(base, 'publishedGenerationId')) return
+      store.database.prepare(`
+        INSERT INTO cloud_base_projections(
+          id, name, status, published_generation_id, revision, updated_at
+        ) VALUES (?, ?, 'ready', ?, ?, ?)
+      `).run(
+        knowledgeBaseId, base.name, base.publishedGenerationId,
+        baseHead.revision, baseHead.updatedAt,
+      )
+      if (!base.publishedGenerationId) return
+      store.database.prepare(`
+        INSERT INTO cloud_generation_projections(
+          id, knowledge_base_id, status, revision, updated_at
+        ) VALUES (?, ?, 'published', ?, ?)
+      `).run(
+        base.publishedGenerationId, knowledgeBaseId,
+        baseHead.revision, baseHead.updatedAt,
+      )
+      const documentHeads = store.database.prepare(`
+        SELECT entity_id AS entityId, revision, payload_json AS payloadJson,
+          updated_at AS updatedAt
+        FROM cloud_remote_entity_heads
+        WHERE knowledge_base_id = ? AND entity_kind = 'document' AND deleted = 0
+        ORDER BY entity_id
+      `).all(knowledgeBaseId) as Array<{
+        entityId: string
+        revision: string
+        payloadJson: string
+        updatedAt: number
+      }>
+      for (const head of documentHeads) {
+        let parsed: unknown
+        try { parsed = JSON.parse(head.payloadJson) } catch { fail('INVALID_INPUT') }
+        const document = documentPayload(parsed)
+        if (!document || document.generationId !== base.publishedGenerationId) continue
+        store.database.prepare(`
+          INSERT INTO cloud_document_projections(
+            id, knowledge_base_id, name, mime_type, active_version_id,
+            status, revision, updated_at
+          ) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?)
+        `).run(
+          head.entityId, knowledgeBaseId, document.name, document.mimeType,
+          document.versionId, head.revision, head.updatedAt,
+        )
+        store.database.prepare(`
+          INSERT INTO cloud_version_projections(
+            id, knowledge_base_id, document_id, version_number, status,
+            content_hash, generation_id, created_at, local_object_available,
+            revision, updated_at
+          ) VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, 0, ?, ?)
+        `).run(
+          document.versionId, knowledgeBaseId, head.entityId, document.versionNumber,
+          document.contentHash, document.generationId, document.createdAt,
+          head.revision, head.updatedAt,
+        )
+      }
+    }
     const writeHead = (
       change: CloudKnowledgeChange,
       guard: {
@@ -381,7 +601,24 @@ export function createLocalKnowledgeService(
         readonly projection: 'local' | 'remote'
       },
     ): void => {
-      const payloadJson = JSON.stringify(change.payload)
+      let payload = change.payload
+      if (guard.projection === 'remote' && change.operation === 'upsert') {
+        if (change.entityKind === 'knowledge_base') {
+          if (change.entityId !== guard.knowledgeBaseId || !basePayload(payload)) {
+            fail('INVALID_INPUT')
+          }
+          payload = {
+            ...storedHeadPayload(
+              guard.knowledgeBaseId, change.entityKind, change.entityId,
+            ),
+            ...payload,
+          }
+          if (!basePayload(payload)) fail('INVALID_INPUT')
+        } else if (change.entityKind === 'document' && !documentPayload(payload)) {
+          fail('INVALID_INPUT')
+        }
+      }
+      const payloadJson = JSON.stringify(payload)
       if (Buffer.byteLength(payloadJson, 'utf8') > 64 * 1_024) fail('INVALID_INPUT')
       store.database.prepare(`
         INSERT INTO ${guard.projection === 'remote'
@@ -395,6 +632,7 @@ export function createLocalKnowledgeService(
         guard.knowledgeBaseId, change.entityKind, change.entityId, change.revision,
         payloadJson, Number(change.operation === 'delete'), now(),
       )
+      if (guard.projection === 'remote') rebuildRemoteProjection(guard.knowledgeBaseId)
     }
     return new KnowledgeSyncService(store.database, cloudRemote, {
       now,
@@ -411,6 +649,7 @@ export function createLocalKnowledgeService(
             WHERE knowledge_base_id = ?
           `).run(guard.knowledgeBaseId)
           for (const change of changes) writeHead(change, guard)
+          if (guard.projection === 'remote') rebuildRemoteProjection(guard.knowledgeBaseId)
         })
       ),
     })
@@ -1053,7 +1292,22 @@ export function createLocalKnowledgeService(
     if (!remote || !liveCloudAllowed || (admittedScope && !admittedScope.cloudAllowed)) {
       return result
     }
-    const cloudEntries = admittedScope?.entries ?? active.store.database.prepare(`
+    if (!admittedScope) {
+      for (const baseId of allowedBases) {
+        const local = active.store.database.prepare(
+          'SELECT 1 AS present FROM knowledge_bases WHERE id = ?',
+        ).get(baseId)
+        if (local) continue
+        try {
+          await active.cloud.synchronizeRemoteProjection(baseId)
+          assertCurrentBinding(active)
+          if (!ordinaryCloudAllowed(active)) return result
+        } catch {
+          assertCurrentBinding(active)
+        }
+      }
+    }
+    const localCloudEntries = active.store.database.prepare(`
       SELECT base.id AS baseId, document.id AS documentId,
         version.id AS versionId, version.publication_generation AS publicationGeneration,
         sync.published_generation_id AS cloudGenerationId
@@ -1067,6 +1321,24 @@ export function createLocalKnowledgeService(
         AND version.status = 'ready' AND sync.published_generation_id IS NOT NULL
       ORDER BY base.id, document.id, version.id
     `).all(...allowedBases) as KnowledgeSearchScopeEntry[]
+    const remoteCloudEntries = active.store.database.prepare(`
+      SELECT base.id AS baseId, document.id AS documentId,
+        version.id AS versionId, 0 AS publicationGeneration,
+        base.published_generation_id AS cloudGenerationId
+      FROM cloud_base_projections AS base
+      JOIN cloud_document_projections AS document
+        ON document.knowledge_base_id = base.id
+      JOIN cloud_version_projections AS version
+        ON version.id = document.active_version_id
+        AND version.document_id = document.id
+        AND version.generation_id = base.published_generation_id
+      WHERE base.id IN (${allowedBases.map(() => '?').join(', ')})
+        AND document.status = 'ready' AND version.status = 'ready'
+        AND version.local_object_available = 0
+      ORDER BY base.id, document.id, version.id
+    `).all(...allowedBases) as KnowledgeSearchScopeEntry[]
+    const cloudEntries = admittedScope?.entries
+      ?? [...localCloudEntries, ...remoteCloudEntries]
     const generations = new Map<string, string>()
     for (const baseId of allowedBases) {
       const selected = new Set(cloudEntries
@@ -1078,11 +1350,18 @@ export function createLocalKnowledgeService(
     if (cloudBases.length === 0) return result
     try {
       for (const baseId of cloudBases) {
-        await serialCloudTask(active, baseId, async () => {
-          await processCloudPublication(active, baseId)
-          const synchronized = await active.cloud.synchronize(baseId) as { status?: string }
-          if (synchronized.status !== 'synced') fail('SERVICE_UNAVAILABLE')
-        })
+        const local = active.store.database.prepare(
+          'SELECT 1 AS present FROM knowledge_bases WHERE id = ?',
+        ).get(baseId)
+        if (local || !admittedScope) {
+          await serialCloudTask(active, baseId, async () => {
+            if (local) await processCloudPublication(active, baseId)
+            const synchronized = await (local
+              ? active.cloud.synchronize(baseId)
+              : active.cloud.synchronizeRemoteProjection(baseId)) as { status?: string }
+            if (synchronized.status !== 'synced') fail('SERVICE_UNAVAILABLE')
+          })
+        }
         assertCurrentBinding(active)
         if (!ordinaryCloudAllowed(active)) return result
       }
@@ -1479,11 +1758,19 @@ export function createLocalKnowledgeService(
       const ids = active.store.database.prepare(
         'SELECT id FROM knowledge_bases ORDER BY created_at, id',
       ).all() as Array<{ id: string }>
-      return ids.map(row => baseSummary(
+      const local = ids.map(row => baseSummary(
         active.store.database,
         row.id,
         !member && kept?.baseId !== row.id,
       )!)
+      const remoteIds = active.store.database.prepare(`
+        SELECT remote.id FROM cloud_base_projections AS remote
+        LEFT JOIN knowledge_bases AS local ON local.id = remote.id
+        WHERE local.id IS NULL ORDER BY remote.updated_at, remote.id
+      `).all() as Array<{ id: string }>
+      return [...local, ...remoteIds.map(row => remoteBaseSummary(
+        active.store.database, row.id,
+      )!)]
     },
     captureSearchScope: async (owner, requestedBaseIds) => {
       const active = current(owner)
@@ -1496,7 +1783,22 @@ export function createLocalKnowledgeService(
       const allowed = state.tier === 'member' && state.status !== 'expired'
         ? unique
         : kept && unique.includes(kept.baseId) ? [kept.baseId] : []
-      const entries = allowed.length === 0 ? [] : active.store.database.prepare(`
+      if (ordinaryCloudAllowed(active)) {
+        for (const baseId of allowed) {
+          const local = active.store.database.prepare(
+            'SELECT 1 AS present FROM knowledge_bases WHERE id = ?',
+          ).get(baseId)
+          if (local) continue
+          try {
+            await active.cloud.synchronizeRemoteProjection(baseId)
+            assertCurrentBinding(active)
+            if (!ordinaryCloudAllowed(active)) break
+          } catch {
+            assertCurrentBinding(active)
+          }
+        }
+      }
+      const localEntries = allowed.length === 0 ? [] : active.store.database.prepare(`
         SELECT base.id AS baseId, document.id AS documentId,
           version.id AS versionId, version.publication_generation AS publicationGeneration,
           sync.published_generation_id AS cloudGenerationId
@@ -1511,6 +1813,24 @@ export function createLocalKnowledgeService(
           ${kept?.documentId ? 'AND document.id = ?' : ''}
         ORDER BY base.id, document.id, version.id
       `).all(...allowed, ...(kept?.documentId ? [kept.documentId] : [])) as KnowledgeSearchScopeEntry[]
+      const remoteEntries = allowed.length === 0 || kept?.documentId ? []
+        : active.store.database.prepare(`
+          SELECT base.id AS baseId, document.id AS documentId,
+            version.id AS versionId, 0 AS publicationGeneration,
+            base.published_generation_id AS cloudGenerationId
+          FROM cloud_base_projections AS base
+          JOIN cloud_document_projections AS document
+            ON document.knowledge_base_id = base.id
+          JOIN cloud_version_projections AS version
+            ON version.id = document.active_version_id
+            AND version.document_id = document.id
+            AND version.generation_id = base.published_generation_id
+          WHERE base.id IN (${allowed.map(() => '?').join(', ')})
+            AND document.status = 'ready' AND version.status = 'ready'
+            AND version.local_object_available = 0
+          ORDER BY base.id, document.id, version.id
+        `).all(...allowed) as KnowledgeSearchScopeEntry[]
+      const entries = [...localEntries, ...remoteEntries]
       const scope = Object.freeze({
         scopeId: id(), ownerId: active.ownerId, ownerEpoch: active.epoch,
         baseIds: Object.freeze([...allowed]),
@@ -1546,7 +1866,15 @@ export function createLocalKnowledgeService(
     listDocuments: async (owner, baseId) => {
       const active = current(owner)
       recoverDueCloudPublications(active)
-      if (!baseSummary(active.store.database, baseId)) fail('NOT_FOUND')
+      const localBase = baseSummary(active.store.database, baseId)
+      if (!localBase) {
+        if (!remoteBaseSummary(active.store.database, baseId)) fail('NOT_FOUND')
+        const remoteRows = active.store.database.prepare(`
+          SELECT id FROM cloud_document_projections
+          WHERE knowledge_base_id = ? ORDER BY updated_at, id
+        `).all(baseId) as Array<{ id: string }>
+        return remoteRows.map(row => remoteDocumentSummary(active.store.database, row.id)!)
+      }
       const state = entitlement(active)
       const kept = retention(active, state)
       const member = state.tier === 'member' && state.status !== 'expired'
@@ -1561,7 +1889,27 @@ export function createLocalKnowledgeService(
     },
     listVersions: async (owner, documentId) => {
       const active = current(owner)
-      if (!documentSummary(active.store.database, documentId)) fail('NOT_FOUND')
+      if (!documentSummary(active.store.database, documentId)) {
+        if (!remoteDocumentSummary(active.store.database, documentId)) fail('NOT_FOUND')
+        const remoteRows = active.store.database.prepare(`
+          SELECT id, document_id, version_number, status, created_at
+          FROM cloud_version_projections
+          WHERE document_id = ? ORDER BY version_number DESC
+        `).all(documentId) as Array<{
+          id: string
+          document_id: string
+          version_number: number
+          status: KnowledgeVersionSummary['status']
+          created_at: number
+        }>
+        return remoteRows.map((row): KnowledgeVersionSummary => ({
+          id: row.id,
+          documentId: row.document_id,
+          number: row.version_number,
+          status: row.status,
+          createdAt: timestamp(row.created_at),
+        }))
+      }
       const rows = active.store.database.prepare(`
         SELECT id, document_id, version_number, status, created_at
         FROM document_versions WHERE document_id = ? ORDER BY version_number DESC
@@ -1823,7 +2171,10 @@ export function createLocalKnowledgeService(
     },
     exportBase: async (owner, baseId) => {
       const active = current(owner)
-      if (!baseSummary(active.store.database, baseId)) fail('NOT_FOUND')
+      if (!baseSummary(active.store.database, baseId)) {
+        if (remoteBaseSummary(active.store.database, baseId)) fail('SERVICE_UNAVAILABLE')
+        fail('NOT_FOUND')
+      }
       const exporter = new KnowledgeExportService({
         database: active.store.database,
         objects: active.store.objects,
@@ -1836,7 +2187,11 @@ export function createLocalKnowledgeService(
     search: async (owner, query) => {
       const active = current(owner)
       const bases = active.store.database.prepare(`
-        SELECT id FROM knowledge_bases WHERE recycled_at IS NULL ORDER BY created_at, id
+        SELECT id FROM knowledge_bases WHERE recycled_at IS NULL
+        UNION SELECT remote.id FROM cloud_base_projections AS remote
+          LEFT JOIN knowledge_bases AS local ON local.id = remote.id
+          WHERE local.id IS NULL
+        ORDER BY id
       `).all() as Array<{ id: string }>
       return searchBases(active, query, bases.map(base => base.id))
     },

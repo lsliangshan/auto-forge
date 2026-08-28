@@ -372,6 +372,170 @@ describe('local knowledge service', () => {
     `).get(base.id)).toEqual({ revision: 'remote_r1' })
   })
 
+  it('materializes remote-only snapshots, stale replacement, incrementals, and tombstones without local objects', async () => {
+    const memory = memoryKnowledgeStore()
+    const saveExport = vi.fn()
+    const readObject = vi.spyOn(memory.objects, 'read')
+    const baseChange = (
+      sequence: number,
+      generationId: string,
+      name = 'Remote contracts',
+    ) => ({
+      sequence, entityKind: 'knowledge_base' as const, entityId: 'remote_base',
+      operation: 'upsert' as const, revision: `base_r${sequence}`,
+      payload: { name, publishedGenerationId: generationId },
+    })
+    const documentChange = (
+      sequence: number,
+      documentId: string,
+      versionId: string,
+      generationId: string,
+      versionNumber: number,
+    ) => ({
+      sequence, entityKind: 'document' as const, entityId: documentId,
+      operation: 'upsert' as const, revision: `document_r${sequence}`,
+      payload: {
+        name: `${documentId}.txt`, mimeType: 'text/plain', versionId, versionNumber,
+        contentHash: versionNumber.toString(16).repeat(64),
+        generationId, createdAt: sequence * 1_000,
+      },
+    })
+    const fullResync = vi.fn()
+      .mockResolvedValueOnce({
+        kind: 'snapshot' as const, nextSequence: 2,
+        changes: [
+          documentChange(1, 'remote_document_1', 'remote_version_1', 'remote_generation_1', 1),
+          baseChange(2, 'remote_generation_1'),
+        ],
+      })
+      .mockResolvedValueOnce({
+        kind: 'snapshot' as const, nextSequence: 5,
+        changes: [
+          documentChange(4, 'remote_document_2', 'remote_version_2', 'remote_generation_2', 2),
+          baseChange(5, 'remote_generation_2', 'Remote contracts renamed'),
+        ],
+      })
+    const pullChanges = vi.fn()
+      .mockResolvedValueOnce({ kind: 'cursor_stale' as const })
+      .mockResolvedValueOnce({
+        kind: 'incremental' as const, nextSequence: 7, hasMore: false,
+        changes: [
+          baseChange(6, 'remote_generation_3', 'Remote contracts renamed'),
+          documentChange(7, 'remote_document_2', 'remote_version_3', 'remote_generation_3', 3),
+        ],
+      })
+      .mockResolvedValueOnce({
+        kind: 'incremental' as const, nextSequence: 8, hasMore: false,
+        changes: [{
+          sequence: 8, entityKind: 'document' as const, entityId: 'remote_document_2',
+          operation: 'delete' as const, revision: 'document_r8', payload: {},
+        }],
+      })
+    const search = vi.fn(async () => ({
+      generationState: 'published',
+      generations: [{
+        knowledgeBaseId: 'remote_base', generationId: 'remote_generation_1',
+        previousGenerationId: null,
+      }],
+      strategy: 'keyword_only_consent' as const,
+      embedding: {
+        model: 'kinfra-text-embedding-0.6b' as const, dimensions: 1024 as const,
+        configurationVersion: 'autoforge-knowledge-embedding-v1' as const,
+        region: 'guangzhou' as const,
+      },
+      keywordCandidates: [{
+        id: 'remote_chunk_1', knowledgeBaseId: 'remote_base',
+        documentId: 'remote_document_1', versionId: 'remote_version_1',
+        generationId: 'remote_generation_1', rank: 1, body: '远程合同条款',
+        coordinates: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 6 },
+      }],
+      vectorCandidates: [], driftProbeRequired: false,
+    }))
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({
+        parse: async () => parsedText('unused'), terminateAll: async () => undefined,
+      }),
+      saveExport,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => false,
+    })
+    service.configureCloudRemote!(cloudRemote({ fullResync, pullChanges, search }))
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    memory.database.prepare(`
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+        accepted_key_generation, verified, explicit_free, max_observed_at
+      ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1)
+    `).run()
+
+    const firstScope = await service.captureSearchScope(owner, ['remote_base'])
+    await expect(service.list(owner)).resolves.toContainEqual(expect.objectContaining({
+      id: 'remote_base', name: 'Remote contracts', kind: 'cloud', status: 'read_only',
+      searchable: true, documentCount: 1, readOnly: true,
+    }))
+    await expect(service.listDocuments(owner, 'remote_base')).resolves.toEqual([
+      expect.objectContaining({
+        id: 'remote_document_1', baseId: 'remote_base', status: 'ready', readOnly: true,
+      }),
+    ])
+    await expect(service.listVersions(owner, 'remote_document_1')).resolves.toEqual([
+      expect.objectContaining({ id: 'remote_version_1', number: 1, status: 'ready' }),
+    ])
+    expect(firstScope.entries).toEqual([expect.objectContaining({
+      baseId: 'remote_base', documentId: 'remote_document_1', versionId: 'remote_version_1',
+      cloudGenerationId: 'remote_generation_1',
+    })])
+    await expect(service.searchSelected(
+      owner, '远程合同', ['remote_base'], undefined, firstScope,
+    )).resolves.toMatchObject({
+      kind: 'results', evidence: [expect.objectContaining({ id: 'evidence:cloud:remote_chunk_1' })],
+    })
+    await expect(service.sourceAvailable(
+      owner, 'remote_document_1', 'remote_version_1', undefined, firstScope,
+    )).resolves.toBe(false)
+    await expect(service.exportBase(owner, 'remote_base')).rejects.toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+    })
+    expect(readObject).not.toHaveBeenCalled()
+    expect(saveExport).not.toHaveBeenCalled()
+    service.releaseSearchScope(firstScope)
+
+    const staleScope = await service.captureSearchScope(owner, ['remote_base'])
+    expect(staleScope.entries).toEqual([expect.objectContaining({
+      documentId: 'remote_document_2', versionId: 'remote_version_2',
+      cloudGenerationId: 'remote_generation_2',
+    })])
+    await expect(service.listDocuments(owner, 'remote_base')).resolves.toEqual([
+      expect.objectContaining({ id: 'remote_document_2' }),
+    ])
+    service.releaseSearchScope(staleScope)
+
+    const incrementalScope = await service.captureSearchScope(owner, ['remote_base'])
+    expect(incrementalScope.entries).toEqual([expect.objectContaining({
+      documentId: 'remote_document_2', versionId: 'remote_version_3',
+      cloudGenerationId: 'remote_generation_3',
+    })])
+    service.releaseSearchScope(incrementalScope)
+
+    const tombstoneScope = await service.captureSearchScope(owner, ['remote_base'])
+    expect(tombstoneScope.entries).toEqual([])
+    await expect(service.listDocuments(owner, 'remote_base')).resolves.toEqual([])
+    expect(memory.database.prepare(`
+      SELECT sequence FROM cloud_remote_sync_cursors WHERE knowledge_base_id = 'remote_base'
+    `).get()).toEqual({ sequence: 8 })
+    expect(memory.database.prepare(`
+      SELECT local_object_available AS localObjectAvailable
+      FROM cloud_version_projections WHERE id = 'remote_version_3'
+    `).get()).toBeUndefined()
+  })
+
   it('durably resumes a queued cloud generation after the third poll without duplicate upload', async () => {
     const memory = memoryKnowledgeStore()
     let observedAt = 1_000

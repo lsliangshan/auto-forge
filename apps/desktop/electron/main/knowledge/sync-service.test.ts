@@ -413,7 +413,6 @@ describe('KnowledgeSyncService', () => {
   })
 
   it('rolls back a remote-only snapshot projection when its cursor cannot commit', async () => {
-    let database!: Database.Database
     const replaceRemoteSnapshot = async (...args: unknown[]) => {
       const guard = args[1] as {
         commitSnapshot(sequence: number, write: () => void): void
@@ -431,7 +430,7 @@ describe('KnowledgeSyncService', () => {
         kind: 'snapshot', nextSequence: 7, changes: [],
       }),
     }, true, { replaceRemoteSnapshot })
-    database = fixtureResult.database
+    const { database } = fixtureResult
     database.exec(`
       CREATE TRIGGER reject_remote_cursor
       BEFORE INSERT ON cloud_remote_sync_cursors
