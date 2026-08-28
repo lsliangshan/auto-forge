@@ -9,6 +9,7 @@ import {
   authOtpRequestSchema,
   authOtpVerificationSchema,
   browserActionAuditEntrySchema,
+  chatFileSupport,
   authSessionSchema,
   authUserSchema,
   authorizationSnapshotSchema,
@@ -36,6 +37,7 @@ import {
   messagePageSchema,
   mediaAssetSchema,
   mediaBlockSchema,
+  mediaGenerationBlockSchema,
   modelInfoSchema,
   normalizeProxySettings,
   parseProxyBypassText,
@@ -951,6 +953,46 @@ describe('cross-process contracts', () => {
       enabled: false,
       bypassDomains: ['example.com', 'https://private.example'],
     })).toThrow()
+  })
+
+  it('accepts generic file attachment blocks without allowing files in media generation blocks', () => {
+    const fileBlock = {
+      type: 'media' as const,
+      blockId: 'block_file_1',
+      assetId: 'asset_file_1',
+      kind: 'file' as const,
+      purpose: 'input' as const,
+      name: 'notes.txt',
+      mimeType: 'text/plain',
+      byteSize: 12,
+    }
+    const fileAsset = {
+      id: 'asset_file_1',
+      kind: 'file' as const,
+      name: 'notes.txt',
+      mimeType: 'text/plain',
+      byteSize: 12,
+    }
+
+    expect(mediaBlockSchema.parse(fileBlock)).toEqual(fileBlock)
+    expect(mediaAssetSchema.parse(fileAsset)).toEqual(fileAsset)
+    expect(() => mediaGenerationBlockSchema.parse({
+      type: 'media_generation',
+      blockId: 'block_file_1',
+      jobId: 'job_file_1',
+      kind: 'file',
+      status: 'pending',
+    })).toThrow()
+  })
+
+  it.each([
+    ['deepseek', 'notes.anything', 'text/plain', { mode: 'text' }],
+    ['openrouter', 'report.pdf', 'application/octet-stream', { mode: 'provider-file', mimeType: 'application/pdf' }],
+    ['openrouter', 'sheet.xlsx', 'application/octet-stream', { mode: 'provider-file', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }],
+    ['openrouter', 'archive.zip', 'application/octet-stream', { mode: 'unsupported' }],
+    ['deepseek', 'report.pdf', 'application/pdf', { mode: 'unsupported' }],
+  ] as const)('classifies %s %s', (provider, name, mimeType, expected) => {
+    expect(chatFileSupport(provider, name, mimeType)).toEqual(expected)
   })
 
   it('accepts strict persisted media blocks without paths or encoded bytes', () => {

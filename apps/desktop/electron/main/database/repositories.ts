@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3'
 import { z } from 'zod'
 import {
   appErrorCodeSchema,
+  attachmentKindSchema,
   browserAuditTextSchema,
   capabilitySchema,
   chatBlockSchema,
@@ -14,7 +15,7 @@ import {
   type ByokUsageEvent,
   type ChatBlock,
   type ConversationGenerationPreferences,
-  type MediaKind,
+  type AttachmentKind,
   type ModelProviderId,
 } from '@autoforge/shared'
 import { addUsd, normalizeUsd } from '../billing/decimal-usd.js'
@@ -348,7 +349,7 @@ export interface MediaAssetRecord {
   conversationId: string
   messageId?: string
   source: MediaAssetSource
-  kind: MediaKind
+  kind: AttachmentKind
   mimeType?: string
   originalName: string
   relativePath?: string
@@ -464,7 +465,7 @@ const mediaAssetRecordShape = {
   conversationId: identifierSchema,
   messageId: identifierSchema.optional(),
   source: z.enum(['upload', 'generated']),
-  kind: z.enum(['image', 'audio', 'video']),
+  kind: attachmentKindSchema,
   mimeType: z.string().trim().min(1).optional(),
   originalName: z.string().trim().min(1),
   relativePath: z.string().trim().min(1).optional(),
@@ -1075,7 +1076,7 @@ function mediaAssetFromRow(row: Query): MediaAssetRecord {
     conversationId: row.conversationId as string,
     messageId: optional<string>(row.messageId),
     source: row.source as MediaAssetSource,
-    kind: row.kind as MediaKind,
+    kind: row.kind as AttachmentKind,
     mimeType: optional<string>(row.mimeType),
     originalName: row.originalName as string,
     relativePath: optional<string>(row.relativePath),

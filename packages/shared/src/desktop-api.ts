@@ -5,7 +5,7 @@ import { proxySettingsSchema } from './proxy-settings.js'
 import { appErrorCodeSchema } from './errors.js'
 import {
   chatBlockSchema,
-  mediaKindSchema,
+  attachmentKindSchema,
   type ChatBlock,
   type ChatEvent,
   type ExecutionEvent,
@@ -325,7 +325,7 @@ export type GenerationOptions = z.infer<typeof generationOptionsSchema>
 
 export const mediaAssetSchema = z.object({
   id: identifierSchema,
-  kind: mediaKindSchema,
+  kind: attachmentKindSchema,
   mimeType: nonEmptyStringSchema,
   name: nonEmptyStringSchema,
   byteSize: z.number().int().nonnegative(),

@@ -582,7 +582,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(14)
+    expect(database.schemaVersion()).toBe(15)
     const inspection = new Database(path, { readonly: true })
     expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string; on_delete: string }>)
       .map(({ table, on_delete }) => ({ table, on_delete })))
@@ -648,7 +648,7 @@ describe('openAppDatabase', () => {
     })
     expect(database.chatRuns.get('user_cache_run_not_in_global_chat_runs')).toBeUndefined()
     expect(database.chatRuns.get('updated_user_cache_run_not_in_global_chat_runs')).toBeUndefined()
-    expect(database.schemaVersion()).toBe(14)
+    expect(database.schemaVersion()).toBe(15)
     database.close()
 
     const inspection = new Database(path)
@@ -723,7 +723,7 @@ describe('openAppDatabase', () => {
       .toMatchObject({ status: 'completed' })
     expect(database.executionSteps.listForUser('owned_execution', 'other_user')).toEqual([])
     expect(database.executionLogs.listForUser('owned_execution', 'other_user')).toEqual([])
-    expect(database.schemaVersion()).toBe(14)
+    expect(database.schemaVersion()).toBe(15)
     database.close()
 
     const inspection = new Database(path, { readonly: true })
@@ -848,7 +848,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(14)
+    expect(database.schemaVersion()).toBe(15)
     expect(database.conversations.get('conversation_v1')).toMatchObject({
       title: 'Persisted v1',
       titleState: 'user_named',
@@ -862,7 +862,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(14)
+    expect(database.schemaVersion()).toBe(15)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -873,7 +873,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(14)
+    expect(database.schemaVersion()).toBe(15)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
@@ -893,7 +893,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(14)
+    expect(database.schemaVersion()).toBe(15)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -1872,7 +1872,7 @@ describe('openAppDatabase', () => {
     sqlite.close()
 
     const database = openAppDatabase(path)
-    expect(database.schemaVersion()).toBe(14)
+    expect(database.schemaVersion()).toBe(15)
     expect(database.messages.get('current_message')?.blocks).toEqual([currentApproval])
     expect(database.messages.hasWorkflowApproval('current_execution')).toBe(true)
     expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(true)
@@ -2259,6 +2259,95 @@ describe('openAppDatabase', () => {
     expect(database.mediaAssets.get('asset_invalid_ready')).toBeUndefined()
     expect(database.mediaAssets.get('asset_invalid_metadata')).toBeUndefined()
     expect(database.mediaAssets.get('asset_staging_validation')).toMatchObject({ status: 'staging' })
+  })
+
+  it('persists a ready generic file attachment after the attachment-kind migration', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_file_attachment', title: 'File attachment' })
+
+    database.mediaAssets.insert({
+      ...readyAsset('asset_file_attachment', 'conversation_file_attachment'),
+      kind: 'file',
+      mimeType: 'application/pdf',
+      originalName: 'report.pdf',
+      relativePath: 'conversation_file_attachment/asset_file_attachment.pdf',
+    })
+
+    expect(database.mediaAssets.get('asset_file_attachment')).toMatchObject({
+      kind: 'file',
+      mimeType: 'application/pdf',
+      originalName: 'report.pdf',
+    })
+  })
+
+  it('migrates v14 media assets to support generic file attachments without losing media relationships', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-v14-file-attachment-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const sqlite = new Database(path)
+    const migrationDirectory = fileURLToPath(new URL('../../../resources/migrations/', import.meta.url))
+    const migrations = readdirSync(migrationDirectory)
+      .map((fileName) => ({ fileName, version: Number.parseInt(fileName.slice(0, 4), 10) }))
+      .filter(({ fileName, version }) => fileName.endsWith('.sql') && version <= 14)
+      .sort((left, right) => left.version - right.version)
+    for (const migration of migrations) {
+      sqlite.exec(readFileSync(join(migrationDirectory, migration.fileName), 'utf8'))
+      sqlite.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
+        .run(migration.version, migration.version)
+    }
+    sqlite.prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)')
+      .run('conversation_v14_file_attachment', 'V14 attachment', 1, 1)
+    sqlite.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('message_v14_file_attachment', 'conversation_v14_file_attachment', 'assistant', '[]', 1, 1)
+    sqlite.prepare(`
+      INSERT INTO media_assets (
+        id, conversation_id, message_id, source, kind, mime_type, original_name, relative_path,
+        byte_size, sha256, status, created_at, updated_at
+      ) VALUES (?, ?, ?, 'generated', 'image', 'image/png', 'preserved.png', ?, 12, ?, 'ready', 1, 1)
+    `).run(
+      'asset_v14_file_attachment',
+      'conversation_v14_file_attachment',
+      'message_v14_file_attachment',
+      'conversation_v14_file_attachment/asset_v14_file_attachment.png',
+      'a'.repeat(64),
+    )
+    sqlite.prepare(`
+      INSERT INTO media_generation_jobs (
+        id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id,
+        status, parameters_json, asset_id, created_at, updated_at
+      ) VALUES (?, ?, ?, 'openrouter', 'video-model', 'video', 'provider-job', 'completed', '{}', ?, 1, 1)
+    `).run(
+      'job_v14_file_attachment',
+      'conversation_v14_file_attachment',
+      'message_v14_file_attachment',
+      'asset_v14_file_attachment',
+    )
+    sqlite.close()
+
+    const database = openAppDatabase(path)
+
+    expect(database.schemaVersion()).toBe(15)
+    expect(database.mediaAssets.get('asset_v14_file_attachment')).toMatchObject({
+      id: 'asset_v14_file_attachment',
+      kind: 'image',
+      messageId: 'message_v14_file_attachment',
+    })
+    expect(database.mediaGenerationJobs.get('job_v14_file_attachment')?.assetId)
+      .toBe('asset_v14_file_attachment')
+    database.mediaAssets.insert({
+      ...readyAsset('asset_v15_file_attachment', 'conversation_v14_file_attachment'),
+      kind: 'file',
+      mimeType: 'application/pdf',
+      originalName: 'new-report.pdf',
+      relativePath: 'conversation_v14_file_attachment/asset_v15_file_attachment.pdf',
+    })
+    database.close()
+
+    const inspection = new Database(path, { readonly: true })
+    expect((inspection.prepare('PRAGMA index_list(media_assets)').all() as Array<{ name: string }>).map(({ name }) => name))
+      .toEqual(expect.arrayContaining(['media_assets_conversation_status_idx', 'media_assets_unclaimed_idx']))
+    expect(inspection.prepare('PRAGMA foreign_key_check').all()).toEqual([])
+    inspection.close()
   })
 
   it('rejects invalid persisted media records and blocks when they are read', () => {

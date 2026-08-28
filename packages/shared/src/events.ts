@@ -84,12 +84,14 @@ const workflowBlockContextSchema = z.object({
 
 export const mediaKindSchema = z.enum(['image', 'audio', 'video'])
 export type MediaKind = z.infer<typeof mediaKindSchema>
+export const attachmentKindSchema = z.union([mediaKindSchema, z.literal('file')])
+export type AttachmentKind = z.infer<typeof attachmentKindSchema>
 
 export const mediaBlockSchema = z.object({
   type: z.literal('media'),
   blockId: identifierSchema,
   assetId: identifierSchema,
-  kind: mediaKindSchema,
+  kind: attachmentKindSchema,
   purpose: z.enum(['input', 'output']),
   name: z.string().trim().min(1),
   mimeType: z.string().trim().min(1),
