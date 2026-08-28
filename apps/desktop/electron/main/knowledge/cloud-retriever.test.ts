@@ -106,6 +106,22 @@ describe('CloudKnowledgeRetriever', () => {
     })
   })
 
+  it('rejects a published generation that differs from the admitted request snapshot', async () => {
+    const retriever = new CloudKnowledgeRetriever({ search: vi.fn().mockResolvedValue({
+      generationState: 'published', generations: [{ knowledgeBaseId: 'kb_1',
+        generationId: 'generation_late', previousGenerationId: 'generation_admitted' }],
+      strategy: 'keyword_only_consent', embedding: fixedCloudEmbeddingConfiguration,
+      keywordCandidates: [candidate('chunk_late', 1, 'generation_late')],
+      vectorCandidates: [], driftProbeRequired: false,
+    }) })
+
+    await expect(retriever.search(
+      '合同条款',
+      ['kb_1'],
+      new Map([['kb_1', 'generation_admitted']]),
+    )).rejects.toMatchObject({ code: 'INVALID_CLOUD_RETRIEVAL_RESPONSE' })
+  })
+
   it('retains duplicate chunk identifiers from different bases during fusion', async () => {
     const first = candidate('chunk_same', 1)
     const second = { ...candidate('chunk_same', 2, 'generation_second'),

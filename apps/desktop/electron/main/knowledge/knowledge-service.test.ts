@@ -38,6 +38,22 @@ function cloudRemote(overrides: Partial<CloudKnowledgeRemote> = {}): CloudKnowle
     }),
     cancelJob: vi.fn().mockResolvedValue(undefined),
     cleanupOrphans: vi.fn().mockResolvedValue({ removed: 0 }),
+    beginGeneration: vi.fn(async input => ({
+      knowledgeBaseId: input.knowledgeBaseId,
+      generationId: input.generationId,
+      status: 'staging' as const,
+    })),
+    uploadDocument: vi.fn().mockResolvedValue({
+      jobId: 'unused', storageReference: 'knowledge/unused',
+    }),
+    search: vi.fn().mockResolvedValue({
+      generationState: 'published', generations: [], strategy: 'keyword_only_consent',
+      embedding: {
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        configurationVersion: 'autoforge-knowledge-embedding-v1', region: 'guangzhou',
+      },
+      keywordCandidates: [], vectorCandidates: [], driftProbeRequired: false,
+    }),
     ...overrides,
   }
 }
@@ -242,6 +258,155 @@ describe('local knowledge service', () => {
     })
     await expect(restarted.refreshEntitlement!('alice', laterSigned, true))
       .rejects.toMatchObject({ code: 'FORBIDDEN' })
+  })
+
+  it('runs admitted cloud import, synchronization, and retrieval only through the production remote', async () => {
+    const memory = memoryKnowledgeStore()
+    const selected = [{
+      name: 'cloud.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('云端合同条款'),
+    }]
+    let publishedGeneration = ''
+    let cloudDocumentId = ''
+    let cloudVersionId = ''
+    const beginGeneration = vi.fn(async (input: {
+      knowledgeBaseId: string; generationId: string
+    }) => ({ ...input, status: 'staging' as const }))
+    const uploadDocument = vi.fn().mockResolvedValue({
+      jobId: 'upload_job_1', storageReference: 'knowledge/1/base/object_1',
+    })
+    const search = vi.fn(async ({ knowledgeBaseIds }: { knowledgeBaseIds: string[] }) => ({
+      generationState: 'published',
+      generations: knowledgeBaseIds.map(knowledgeBaseId => ({
+        knowledgeBaseId, generationId: publishedGeneration, previousGenerationId: null,
+      })),
+      strategy: 'keyword_only_consent' as const,
+      embedding: {
+        model: 'kinfra-text-embedding-0.6b' as const, dimensions: 1024 as const,
+        configurationVersion: 'autoforge-knowledge-embedding-v1' as const,
+        region: 'guangzhou' as const,
+      },
+      keywordCandidates: [{
+        id: 'cloud_chunk_1', knowledgeBaseId: knowledgeBaseIds[0]!,
+        documentId: cloudDocumentId, versionId: cloudVersionId,
+        generationId: publishedGeneration, rank: 1, body: '云端合同条款',
+        coordinates: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 6 },
+      }],
+      vectorCandidates: [], driftProbeRequired: false,
+    }))
+    const remote = {
+      ...cloudRemote({
+        pushMutation: vi.fn(async input => ({
+          mutationId: input.mutationId, status: 'applied' as const,
+          sequence: 1, revision: input.mutationId,
+        })),
+        pullChanges: vi.fn(async input => ({
+          kind: 'incremental' as const, nextSequence: input.afterSequence + 1,
+          hasMore: false, changes: [{
+            sequence: input.afterSequence + 1, entityKind: 'metadata' as const,
+            entityId: 'remote_head_1', operation: 'upsert' as const,
+            revision: 'remote_r1', payload: { source: 'remote' },
+          }],
+        })),
+        fullResync: vi.fn().mockResolvedValue({ kind: 'snapshot', nextSequence: 0, changes: [] }),
+        publishGeneration: vi.fn(async input => {
+          publishedGeneration = input.generationId
+          return { generationId: input.generationId, previousGenerationId: null, sequence: 7 }
+        }),
+        getJob: vi.fn(async input => ({
+          jobId: input.jobId, state: 'completed' as const, errorCode: null,
+        })),
+      }),
+      beginGeneration,
+      uploadDocument,
+      search,
+    }
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => selected.splice(0),
+      createParser: () => ({
+        parse: async () => parsedText('云端合同条款'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => false,
+    })
+    service.configureCloudRemote!(remote)
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    memory.database.prepare(`
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+        accepted_key_generation, verified, explicit_free, max_observed_at
+      ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1)
+    `).run()
+    const base = await service.create(owner, 'Cloud')
+    const handle = (await service.pickImportFiles(owner))[0]!
+    const document = (await service.importDocument(owner, base.id, handle.id))!
+
+    await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(publishedGeneration).not.toBe(''))
+    cloudDocumentId = document.id
+    cloudVersionId = (memory.database.prepare(`
+      SELECT active_version_id AS versionId FROM documents WHERE id = ?
+    `).get(document.id) as { versionId: string }).versionId
+    const scope = await service.captureSearchScope(owner, [base.id])
+    const result = await service.searchSelected(owner, '云端合同', [base.id], undefined, scope)
+
+    expect(beginGeneration).toHaveBeenCalledOnce()
+    expect(uploadDocument).toHaveBeenCalledWith(expect.objectContaining({
+      knowledgeBaseId: base.id, documentId: document.id, bytes: expect.any(Buffer),
+    }))
+    expect(remote.pushMutation).toHaveBeenCalled()
+    expect(remote.pullChanges).toHaveBeenCalled()
+    expect(search).toHaveBeenCalledWith({ query: '云端合同', knowledgeBaseIds: [base.id], limit: 24 })
+    expect(result).toMatchObject({
+      kind: 'results', evidence: [expect.objectContaining({ id: 'evidence:cloud:cloud_chunk_1' })],
+    })
+    expect(memory.database.prepare(`
+      SELECT revision FROM cloud_entity_heads
+      WHERE knowledge_base_id = ? AND entity_kind = 'metadata' AND entity_id = 'remote_head_1'
+    `).get(base.id)).toEqual({ revision: 'remote_r1' })
+  })
+
+  it('keeps import and search local when the cloud kill switch is closed', async () => {
+    const memory = memoryKnowledgeStore()
+    const beginGeneration = vi.fn()
+    const uploadDocument = vi.fn()
+    const search = vi.fn()
+    const remote = { ...cloudRemote(), beginGeneration, uploadDocument, search }
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [{
+        name: 'local.txt', mimeType: 'text/plain', bytes: Buffer.from('本地合同条款'),
+      }],
+      createParser: () => ({
+        parse: async () => parsedText('本地合同条款'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => true,
+    })
+    service.configureCloudRemote!(remote)
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    const base = await service.create(owner, 'Local')
+    const handle = (await service.pickImportFiles(owner))[0]!
+    await service.importDocument(owner, base.id, handle.id)
+    await vi.waitFor(async () => expect(await service.searchSelected(
+      owner, '本地合同', [base.id],
+    )).toMatchObject({ kind: 'results', evidence: [expect.any(Object)] }))
+
+    expect(beginGeneration).not.toHaveBeenCalled()
+    expect(uploadDocument).not.toHaveBeenCalled()
+    expect(search).not.toHaveBeenCalled()
   })
 
   it('rejects entitlement key-generation rollback and same-generation key replacement across restart', async () => {

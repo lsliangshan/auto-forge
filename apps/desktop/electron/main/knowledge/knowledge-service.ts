@@ -7,6 +7,7 @@ import {
   type KnowledgeBaseSummary,
   type KnowledgeDocumentSummary,
   type KnowledgeEvent,
+  type KnowledgeEvidence,
   type KnowledgeImportHandle,
   type KnowledgeEntitlementState,
   type KnowledgeRetentionSelection,
@@ -21,6 +22,8 @@ import { KnowledgeExportService } from './export-service.js'
 import { ImportJobRunner, type KnowledgeParserPort } from './import-job-runner.js'
 import { LocalKnowledgeRetriever } from './local-retriever.js'
 import type { LocalKnowledgeVersionScope } from './local-retriever.js'
+import { CloudKnowledgeRetriever, type CloudCandidate } from './cloud-retriever.js'
+import type { CloudKnowledgeChange } from './cloudbase-knowledge-client.js'
 import { sanitizeKnowledgeText } from './knowledge-sanitizer.js'
 import type { KnowledgeOwner, KnowledgeService } from './knowledge-types.js'
 import { PARSER_MEDIA_TYPES, type ParserMediaType } from './parser-protocol.js'
@@ -84,6 +87,7 @@ interface Binding {
   handles: Map<string, ImportHandleRecord>
   cloud: KnowledgeCloudLifecycle
   cloudTasks: Set<Promise<unknown>>
+  cloudPublications: Map<string, Promise<void>>
 }
 
 interface UnavailableBinding {
@@ -128,6 +132,7 @@ export interface KnowledgeSearchScope {
   readonly ownerEpoch: number
   readonly baseIds: readonly string[]
   readonly entries: readonly KnowledgeSearchScopeEntry[]
+  readonly cloudAllowed: boolean
 }
 
 interface RetentionSelection {
@@ -161,11 +166,40 @@ interface EntitlementProjectionRow {
 
 interface KnowledgeCloudLifecycle {
   setCloudAccess(allowed: boolean): void
+  enableSync(input: {
+    requestId: string
+    knowledgeBaseId: string
+    name: string
+    revision: string
+    generationId: string
+  }): Promise<void>
+  enqueue(input: Parameters<KnowledgeSyncService['enqueue']>[0]): void
+  synchronize(knowledgeBaseId: string): Promise<unknown>
+  publishGeneration(input: {
+    requestId: string
+    knowledgeBaseId: string
+    generationId: string
+  }): Promise<void>
   beginCloudRetention(knowledgeBaseId: string, boundaryAt: number): CloudRetentionState
   advanceCloudRetention(knowledgeBaseId: string): Promise<CloudRetentionState | undefined>
   purgeCloudImmediately(knowledgeBaseId: string): Promise<void>
   invalidateOwner(): void
   drain(): Promise<void>
+}
+
+type ProductionCloudKnowledgeRemote = CloudKnowledgeRemote & Required<Pick<
+  CloudKnowledgeRemote, 'beginGeneration' | 'uploadDocument' | 'search'
+>>
+
+function productionCloudRemote(
+  remote: CloudKnowledgeRemote | undefined,
+): ProductionCloudKnowledgeRemote | undefined {
+  return remote
+    && typeof remote.beginGeneration === 'function'
+    && typeof remote.uploadDocument === 'function'
+    && typeof remote.search === 'function'
+    ? remote as ProductionCloudKnowledgeRemote
+    : undefined
 }
 
 function fail(code: AppError['code']): never {
@@ -266,6 +300,10 @@ export function createLocalKnowledgeService(
           epoch = epoch + 1, updated_at = ? WHERE mode <> 'local_only'
       `).run(now())
     },
+    enableSync: async () => fail('SERVICE_UNAVAILABLE'),
+    enqueue: () => fail('SERVICE_UNAVAILABLE'),
+    synchronize: async () => fail('SERVICE_UNAVAILABLE'),
+    publishGeneration: async () => fail('SERVICE_UNAVAILABLE'),
     beginCloudRetention: (knowledgeBaseId, boundaryAt) => {
       const select = () => database.prepare(`
         SELECT knowledge_base_id AS knowledgeBaseId, stage, download_until AS downloadUntil,
@@ -329,12 +367,49 @@ export function createLocalKnowledgeService(
 
   const createCloudLifecycle = (store: LocalKnowledgeStore): KnowledgeCloudLifecycle => {
     if (!cloudRemote) return failClosedCloudLifecycle(store.database)
+    const applyChange = (
+      change: CloudKnowledgeChange,
+      guard: { readonly knowledgeBaseId: string; commit(write: () => void): void },
+    ): void => guard.commit(() => {
+      const payloadJson = JSON.stringify(change.payload)
+      if (Buffer.byteLength(payloadJson, 'utf8') > 64 * 1_024) fail('INVALID_INPUT')
+      store.database.prepare(`
+        INSERT INTO cloud_entity_heads(
+          knowledge_base_id, entity_kind, entity_id, revision, payload_json, deleted, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(knowledge_base_id, entity_kind, entity_id) DO UPDATE SET
+          revision = excluded.revision, payload_json = excluded.payload_json,
+          deleted = excluded.deleted, updated_at = excluded.updated_at
+      `).run(
+        guard.knowledgeBaseId, change.entityKind, change.entityId, change.revision,
+        payloadJson, Number(change.operation === 'delete'), now(),
+      )
+    })
     return new KnowledgeSyncService(store.database, cloudRemote, {
       now,
       id,
       isOnline: () => true,
-      applyRemoteChange: async () => fail('CONFLICT'),
-      replaceRemoteSnapshot: async () => fail('CONFLICT'),
+      applyRemoteChange: async (change, guard) => applyChange(change, guard),
+      replaceRemoteSnapshot: async (changes, guard) => guard.commit(() => {
+        store.database.transaction(() => {
+          store.database.prepare(
+            'DELETE FROM cloud_entity_heads WHERE knowledge_base_id = ?',
+          ).run(guard.knowledgeBaseId)
+          for (const change of changes) {
+            const payloadJson = JSON.stringify(change.payload)
+            if (Buffer.byteLength(payloadJson, 'utf8') > 64 * 1_024) fail('INVALID_INPUT')
+            store.database.prepare(`
+              INSERT INTO cloud_entity_heads(
+                knowledge_base_id, entity_kind, entity_id, revision,
+                payload_json, deleted, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(
+              guard.knowledgeBaseId, change.entityKind, change.entityId, change.revision,
+              payloadJson, Number(change.operation === 'delete'), now(),
+            )
+          }
+        })()
+      }),
     })
   }
 
@@ -371,10 +446,15 @@ export function createLocalKnowledgeService(
   }
 
   const reconcileCloud = (active: Binding, state: KnowledgeEntitlementState): void => {
-    const allowed = cloudRemote !== undefined
+    const verified = (active.store.database.prepare(`
+      SELECT verified FROM knowledge_entitlement_projection WHERE singleton = 1
+    `).get() as { verified: number } | undefined)?.verified === 1
+    const allowed = productionCloudRemote(cloudRemote) !== undefined
+      && verified
       && state.cloudEnabled
+      && state.betaEnabled === true
       && state.tier === 'member'
-      && state.status !== 'expired'
+      && (state.status === 'active' || state.status === 'offline_grace')
       && dependencies.cloudKillSwitchEnabled?.() === false
     active.cloud.setCloudAccess(allowed)
     const projection = active.store.database.prepare(`
@@ -585,6 +665,253 @@ export function createLocalKnowledgeService(
     if (!kept?.documentId || kept.documentId !== documentId) fail('FORBIDDEN')
   }
 
+  const ordinaryCloudAllowed = (active: Binding): boolean => {
+    const state = entitlement(active)
+    return productionCloudRemote(cloudRemote) !== undefined
+      && readProjection(active)?.verified === 1
+      && state.tier === 'member'
+      && (state.status === 'active' || state.status === 'offline_grace')
+      && state.betaEnabled === true
+      && state.cloudEnabled
+      && dependencies.cloudKillSwitchEnabled?.() === false
+  }
+
+  const assertCurrentBinding = (active: Binding): void => {
+    if (binding !== active || active.epoch !== epoch) fail('CONFLICT')
+  }
+
+  const stableCloudId = (prefix: string, ...parts: readonly string[]): string => (
+    `${prefix}:${createHash('sha256').update(parts.join('\u0000')).digest('hex')}`
+  )
+
+  interface PendingCloudPublication {
+    knowledgeBaseId: string
+    generationId: string
+    documentId: string
+    versionId: string
+    objectId: string
+    uploadJobId: string | null
+    publishRequestId: string
+    baseName: string
+    documentName: string
+    mimeType: string
+    versionNumber: number
+    contentHash: string
+  }
+
+  const pendingCloudPublication = (
+    active: Binding,
+    knowledgeBaseId: string,
+  ): PendingCloudPublication | undefined => active.store.database.prepare(`
+    SELECT pending.knowledge_base_id AS knowledgeBaseId,
+      pending.generation_id AS generationId, pending.document_id AS documentId,
+      pending.version_id AS versionId, pending.object_id AS objectId,
+      pending.upload_job_id AS uploadJobId, pending.publish_request_id AS publishRequestId,
+      base.name AS baseName, document.name AS documentName, version.mime_type AS mimeType,
+      version.version_number AS versionNumber, version.content_hash AS contentHash
+    FROM cloud_pending_publications AS pending
+    JOIN knowledge_bases AS base ON base.id = pending.knowledge_base_id
+    JOIN documents AS document ON document.id = pending.document_id
+      AND document.knowledge_base_id = pending.knowledge_base_id
+    JOIN document_versions AS version ON version.id = pending.version_id
+      AND version.document_id = pending.document_id
+    WHERE pending.knowledge_base_id = ?
+  `).get(knowledgeBaseId) as PendingCloudPublication | undefined
+
+  const processCloudPublication = async (
+    active: Binding,
+    knowledgeBaseId: string,
+  ): Promise<void> => {
+    const remote = productionCloudRemote(cloudRemote)
+    if (!remote || !ordinaryCloudAllowed(active)) return
+    let pending = pendingCloudPublication(active, knowledgeBaseId)
+    if (!pending) return
+    const revision = stableCloudId(
+      'revision', pending.documentId, pending.versionId, pending.contentHash,
+    )
+    await active.cloud.enableSync({
+      requestId: stableCloudId('begin', pending.knowledgeBaseId, pending.generationId),
+      knowledgeBaseId: pending.knowledgeBaseId,
+      name: pending.baseName,
+      revision,
+      generationId: pending.generationId,
+    })
+    assertCurrentBinding(active)
+    if (!ordinaryCloudAllowed(active)) return
+    const head = active.store.database.prepare(`
+      SELECT revision FROM cloud_entity_heads
+      WHERE knowledge_base_id = ? AND entity_kind = 'document' AND entity_id = ?
+    `).get(pending.knowledgeBaseId, pending.documentId) as { revision: string } | undefined
+    active.cloud.enqueue({
+      mutationId: stableCloudId('mutation', pending.documentId, pending.versionId),
+      knowledgeBaseId: pending.knowledgeBaseId,
+      entityKind: 'document',
+      entityId: pending.documentId,
+      operation: 'upsert',
+      baseRevision: head?.revision ?? null,
+      payload: {
+        name: pending.documentName,
+        mimeType: pending.mimeType,
+        versionId: pending.versionId,
+        versionNumber: pending.versionNumber,
+        contentHash: pending.contentHash,
+        generationId: pending.generationId,
+      },
+    })
+    const synchronization = await active.cloud.synchronize(pending.knowledgeBaseId) as {
+      status?: string
+    }
+    assertCurrentBinding(active)
+    if (synchronization.status !== 'synced' || !ordinaryCloudAllowed(active)) return
+    if (!pending.uploadJobId) {
+      const bytes = await active.store.objects.read(pending.objectId)
+      assertCurrentBinding(active)
+      try {
+        const uploaded = await remote.uploadDocument({
+          requestId: stableCloudId('upload', pending.documentId, pending.versionId),
+          knowledgeBaseId: pending.knowledgeBaseId,
+          documentId: pending.documentId,
+          versionId: pending.versionId,
+          byteSize: bytes.byteLength,
+          sha256: pending.contentHash,
+          mimeType: pending.mimeType,
+          bytes,
+        })
+        assertCurrentBinding(active)
+        if (!ordinaryCloudAllowed(active)) return
+        const updated = active.store.database.prepare(`
+          UPDATE cloud_pending_publications SET upload_job_id = ?, updated_at = ?
+          WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id IS NULL
+        `).run(
+          uploaded.jobId, now(), pending.knowledgeBaseId, pending.generationId,
+        )
+        if (updated.changes !== 1) fail('CONFLICT')
+        pending = { ...pending, uploadJobId: uploaded.jobId }
+      } finally {
+        bytes.fill(0)
+      }
+    }
+    const uploadJobId = pending.uploadJobId
+    if (!uploadJobId) return
+    let completed = false
+    for (let poll = 0; poll < 3; poll += 1) {
+      const job = await remote.getJob({ jobId: uploadJobId })
+      assertCurrentBinding(active)
+      if (!ordinaryCloudAllowed(active)) return
+      if (job.jobId !== uploadJobId) fail('INTERNAL_ERROR')
+      if (job.state === 'completed') { completed = true; break }
+      if (job.state === 'failed' || job.state === 'cancelled') {
+        fail('SERVICE_UNAVAILABLE')
+      }
+    }
+    if (!completed) return
+    await active.cloud.publishGeneration({
+      requestId: pending.publishRequestId,
+      knowledgeBaseId: pending.knowledgeBaseId,
+      generationId: pending.generationId,
+    })
+    assertCurrentBinding(active)
+    active.store.database.prepare(`
+      DELETE FROM cloud_pending_publications
+      WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
+    `).run(pending.knowledgeBaseId, pending.generationId, uploadJobId)
+  }
+
+  const serialCloudTask = (
+    active: Binding,
+    knowledgeBaseId: string,
+    operation: () => Promise<void>,
+  ): Promise<void> => {
+    const preceding = active.cloudPublications.get(knowledgeBaseId) ?? Promise.resolve()
+    const task = preceding.catch(() => undefined).then(operation)
+    active.cloudPublications.set(knowledgeBaseId, task)
+    active.cloudTasks.add(task)
+    void task.finally(() => {
+      active.cloudTasks.delete(task)
+      if (active.cloudPublications.get(knowledgeBaseId) === task) {
+        active.cloudPublications.delete(knowledgeBaseId)
+      }
+    }).catch(() => undefined)
+    return task
+  }
+
+  const stageCloudPublication = (
+    active: Binding,
+    knowledgeBaseId: string,
+    documentId: string,
+    publicationGeneration: number,
+  ): void => {
+    if (!ordinaryCloudAllowed(active)) return
+    const version = active.store.database.prepare(`
+      SELECT version.id AS versionId, version.object_id AS objectId,
+        version.content_hash AS contentHash
+      FROM documents AS document
+      JOIN document_versions AS version ON version.id = document.active_version_id
+        AND version.document_id = document.id
+      WHERE document.id = ? AND document.knowledge_base_id = ?
+        AND document.recycled_at IS NULL AND version.status = 'ready'
+        AND version.publication_generation = ?
+    `).get(documentId, knowledgeBaseId, publicationGeneration) as {
+      versionId: string; objectId: string; contentHash: string
+    } | undefined
+    if (!version) return
+    const generationId = stableCloudId(
+      'generation', knowledgeBaseId, documentId, version.versionId, version.contentHash,
+    )
+    const inserted = active.store.database.prepare(`
+      INSERT INTO cloud_pending_publications(
+        knowledge_base_id, generation_id, document_id, version_id, object_id,
+        upload_job_id, publish_request_id, updated_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+      ON CONFLICT(knowledge_base_id) DO NOTHING
+    `).run(
+      knowledgeBaseId, generationId, documentId, version.versionId, version.objectId,
+      stableCloudId('publish', knowledgeBaseId, generationId), now(),
+    )
+    if (inserted.changes !== 1) {
+      const existing = pendingCloudPublication(active, knowledgeBaseId)
+      if (existing?.generationId !== generationId) fail('CONFLICT')
+    }
+  }
+
+  const cloudCoordinate = (
+    candidate: CloudCandidate,
+  ): KnowledgeEvidence['citation']['coordinate'] | undefined => {
+    const raw = candidate.coordinates
+    if (raw.kind === 'pdf'
+      && Number.isSafeInteger(raw.page) && Number(raw.page) > 0
+      && Number.isSafeInteger(raw.itemStart) && Number(raw.itemStart) >= 0
+      && Number.isSafeInteger(raw.itemEnd) && Number(raw.itemEnd) >= Number(raw.itemStart)) {
+      return {
+        kind: 'pdf', page: Number(raw.page), startOffset: Number(raw.itemStart),
+        endOffset: Number(raw.itemEnd),
+      }
+    }
+    if (raw.kind === 'docx' && Array.isArray(raw.headingPath)
+      && raw.headingPath.length <= 32 && raw.headingPath.every(item => typeof item === 'string' && item)
+      && typeof raw.paragraphId === 'string' && /^p-[1-9][0-9]*$/u.test(raw.paragraphId)) {
+      return {
+        kind: 'docx', headingPath: raw.headingPath as string[],
+        paragraph: Number(raw.paragraphId.slice(2)) - 1,
+      }
+    }
+    if (raw.kind === 'txt'
+      && Number.isSafeInteger(raw.lineStart) && Number(raw.lineStart) > 0
+      && Number.isSafeInteger(raw.charStart) && Number(raw.charStart) >= 0
+      && Number.isSafeInteger(raw.charEnd) && Number(raw.charEnd) >= Number(raw.charStart)) {
+      return {
+        kind: 'text', line: Number(raw.lineStart), startOffset: Number(raw.charStart),
+        endOffset: Number(raw.charEnd),
+      }
+    }
+    if (raw.kind === 'html' && Array.isArray(raw.path) && raw.path.length > 0
+      && raw.path.every(item => typeof item === 'string' && item)) {
+      const structuralPath = raw.path.join(' > ')
+      if (structuralPath.length <= 500) return { kind: 'html', structuralPath }
+    }
+    return undefined
+  }
+
   const searchBases = async (
     active: Binding,
     query: string,
@@ -625,7 +952,88 @@ export function createLocalKnowledgeService(
       admittedScope?.entries,
     )
     if (signal?.aborted) fail('CANCELLED')
-    return result
+    const remote = productionCloudRemote(cloudRemote)
+    const liveCloudAllowed = ordinaryCloudAllowed(active)
+    if (!remote || !liveCloudAllowed || (admittedScope && !admittedScope.cloudAllowed)) {
+      return result
+    }
+    const cloudEntries = admittedScope?.entries ?? active.store.database.prepare(`
+      SELECT base.id AS baseId, document.id AS documentId,
+        version.id AS versionId, version.publication_generation AS publicationGeneration,
+        sync.published_generation_id AS cloudGenerationId
+      FROM knowledge_bases AS base
+      JOIN documents AS document ON document.knowledge_base_id = base.id
+      JOIN document_versions AS version ON version.id = document.active_version_id
+        AND version.document_id = document.id
+      JOIN cloud_sync_states AS sync ON sync.knowledge_base_id = base.id
+      WHERE base.id IN (${allowedBases.map(() => '?').join(', ')})
+        AND base.recycled_at IS NULL AND document.recycled_at IS NULL
+        AND version.status = 'ready' AND sync.published_generation_id IS NOT NULL
+      ORDER BY base.id, document.id, version.id
+    `).all(...allowedBases) as KnowledgeSearchScopeEntry[]
+    const generations = new Map<string, string>()
+    for (const baseId of allowedBases) {
+      const selected = new Set(cloudEntries
+        .filter(entry => entry.baseId === baseId && entry.cloudGenerationId)
+        .map(entry => entry.cloudGenerationId!))
+      if (selected.size === 1) generations.set(baseId, [...selected][0]!)
+    }
+    const cloudBases = allowedBases.filter(baseId => generations.has(baseId))
+    if (cloudBases.length === 0) return result
+    try {
+      for (const baseId of cloudBases) {
+        await serialCloudTask(active, baseId, async () => {
+          await processCloudPublication(active, baseId)
+          const synchronized = await active.cloud.synchronize(baseId) as { status?: string }
+          if (synchronized.status !== 'synced') fail('SERVICE_UNAVAILABLE')
+        })
+        assertCurrentBinding(active)
+        if (!ordinaryCloudAllowed(active)) return result
+      }
+      const retrieved = await new CloudKnowledgeRetriever(remote).search(
+        normalized, cloudBases, generations,
+      )
+      assertCurrentBinding(active)
+      if (signal?.aborted) fail('CANCELLED')
+      const cloudEvidence = retrieved.evidence.flatMap((candidate, index): KnowledgeEvidence[] => {
+        const admitted = cloudEntries.some(entry => entry.baseId === candidate.knowledgeBaseId
+          && entry.documentId === candidate.documentId && entry.versionId === candidate.versionId
+          && entry.cloudGenerationId === candidate.generationId)
+        const coordinate = admitted ? cloudCoordinate(candidate) : undefined
+        if (!coordinate) return []
+        const evidenceId = `evidence:cloud:${candidate.id}`
+        return [{
+          id: evidenceId,
+          baseId: candidate.knowledgeBaseId,
+          documentId: candidate.documentId,
+          versionId: candidate.versionId,
+          snippet: candidate.body.slice(0, 4_000),
+          score: Math.max(0, 1 - index / Math.max(retrieved.evidence.length, 1)),
+          citation: {
+            evidenceId,
+            documentId: candidate.documentId,
+            versionId: candidate.versionId,
+            coordinate,
+          },
+        }]
+      })
+      if (result.kind !== 'results' || cloudEvidence.length === 0) return result
+      const identities = new Set(cloudEvidence.map(
+        item => `${item.documentId}:${item.versionId}:${item.snippet}`,
+      ))
+      return {
+        ...result,
+        evidence: [...cloudEvidence, ...result.evidence.filter(item => {
+          const identity = `${item.documentId}:${item.versionId}:${item.snippet}`
+          if (identities.has(identity)) return false
+          identities.add(identity)
+          return true
+        })].slice(0, 8),
+      }
+    } catch {
+      if (signal?.aborted) fail('CANCELLED')
+      return result
+    }
   }
 
   const firstFailure = (
@@ -805,7 +1213,7 @@ export function createLocalKnowledgeService(
       })
       Object.assign(active, {
         ownerId, epoch: bindEpoch, store, parser, runner, handles: new Map(),
-        cloud: createCloudLifecycle(store), cloudTasks: new Set(),
+        cloud: createCloudLifecycle(store), cloudTasks: new Set(), cloudPublications: new Map(),
       })
       if (bindEpoch !== epoch) {
         const cleanup = await settle([() => runner.drain(), () => store.close()])
@@ -990,6 +1398,7 @@ export function createLocalKnowledgeService(
         scopeId: id(), ownerId: active.ownerId, ownerEpoch: active.epoch,
         baseIds: Object.freeze([...allowed]),
         entries: Object.freeze(entries.map(entry => Object.freeze({ ...entry }))),
+        cloudAllowed: ordinaryCloudAllowed(active),
       })
       activeSearchScopes.set(scope.scopeId, scope)
       return scope
@@ -1110,15 +1519,25 @@ export function createLocalKnowledgeService(
         enqueue(active, documentId, handle, 1, 1)
       })()
       if (!isMember(active)) writeRetention(active, { baseId, documentId, confirmed: false })
-      void active.runner.runQueued().catch(() => undefined)
+      const parsing = active.runner.runQueued()
+      const cloud = serialCloudTask(active, baseId, async () => {
+        await parsing
+        assertCurrentBinding(active)
+        stageCloudPublication(active, baseId, documentId, 1)
+        await processCloudPublication(active, baseId)
+      })
+      void cloud.catch(() => undefined)
       return documentSummary(active.store.database, documentId)
     },
     replaceDocument: async (owner, documentId, handleId) => {
       const active = current(owner)
       assertWritableDocument(active, documentId)
       const document = active.store.database.prepare(`
-        SELECT publication_generation FROM documents WHERE id = ? AND recycled_at IS NULL
-      `).get(documentId) as { publication_generation: number } | undefined
+        SELECT knowledge_base_id, publication_generation
+        FROM documents WHERE id = ? AND recycled_at IS NULL
+      `).get(documentId) as {
+        knowledge_base_id: string; publication_generation: number
+      } | undefined
       if (!document) fail('NOT_FOUND')
       const handle = consumeHandle(active, handleId)
       active.store.database.transaction(() => {
@@ -1134,7 +1553,17 @@ export function createLocalKnowledgeService(
         if (changed.changes !== 1) fail('CONFLICT')
         enqueue(active, documentId, handle, latest.version_number + 1, generation)
       })()
-      void active.runner.runQueued().catch(() => undefined)
+      const publicationGeneration = document.publication_generation + 1
+      const parsing = active.runner.runQueued()
+      const cloud = serialCloudTask(active, document.knowledge_base_id, async () => {
+        await parsing
+        assertCurrentBinding(active)
+        stageCloudPublication(
+          active, document.knowledge_base_id, documentId, publicationGeneration,
+        )
+        await processCloudPublication(active, document.knowledge_base_id)
+      })
+      void cloud.catch(() => undefined)
       return documentSummary(active.store.database, documentId)
     },
     recycleDocument: async (owner, documentId) => {
@@ -1350,7 +1779,7 @@ export function createLocalKnowledgeService(
         && (state.status === 'active' || state.status === 'offline_grace')
       const beta = verified && state.betaEnabled === true
       const cloudbase = cloudRemote !== undefined
-      const cloud = beta && state.cloudEnabled && cloudbase
+      const cloud = beta && state.cloudEnabled && productionCloudRemote(cloudRemote) !== undefined
         && dependencies.cloudKillSwitchEnabled?.() === false
       return {
         encryption: { available: true },

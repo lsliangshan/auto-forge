@@ -1599,6 +1599,7 @@ describe('createApplicationRuntime', () => {
     const emitted: ChatEvent[] = []
     const admittedScope = Object.freeze({
       scopeId: 'scope_1', ownerId: 'test_user_testuser', ownerEpoch: 1,
+      cloudAllowed: false,
       baseIds: Object.freeze(['base_selected']),
       entries: Object.freeze([Object.freeze({
         baseId: 'base_selected', documentId: 'document_1', versionId: 'version_1',

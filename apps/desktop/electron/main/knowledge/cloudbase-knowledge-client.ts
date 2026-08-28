@@ -1,4 +1,6 @@
+import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
+import type { CloudSearchResponse } from './cloud-retriever.js'
 
 export interface CloudBaseFunctionPort {
   callFunction(options: {
@@ -10,6 +12,8 @@ export interface CloudBaseFunctionPort {
 
 interface CloudBaseKnowledgeClientOptions {
   timeoutMs?: number
+  fetchImpl?: typeof fetch
+  id?: () => string
 }
 
 export const cloudKnowledgeErrorCodes = [
@@ -178,6 +182,17 @@ export interface PublishGenerationInput {
   expectedPublishedGenerationId: string | null
 }
 
+export interface CloudUploadDocumentInput {
+  requestId: string
+  knowledgeBaseId: string
+  documentId: string
+  versionId: string
+  byteSize: number
+  sha256: string
+  mimeType: string
+  bytes: Buffer
+}
+
 export class CloudBaseKnowledgeClient {
   constructor(
     private readonly functions: CloudBaseFunctionPort,
@@ -241,6 +256,89 @@ export class CloudBaseKnowledgeClient {
       throw new CloudKnowledgeError('INTERNAL_ERROR')
     }
     return result
+  }
+
+  async beginGeneration(input: {
+    requestId: string
+    knowledgeBaseId: string
+    name: string
+    revision: string
+    generationId: string
+  }): Promise<z.infer<typeof beginSyncSchema>> {
+    const parsed = z.object({
+      requestId: identifier,
+      knowledgeBaseId: identifier,
+      name: canonicalString(200),
+      revision,
+      generationId: identifier,
+    }).strict().safeParse(input)
+    if (!parsed.success) throw new CloudKnowledgeError('INVALID_INPUT')
+    const result = await this.invoke('beginGeneration', parsed.data, beginSyncSchema)
+    if (result.knowledgeBaseId !== parsed.data.knowledgeBaseId
+      || result.generationId !== parsed.data.generationId) {
+      throw new CloudKnowledgeError('INTERNAL_ERROR')
+    }
+    return result
+  }
+
+  async uploadDocument(input: CloudUploadDocumentInput): Promise<{
+    jobId: string
+    storageReference: string
+  }> {
+    const parsed = z.object({
+      requestId: identifier,
+      knowledgeBaseId: identifier,
+      documentId: identifier,
+      versionId: identifier,
+      byteSize: z.number().int().positive().max(512 * 1_024 * 1_024),
+      sha256: z.string().regex(/^[a-f0-9]{64}$/),
+      mimeType: canonicalString(200),
+      bytes: z.instanceof(Buffer),
+    }).strict().safeParse(input)
+    if (!parsed.success
+      || parsed.data.bytes.byteLength !== parsed.data.byteSize
+      || createHash('sha256').update(parsed.data.bytes).digest('hex') !== parsed.data.sha256) {
+      throw new CloudKnowledgeError('INVALID_INPUT')
+    }
+    const { bytes, ...authorizationInput } = parsed.data
+    const authorization = await this.authorizeUpload(authorizationInput)
+    const fetchImpl = this.options.fetchImpl ?? fetch
+    const response = await this.transport(signal => fetchImpl(
+      authorization.uploadAuthorization.url,
+      {
+        method: authorization.uploadAuthorization.method,
+        headers: authorization.uploadAuthorization.headers,
+        body: bytes as unknown as BodyInit,
+        signal,
+      },
+    ))
+    if (!response.ok) throw new CloudKnowledgeError('TRANSIENT_FAILURE')
+    const completed = await this.completeUpload({ uploadTicket: authorization.uploadTicket })
+    if (completed.objectId !== authorization.objectId
+      || completed.storageReference !== authorization.storageReference) {
+      throw new CloudKnowledgeError('INTERNAL_ERROR')
+    }
+    return { jobId: authorization.jobId, storageReference: completed.storageReference }
+  }
+
+  async search(input: {
+    query: string
+    knowledgeBaseIds: string[]
+    limit: number
+  }): Promise<CloudSearchResponse> {
+    const parsed = z.object({
+      query: canonicalString(4_000),
+      knowledgeBaseIds: z.array(identifier).min(1).max(8)
+        .refine(ids => new Set(ids).size === ids.length),
+      limit: z.number().int().positive().max(24),
+    }).strict().safeParse(input)
+    if (!parsed.success) throw new CloudKnowledgeError('INVALID_INPUT')
+    const generatedRequestId = identifier.safeParse((this.options.id ?? randomUUID)())
+    if (!generatedRequestId.success) throw new CloudKnowledgeError('INVALID_INPUT')
+    return this.invoke('searchKnowledge', {
+      requestId: generatedRequestId.data,
+      ...parsed.data,
+    }, z.unknown()) as Promise<CloudSearchResponse>
   }
 
   async pushMutation(input: PushMutationInput): Promise<CloudPushMutationResult> {
@@ -406,33 +504,11 @@ export class CloudBaseKnowledgeClient {
     if (wireBytes(request) > maximumKnowledgeWireBytes) {
       throw new CloudKnowledgeError('INVALID_INPUT')
     }
-    let response: unknown
-    const controller = new AbortController()
-    const timeoutMs = Number.isFinite(this.options.timeoutMs) && (this.options.timeoutMs ?? 0) > 0
-      ? this.options.timeoutMs as number
-      : 10_000
-    let timeoutId: ReturnType<typeof setTimeout> | undefined
-    const deadline = new Promise<never>((_resolve, reject) => {
-      timeoutId = setTimeout(() => {
-        controller.abort()
-        reject(new CloudKnowledgeError('TRANSIENT_FAILURE'))
-      }, timeoutMs)
-    })
-    try {
-      response = await Promise.race([
-        this.functions.callFunction({
+    const response = await this.transport(signal => this.functions.callFunction({
           name: this.functionName,
           data: request,
-          signal: controller.signal,
-        }),
-        deadline,
-      ])
-    } catch {
-      throw new CloudKnowledgeError('TRANSIENT_FAILURE')
-    } finally {
-      clearTimeout(timeoutId)
-      controller.abort()
-    }
+          signal,
+        }))
     if (wireBytes(response) > maximumKnowledgeWireBytes) {
       throw new CloudKnowledgeError('INTERNAL_ERROR')
     }
@@ -445,6 +521,28 @@ export class CloudBaseKnowledgeClient {
     const result = schema.safeParse(succeeded.data.data)
     if (!result.success) throw new CloudKnowledgeError('INTERNAL_ERROR')
     return result.data
+  }
+
+  private async transport<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController()
+    const timeoutMs = Number.isFinite(this.options.timeoutMs) && (this.options.timeoutMs ?? 0) > 0
+      ? this.options.timeoutMs as number
+      : 10_000
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort()
+        reject(new CloudKnowledgeError('TRANSIENT_FAILURE'))
+      }, timeoutMs)
+    })
+    try {
+      return await Promise.race([operation(controller.signal), deadline])
+    } catch {
+      throw new CloudKnowledgeError('TRANSIENT_FAILURE')
+    } finally {
+      clearTimeout(timeoutId)
+      controller.abort()
+    }
   }
 }
 

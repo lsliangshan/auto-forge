@@ -111,7 +111,11 @@ function validCandidateList(
 export class CloudKnowledgeRetriever {
   constructor(private readonly gateway: CloudSearchGateway) {}
 
-  async search(query: string, knowledgeBaseIds: readonly string[]) {
+  async search(
+    query: string,
+    knowledgeBaseIds: readonly string[],
+    expectedGenerations?: ReadonlyMap<string, string>,
+  ) {
     const response = await this.gateway.search({
       query,
       knowledgeBaseIds: [...knowledgeBaseIds],
@@ -146,6 +150,9 @@ export class CloudKnowledgeRetriever {
       || response.generations.length > 8
       || generationByBase.size !== knowledgeBaseIds.length
       || knowledgeBaseIds.some(id => !generationByBase.has(id))
+      || (expectedGenerations !== undefined
+        && (expectedGenerations.size !== knowledgeBaseIds.length
+          || knowledgeBaseIds.some(id => generationByBase.get(id) !== expectedGenerations.get(id))))
       || !validCandidateList(response.keywordCandidates, generationByBase)
       || !validCandidateList(response.vectorCandidates, generationByBase)
       || (response.strategy !== 'hybrid' && response.vectorCandidates.length !== 0)

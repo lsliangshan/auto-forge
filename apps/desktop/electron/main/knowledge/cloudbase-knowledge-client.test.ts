@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import { CloudBaseKnowledgeClient } from './cloudbase-knowledge-client.js'
 
@@ -300,5 +301,99 @@ describe('CloudBaseKnowledgeClient', () => {
     await expect(client.getJob({ jobId: 'job_1' }))
       .resolves.toEqual({ jobId: 'job_1', state: 'completed', errorCode: null })
     expect(JSON.stringify(callFunction.mock.calls)).not.toMatch(/serviceKey|service.?role|cos/i)
+  })
+
+  it('uploads only through the mediated authorization and exposes bounded cloud search', async () => {
+    const bytes = Buffer.from('body')
+    const sha256 = createHash('sha256').update(bytes).digest('hex')
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        knowledgeBaseId: 'kb_1', generationId: 'generation_1', status: 'staging',
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        uploadTicket: 'ticket_1', storageReference: 'knowledge/1/kb_1/object_1',
+        objectId: 'object_1', jobId: 'job_1', mimeType: 'text/plain',
+        expiresAt: '2026-09-26T12:15:00.000Z', uploadAuthorization: {
+          url: 'https://pg-storage.example/upload/ticket_1', method: 'PUT', headers: {
+            'content-length': '4', 'content-type': 'text/plain',
+            'x-content-sha256': sha256, 'x-upload-ticket': 'ticket_1',
+          }, expiresAt: '2026-09-26T12:15:00.000Z',
+        },
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        objectId: 'object_1', storageReference: 'knowledge/1/kb_1/object_1', verified: true,
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        generationState: 'published', generations: [{ knowledgeBaseId: 'kb_1',
+          generationId: 'generation_1', previousGenerationId: null }],
+        strategy: 'keyword_only_consent', embedding: {
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          configurationVersion: 'autoforge-knowledge-embedding-v1', region: 'guangzhou',
+        }, keywordCandidates: [], vectorCandidates: [], driftProbeRequired: false,
+      } } })
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+    const client = new CloudBaseKnowledgeClient(
+      { callFunction }, 'autoforge-knowledge', { fetchImpl, id: () => 'search_1' },
+    )
+    await expect(client.beginGeneration({
+      requestId: 'begin_1', knowledgeBaseId: 'kb_1', name: 'Personal',
+      revision: 'r1', generationId: 'generation_1',
+    })).resolves.toMatchObject({ status: 'staging' })
+    await expect(client.uploadDocument({
+      requestId: 'upload_1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+      versionId: 'version_1', byteSize: 4, sha256, mimeType: 'text/plain', bytes,
+    })).resolves.toEqual({ jobId: 'job_1', storageReference: 'knowledge/1/kb_1/object_1' })
+    await expect(client.search({ query: '合同条款', knowledgeBaseIds: ['kb_1'], limit: 24 }))
+      .resolves.toMatchObject({ generationState: 'published' })
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://pg-storage.example/upload/ticket_1',
+      expect.objectContaining({
+        method: 'PUT', body: bytes, signal: expect.any(AbortSignal),
+        headers: expect.objectContaining({ 'x-upload-ticket': 'ticket_1' }),
+      }),
+    )
+    expect(callFunction.mock.calls.map(([input]) => input.data.action)).toEqual([
+      'beginGeneration', 'authorizeUpload', 'completeUpload', 'searchKnowledge',
+    ])
+  })
+
+  it('aborts a never-settling mediated upload at the same bounded deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      const bytes = Buffer.from('body')
+      const sha256 = createHash('sha256').update(bytes).digest('hex')
+      let uploadSignal: AbortSignal | undefined
+      const fetchImpl = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+        uploadSignal = init?.signal ?? undefined
+        return new Promise<Response>(() => undefined)
+      })
+      const client = new CloudBaseKnowledgeClient({
+        callFunction: vi.fn().mockResolvedValue({ result: { ok: true, data: {
+          uploadTicket: 'ticket_1', storageReference: 'knowledge/1/kb_1/object_1',
+          objectId: 'object_1', jobId: 'job_1', mimeType: 'text/plain',
+          expiresAt: '2026-09-26T12:15:00.000Z', uploadAuthorization: {
+            url: 'https://pg-storage.example/upload/ticket_1', method: 'PUT', headers: {
+              'content-length': '4', 'content-type': 'text/plain',
+              'x-content-sha256': sha256, 'x-upload-ticket': 'ticket_1',
+            }, expiresAt: '2026-09-26T12:15:00.000Z',
+          },
+        } } }),
+      }, 'autoforge-knowledge', { fetchImpl, timeoutMs: 50 })
+
+      const upload = client.uploadDocument({
+        requestId: 'upload_1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+        versionId: 'version_1', byteSize: bytes.byteLength, sha256,
+        mimeType: 'text/plain', bytes,
+      })
+      const rejected = expect(upload).rejects.toMatchObject({
+        code: 'TRANSIENT_FAILURE', retryable: true,
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      await rejected
+      expect(uploadSignal?.aborted).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

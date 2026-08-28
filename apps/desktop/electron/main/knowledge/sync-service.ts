@@ -5,7 +5,9 @@ import type {
   CloudPushMutationResult,
   PublishGenerationInput,
   PushMutationInput,
+  CloudUploadDocumentInput,
 } from './cloudbase-knowledge-client.js'
+import type { CloudSearchGateway } from './cloud-retriever.js'
 
 const LEASE_MS = 60_000
 const MAX_ATTEMPTS = 3
@@ -47,6 +49,18 @@ export interface CloudKnowledgeRemote {
     knowledgeBaseId: string
     storageReferences: string[]
   }): Promise<{ removed: number }>
+  beginGeneration?(input: {
+    requestId: string
+    knowledgeBaseId: string
+    name: string
+    revision: string
+    generationId: string
+  }): Promise<{ knowledgeBaseId: string; generationId: string; status: 'staging' }>
+  uploadDocument?(input: CloudUploadDocumentInput): Promise<{
+    jobId: string
+    storageReference: string
+  }>
+  search?: CloudSearchGateway['search']
 }
 
 export type CloudSyncMode = 'local_only' | 'syncing' | 'synced' | 'paused' | 'converting' | 'failed'
@@ -217,7 +231,9 @@ export class KnowledgeSyncService {
     if (!this.dependencies.isOnline()) throw syncError('OFFLINE')
     const control = this.getControl(input.knowledgeBaseId)
     if (control.mode === 'paused' || control.mode === 'converting') throw syncError('CONFLICT')
-    const begun = await this.remote.beginSync(input)
+    const begun = this.remote.beginGeneration
+      ? await this.remote.beginGeneration(input)
+      : await this.remote.beginSync(input)
     this.assertCloudAccess(entitlementEpoch)
     const current = this.getControl(input.knowledgeBaseId)
     if (current.epoch !== control.epoch

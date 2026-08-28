@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v9', () => {
+describe('knowledge schema v10', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(9)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(10)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -53,6 +53,8 @@ describe('knowledge schema v9', () => {
       'cloud_sync_conversions',
       'cloud_sync_mutations',
       'cloud_sync_states',
+      'cloud_entity_heads',
+      'cloud_pending_publications',
       'conflicts',
       'sync_cursors',
     ]))
@@ -77,6 +79,8 @@ describe('knowledge schema v9', () => {
     database.prepare('DELETE FROM knowledge_schema_migrations WHERE version >= 3').run()
     database.exec(`
       DROP TABLE knowledge_provider_consents;
+      DROP TABLE cloud_pending_publications;
+      DROP TABLE cloud_entity_heads;
       DROP TABLE knowledge_cloud_deletion_receipts;
       DROP TABLE knowledge_cloud_retention;
       DROP TABLE knowledge_free_retention;
