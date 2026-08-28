@@ -1805,9 +1805,7 @@ describe('CloudBase embedding consent and retrieval', () => {
   it('drains bounded batches and marks the shadow ready only after vectors are stored', async () => {
     let claims = 0
     const vector = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0)
-    const rpc = vi.fn().mockImplementation(async (name: string, parameters: {
-      p_request_deadline_ms?: number
-    }) => {
+    const rpc = vi.fn().mockImplementation(async (name: string) => {
       if (name === 'autoforge_knowledge_claim_embedding_batch') {
         claims += 1
         return {
