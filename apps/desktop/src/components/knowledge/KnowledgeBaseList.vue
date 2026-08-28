@@ -57,14 +57,16 @@
     <footer v-if="store.selectedBase">
       <button
         type="button"
-        :disabled="store.busy || !store.localAvailable || (store.selectedBase.status === 'recycled' && store.selectedBase.readOnly === true)"
+        data-testid="knowledge-export-base"
+        :disabled="store.busy || !store.localAvailable"
         @click="store.runBaseAction('export')"
       >
         导出
       </button>
       <button
         type="button"
-        :disabled="store.busy || !store.localAvailable"
+        :data-testid="store.selectedBase.status === 'recycled' ? 'knowledge-restore-base' : 'knowledge-recycle-base'"
+        :disabled="store.busy || !store.localAvailable || (store.selectedBase.status === 'recycled' && store.selectedBase.readOnly === true)"
         @click="store.runBaseAction(store.selectedBase.status === 'recycled' ? 'restore' : 'recycle')"
       >
         {{ store.selectedBase.status === 'recycled' ? '恢复' : '回收' }}

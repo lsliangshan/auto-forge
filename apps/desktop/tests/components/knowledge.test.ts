@@ -136,6 +136,37 @@ describe('personal knowledge workspace', () => {
     })
   })
 
+  it('keeps a recycled read-only extra exportable and deletable without allowing restore', async () => {
+    const recycled = {
+      ...base('base_extra', '额外库'), status: 'recycled' as const,
+      searchable: false, readOnly: true,
+    }
+    const client = api({
+      list: vi.fn().mockResolvedValue([recycled]),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+        retainedBaseId: 'base_kept', retainedDocumentId: 'doc_kept',
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    await useKnowledgeStore().bindOwner('alice')
+    await flushPromises()
+
+    const exportButton = wrapper.get('[data-testid="knowledge-export-base"]')
+    expect(exportButton.attributes()).not.toHaveProperty('disabled')
+    expect(wrapper.get('[data-testid="knowledge-restore-base"]').attributes())
+      .toHaveProperty('disabled')
+    expect(wrapper.get('[data-testid="knowledge-purge-base"]').attributes())
+      .not.toHaveProperty('disabled')
+    await exportButton.trigger('click')
+    await flushPromises()
+    expect(client.knowledge.exportBase).toHaveBeenCalledWith('base_extra')
+    expect(client.knowledge.restoreBase).not.toHaveBeenCalled()
+  })
+
   it('offers keep-one confirmation for every unconfirmed free downgrade state', async () => {
     const client = api({
       list: vi.fn().mockResolvedValue([base('base_1')]),

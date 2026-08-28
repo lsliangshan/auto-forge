@@ -261,7 +261,7 @@ export class KnowledgeKeyStore {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
         const committed = await this.#loadExistingUnlocked(ownerId)
-        if (!committed) throw new Error('Knowledge key is unavailable')
+        if (!committed) throw new Error('Knowledge key is unavailable', { cause: error })
         return committed
       }
       return {
@@ -382,7 +382,7 @@ export class KnowledgeKeyStore {
 
   async #unwrapKey(wrapped: string, token: string): Promise<{ key: Buffer; shouldReEncrypt: boolean }> {
     let envelope: Partial<WrappedKeyEnvelope>
-    let shouldReEncrypt = false
+    let shouldReEncrypt: boolean
     try {
       const decrypted = await this.safeStorage.decrypt(Buffer.from(wrapped, 'base64'))
       shouldReEncrypt = decrypted.shouldReEncrypt

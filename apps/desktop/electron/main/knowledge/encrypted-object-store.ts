@@ -189,7 +189,7 @@ export class KnowledgeObjectStore {
       serialized = await readFile(path)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        throw new Error('Knowledge object is unavailable')
+        throw new Error('Knowledge object is unavailable', { cause: error })
       }
       throw error
     }
@@ -210,8 +210,8 @@ export class KnowledgeObjectStore {
         object.payloadNonce,
         objectAad(PAYLOAD_DOMAIN, objectId),
       )
-    } catch {
-      throw new Error('Knowledge object could not authenticate')
+    } catch (error) {
+      throw new Error('Knowledge object could not authenticate', { cause: error })
     } finally {
       serialized.fill(0)
       wrappingKey.fill(0)

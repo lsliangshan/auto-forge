@@ -204,6 +204,9 @@ export class ParserSupervisor {
     let cancelResponse: ((code: ParserErrorCode) => void) | undefined
     let deadlineAt = Number.POSITIVE_INFINITY
     let expireDeadline: (() => void) | undefined
+    let document: ParsedDocument | undefined
+    let primaryFailure: ParserFailure | undefined
+    let cleanupTimedOut = false
     const cancelled = () => job.cancelled || this.state !== 'open' || input.signal?.aborted === true
 
     try {
@@ -520,10 +523,11 @@ export class ParserSupervisor {
         }
       }))
       if (response.type === 'error') fail(response.code)
-      return response.document
+      document = response.document
     } catch (error) {
-      if (error instanceof ParserFailure) throw error
-      throw new ParserFailure('PARSER_INTERNAL_ERROR')
+      primaryFailure = error instanceof ParserFailure
+        ? error
+        : new ParserFailure('PARSER_INTERNAL_ERROR')
     } finally {
       if (memoryTimer) clearInterval(memoryTimer)
       input.oneTimeKey.fill(0)
@@ -553,7 +557,6 @@ export class ParserSupervisor {
         }
       }))
       if (performance.now() >= deadlineAt) expireDeadline?.()
-      let cleanupTimedOut = false
       try {
         if (deadlinePromise) await Promise.race([cleanupPromise, deadlinePromise])
         else await cleanupPromise
@@ -566,8 +569,11 @@ export class ParserSupervisor {
       cancelResponse = undefined
       this.jobs.delete(job)
       job.drain()
-      if (cleanupTimedOut) throw new ParserFailure('PARSER_TIMEOUT')
     }
+    if (primaryFailure) throw primaryFailure
+    if (cleanupTimedOut) throw new ParserFailure('PARSER_TIMEOUT')
+    if (!document) throw new ParserFailure('PARSER_INTERNAL_ERROR')
+    return document
   }
 
   terminateAll(): Promise<void> {

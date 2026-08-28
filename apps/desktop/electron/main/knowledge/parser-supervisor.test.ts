@@ -480,6 +480,25 @@ describe('sandbox parser supervisor', () => {
     expect(cleanupOutcome).toMatchObject({ code: 'PARSER_TIMEOUT' })
   })
 
+  it('preserves the primary parser error when cleanup also crosses the deadline', async () => {
+    const h = harness((request) => ({
+      version: 1, type: 'error', jobId: request.jobId, code: 'PARSER_UNSUPPORTED_FORMAT',
+    }))
+    let releaseCleanup!: () => void
+    h.parserSession.clearStorageData.mockImplementation(() => new Promise<void>(resolve => {
+      releaseCleanup = resolve
+    }))
+    const parsing = h.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 2),
+      mediaType: 'text/plain',
+      limits: { ...DEFAULT_PARSER_LIMITS, timeoutMs: 50 },
+    })
+
+    await expect(parsing).rejects.toMatchObject({ code: 'PARSER_UNSUPPORTED_FORMAT' })
+    releaseCleanup()
+  })
+
   it('enforces elapsed wall time across synchronous setup and cancellation cleanup', async () => {
     const slowSetup = harness(success, {
       createSession: vi.fn(() => {
