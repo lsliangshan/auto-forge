@@ -122,10 +122,14 @@ function mediaAsset(id: string, kind: MediaAsset['kind'] = 'image'): MediaAsset 
   return {
     id,
     kind,
-    mimeType: kind === 'image' ? 'image/png' : kind === 'audio' ? 'audio/mpeg' : 'video/mp4',
-    name: `${id}.${kind === 'image' ? 'png' : kind === 'audio' ? 'mp3' : 'mp4'}`,
+    mimeType: kind === 'image' ? 'image/png' : kind === 'audio' ? 'audio/mpeg' : kind === 'video' ? 'video/mp4' : 'application/octet-stream',
+    name: `${id}.${kind === 'image' ? 'png' : kind === 'audio' ? 'mp3' : kind === 'video' ? 'mp4' : 'bin'}`,
     byteSize: 1024,
   }
+}
+
+function fileAsset(id: string, name: string, mimeType: string): MediaAsset {
+  return { id, kind: 'file', name, mimeType, byteSize: 1_536 }
 }
 
 function deferred<T>() {
@@ -1894,6 +1898,38 @@ describe('chat interactions', () => {
     expect(api.media.reveal).toHaveBeenCalledWith('asset_svg')
   })
 
+  it('keeps a generic file message as a non-inline attachment card with file actions', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_file',
+          type: 'media',
+          blockId: 'block_file',
+          assetId: 'asset_file',
+          kind: 'file',
+          purpose: 'input',
+          name: 'archive.bin',
+          mimeType: 'application/octet-stream',
+          byteSize: 1_536,
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.find('img').exists()).toBe(false)
+    expect(wrapper.find('audio').exists()).toBe(false)
+    expect(wrapper.find('video').exists()).toBe(false)
+    expect(wrapper.text()).toContain('archive.bin')
+    expect(wrapper.get('[data-testid="save-media-copy"]').text()).toBe('保存附件副本')
+    expect(wrapper.get('[data-testid="reveal-media"]').text()).toBe('在文件管理器中显示附件')
+    await wrapper.get('[data-testid="save-media-copy"]').trigger('click')
+    await wrapper.get('[data-testid="reveal-media"]').trigger('click')
+    expect(api.media.saveCopy).toHaveBeenCalledWith('asset_file')
+    expect(api.media.reveal).toHaveBeenCalledWith('asset_file')
+  })
+
   it('submits a media action only once while its first request is pending', async () => {
     const { api } = createEventApi()
     let resolveSave!: () => void
@@ -3648,6 +3684,69 @@ describe('chat interactions', () => {
     })
     expect(getAsFile).not.toHaveBeenCalled()
     expect(store.drafts.map(({ id }) => id)).toEqual(['picked', 'dropped', 'pasted'])
+  })
+
+  it('renders generic files as attachment drafts and keeps text input enabled when supported', () => {
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'text' })
+    store.draftsByConversation.conversation_1 = [fileAsset('notes', 'notes.txt', 'text/plain')]
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        provider: 'deepseek',
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="attachment-card"]').text()).toContain('文件')
+    expect(wrapper.get('[data-testid="attachment-card"]').text()).toContain('notes.txt')
+    expect(wrapper.get('[data-testid="attachment-card"]').text()).toContain('1.5 KB')
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('blocks unsupported generic files with a file-specific explanation', () => {
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'text' })
+    store.draftsByConversation.conversation_1 = [fileAsset('report', 'report.pdf', 'application/pdf')]
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        provider: 'deepseek',
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
+      .toContain('当前模型无法读取该附件格式')
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('keeps OpenRouter document attachments sendable as text output', () => {
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'text' })
+    store.draftsByConversation.conversation_1 = [fileAsset('report', 'report.pdf', 'application/pdf')]
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        provider: 'openrouter',
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.find('[data-testid="model-attachment-incompatible"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
   })
 
   it('removes drafts through Main and allows the fifth attachment while blocking a sixth', async () => {

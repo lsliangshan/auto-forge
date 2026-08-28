@@ -119,6 +119,7 @@
       <ChatComposer
         :disabled="false"
         :running="chat.isRunning"
+        :provider="settings.activeProvider"
         :models="settings.models"
         :models-loading="settings.modelsLoading"
         :refresh-models="refreshModels"

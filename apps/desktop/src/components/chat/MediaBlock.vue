@@ -30,20 +30,20 @@
         class="af-secondary-button"
         data-testid="save-media-copy"
         :disabled="busy !== null"
-        aria-label="保存媒体副本"
+        :aria-label="isFile ? '保存附件副本' : '保存媒体副本'"
         @click="runAction('save')"
       >
-        保存副本
+        {{ isFile ? '保存附件副本' : '保存副本' }}
       </button>
       <button
         type="button"
         class="af-secondary-button"
         data-testid="reveal-media"
         :disabled="busy !== null"
-        aria-label="在文件管理器中显示媒体"
+        :aria-label="isFile ? '在文件管理器中显示附件' : '在文件管理器中显示媒体'"
         @click="runAction('reveal')"
       >
-        在文件管理器中显示
+        {{ isFile ? '在文件管理器中显示附件' : '在文件管理器中显示' }}
       </button>
     </div>
     <p
@@ -66,10 +66,11 @@ type MediaBlockData = Extract<UiChatBlock, { type: 'media' }>
 const props = defineProps<{ block: MediaBlockData }>()
 const assetIdPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const source = computed(() => (
-  assetIdPattern.test(props.block.assetId)
+  props.block.kind !== 'file' && assetIdPattern.test(props.block.assetId)
     ? `autoforge-media://asset/${props.block.assetId}`
     : undefined
 ))
+const isFile = computed(() => props.block.kind === 'file')
 const inlineImage = computed(() => (
   props.block.kind === 'image' && props.block.mimeType.toLowerCase() !== 'image/svg+xml'
 ))
@@ -115,7 +116,9 @@ async function runAction(action: 'save' | 'reveal'): Promise<void> {
   } catch (error) {
     actionError.value = displayError(
       error,
-      action === 'save' ? '媒体副本保存失败' : '无法在文件管理器中显示媒体',
+      action === 'save'
+        ? isFile.value ? '附件副本保存失败' : '媒体副本保存失败'
+        : isFile.value ? '无法在文件管理器中显示附件' : '无法在文件管理器中显示媒体',
     )
   } finally {
     busy.value = null

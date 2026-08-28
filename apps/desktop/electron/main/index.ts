@@ -30,6 +30,7 @@ import {
   startDevelopmentParentWatchdog,
 } from './development-parent-watchdog.js'
 import { createMediaProtocolHandler } from './media/media-protocol.js'
+import { attachmentDialogOptions } from './media/attachment-dialog-options.js'
 import { NetworkProxyService } from './network/network-proxy-service.js'
 import { ElectronBrowserWorkspace } from './browser/electron-browser-workspace.js'
 import { UserDataStoreManager } from './database/user-data-client.js'
@@ -126,14 +127,9 @@ async function initialize(): Promise<ApplicationRuntime> {
       return result.canceled ? undefined : result.filePaths[0]
     },
     chooseMediaFiles: async (remainingSlots) => {
-      const dialogOptions: OpenDialogOptions = {
-        title: '选择媒体文件',
-        properties: ['openFile', 'multiSelections'],
-        filters: [{ name: 'Media', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg', 'mp3', 'wav', 'ogg', 'flac', 'm4a', 'mp4', 'webm', 'mov'] }],
-      }
       const result = mainWindow
-        ? await dialog.showOpenDialog(mainWindow, dialogOptions)
-        : await dialog.showOpenDialog(dialogOptions)
+        ? await dialog.showOpenDialog(mainWindow, { ...attachmentDialogOptions })
+        : await dialog.showOpenDialog({ ...attachmentDialogOptions })
       return result.canceled ? [] : result.filePaths.slice(0, remainingSlots)
     },
     chooseAvatarFile: async () => {

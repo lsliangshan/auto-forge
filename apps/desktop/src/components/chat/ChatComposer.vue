@@ -98,7 +98,7 @@
       data-testid="model-attachment-incompatible"
       role="alert"
     >
-      当前模型不支持已添加的附件。
+      {{ hasFileDraft ? '当前模型无法读取该附件格式。' : '当前模型不支持已添加的附件。' }}
     </div>
 
     <div
@@ -328,12 +328,15 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type {
-  ChatSendInput,
-  ConversationGenerationPreferences,
-  GenerationOptions,
-  ModelInfo,
-  OutputType,
+import {
+  chatFileSupport,
+  type AttachmentKind,
+  type ChatSendInput,
+  type ConversationGenerationPreferences,
+  type GenerationOptions,
+  type ModelInfo,
+  type ModelProviderId,
+  type OutputType,
 } from '@autoforge/shared'
 import { useChatStore, type ChatSendAcknowledgement } from '../../stores/chat'
 
@@ -342,6 +345,7 @@ type ConcreteOutput = Exclude<OutputType, 'auto'>
 const props = withDefaults(defineProps<{
   disabled: boolean
   running: boolean
+  provider: ModelProviderId
   models?: ModelInfo[]
   defaultModel?: string
   defaultModels?: Partial<Record<ConcreteOutput, string>>
@@ -396,7 +400,13 @@ function modelSupportsRequest(model: ModelInfo, output: ConcreteOutput): boolean
     )
     if (chat.drafts.length > imageCapacity) return false
   }
-  return chat.drafts.every(({ kind }) => model.inputModalities.includes(kind))
+  return chat.drafts.every((asset) => {
+    if (asset.kind === 'file') {
+      return output === 'text'
+        && chatFileSupport(props.provider, asset.name, asset.mimeType).mode !== 'unsupported'
+    }
+    return model.inputModalities.includes(asset.kind)
+  })
 }
 
 function modelsForOutput(output: OutputType, models = props.models): ModelInfo[] {
@@ -439,6 +449,8 @@ const selectedModelSupportsRequest = computed(() => {
   return selectedModel.value.outputModalities
     .some((candidate) => modelSupportsRequest(selectedModel.value!, candidate))
 })
+
+const hasFileDraft = computed(() => chat.drafts.some(({ kind }) => kind === 'file'))
 
 const autoChoiceRequired = computed(() => {
   if (chat.preferences.outputType !== 'auto' || !selectedModel.value) return false
@@ -683,8 +695,8 @@ function onKeydown(event: KeyboardEvent) {
   submit()
 }
 
-function kindLabel(kind: 'image' | 'audio' | 'video') {
-  return kind === 'image' ? '图片' : kind === 'audio' ? '音频' : '视频'
+function kindLabel(kind: AttachmentKind) {
+  return kind === 'image' ? '图片' : kind === 'audio' ? '音频' : kind === 'video' ? '视频' : '文件'
 }
 
 function formatBytes(bytes: number) {
