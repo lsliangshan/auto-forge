@@ -109,6 +109,12 @@ describe('personal knowledge release evaluation corpus', () => {
       )
       return result.kind !== 'insufficient' || result.reason !== 'unsupported-claim'
     }).map(item => item.id)
+    const residualGroundingMisses = corpus.holdout.residualGrounding.filter(item => {
+      const result = validateKnowledgeAnswer(
+        `${item.claim}[[kb:evaluation-evidence]]`, [evidence(item.evidence)], 'strict', 1,
+      )
+      return result.kind !== 'insufficient' || result.reason !== 'unsupported-claim'
+    }).map(item => item.id)
     const noEvidence = corpus.holdout.noEvidence.filter(claim => {
       const result = validateKnowledgeAnswer(claim, [], 'strict', 1)
       return result.kind === 'insufficient' && result.reason === 'no-evidence'
@@ -126,12 +132,20 @@ describe('personal knowledge release evaluation corpus', () => {
     ).toBeGreaterThanOrEqual(
       corpus.thresholds.grounding,
     )
+    expect(
+      percent(corpus.holdout.residualGrounding.length - residualGroundingMisses.length, corpus.holdout.residualGrounding.length),
+      `residual grounding misses: ${residualGroundingMisses.join(', ')}`,
+    ).toBeGreaterThanOrEqual(corpus.thresholds.residualGrounding)
     expect(percent(noEvidence, corpus.holdout.noEvidence.length), 'no evidence').toBeGreaterThanOrEqual(
       corpus.thresholds.noEvidence,
     )
     reportGate('grounding', {
       citationSupport: percent(corpus.holdout.support.length - unsupportedPositiveIds.length, corpus.holdout.support.length),
       grounding: percent(corpus.holdout.grounding.length - ungroundedAdversarialIds.length, corpus.holdout.grounding.length),
+      residualGrounding: percent(
+        corpus.holdout.residualGrounding.length - residualGroundingMisses.length,
+        corpus.holdout.residualGrounding.length,
+      ),
       noEvidence: percent(noEvidence, corpus.holdout.noEvidence.length),
       holdout: true,
     })

@@ -412,6 +412,46 @@ describe('knowledge tool and answer validation', () => {
 
   it.each([
     {
+      name: 'status field with a clause-like value',
+      snippet: 'A项目系统状态异常，B项目当前运行稳定。',
+      answer: 'A项目系统状态，当前运行稳定。[[kb:evidence:0]]',
+    },
+    {
+      name: 'material field with a clause-like value',
+      snippet: 'A项目材料钢材，B项目默认采用铝材。',
+      answer: 'A项目材料，默认采用铝材。[[kb:evidence:0]]',
+    },
+    {
+      name: 'owner field with a clause-like value',
+      snippet: 'A项目负责人张三，B项目验收工作由李四负责。',
+      answer: 'A项目负责人，验收工作由李四负责。[[kb:evidence:0]]',
+    },
+    {
+      name: 'English start-time field with a finite clause value',
+      snippet: 'project a start time pending, project b work will start tomorrow.',
+      answer: 'project a start time, work will start tomorrow. [[kb:evidence:0]]',
+    },
+    {
+      name: 'hours field with a planned-duration value',
+      snippet: 'A项目工时100小时，B项目计划持续200小时。',
+      answer: 'A项目工时，计划持续200小时。[[kb:evidence:0]]',
+    },
+  ])('does not let a clause-like field value bypass tuple grounding: $name', ({ snippet, answer }) => {
+    const current = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it.each([
+    {
       name: 'standalone number from another party field',
       snippet: '乙方编号为 7。',
       answer: '7。[[kb:evidence:0]]',
@@ -490,6 +530,27 @@ describe('knowledge tool and answer validation', () => {
     '[[kb:evidence:forged',
     '[[kb:',
   ])('fails mixed no-evidence output closed when marker cleanup leaves no answer: %s', (answer) => {
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'insufficient', reason: 'no-evidence',
+    })
+  })
+
+  it('removes a malformed marker tail while retaining an admitted mixed citation', () => {
+    expect(validateKnowledgeAnswer(
+      '合同生效。[[kb:evidence:0]][[kb:',
+      [evidence(0, { snippet: '合同生效。' })],
+      'mixed', 1,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: '【知识库依据】合同生效。',
+    })
+  })
+
+  it.each([
+    '[[ kb:evidence:forged]]',
+    '[[kb:evidence:forged]]。',
+    '([[kb:evidence:forged]])',
+  ])('treats marker-only mixed output as insufficient after removing wrappers: %s', (answer) => {
     expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
       kind: 'insufficient', reason: 'no-evidence',
     })

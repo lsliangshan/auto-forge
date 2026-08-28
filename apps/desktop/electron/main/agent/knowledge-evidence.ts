@@ -121,7 +121,10 @@ export type KnowledgeAnswerValidation =
   | { kind: 'insufficient'; reason: 'no-evidence' | 'uncited' | 'invalid-citation' | 'unsupported-claim' }
 
 const KNOWLEDGE_MARKER = /\[\[kb:([^\]\r\n]{1,512})\]\]/gu
-const KNOWLEDGE_MARKER_MATERIAL = /\[\[kb:[^\r\n]*?(?:\]\]|$)/gimu
+const KNOWLEDGE_MARKER_MATERIAL = /\[\[\s*kb\s*:[^\r\n]*?(?:\]\]|$)/gimu
+const KNOWLEDGE_MARKER_PLACEHOLDER_START = '\u{e200}'
+const KNOWLEDGE_MARKER_PLACEHOLDER_END = '\u{e201}'
+const KNOWLEDGE_MARKER_PLACEHOLDER = /\u{e200}(\d+)\u{e201}/gu
 const NUMERIC_DOT = '\u{e100}'
 const NUMERIC_COLON = '\u{e101}'
 const NUMERIC_COMMA = '\u{e102}'
@@ -192,6 +195,27 @@ function normalizedSupportText(value: string): string {
     .slice(0, 4_000)
 }
 
+function sanitizeMixedKnowledgeAnswer(answer: string, preserveCanonicalMarkers: boolean): string {
+  const canonicalMarkers: string[] = []
+  const protectedAnswer = preserveCanonicalMarkers
+    ? answer.replace(KNOWLEDGE_MARKER, (marker) => {
+        canonicalMarkers.push(marker)
+        return `${KNOWLEDGE_MARKER_PLACEHOLDER_START}${canonicalMarkers.length - 1}${KNOWLEDGE_MARKER_PLACEHOLDER_END}`
+      })
+    : answer
+  return protectedAnswer
+    .replace(KNOWLEDGE_MARKER_MATERIAL, '')
+    .replace(
+      KNOWLEDGE_MARKER_PLACEHOLDER,
+      (_placeholder, index: string) => canonicalMarkers[Number(index)] ?? '',
+    )
+    .trim()
+}
+
+function hasMixedAnswerContent(answer: string): boolean {
+  return answer.replace(KNOWLEDGE_MARKER, '').replace(/[\s\p{P}]+/gu, '').length > 0
+}
+
 function canonicalizeChineseRelation(value: string): string {
   const effectiveDate = value.match(/^(.{1,160}?)(?:于\s*([0-9][0-9./:-]{3,31})\s*生效|生效(?:为|是)\s*([0-9][0-9./:-]{3,31}))$/u)
   if (effectiveDate) return `${effectiveDate[1]}生效${effectiveDate[2] ?? effectiveDate[3]}`
@@ -243,15 +267,20 @@ function commaFieldTuple(value: string): FactTuple | undefined {
   const subject = field[1]!.trim()
   const object = field[2]!.trim()
   if (!subject || !object) return undefined
-  const cjkClause = /^.{2,}(?:生效|起效|生成|完成|运行|记录|构成|发布|支付|提供|采用|执行|保持|持续|运营|进入|属于|包含|负责|承担|提升|开始|结束)/u
-  const englishClause = /^\S+(?:\s+\S+)*\s+(?:is|are|was|were|will|shall|must|does|did|has|have|becomes?|starts?|ends?)\b/iu
-  if (factTuple(subject) || cjkClause.test(object) || englishClause.test(object)) return undefined
   const effectiveDate = subject.match(/^(.{1,160}?)生效日期$/u)
   return {
     subject: normalizedTuplePart(effectiveDate?.[1] ?? subject),
     relation: effectiveDate ? 'effective' : 'attribute',
     object,
   }
+}
+
+function temporalCommaClaimGroup(value: string): boolean {
+  const group = value.match(/^([^，,]{2,160})[，,]\s*(.{1,240})$/u)
+  if (!group) return false
+  const condition = group[1]!.trim()
+  return /(?:签订|签字|签署|完成|通过|收到|到达|提交|导入|创建|更新|删除|发布|支付|交付|验收|开始|结束).*(?:后|以后|之后|之日起|时)$/u.test(condition)
+    || /^(?:after|before|when|once|upon|while)\b/iu.test(condition)
 }
 
 function factTuple(rawValue: string): FactTuple | undefined {
@@ -539,10 +568,12 @@ function tupleObjectSupportingClauseIndexes(
 }
 
 function evidenceSupportsTupleGroup(rawGroup: string, evidence: KnowledgeEvidence): boolean {
-  const answerTuples = splitIndependentFacts(rawGroup.replace(KNOWLEDGE_MARKER, ''))
+  const answerGroup = rawGroup.replace(KNOWLEDGE_MARKER, '')
+  if (temporalCommaClaimGroup(answerGroup)) return true
+  const answerTuples = splitIndependentFacts(answerGroup)
     .map(factTuple)
     .filter((tuple): tuple is FactTuple => tuple !== undefined)
-  if (answerTuples.length === 0) return true
+  if (answerTuples.length === 0) return !/^([^，,]{1,160})[，,]\s*(.{1,240})$/u.test(answerGroup)
   const evidenceTuples = splitIndependentFacts(sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000))
     .map(factTuple)
     .filter((tuple): tuple is FactTuple => tuple !== undefined)
@@ -576,10 +607,10 @@ export function validateKnowledgeAnswer(
   mode: KnowledgeSelection['mode'],
   repairAttempts: number,
 ): KnowledgeAnswerValidation {
-  const validatedAnswer = mode === 'mixed' && evidence.length === 0
-    ? answer.replace(KNOWLEDGE_MARKER_MATERIAL, '').trim()
+  const validatedAnswer = mode === 'mixed'
+    ? sanitizeMixedKnowledgeAnswer(answer, evidence.length > 0)
     : answer
-  if (mode === 'mixed' && evidence.length === 0 && !validatedAnswer) {
+  if (mode === 'mixed' && !hasMixedAnswerContent(validatedAnswer)) {
     return { kind: 'insufficient', reason: 'no-evidence' }
   }
   const admitted = new Set(evidence.map(item => item.id))

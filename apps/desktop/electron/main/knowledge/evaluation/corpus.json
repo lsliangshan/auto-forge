@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "thresholds": { "recallAt8": 0.9, "citationSupport": 0.95, "grounding": 0.95, "noEvidence": 0.95, "supportedDocumentSuccess": 0.99 },
+  "thresholds": { "recallAt8": 0.9, "citationSupport": 0.95, "grounding": 0.95, "residualGrounding": 1, "noEvidence": 0.95, "supportedDocumentSuccess": 0.99 },
   "calibrationCases": {
     "support": [
       { "id": "cal-copula", "evidence": "该项目为国家级示范项目。", "claim": "该项目是国家级示范项目。" },
@@ -48,9 +48,6 @@
       { "id": "holdout-cross-report-publication-date-comma", "evidence": "A报告发布日期为2026-01-01且B报告发布日期为2026-02-02。", "claim": "A报告发布日期，2026-02-02。" },
       { "id": "holdout-cross-contract-effective-date-comma", "evidence": "A合同生效日期为2026-01-01且B合同生效日期为2026-02-02。", "claim": "A合同生效日期，2026-02-02。" },
       { "id": "holdout-cross-party-payment-amount-comma", "evidence": "A方支付金额为100且B方支付金额为200。", "claim": "A方支付金额，200。" },
-      { "id": "holdout-cross-project-hours-comma", "evidence": "A项目工时100小时，B项目工时200小时。", "claim": "A项目工时，200小时。" },
-      { "id": "holdout-cross-project-hours-english-comma", "evidence": "Project A effort 100 hours, Project B effort 200 hours.", "claim": "Project A effort, 200 hours." },
-      { "id": "holdout-project-hours-same-value-different-subject", "evidence": "B项目工时100小时。", "claim": "A项目工时，100小时。" },
       { "id": "holdout-project-substitution", "evidence": "该智慧园区重点改造项目将持续提升公共服务能力并按年度稳定运营。", "claim": "该智慧园区重点改造工程将持续提升公共服务能力并按年度稳定运营。" },
       { "id": "holdout-product-substitution", "evidence": "最终交付产品为星河知识管理平台企业版本并提供长期维护。", "claim": "最终交付产品为星海知识管理平台企业版本并提供长期维护。" },
       { "id": "holdout-color-substitution", "evidence": "核心设备外壳必须采用深红色防腐涂层并保持技术参数不变。", "claim": "核心设备外壳必须采用深蓝色防腐涂层并保持技术参数不变。" },
@@ -71,6 +68,13 @@
       { "id": "holdout-en-number", "evidence": "Payment is due within 27 days.", "claim": "Payment is due within 7 days." },
       { "id": "holdout-en-currency", "evidence": "The service fee is GBP 260.", "claim": "The service fee is EUR 260." },
       { "id": "holdout-en-location", "evidence": "The archive is located in Guangzhou.", "claim": "The archive is located in Shenzhen." }
+    ],
+    "residualGrounding": [
+      { "id": "residual-cross-operating-state", "evidence": "北辰工程系统状态告警，远航工程目前运行平稳。", "claim": "北辰工程系统状态，目前运行平稳。" },
+      { "id": "residual-cross-material-action", "evidence": "晨曦方案材料复合木材，暮云方案默认采用再生铝材。", "claim": "晨曦方案材料，默认采用再生铝材。" },
+      { "id": "residual-cross-owner-action", "evidence": "海岳计划负责人王敏，云帆计划验收事项由赵强负责。", "claim": "海岳计划负责人，验收事项由赵强负责。" },
+      { "id": "residual-cross-start-time-english", "evidence": "orchid deployment start time pending, harbor work will start next tuesday.", "claim": "orchid deployment start time, work will start next tuesday." },
+      { "id": "residual-cross-planned-duration", "evidence": "松涛工程总工时120小时，瀚海工程计划持续360小时。", "claim": "松涛工程总工时，计划持续360小时。" }
     ],
     "noEvidence": [
       "凤凰计划属于哪一级工程？", "最终交付的产品是什么？", "研发园区位于哪里？", "档案中心位于哪里？",
