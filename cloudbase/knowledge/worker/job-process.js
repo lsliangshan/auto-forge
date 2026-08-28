@@ -1,4 +1,4 @@
-/* global AbortSignal, Buffer, __dirname, module, process, require */
+/* global AbortSignal, Buffer, __dirname, clearTimeout, module, process, require, setTimeout */
 
 const { spawn } = require('node:child_process')
 const { existsSync, realpathSync, statSync } = require('node:fs')
@@ -7,6 +7,7 @@ const { isAbsolute, resolve } = require('node:path')
 const MAX_INPUT_BYTES = 8 * 1024
 const MAX_RESPONSE_BYTES = 1024
 const MAX_STDERR_BYTES = 8 * 1024
+const TERMINATION_GRACE_MS = 100
 const jobChildDefault = resolve(__dirname, 'job-child.js')
 const jobKinds = new Set(['upload', 'embedding', 'purge'])
 const resultCodes = new Set([
@@ -99,6 +100,31 @@ function environmentForJob(source) {
   return environment
 }
 
+function processGroupExists(groupId) {
+  try {
+    process.kill(-groupId, 0)
+    return true
+  } catch (error) {
+    return error?.code !== 'ESRCH'
+  }
+}
+
+function signalProcessGroup(groupId, signal) {
+  try {
+    process.kill(-groupId, signal)
+    return true
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false
+    throw error
+  }
+}
+
+async function waitForProcessGroupExit(groupId) {
+  while (processGroupExists(groupId)) {
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
+  }
+}
+
 function encodeFrame(value) {
   const body = Buffer.from(JSON.stringify(value), 'utf8')
   if (body.byteLength > MAX_INPUT_BYTES) throw { code: 'INVALID_INPUT' }
@@ -164,6 +190,7 @@ function createKnowledgeJobProcess({
             cwd: __dirname,
             env: environmentForJob(environment),
             stdio: ['pipe', 'pipe', 'pipe'],
+            detached: true,
             windowsHide: true,
           })
         } catch {
@@ -176,9 +203,17 @@ function createKnowledgeJobProcess({
         let responseLength = 0
         let stderrLength = 0
         const responseChunks = []
+        const groupId = child.pid
+        if (!Number.isSafeInteger(groupId) || groupId <= 0) {
+          try { child.kill('SIGKILL') } catch { /* spawn failed before PID assignment */ }
+          rejectPromise({ code: 'TRANSIENT_FAILURE' })
+          return
+        }
         let acknowledgeClose
         const closed = new Promise(resolveClose => { acknowledgeClose = resolveClose })
-        const state = { child, closed, setStopping: error => { stopping ??= error } }
+        const state = {
+          child, groupId, closed, setStopping: error => { stopping ??= error },
+        }
         active.set(key, state)
 
         const cleanup = () => {
@@ -197,7 +232,9 @@ function createKnowledgeJobProcess({
         }
         const stop = (error, signal) => {
           state.setStopping(error)
-          try { child.kill(signal) } catch { /* already closed */ }
+          try { signalProcessGroup(groupId, signal) } catch {
+            state.setStopping({ code: 'TRANSIENT_FAILURE' })
+          }
         }
         const onAbort = () => stop({ code: 'TRANSIENT_FAILURE' }, 'SIGTERM')
         boundary.signal.addEventListener('abort', onAbort, { once: true })
@@ -222,20 +259,29 @@ function createKnowledgeJobProcess({
         })
         child.stdin?.on('error', () => stop({ code: 'TRANSIENT_FAILURE' }, 'SIGKILL'))
         child.once('close', (code, closeSignal) => {
-          acknowledgeClose()
-          if (stopping) {
-            settle(stopping)
-            return
-          }
-          if (code !== 0 || closeSignal !== null) {
-            settle({ code: 'TRANSIENT_FAILURE' })
-            return
-          }
-          try {
-            settle(undefined, decodeFrame(Buffer.concat(responseChunks, responseLength)))
-          } catch (error) {
-            settle(isRecord(error) ? error : { code: 'INTERNAL_ERROR' })
-          }
+          void (async () => {
+            if (processGroupExists(groupId)) {
+              state.setStopping(stopping ?? { code: 'TRANSIENT_FAILURE' })
+              try { signalProcessGroup(groupId, 'SIGKILL') } catch {
+                state.setStopping({ code: 'TRANSIENT_FAILURE' })
+              }
+              await waitForProcessGroupExit(groupId)
+            }
+            acknowledgeClose()
+            if (stopping) {
+              settle(stopping)
+              return
+            }
+            if (code !== 0 || closeSignal !== null) {
+              settle({ code: 'TRANSIENT_FAILURE' })
+              return
+            }
+            try {
+              settle(undefined, decodeFrame(Buffer.concat(responseChunks, responseLength)))
+            } catch (error) {
+              settle(isRecord(error) ? error : { code: 'INTERNAL_ERROR' })
+            }
+          })()
         })
 
         if (!child.stdin || !child.stdout || !child.stderr) {
@@ -252,7 +298,20 @@ function createKnowledgeJobProcess({
       const state = active.get(key)
       if (!state) return
       state.setStopping({ code: 'TRANSIENT_FAILURE' })
-      try { state.child.kill('SIGKILL') } catch { /* already closed */ }
+      let graceId
+      try { signalProcessGroup(state.groupId, 'SIGTERM') } catch {
+        state.setStopping({ code: 'TRANSIENT_FAILURE' })
+      }
+      await Promise.race([
+        state.closed,
+        new Promise(resolvePromise => { graceId = setTimeout(resolvePromise, TERMINATION_GRACE_MS) }),
+      ])
+      clearTimeout(graceId)
+      if (processGroupExists(state.groupId)) {
+        try { signalProcessGroup(state.groupId, 'SIGKILL') } catch {
+          state.setStopping({ code: 'TRANSIENT_FAILURE' })
+        }
+      }
       await state.closed
     },
   })

@@ -5,6 +5,7 @@ const { createPostgresRpcClient, createTokenHubClient } = require('../function/k
 const { createKnowledgeJobProcess } = require('./job-process.js')
 const { createKnowledgeWorker, createWorkerStorageClient } = require('./knowledge-worker.js')
 const { createKnowledgeParserProcess } = require('./parser-process.js')
+const { createKnowledgeSettlementProcess } = require('./settlement-process.js')
 
 let worker
 
@@ -35,7 +36,8 @@ function configuredWorker() {
     ? configuredId
     : `worker_${randomUUID()}`
   worker = createKnowledgeWorker({
-    rpc, jobExecution: createKnowledgeJobProcess(), workerId,
+    rpc, jobExecution: createKnowledgeJobProcess(),
+    settlementExecution: createKnowledgeSettlementProcess(), workerId,
   })
   return worker
 }

@@ -267,7 +267,8 @@ function createJobBoundary(
 }
 
 function createKnowledgeWorker({
-  rpc, storage, parser, embeddingWorker, jobExecution, workerId, id = randomUUID,
+  rpc, storage, parser, embeddingWorker, jobExecution, settlementExecution,
+  workerId, id = randomUUID,
   maxJobs = MAX_JOBS_PER_RUN, parserTimeoutMs = DEFAULT_PARSER_TIMEOUT_MS,
   jobTimeoutMs = DEFAULT_JOB_TIMEOUT_MS,
   settlementReserveMs = DEFAULT_SETTLEMENT_RESERVE_MS,
@@ -280,11 +281,14 @@ function createKnowledgeWorker({
     && parser && typeof parser.parse === 'function'
   const containedExecution = jobExecution && typeof jobExecution.run === 'function'
     && typeof jobExecution.terminate === 'function'
+  const containedSettlement = settlementExecution
+    && typeof settlementExecution.confirm === 'function'
   const terminateExecution = terminateJobExecution
     ?? (containedExecution
       ? identity => jobExecution.terminate(identity)
       : terminateCurrentWorkerExecution)
   if (typeof rpc !== 'function' || (!directExecution && !containedExecution)
+    || (containedExecution && !containedSettlement)
     || !nonEmptyString(workerId) || !Number.isSafeInteger(maxJobs)
     || maxJobs < 1 || maxJobs > MAX_JOBS_PER_RUN
     || !Number.isSafeInteger(parserTimeoutMs)
@@ -307,6 +311,40 @@ function createKnowledgeWorker({
     return {
       ...parameters,
       p_mutation_permit: requestBoundary.mutationAuthorization.capability,
+    }
+  }
+
+  async function confirmSettlement(input, requestBoundary) {
+    if (containedSettlement) {
+      const result = await settlementExecution.confirm(input, requestBoundary)
+      if (!exactKeys(result, ['confirmed']) || result.confirmed !== true) {
+        throw { code: 'INTERNAL_ERROR' }
+      }
+      return
+    }
+    if (input.kind === 'abandon') {
+      const parameters = {
+        p_worker_id: input.workerId, p_job_id: input.jobId,
+        p_lease_token: input.leaseToken, p_mutation_permit: input.mutationPermit,
+      }
+      const abandoned = requestBoundary === undefined
+        ? await rpc('autoforge_knowledge_abandon_claimed_job', parameters)
+        : await rpc('autoforge_knowledge_abandon_claimed_job', parameters, requestBoundary)
+      if (!exactKeys(abandoned, ['abandoned']) || abandoned.abandoned !== true) {
+        throw { code: 'INTERNAL_ERROR' }
+      }
+      return
+    }
+    const parameters = {
+      p_worker_id: input.workerId, p_job_id: input.jobId,
+      p_lease_token: input.leaseToken, p_state: input.state,
+      p_error_code: input.errorCode, p_mutation_permit: input.mutationPermit,
+    }
+    const completed = requestBoundary === undefined
+      ? await rpc('autoforge_knowledge_complete_job', parameters)
+      : await rpc('autoforge_knowledge_complete_job', parameters, requestBoundary)
+    if (!exactKeys(completed, ['completed']) || completed.completed !== true) {
+      throw { code: 'INTERNAL_ERROR' }
     }
   }
 
@@ -442,13 +480,10 @@ function createKnowledgeWorker({
           jobTimeoutMs, Math.max(0, job.mutationBudgetMs - claimElapsedMs),
         )
         if (localBudgetMs <= settlementReserveMs) {
-          const abandoned = await rpc('autoforge_knowledge_abandon_claimed_job', {
-            p_worker_id: workerId, p_job_id: job.id,
-            p_lease_token: job.leaseToken, p_mutation_permit: job.mutationPermit,
+          await confirmSettlement({
+            kind: 'abandon', workerId, jobId: job.id,
+            leaseToken: job.leaseToken, mutationPermit: job.mutationPermit,
           })
-          if (!exactKeys(abandoned, ['abandoned']) || abandoned.abandoned !== true) {
-            throw { code: 'INTERNAL_ERROR' }
-          }
           throw { code: 'TRANSIENT_FAILURE' }
         }
         const mutationAuthorization = Object.freeze({
@@ -476,13 +511,20 @@ function createKnowledgeWorker({
           completed += 1
         } catch (error) {
           const code = safeCode(error)
+          const settlement = {
+            kind: 'complete', workerId, jobId: job.id, leaseToken: job.leaseToken,
+            mutationPermit: job.mutationPermit, state: 'failed', errorCode: code,
+          }
           try {
-            await boundary.settle(requestBoundary => rpc('autoforge_knowledge_complete_job', mutationParameters({
-              p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
-              p_state: 'failed', p_error_code: code,
-            }, requestBoundary), requestBoundary))
-          } catch {
+            if (containedSettlement) await confirmSettlement(settlement)
+            else {
+              await boundary.settle(requestBoundary => (
+                confirmSettlement(settlement, requestBoundary)
+              ))
+            }
+          } catch (settlementError) {
             // A lost/expired lease must never be settled under a different identity.
+            if (containedSettlement) throw settlementError
           }
           failed += 1
           stopAfterJob = code === 'TRANSIENT_FAILURE'

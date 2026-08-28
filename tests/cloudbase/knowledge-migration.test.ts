@@ -777,6 +777,43 @@ describe('CloudBase personal knowledge migration', () => {
     )
   })
 
+  it('idempotently confirms the exact completion or abandon after a lost response', async () => {
+    const sql = await readFile(canonicalUrl, 'utf8')
+    for (const column of [
+      'settlement_kind varchar(32)',
+      'settlement_worker_id varchar(128)',
+      'settlement_lease_token varchar(128)',
+      'settlement_mutation_permit varchar(128)',
+      'settlement_state varchar(32)',
+      'settlement_error_code varchar(64)',
+    ]) expect(sql).toContain(column)
+
+    const claim = staticFunctionBodyFragment(sql, 'autoforge_knowledge_claim_job')
+    expect(claim).not.toContain('settlement_kind = NULL')
+    expect(claim).not.toContain('settlement_mutation_permit = NULL')
+
+    const abandon = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_abandon_claimed_job',
+    )
+    expect(abandon).toContain("settlement_kind = 'abandon'")
+    expect(abandon).toContain('settlement_worker_id = p_worker_id')
+    expect(abandon).toContain('settlement_lease_token = p_lease_token')
+    expect(abandon).toContain('settlement_mutation_permit = p_mutation_permit')
+    expect(abandon).toContain('PERFORM 1 FROM public.knowledge_jobs')
+    expect(abandon).not.toContain("job.state <> 'queued'")
+
+    const complete = staticFunctionBodyFragment(sql, 'autoforge_knowledge_complete_job')
+    expect(complete).toContain("settlement_kind = 'complete'")
+    expect(complete).toContain('settlement_worker_id = p_worker_id')
+    expect(complete).toContain('settlement_lease_token = p_lease_token')
+    expect(complete).toContain('settlement_mutation_permit = p_mutation_permit')
+    expect(complete).toContain('settlement_state = p_state')
+    expect(complete).toContain('settlement_error_code = p_error_code')
+    expect(complete).toContain('PERFORM 1 FROM public.knowledge_jobs')
+    expect(complete).toContain('settlement_error_code IS NOT DISTINCT FROM p_error_code')
+    expect(complete).not.toContain('job.state <> CASE')
+  })
+
   it('statically requires payload purge after exact Storage deletion and models payload removal separately', async () => {
     const sql = await readFile(canonicalUrl, 'utf8')
     expect(sql).toContain('autoforge_knowledge_prepare_base_purge')

@@ -173,6 +173,9 @@ describe('CloudBase knowledge deploy package', () => {
 
         const deployedRequire = createRequire(join(deployRoot, 'package.json'))
         expect(deployedRequire('./index.js')).toEqual({ main: expect.any(Function) })
+        expect(deployedRequire('./worker/settlement-process.js')).toEqual({
+          createKnowledgeSettlementProcess: expect.any(Function),
+        })
         const directParser = (deployedRequire('./worker/knowledge-worker.js') as {
           createKnowledgeParser: () => {
             parse: (input: { bytes: Buffer, mimeType: string, versionId: string }) => Promise<unknown>

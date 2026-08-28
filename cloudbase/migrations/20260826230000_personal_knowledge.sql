@@ -295,6 +295,21 @@ CREATE TABLE IF NOT EXISTS public.knowledge_jobs (
   mutation_permit varchar(128),
   mutation_deadline_at timestamptz,
   CHECK ((mutation_permit IS NULL) = (mutation_deadline_at IS NULL)),
+  settlement_kind varchar(32) CHECK (settlement_kind IN ('abandon', 'complete')),
+  settlement_worker_id varchar(128),
+  settlement_lease_token varchar(128),
+  settlement_mutation_permit varchar(128),
+  settlement_state varchar(32) CHECK (settlement_state IN ('completed', 'failed')),
+  settlement_error_code varchar(64),
+  CHECK ((settlement_kind IS NULL AND settlement_worker_id IS NULL
+      AND settlement_lease_token IS NULL AND settlement_mutation_permit IS NULL
+      AND settlement_state IS NULL AND settlement_error_code IS NULL)
+    OR (settlement_kind = 'abandon' AND settlement_worker_id IS NOT NULL
+      AND settlement_lease_token IS NOT NULL AND settlement_mutation_permit IS NOT NULL
+      AND settlement_state IS NULL AND settlement_error_code IS NULL)
+    OR (settlement_kind = 'complete' AND settlement_worker_id IS NOT NULL
+      AND settlement_lease_token IS NOT NULL AND settlement_mutation_permit IS NOT NULL
+      AND settlement_state IS NOT NULL)),
   error_code varchar(64),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
@@ -1797,6 +1812,10 @@ BEGIN
     attempt = greatest(attempt - 1, 0), error_code = NULL,
     worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
     mutation_permit = NULL, mutation_deadline_at = NULL,
+    settlement_kind = 'abandon', settlement_worker_id = p_worker_id,
+    settlement_lease_token = p_lease_token,
+    settlement_mutation_permit = p_mutation_permit,
+    settlement_state = NULL, settlement_error_code = NULL,
     updated_at = clock_timestamp()
     WHERE id = p_job_id AND state = 'running' AND worker_id = p_worker_id
       AND lease_token = p_lease_token
@@ -1804,7 +1823,15 @@ BEGIN
       AND mutation_permit = p_mutation_permit;
   GET DIAGNOSTICS changed = ROW_COUNT;
   IF changed <> 1 THEN
-    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    PERFORM 1 FROM public.knowledge_jobs
+      WHERE id = p_job_id AND settlement_kind = 'abandon'
+      AND settlement_worker_id = p_worker_id
+      AND settlement_lease_token = p_lease_token
+      AND settlement_mutation_permit = p_mutation_permit
+      FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
   END IF;
   RETURN jsonb_build_object('abandoned', true);
 END;
@@ -1840,6 +1867,10 @@ BEGIN
     error_code = p_error_code,
     worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
     mutation_permit = NULL, mutation_deadline_at = NULL,
+    settlement_kind = 'complete', settlement_worker_id = p_worker_id,
+    settlement_lease_token = p_lease_token,
+    settlement_mutation_permit = p_mutation_permit,
+    settlement_state = p_state, settlement_error_code = p_error_code,
     updated_at = clock_timestamp()
     WHERE id = p_job_id AND state = 'running' AND worker_id = p_worker_id
       AND lease_token = p_lease_token
@@ -1847,7 +1878,19 @@ BEGIN
       AND mutation_permit = p_mutation_permit
       AND mutation_deadline_at > clock_timestamp();
   GET DIAGNOSTICS changed = ROW_COUNT;
-  IF changed <> 1 THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
+  IF changed <> 1 THEN
+    PERFORM 1 FROM public.knowledge_jobs
+      WHERE id = p_job_id AND settlement_kind = 'complete'
+      AND settlement_worker_id = p_worker_id
+      AND settlement_lease_token = p_lease_token
+      AND settlement_mutation_permit = p_mutation_permit
+      AND settlement_state = p_state
+      AND settlement_error_code IS NOT DISTINCT FROM p_error_code
+      FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+  END IF;
   RETURN jsonb_build_object('completed', true);
 END;
 $$;
