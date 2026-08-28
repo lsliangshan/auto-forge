@@ -6,12 +6,12 @@ import {
   lstat,
   mkdir,
   open,
+  readFile,
   readdir,
   realpath,
   rename,
   rm,
   rmdir,
-  writeFile,
 } from 'node:fs/promises'
 import type { IncomingMessage } from 'node:http'
 import { request as httpsRequest, type RequestOptions } from 'node:https'
@@ -30,6 +30,7 @@ import {
 import {
   approvedConverterPackTarget,
   compareSemanticVersions,
+  converterPackPortablePathKey,
   DEFAULT_CONVERTER_PACK_LIMITS,
   isConverterPackVersion,
   safeConverterPackEntryPath,
@@ -45,6 +46,43 @@ const defaultRequestTimeoutMs = 120_000
 const maximumRequestTimeoutMs = 10 * 60_000
 const tarBlockBytes = 512
 const sequenceDirectoryName = '.index-sequences'
+const sequenceMarkerPattern = /^(?:0|[1-9]\d*)$/u
+const sequencePartialPattern = /^\.sequence-(?:0|[1-9]\d*)\.partial-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+const restrictedUstarMagic = Buffer.from('ustar\0', 'ascii')
+const restrictedUstarVersion = Buffer.from('00', 'ascii')
+const sequenceTails = new Map<string, Promise<void>>()
+
+export interface ConverterPackSequenceFile {
+  write(value: string): Promise<void>
+  sync(): Promise<void>
+  close(): Promise<void>
+}
+
+export interface ConverterPackSequencePersistence {
+  openExclusive(path: string): Promise<ConverterPackSequenceFile>
+  rename(source: string, destination: string): Promise<void>
+  syncDirectory(path: string): Promise<void>
+}
+
+const nodeSequencePersistence: ConverterPackSequencePersistence = Object.freeze({
+  async openExclusive(path: string): Promise<ConverterPackSequenceFile> {
+    const handle = await open(path, 'wx', 0o600)
+    return {
+      write: async (value) => { await handle.writeFile(value, 'utf8') },
+      sync: async () => { await handle.sync() },
+      close: async () => { await handle.close() },
+    }
+  },
+  rename: async (source: string, destination: string) => { await rename(source, destination) },
+  async syncDirectory(path: string): Promise<void> {
+    const handle = await open(path, constants.O_RDONLY)
+    try {
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  },
+})
 
 export interface ConverterPackManagerOptions {
   packsRoot: string
@@ -55,6 +93,7 @@ export interface ConverterPackManagerOptions {
   maxRedirects?: number
   requestTimeoutMs?: number
   limits?: Partial<ConverterPackVerificationLimits>
+  sequencePersistence?: ConverterPackSequencePersistence
 }
 
 export interface AcquireConverterPackInput {
@@ -174,6 +213,7 @@ function isZeroBlock(block: Buffer): boolean {
 function tarString(block: Buffer, offset: number, length: number): string {
   const field = block.subarray(offset, offset + length)
   const end = field.indexOf(0)
+  if (end !== -1 && !field.subarray(end + 1).every((value) => value === 0)) failure('archive_entry_invalid')
   const bytes = end === -1 ? field : field.subarray(0, end)
   try {
     return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
@@ -182,20 +222,44 @@ function tarString(block: Buffer, offset: number, length: number): string {
   }
 }
 
-function tarOctal(block: Buffer, offset: number, length: number): number {
-  const value = tarString(block, offset, length).trim()
-  if (!/^[0-7]+$/u.test(value)) failure('archive_entry_invalid')
-  const parsed = Number.parseInt(value, 8)
+function restrictedTarOctal(block: Buffer, offset: number, length: number): number {
+  const field = block.subarray(offset, offset + length)
+  if (
+    field.byteLength !== length
+    || field[length - 1] !== 0
+    || !field.subarray(0, length - 1).every((value) => value >= 0x30 && value <= 0x37)
+  ) failure('archive_entry_invalid')
+  const parsed = Number.parseInt(field.subarray(0, length - 1).toString('ascii'), 8)
   if (!Number.isSafeInteger(parsed)) failure('archive_entry_invalid')
   return parsed
 }
 
 function verifyTarChecksum(block: Buffer): void {
-  const declared = tarOctal(block, 148, 8)
+  const checksum = block.subarray(148, 156)
+  if (
+    checksum[6] !== 0
+    || checksum[7] !== 0x20
+    || !checksum.subarray(0, 6).every((value) => value >= 0x30 && value <= 0x37)
+  ) failure('archive_entry_invalid')
+  const declared = Number.parseInt(checksum.subarray(0, 6).toString('ascii'), 8)
   const copy = Buffer.from(block)
   copy.fill(0x20, 148, 156)
   const actual = copy.reduce((sum, value) => sum + value, 0)
   if (actual !== declared) failure('archive_entry_invalid')
+}
+
+function verifyRestrictedUstarHeader(block: Buffer): void {
+  if (
+    !block.subarray(257, 263).equals(restrictedUstarMagic)
+    || !block.subarray(263, 265).equals(restrictedUstarVersion)
+    || block[156] !== 0x30
+    || !block.subarray(157, 257).every((value) => value === 0)
+    || restrictedTarOctal(block, 108, 8) !== 0
+    || restrictedTarOctal(block, 116, 8) !== 0
+    || restrictedTarOctal(block, 136, 12) !== 0
+    || !block.subarray(265, 345).every((value) => value === 0)
+    || !block.subarray(500, tarBlockBytes).every((value) => value === 0)
+  ) failure('archive_entry_invalid')
 }
 
 async function ensureChildDirectory(root: string, segments: readonly string[]): Promise<string> {
@@ -285,10 +349,11 @@ async function verifyInstalledPack(
         await visit(absolutePath, relativePath)
         continue
       }
-      if (!metadata.isFile() || !expectedFiles.has(relativePath) || discovered.has(relativePath.toLowerCase())) {
+      const collisionKey = converterPackPortablePathKey(relativePath)
+      if (!metadata.isFile() || !expectedFiles.has(relativePath) || discovered.has(collisionKey)) {
         failure('installed_pack_invalid')
       }
-      discovered.add(relativePath.toLowerCase())
+      discovered.add(collisionKey)
     }
   }
   try {
@@ -355,18 +420,17 @@ async function extractTar(
       }
       if (terminators !== 0) failure('archive_entry_invalid')
       verifyTarChecksum(header)
+      verifyRestrictedUstarHeader(header)
       const name = tarString(header, 0, 100)
       const prefix = tarString(header, 345, 155)
       const path = prefix ? `${prefix}/${name}` : name
-      const type = header[156]
-      if (type !== 0 && type !== 0x30) failure('archive_entry_invalid')
       if (!safeConverterPackEntryPath(path)) failure('archive_entry_invalid')
-      const collisionKey = path.toLowerCase()
+      const collisionKey = converterPackPortablePathKey(path)
       if (seen.has(collisionKey)) failure('archive_entry_invalid')
       const expectedEntry = expected.get(path)
       if (!expectedEntry) failure('archive_entry_invalid')
-      const size = tarOctal(header, 124, 12)
-      const mode = tarOctal(header, 100, 8) & 0o7777
+      const size = restrictedTarOctal(header, 124, 12)
+      const mode = restrictedTarOctal(header, 100, 8)
       const expectedMode = expectedEntry.executable ? 0o755 : 0o644
       if (size !== expectedEntry.bytes || mode !== expectedMode || size > limits.maxEntryBytes) {
         failure('archive_entry_invalid')
@@ -447,9 +511,9 @@ export class ConverterPackManager {
   private readonly maxRedirects: number
   private readonly requestTimeoutMs: number
   private readonly limits: ConverterPackVerificationLimits
+  private readonly sequencePersistence: ConverterPackSequencePersistence
   private initializePromise?: Promise<void>
   private canonicalRoot?: string
-  private indexTail = Promise.resolve()
   private lifecycleTail = Promise.resolve()
   private readonly inFlight = new Map<string, Promise<InstalledPack>>()
   private readonly activeLeases = new Map<string, number>()
@@ -468,6 +532,7 @@ export class ConverterPackManager {
     this.maxRedirects = options.maxRedirects ?? 3
     this.requestTimeoutMs = options.requestTimeoutMs ?? defaultRequestTimeoutMs
     this.limits = { ...DEFAULT_CONVERTER_PACK_LIMITS, ...options.limits }
+    this.sequencePersistence = options.sequencePersistence ?? nodeSequencePersistence
     if (
       typeof options.packsRoot !== 'string'
       || options.packsRoot.length === 0
@@ -510,18 +575,52 @@ export class ConverterPackManager {
     const directory = await ensureChildDirectory(this.root(), [sequenceDirectoryName])
     let highest = 0
     for (const entry of await readdir(directory, { withFileTypes: true })) {
-      if (!entry.isFile() || !/^(?:0|[1-9]\d*)$/u.test(entry.name)) failure('sequence_state_invalid')
+      if (sequencePartialPattern.test(entry.name)) {
+        try {
+          await rm(join(directory, entry.name), { force: true })
+        } catch {
+          failure('sequence_state_invalid')
+        }
+        continue
+      }
+      if (!entry.isFile() || !sequenceMarkerPattern.test(entry.name)) failure('sequence_state_invalid')
       const sequence = Number(entry.name)
       if (!Number.isSafeInteger(sequence)) failure('sequence_state_invalid')
+      try {
+        if (await readFile(join(directory, entry.name), 'utf8') !== `${entry.name}\n`) failure('sequence_state_invalid')
+      } catch (error) {
+        if (error instanceof ConverterPackError) throw error
+        failure('sequence_state_invalid')
+      }
       highest = Math.max(highest, sequence)
     }
     return highest
   }
 
+  private async persistSequence(directory: string, sequence: number): Promise<void> {
+    const temporaryPath = join(directory, `.sequence-${sequence}.partial-${randomUUID()}`)
+    const markerPath = join(directory, String(sequence))
+    let handle: ConverterPackSequenceFile | undefined
+    try {
+      handle = await this.sequencePersistence.openExclusive(temporaryPath)
+      await handle.write(`${sequence}\n`)
+      await handle.sync()
+      await handle.close()
+      handle = undefined
+      await this.sequencePersistence.rename(temporaryPath, markerPath)
+      await this.sequencePersistence.syncDirectory(directory)
+    } finally {
+      await handle?.close().catch(() => undefined)
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
+    }
+  }
+
   private async verifyAndRecordIndex(signedIndex: SignedConverterPackIndex) {
+    const lockKey = this.root()
     let release!: () => void
-    const previous = this.indexTail
-    this.indexTail = new Promise<void>((resolve) => { release = resolve })
+    const previous = sequenceTails.get(lockKey) ?? Promise.resolve()
+    const current = new Promise<void>((resolve) => { release = resolve })
+    sequenceTails.set(lockKey, current)
     await previous
     try {
       const minimumSequence = await this.highestSequence()
@@ -534,15 +633,12 @@ export class ConverterPackManager {
       })
       if (index.sequence > minimumSequence) {
         const directory = join(this.root(), sequenceDirectoryName)
-        try {
-          await writeFile(join(directory, String(index.sequence)), '', { flag: 'wx', mode: 0o600 })
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-        }
+        await this.persistSequence(directory, index.sequence)
       }
       return index
     } finally {
       release()
+      if (sequenceTails.get(lockKey) === current) sequenceTails.delete(lockKey)
     }
   }
 

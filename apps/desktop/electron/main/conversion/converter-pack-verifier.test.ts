@@ -114,6 +114,12 @@ describe('converter pack index verification', () => {
     ['non-normal path', 'bin/../bin/tool'],
     ['Windows separator', 'bin\\tool'],
     ['Windows reserved name', 'bin/CON'],
+    ['trailing dot', 'bin/tool.'],
+    ['trailing space', 'bin/tool '],
+    ['Windows-forbidden character', 'bin/tool?.exe'],
+    ['control character', 'bin/\u0001tool'],
+    ['drive separator', 'C:/tool'],
+    ['portable-alphabet violation', 'bin/étool'],
     ['non-canonical Unicode path', 'bin/e\u0301tool'],
   ])('rejects an entry with a %s', (_label, path) => {
     const base = fixtureIndex()
@@ -125,13 +131,16 @@ describe('converter pack index verification', () => {
       .toThrowError(expect.objectContaining({ reason: 'index_invalid' }))
   })
 
-  it('rejects duplicate normalized entry paths and duplicate pack coordinates', () => {
+  it('rejects portable-colliding entry paths and duplicate pack coordinates', () => {
     const base = fixtureIndex()
     const duplicateEntries = signed({
       ...base,
       packs: [{
         ...base.packs[0]!,
-        entries: [base.packs[0]!.entries[0]!, { ...base.packs[0]!.entries[0]! }],
+        entries: [
+          base.packs[0]!.entries[0]!,
+          { ...base.packs[0]!.entries[0]!, path: 'BIN/IMAGE-CONVERTER' },
+        ],
       }],
     })
     expect(() => verifyConverterPackIndex({ ...duplicateEntries, minimumSequence: 0 }))
@@ -213,5 +222,21 @@ describe('converter pack index verification', () => {
     expect(selectConverterPack(verified, {
       name: 'image-icon', platform: 'darwin', arch: 'arm64',
     }).version).toBe('9007199254740993.0.0')
+  })
+
+  it('prefers a stable version with hyphenated build metadata over its prerelease', () => {
+    const base = fixtureIndex()
+    const index = {
+      ...base,
+      packs: [
+        { ...base.packs[0]!, version: '1.0.0+build-1' },
+        { ...base.packs[0]!, version: '1.0.0-rc.1' },
+      ],
+    }
+    const fixture = signed(index)
+    const verified = verifyConverterPackIndex({ ...fixture, minimumSequence: 0 })
+    expect(selectConverterPack(verified, {
+      name: 'image-icon', platform: 'darwin', arch: 'arm64',
+    }).version).toBe('1.0.0+build-1')
   })
 })

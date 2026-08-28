@@ -43,6 +43,10 @@ const packNames = new Set<string>(CONVERTER_PACK_NAMES)
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const semverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u
 const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
+// Signed pack paths are portable identifiers, not arbitrary host paths. This
+// deliberately limits every segment to ASCII letters, digits, dot, dash, and
+// underscore so the same signed name has one meaning on macOS and Windows.
+const portablePathSegment = /^[A-Za-z0-9._-]+$/u
 
 function failure(reason: ConstructorParameters<typeof ConverterPackError>[0]): never {
   throw new ConverterPackError(reason)
@@ -146,11 +150,18 @@ export function safeConverterPackEntryPath(value: unknown): value is string {
     segment.length > 0
     && segment !== '.'
     && segment !== '..'
+    && portablePathSegment.test(segment)
     && !segment.endsWith('.')
     && !segment.endsWith(' ')
     && !segment.includes(':')
     && !reservedWindowsName.test(segment)
   ))
+}
+
+export function converterPackPortablePathKey(value: string): string {
+  // safeConverterPackEntryPath restricts this input to ASCII, making this a
+  // complete portable case-fold rather than a locale-dependent approximation.
+  return value.toLowerCase()
 }
 
 function verificationLimits(input: Partial<ConverterPackVerificationLimits> | undefined): ConverterPackVerificationLimits {
@@ -193,7 +204,7 @@ function validatePack(value: unknown, limits: ConverterPackVerificationLimits): 
       || !boundedNonNegativeInteger(entry.bytes, limits.maxEntryBytes)
       || typeof entry.executable !== 'boolean'
     ) failure('index_invalid')
-    const collisionKey = entry.path.toLowerCase()
+    const collisionKey = converterPackPortablePathKey(entry.path)
     if (paths.has(collisionKey)) failure('index_invalid')
     paths.add(collisionKey)
     expandedBytes += entry.bytes
@@ -278,8 +289,14 @@ function compareSemanticVersions(left: string, right: string): number {
     const rightIdentifier = BigInt(rightMain[index]!)
     if (leftIdentifier !== rightIdentifier) return leftIdentifier < rightIdentifier ? -1 : 1
   }
-  const leftPre = left.includes('-') ? left.slice(left.indexOf('-') + 1).split('+', 1)[0]!.split('.') : undefined
-  const rightPre = right.includes('-') ? right.slice(right.indexOf('-') + 1).split('+', 1)[0]!.split('.') : undefined
+  const prerelease = (version: string): string[] | undefined => {
+    const metadataStart = version.indexOf('+')
+    const semanticVersion = metadataStart === -1 ? version : version.slice(0, metadataStart)
+    const prereleaseStart = semanticVersion.indexOf('-')
+    return prereleaseStart === -1 ? undefined : semanticVersion.slice(prereleaseStart + 1).split('.')
+  }
+  const leftPre = prerelease(left)
+  const rightPre = prerelease(right)
   if (!leftPre || !rightPre) return leftPre ? -1 : rightPre ? 1 : 0
   for (let index = 0; index < Math.max(leftPre.length, rightPre.length); index += 1) {
     const leftIdentifier = leftPre[index]

@@ -6,9 +6,11 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -20,7 +22,11 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ConverterPackManager, type ConverterPackManagerOptions } from './converter-pack-manager.js'
+import {
+  ConverterPackManager,
+  type ConverterPackManagerOptions,
+  type ConverterPackSequencePersistence,
+} from './converter-pack-manager.js'
 import type {
   ConverterPackEntry,
   ConverterPackIndex,
@@ -41,6 +47,8 @@ interface TarEntry {
   mode?: number
   type?: '0' | '1' | '2'
   linkName?: string
+  magic?: string
+  version?: string
 }
 
 const roots: string[] = []
@@ -99,8 +107,8 @@ function tar(entries: readonly TarEntry[]): Buffer {
     block.fill(0x20, 148, 156)
     writeString(block, 156, 1, entry.type ?? '0')
     writeString(block, 157, 100, entry.linkName ?? '')
-    writeString(block, 257, 6, 'ustar\0')
-    writeString(block, 263, 2, '00')
+    writeString(block, 257, 6, entry.magic ?? 'ustar\0')
+    writeString(block, 263, 2, entry.version ?? '00')
     const checksum = block.reduce((sum, value) => sum + value, 0)
     writeString(block, 148, 8, `${checksum.toString(8).padStart(6, '0')}\0 `)
     chunks.push(block, bytes)
@@ -259,6 +267,13 @@ describe('ConverterPackManager download and installation', () => {
     ['absolute', '/tmp/escape'],
     ['traversal', '../escape'],
     ['non-normal', 'bin/../escape'],
+    ['Windows separator', 'bin\\escape'],
+    ['drive separator', 'C:/escape'],
+    ['trailing dot', 'bin/tool.'],
+    ['trailing space', 'bin/tool '],
+    ['Windows-forbidden', 'bin/tool?.exe'],
+    ['control-character', 'bin/\u0001tool'],
+    ['non-portable Unicode', 'bin/étool'],
   ])('rejects a %s archive entry path before writing it', async (_label, maliciousPath) => {
     const packsRoot = await temporaryRoot()
     const keyPair = generateKeyPairSync('ed25519')
@@ -289,12 +304,28 @@ describe('ConverterPackManager download and installation', () => {
     })).rejects.toMatchObject({ reason: 'archive_entry_invalid' })
   })
 
+  it.each([
+    ['invalid USTAR magic', { magic: 'notar\0' }],
+    ['invalid USTAR version', { version: '99' }],
+    ['mode with file-type bits', { mode: 0o100755 }],
+  ])('rejects %s', async (_label, headerOverride) => {
+    const packsRoot = await temporaryRoot()
+    const keyPair = generateKeyPairSync('ed25519')
+    const executable = Buffer.from('fixture executable\n')
+    const archive = tar([{ path: 'bin/tool', bytes: executable, ...headerOverride }])
+    const { port } = await listen((_request, response) => response.end(archive))
+    const signed = signedIndex({ archive, archiveUrl: `https://127.0.0.1:${port}/pack.tar`, ...keyPair })
+    await expect(manager(packsRoot, keyPair.publicKey.export({ type: 'spki', format: 'pem' })).acquire({
+      signedIndex: signed, name: 'image-icon', version: '1.0.0',
+    })).rejects.toMatchObject({ reason: 'archive_entry_invalid' })
+  })
+
   it('rejects duplicate, undeclared, and extra-executable archive entries', async () => {
     const keyPair = generateKeyPairSync('ed25519')
     const publicKey = keyPair.publicKey.export({ type: 'spki', format: 'pem' })
     const executable = Buffer.from('fixture executable\n')
     const archives = [
-      tar([{ path: 'bin/tool', bytes: executable }, { path: 'bin/tool', bytes: executable }]),
+      tar([{ path: 'bin/tool', bytes: executable }, { path: 'BIN/TOOL', bytes: executable }]),
       tar([{ path: 'bin/extra', bytes: executable }]),
       tar([{ path: 'bin/tool', bytes: executable, mode: 0o755 }]),
     ]
@@ -430,6 +461,125 @@ describe('ConverterPackManager download and installation', () => {
       signedIndex: rollback, name: 'image-icon', version: '1.0.0',
     })).rejects.toMatchObject({ reason: 'index_rollback' })
   })
+
+  it('persists a sequence through file sync, atomic rename, then directory sync', async () => {
+    const packsRoot = await temporaryRoot()
+    const keyPair = generateKeyPairSync('ed25519')
+    const archive = tar([{ path: 'bin/tool', bytes: Buffer.from('fixture executable\n') }])
+    const { port } = await listen((_request, response) => response.end(archive))
+    const sequenceRoot = join(await realpath(packsRoot), '.index-sequences')
+    const events: string[] = []
+    let temporaryPath = ''
+    const sequencePersistence: ConverterPackSequencePersistence = {
+      openExclusive: async (path) => {
+        expect(dirname(path)).toBe(sequenceRoot)
+        expect(path).toMatch(/\/\.sequence-8\.partial-[0-9a-f-]{36}$/u)
+        temporaryPath = path
+        events.push('open')
+        return {
+          write: async (value) => {
+            expect(value).toBe('8\n')
+            events.push('write')
+          },
+          sync: async () => { events.push('sync-file') },
+          close: async () => { events.push('close-file') },
+        }
+      },
+      rename: async (source, destination) => {
+        expect(source).toBe(temporaryPath)
+        expect(destination).toBe(join(sequenceRoot, '8'))
+        events.push('rename')
+      },
+      syncDirectory: async (path) => {
+        expect(path).toBe(sequenceRoot)
+        events.push('sync-directory')
+      },
+    }
+    const signed = signedIndex({
+      archive, archiveUrl: `https://127.0.0.1:${port}/pack.tar`, sequence: 8, ...keyPair,
+    })
+    const lease = await manager(
+      packsRoot,
+      keyPair.publicKey.export({ type: 'spki', format: 'pem' }),
+      { sequencePersistence },
+    ).acquire({ signedIndex: signed, name: 'image-icon', version: '1.0.0' })
+    lease.release()
+    expect(events).toEqual(['open', 'write', 'sync-file', 'close-file', 'rename', 'sync-directory'])
+  })
+
+  it('serializes sequence persistence across managers sharing one root', async () => {
+    const packsRoot = await temporaryRoot()
+    const keyPair = generateKeyPairSync('ed25519')
+    const publicKey = keyPair.publicKey.export({ type: 'spki', format: 'pem' })
+    const archive = tar([{ path: 'bin/tool', bytes: Buffer.from('fixture executable\n') }])
+    const { port } = await listen((_request, response) => response.end(archive))
+    let reachedRename!: () => void
+    let allowRename!: () => void
+    const renameReached = new Promise<void>((resolve) => { reachedRename = resolve })
+    const renameGate = new Promise<void>((resolve) => { allowRename = resolve })
+    const highPersistence: ConverterPackSequencePersistence = {
+      openExclusive: async (path) => {
+        const handle = await open(path, 'wx', 0o600)
+        return {
+          write: async (value) => { await handle.writeFile(value, 'utf8') },
+          sync: async () => { await handle.sync() },
+          close: async () => { await handle.close() },
+        }
+      },
+      rename: async (source, destination) => {
+        reachedRename()
+        await renameGate
+        await rename(source, destination)
+      },
+      syncDirectory: async (path) => {
+        const handle = await open(path, 'r')
+        try {
+          await handle.sync()
+        } finally {
+          await handle.close()
+        }
+      },
+    }
+    const highManager = manager(packsRoot, publicKey, { sequencePersistence: highPersistence })
+    const lowManager = manager(packsRoot, publicKey)
+    await Promise.all([highManager.initialize(), lowManager.initialize()])
+    const high = signedIndex({
+      archive, archiveUrl: `https://127.0.0.1:${port}/high.tar`, sequence: 8, version: '8.0.0', ...keyPair,
+    })
+    const low = signedIndex({
+      archive, archiveUrl: `https://127.0.0.1:${port}/low.tar`, sequence: 7, version: '7.0.0', ...keyPair,
+    })
+
+    const highAcquiring = highManager.acquire({ signedIndex: high, name: 'image-icon', version: '8.0.0' })
+    await renameReached
+    const lowAcquiring = lowManager.acquire({ signedIndex: low, name: 'image-icon', version: '7.0.0' })
+    const lowRejected = expect(lowAcquiring).rejects.toMatchObject({ reason: 'index_rollback' })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    allowRename()
+
+    const highLease = await highAcquiring
+    highLease.release()
+    await lowRejected
+  })
+
+  it('cleans an exact stale sequence temp and still rejects below a committed marker', async () => {
+    const packsRoot = await temporaryRoot()
+    const sequenceRoot = join(packsRoot, '.index-sequences')
+    const staleTemp = join(sequenceRoot, '.sequence-9.partial-123e4567-e89b-42d3-a456-426614174000')
+    await mkdir(sequenceRoot, { recursive: true })
+    await writeFile(join(sequenceRoot, '8'), '8\n')
+    await writeFile(staleTemp, '9\n')
+    const keyPair = generateKeyPairSync('ed25519')
+    const archive = tar([{ path: 'bin/tool', bytes: Buffer.from('fixture executable\n') }])
+    const { port } = await listen((_request, response) => response.end(archive))
+    const rollback = signedIndex({
+      archive, archiveUrl: `https://127.0.0.1:${port}/pack.tar`, sequence: 7, ...keyPair,
+    })
+    await expect(manager(packsRoot, keyPair.publicKey.export({ type: 'spki', format: 'pem' })).acquire({
+      signedIndex: rollback, name: 'image-icon', version: '1.0.0',
+    })).rejects.toMatchObject({ reason: 'index_rollback' })
+    expect(await exists(staleTemp)).toBe(false)
+  })
 })
 
 describe('ConverterPackManager cleanup and fixture tooling', () => {
@@ -487,6 +637,32 @@ describe('ConverterPackManager cleanup and fixture tooling', () => {
     expect(await exists(join(packsRoot, 'image-icon/1.0.0'))).toBe(false)
     expect(await exists(join(packsRoot, 'image-icon/2.0.0/darwin-arm64'))).toBe(true)
     expect(await exists(join(packsRoot, 'image-icon/3.0.0/darwin-arm64'))).toBe(true)
+  })
+
+  it('retains stable hyphenated build metadata as current and the highest prerelease as previous', async () => {
+    const packsRoot = await temporaryRoot()
+    const keyPair = generateKeyPairSync('ed25519')
+    const publicKey = keyPair.publicKey.export({ type: 'spki', format: 'pem' })
+    const archive = tar([{ path: 'bin/tool', bytes: Buffer.from('fixture executable\n') }])
+    const { port } = await listen((_request, response) => response.end(archive))
+    const packManager = manager(packsRoot, publicKey)
+    const versions = ['1.0.0+build-1', '1.0.0-rc.1', '1.0.0-rc.2']
+    for (const [index, version] of versions.entries()) {
+      const signed = signedIndex({
+        archive,
+        archiveUrl: `https://127.0.0.1:${port}/${encodeURIComponent(version)}.tar`,
+        sequence: index + 1,
+        version,
+        ...keyPair,
+      })
+      const lease = await packManager.acquire({ signedIndex: signed, name: 'image-icon', version })
+      lease.release()
+    }
+
+    await packManager.cleanup()
+    expect(await exists(join(packsRoot, 'image-icon/1.0.0+build-1/darwin-arm64'))).toBe(true)
+    expect(await exists(join(packsRoot, 'image-icon/1.0.0-rc.2/darwin-arm64'))).toBe(true)
+    expect(await exists(join(packsRoot, 'image-icon/1.0.0-rc.1/darwin-arm64'))).toBe(false)
   })
 
   it('does not remove a version whose acquire becomes active during cleanup', async () => {
