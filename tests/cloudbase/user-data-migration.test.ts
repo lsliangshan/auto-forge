@@ -75,6 +75,18 @@ function evaluateModeGuard(guard: string, mode: unknown): boolean {
   return !allowed.includes(mode)
 }
 
+function applyFunctionReplacements(definition: string, migration: string): string {
+  const replacements = [...migration.matchAll(
+    /\$old\$([\s\S]*?)\$old\$,\s*\$new\$([\s\S]*?)\$new\$/g,
+  )]
+  expect(replacements.length).toBeGreaterThan(0)
+  return replacements.reduce((current, replacement) => {
+    const next = current.replace(replacement[1], replacement[2])
+    expect(next, `replacement anchor was not found: ${replacement[1]}`).not.toBe(current)
+    return next
+  }, definition)
+}
+
 describe('CloudBase user data migration', () => {
   it('keeps the canonical and deployable migrations byte-identical', async () => {
     const [canonical, featureCopy] = await Promise.all([
@@ -450,15 +462,21 @@ describe('CloudBase user data migration', () => {
   })
 
   it('ships a mirrored additive consent-state migration with purpose OCC and data-preserving rollback', async () => {
-    const numbered = await readFile(new URL(
-      '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.sql', import.meta.url,
-    ), 'utf8')
-    const deployed = await readFile(new URL(
-      '../../cloudbase/migrations/20260828230000_privacy_consent_revocation.sql', import.meta.url,
-    ), 'utf8')
-    const rollback = await readFile(new URL(
-      '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.rollback.sql', import.meta.url,
-    ), 'utf8')
+    const [foundation, knowledgePreferences, numbered, deployed, rollback] = await Promise.all([
+      readFile(featureUrl, 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/user-data/migrations/0002_conversation_knowledge_preferences.sql', import.meta.url,
+      ), 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.sql', import.meta.url,
+      ), 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/migrations/20260828230000_privacy_consent_revocation.sql', import.meta.url,
+      ), 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.rollback.sql', import.meta.url,
+      ), 'utf8'),
+    ])
 
     expect(numbered).toBe(deployed)
     expect(numbered).toContain('CREATE TABLE IF NOT EXISTS app_privacy_consent_states')
@@ -477,6 +495,16 @@ describe('CloudBase user data migration', () => {
     )
     expect(numbered).not.toMatch(/GRANT .* ON TABLE/i)
     expect(rollback).not.toMatch(/DROP TABLE|TRUNCATE|DELETE FROM/i)
+
+    const originalSyncPush = extractFunction(foundation, 'autoforge_sync_push')
+    const preConsentSyncPush = applyFunctionReplacements(originalSyncPush, knowledgePreferences)
+    const forwardSyncPush = applyFunctionReplacements(preConsentSyncPush, numbered)
+    expect(forwardSyncPush).toContain("'privacy.consent.revoke'")
+    expect(forwardSyncPush).toContain('autoforge_apply_privacy_consent_mutation')
+    const rolledBackSyncPush = applyFunctionReplacements(forwardSyncPush, rollback)
+    expect(rolledBackSyncPush).toBe(preConsentSyncPush)
+    expect(rolledBackSyncPush).not.toContain("'privacy.consent.revoke'")
+    expect(rolledBackSyncPush).not.toContain('autoforge_apply_privacy_consent_mutation')
   })
 
   it('replays a post-purge stale conflict verbatim after a lost response', async () => {
