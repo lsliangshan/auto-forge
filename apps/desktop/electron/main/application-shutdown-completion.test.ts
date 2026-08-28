@@ -5,6 +5,28 @@ import {
 } from './application-shutdown-completion.js'
 
 describe('application shutdown completion', () => {
+  it('waits for conversion drain before closing application and user databases', async () => {
+    let releaseStop!: () => void
+    const stop = new Promise<void>((resolve) => { releaseStop = resolve })
+    const order: string[] = []
+
+    const completion = closeDesktopApplicationResources({
+      stopConversionJobs: async () => {
+        order.push('stop-conversions')
+        await stop
+      },
+      closeApplication: async () => { order.push('application') },
+      resetUserDataStores: () => { order.push('reset-user-stores') },
+      closeUserDataStores: () => { order.push('close-user-stores') },
+    })
+
+    await Promise.resolve()
+    expect(order).toEqual(['stop-conversions'])
+    releaseStop()
+    await completion
+    expect(order).toEqual(['stop-conversions', 'application', 'reset-user-stores', 'close-user-stores'])
+  })
+
   it('closes and resets user stores after application close rejects while preserving that error', async () => {
     const applicationFailure = new Error('application close failed')
     const userStoreFailure = new Error('user store close failed')

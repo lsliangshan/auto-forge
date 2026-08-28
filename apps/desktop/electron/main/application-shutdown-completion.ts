@@ -6,20 +6,30 @@ export interface ApplicationShutdownCompletionOptions {
 }
 
 export interface DesktopApplicationResourceCloseOptions {
+  stopConversionJobs?(): Promise<void>
   closeApplication?(): Promise<void>
   closeUserDataStores?(): void
   resetUserDataStores(): void
 }
 
 export async function closeDesktopApplicationResources({
+  stopConversionJobs,
   closeApplication,
   closeUserDataStores,
   resetUserDataStores,
 }: DesktopApplicationResourceCloseOptions): Promise<void> {
+  let conversionFailure: unknown
+  let conversionRejected = false
   let applicationFailure: unknown
   let applicationRejected = false
   let userStoreFailure: unknown
   let userStoreCloseRejected = false
+  try {
+    await stopConversionJobs?.()
+  } catch (error) {
+    conversionFailure = error
+    conversionRejected = true
+  }
   try {
     await closeApplication?.()
   } catch (error) {
@@ -34,6 +44,7 @@ export async function closeDesktopApplicationResources({
       userStoreCloseRejected = true
     }
   }
+  if (conversionRejected) throw conversionFailure
   if (applicationRejected) throw applicationFailure
   if (userStoreCloseRejected) throw userStoreFailure
 }
