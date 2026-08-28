@@ -142,7 +142,12 @@ function restoreNumericPunctuation(value: string): string {
     .replaceAll(NUMERIC_CJK_COMMA, '，')
 }
 
-function splitKnowledgeClaimGroups(answer: string): string[][] {
+interface KnowledgeClaimGroup {
+  raw: string
+  fragments: string[]
+}
+
+function splitKnowledgeClaimGroups(answer: string): KnowledgeClaimGroup[] {
   const sentences = protectNumericPunctuation(answer)
     .split(/(?<=[。！？.!?])|\n+/gu)
     .map(part => part.trim())
@@ -164,7 +169,7 @@ function splitKnowledgeClaimGroups(answer: string): string[][] {
       protectedMarkers.push(marker)
       return `\u{e000}${protectedMarkers.length - 1}\u{e001}`
     })
-    return protectedSentence
+    const fragments = protectedSentence
       .split(/[，,；;：:]/gu)
       .flatMap(part => part.split(/(?=(?:但是|但|然而|不过|而且|并且|同时|以及|且|所以|因此)|\b(?=(?:and|or|but|however|while|whereas|although|though|yet|also|moreover)\b))/giu))
       .map(part => part.trim())
@@ -174,6 +179,7 @@ function splitKnowledgeClaimGroups(answer: string): string[][] {
       .map(claim => propagatedMarker && !/\[\[kb:[^\]\r\n]{1,512}\]\]/u.test(claim)
         ? `${claim}${propagatedMarker}`
         : claim)
+    return { raw: restoreNumericPunctuation(sentence), fragments }
   })
 }
 
@@ -216,11 +222,106 @@ function canonicalSupportText(value: string): string {
   return canonicalizeChineseRelation(normalized)
 }
 
-function splitEvidenceClauses(value: string): string[] {
-  return protectNumericPunctuation(value)
-    .split(/[。！？!?；;，,\n]+/gu)
-    .map(part => restoreNumericPunctuation(part.trim()))
-    .filter(Boolean)
+interface FactTuple {
+  subject: string
+  relation: string
+  object: string
+}
+
+function normalizedTuplePart(value: string): string {
+  return canonicalSupportText(value).replace(/\s+/gu, '')
+}
+
+function factTuple(rawValue: string): FactTuple | undefined {
+  const value = normalizedSupportText(rawValue)
+    .replace(/^(?:(?:但是|但|然而|不过|而且|并且|同时|以及|且)|\b(?:and|also|moreover)\b)\s*/iu, '')
+    .replace(/[。！？.!?]+$/gu, '')
+    .trim()
+  if (!value) return undefined
+
+  const effective = value.match(/^(.{1,160}?)(?:于\s*([0-9][0-9./:-]{3,31})\s*生效|生效日期(?:为|是)\s*([0-9][0-9./:-]{3,31}))$/u)
+  if (effective) {
+    return {
+      subject: normalizedTuplePart(effective[1]!),
+      relation: 'effective',
+      object: effective[2] ?? effective[3]!,
+    }
+  }
+
+  const location = value.match(/^(.{1,160}?)(?:地点(?:为|是)|位于)(.{1,240})$/u)
+  if (location) {
+    return {
+      subject: normalizedTuplePart(location[1]!),
+      relation: 'location',
+      object: location[2]!,
+    }
+  }
+
+  const field = value.match(/^(.{1,160}?)[：:]\s*(.{1,240})$/u)
+  if (field) {
+    return {
+      subject: normalizedTuplePart(field[1]!),
+      relation: 'attribute',
+      object: field[2]!,
+    }
+  }
+
+  const chineseAttribute = value.match(/^(.{1,160}?)(?:为|是|包括)(.{1,240})$/u)
+  if (chineseAttribute && !/[因认作成视所以较极尤甚不若各自无]$/u.test(chineseAttribute[1]!)) {
+    return {
+      subject: normalizedTuplePart(chineseAttribute[1]!),
+      relation: 'attribute',
+      object: chineseAttribute[2]!,
+    }
+  }
+
+  const englishAttribute = value.match(/^(.{1,160}?)\s+(?:is|are|was|were)\s+(.{1,240})$/iu)
+  if (englishAttribute) {
+    return {
+      subject: normalizedTuplePart(englishAttribute[1]!),
+      relation: 'attribute',
+      object: englishAttribute[2]!,
+    }
+  }
+
+  const chineseRelation = value.match(/^(.{1,160}?)(支持|允许|禁止|适用)(.{1,240})$/u)
+  if (chineseRelation) {
+    return {
+      subject: normalizedTuplePart(chineseRelation[1]!),
+      relation: normalizedTuplePart(chineseRelation[2]!),
+      object: chineseRelation[3]!,
+    }
+  }
+
+  const englishRelation = value.match(/^(.{1,160}?)\s+(does not permit|forbids?|permits?|prohibits?|supports?|allows?|authori[sz]es?)\s+(.{1,240})$/iu)
+  if (englishRelation) {
+    return {
+      subject: normalizedTuplePart(englishRelation[1]!),
+      relation: normalizedTuplePart(englishRelation[2]!),
+      object: englishRelation[3]!,
+    }
+  }
+  return undefined
+}
+
+function splitIndependentFacts(value: string): string[] {
+  const facts: string[] = []
+  for (const sentence of protectNumericPunctuation(value).split(/[。！？!?；;\n]+/gu)) {
+    const pieces = sentence.split(/(并且|以及|同时|而且|且|，|,|、|\band\b)/giu)
+    let current = pieces.shift()?.trim() ?? ''
+    while (pieces.length >= 2) {
+      const connector = pieces.shift() ?? ''
+      const next = pieces.shift()?.trim() ?? ''
+      if (current && next && factTuple(restoreNumericPunctuation(current)) && factTuple(restoreNumericPunctuation(next))) {
+        facts.push(restoreNumericPunctuation(current))
+        current = next
+      } else {
+        current = `${current}${connector}${next}`
+      }
+    }
+    if (current.trim()) facts.push(restoreNumericPunctuation(current.trim()))
+  }
+  return facts
 }
 
 interface ClaimPolarity {
@@ -377,10 +478,30 @@ function clauseSupportsClaim(rawClaim: string, rawEvidence: string): boolean {
   return true
 }
 
+function factTupleSupports(claim: FactTuple, evidence: FactTuple): boolean {
+  return claim.subject === evidence.subject
+    && claim.relation === evidence.relation
+    && (
+      canonicalSupportText(claim.object) === canonicalSupportText(evidence.object)
+      || clauseSupportsClaim(claim.object, evidence.object)
+    )
+}
+
+function evidenceSupportsTupleGroup(rawGroup: string, evidence: KnowledgeEvidence): boolean {
+  const answerTuples = splitIndependentFacts(rawGroup.replace(KNOWLEDGE_MARKER, ''))
+    .map(factTuple)
+    .filter((tuple): tuple is FactTuple => tuple !== undefined)
+  if (answerTuples.length === 0) return true
+  const evidenceTuples = splitIndependentFacts(sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000))
+    .map(factTuple)
+    .filter((tuple): tuple is FactTuple => tuple !== undefined)
+  return answerTuples.every(claim => evidenceTuples.some(item => factTupleSupports(claim, item)))
+}
+
 function supportingClauseIndexes(claim: string, evidence: KnowledgeEvidence): number[] {
   const rawClaim = claim.replace(KNOWLEDGE_MARKER, '').slice(0, 4_000)
   const rawEvidence = sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000)
-  return splitEvidenceClauses(rawEvidence).flatMap((clause, index) => (
+  return splitIndependentFacts(rawEvidence).flatMap((clause, index) => (
     clauseSupportsClaim(rawClaim, clause) ? [index] : []
   ))
 }
@@ -417,13 +538,14 @@ export function validateKnowledgeAnswer(
   }
   const evidenceById = new Map(evidence.map(item => [item.id, item]))
   const claimGroups = splitKnowledgeClaimGroups(answer).map((group) => {
-    const citedIds = group.flatMap(claim => [...claim.matchAll(KNOWLEDGE_MARKER)].map(match => match[1]!))
+    const citedIds = group.fragments.flatMap(claim => [...claim.matchAll(KNOWLEDGE_MARKER)].map(match => match[1]!))
       .filter((id, index, values) => values.indexOf(id) === index)
     const commonSupportingIds = citedIds.filter((id) => {
       const item = evidenceById.get(id)
       if (!item) return false
+      if (!evidenceSupportsTupleGroup(group.raw, item)) return false
       let common: Set<number> | undefined
-      for (const claim of group) {
+      for (const claim of group.fragments) {
         const supported = new Set(supportingClauseIndexes(claim, item))
         common = common === undefined
           ? supported
@@ -432,7 +554,7 @@ export function validateKnowledgeAnswer(
       }
       return (common?.size ?? 0) > 0
     })
-    const fragments = group.map((claim) => {
+    const fragments = group.fragments.map((claim) => {
       const ids = [...claim.matchAll(KNOWLEDGE_MARKER)].map(match => match[1]!)
       return {
         text: claim.replace(KNOWLEDGE_MARKER, '').trim(),

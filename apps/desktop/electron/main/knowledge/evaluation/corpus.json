@@ -25,7 +25,8 @@
       { "id": "holdout-en-permission", "evidence": "The agreement authorizes early termination.", "claim": "The contract permits early termination." },
       { "id": "holdout-en-prohibition", "evidence": "The contract forbids external disclosure.", "claim": "The contract prohibits external disclosure." },
       { "id": "holdout-copula-model", "evidence": "备用机型为 AF-LOCAL-9。", "claim": "备用机型是 AF-LOCAL-9。" },
-      { "id": "holdout-same-clause-list", "evidence": "甲方设备可用颜色包括红色、蓝色、绿色。", "claim": "甲方设备可用颜色：红色、蓝色、绿色。" }
+      { "id": "holdout-same-clause-list", "evidence": "甲方设备可用颜色包括红色、蓝色、绿色。", "claim": "甲方设备可用颜色：红色、蓝色、绿色。" },
+      { "id": "holdout-one-subject-value-list", "evidence": "甲方支持红色、蓝色。", "claim": "甲方支持红色、蓝色。" }
     ],
     "grounding": [
       { "id": "holdout-cross-color", "evidence": "甲方设备颜色为红色。乙方设备颜色为蓝色。", "claim": "甲方设备颜色为蓝色。" },
@@ -35,6 +36,12 @@
       { "id": "holdout-cross-color-colon", "evidence": "甲方设备颜色为红色。乙方设备颜色为蓝色。", "claim": "甲方设备颜色：蓝色。" },
       { "id": "holdout-cross-color-comma", "evidence": "甲方设备颜色为红色。乙方设备颜色为蓝色。", "claim": "甲方设备颜色，蓝色。" },
       { "id": "holdout-cross-color-list", "evidence": "甲方设备颜色为红色。乙方设备颜色为蓝色。", "claim": "设备颜色清单：甲方设备、蓝色。" },
+      { "id": "holdout-cross-color-and", "evidence": "甲方设备颜色为红色且乙方设备颜色为蓝色。", "claim": "甲方设备颜色：蓝色。" },
+      { "id": "holdout-cross-color-conjunction", "evidence": "甲方设备颜色为红色并且乙方设备颜色为蓝色。", "claim": "甲方设备颜色：蓝色。" },
+      { "id": "holdout-cross-color-and-also", "evidence": "甲方设备颜色为红色以及乙方设备颜色为蓝色。", "claim": "甲方设备颜色：蓝色。" },
+      { "id": "holdout-cross-color-simultaneous", "evidence": "甲方设备颜色为红色同时乙方设备颜色为蓝色。", "claim": "甲方设备颜色：蓝色。" },
+      { "id": "holdout-cross-color-enumeration", "evidence": "甲方设备颜色为红色、乙方设备颜色为蓝色。", "claim": "甲方设备颜色：蓝色。" },
+      { "id": "holdout-cross-color-english-and", "evidence": "Device A color is red and Device B color is blue.", "claim": "Device A color: blue." },
       { "id": "holdout-project-substitution", "evidence": "该智慧园区重点改造项目将持续提升公共服务能力并按年度稳定运营。", "claim": "该智慧园区重点改造工程将持续提升公共服务能力并按年度稳定运营。" },
       { "id": "holdout-product-substitution", "evidence": "最终交付产品为星河知识管理平台企业版本并提供长期维护。", "claim": "最终交付产品为星海知识管理平台企业版本并提供长期维护。" },
       { "id": "holdout-color-substitution", "evidence": "核心设备外壳必须采用深红色防腐涂层并保持技术参数不变。", "claim": "核心设备外壳必须采用深蓝色防腐涂层并保持技术参数不变。" },

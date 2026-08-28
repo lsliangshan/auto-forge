@@ -143,7 +143,7 @@ function success(request: { jobId: string; mediaType: string }) {
 describe('sandbox parser supervisor', () => {
   it('bounds missing startup metrics by a grace shorter than the parser wall timeout', () => {
     expect(PARSER_MEMORY_BOOTSTRAP_GRACE_MS).toBeLessThan(DEFAULT_PARSER_LIMITS.timeoutMs)
-    expect(parserMemoryBootstrapGraceMs(50)).toBe(49)
+    expect(parserMemoryBootstrapGraceMs(50)).toBe(25)
     expect(parserMemoryBootstrapGraceMs(50)).toBeLessThan(50)
     expect(evaluateParserMemorySample({
       startedAt: 10,
@@ -170,6 +170,85 @@ describe('sandbox parser supervisor', () => {
       startedAt: 10, observed: true, now: 21,
       wallTimeoutMs: DEFAULT_PARSER_LIMITS.timeoutMs, bytes: 0,
     })).toEqual({ action: 'fail', observed: true })
+  })
+
+  it('rejects a fast successful result when the final memory sample exceeds the limit', async () => {
+    const h = harness(success, {
+      processMemoryBytes: vi.fn()
+        .mockResolvedValueOnce(16 * 1024 * 1024)
+        .mockResolvedValueOnce(1024 * 1024 * 1024),
+    })
+    await expect(h.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 7),
+      mediaType: 'text/plain',
+      limits: { ...DEFAULT_PARSER_LIMITS, maxMemoryBytes: 32 * 1024 * 1024 },
+    })).rejects.toMatchObject({ code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(h.webContents.postMessage).toHaveBeenCalledOnce()
+  })
+
+  it('fails a fast successful result when process metrics stay missing through bootstrap', async () => {
+    const h = harness(success, {
+      processMemoryBytes: vi.fn(async () => 0),
+    })
+    await expect(h.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 7),
+      mediaType: 'text/plain',
+      limits: { ...DEFAULT_PARSER_LIMITS, timeoutMs: 200 },
+    })).rejects.toMatchObject({ code: 'PARSER_INTERNAL_ERROR' })
+    expect(h.webContents.postMessage).not.toHaveBeenCalled()
+  })
+
+  it('samples memory before request and again before accepting a fast normal result', async () => {
+    const processMemoryBytes = vi.fn(async () => 16 * 1024 * 1024)
+    const h = harness(success, {
+      processMemoryBytes,
+    })
+    await expect(h.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 7),
+      mediaType: 'text/plain',
+      limits: DEFAULT_PARSER_LIMITS,
+    })).resolves.toMatchObject({ text: 'sandbox text' })
+    expect(processMemoryBytes).toHaveBeenCalledTimes(2)
+  })
+
+  it('fails closed when an observed metric is missing at final response acceptance', async () => {
+    const h = harness(success, {
+      processMemoryBytes: vi.fn()
+        .mockResolvedValueOnce(16 * 1024 * 1024)
+        .mockResolvedValueOnce(0),
+    })
+    await expect(h.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 7),
+      mediaType: 'text/plain',
+      limits: DEFAULT_PARSER_LIMITS,
+    })).rejects.toMatchObject({ code: 'PARSER_INTERNAL_ERROR' })
+  })
+
+  it('cancels while a final memory sample waits and clears response frames and ports', async () => {
+    let releaseFinal!: (bytes: number) => void
+    const processMemoryBytes = vi.fn()
+      .mockResolvedValueOnce(16 * 1024 * 1024)
+      .mockImplementationOnce(() => new Promise<number>(resolve => { releaseFinal = resolve }))
+    const h = harness(success, { processMemoryBytes })
+    const controller = new AbortController()
+    const parsing = h.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 7),
+      mediaType: 'text/plain',
+      limits: DEFAULT_PARSER_LIMITS,
+      signal: controller.signal,
+    })
+    await vi.waitFor(() => expect(releaseFinal).toBeTypeOf('function'))
+    controller.abort()
+    await expect(parsing).rejects.toMatchObject({ code: 'PARSER_CANCELLED' })
+    expect(h.responseFrames.every(bytes => bytes.every(byte => byte === 0))).toBe(true)
+    expect(h.port1.close).toHaveBeenCalledOnce()
+    expect(h.port2.close).toHaveBeenCalledOnce()
+    releaseFinal(16 * 1024 * 1024)
   })
 
   it('treats a missing PID or metric as missing rather than a zero-byte observation', () => {

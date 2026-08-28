@@ -291,6 +291,44 @@ describe('knowledge tool and answer validation', () => {
   })
 
   it.each([
+    '甲方设备颜色为红色且乙方设备颜色为蓝色。',
+    '甲方设备颜色为红色并且乙方设备颜色为蓝色。',
+    '甲方设备颜色为红色以及乙方设备颜色为蓝色。',
+    '甲方设备颜色为红色同时乙方设备颜色为蓝色。',
+    '甲方设备颜色为红色、乙方设备颜色为蓝色。',
+  ])('anchors field:value to one fact tuple across evidence connectors: %s', (snippet) => {
+    const splitFacts = evidence(0, { snippet })
+    const answer = '甲方设备颜色：蓝色。[[kb:evidence:0]]'
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it('anchors an English field:value claim across independent facts joined by and', () => {
+    const splitFacts = evidence(0, {
+      snippet: 'Device A color is red and Device B color is blue.',
+    })
+    expect(validateKnowledgeAnswer(
+      'Device A color: blue. [[kb:evidence:0]]', [splitFacts], 'strict', 1,
+    )).toEqual({ kind: 'insufficient', reason: 'unsupported-claim' })
+  })
+
+  it('keeps one-subject value lists as one supported fact tuple', () => {
+    expect(validateKnowledgeAnswer(
+      '甲方支持红色、蓝色。[[kb:evidence:0]]',
+      [evidence(0, { snippet: '甲方支持红色、蓝色。' })],
+      'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
     ['该项目为国家级示范项目。', '该项目是国家级示范项目。'],
     ['数据中心位于北京市海淀区。', '数据中心地点是北京市海淀区。'],
     ['设备外壳颜色为深蓝色。', '设备外壳颜色是深蓝色。'],

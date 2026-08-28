@@ -21,6 +21,7 @@ const OBJECT_HANDLE_PATTERN = /^[0-9a-f]{32}$/
 const SNAPSHOT_MAGIC = Buffer.from('AFKBSNP1', 'ascii')
 const NONCE_BYTES = 12
 export const PARSER_MEMORY_BOOTSTRAP_GRACE_MS = 1_000
+const PARSER_MEMORY_SAMPLE_INTERVAL_MS = 25
 
 interface ParserPort extends EventEmitter {
   start(): void
@@ -81,7 +82,10 @@ export class ParserFailure extends Error {
 }
 
 export function parserMemoryBootstrapGraceMs(wallTimeoutMs: number): number {
-  return Math.min(PARSER_MEMORY_BOOTSTRAP_GRACE_MS, Math.max(1, wallTimeoutMs - 1))
+  return Math.min(
+    PARSER_MEMORY_BOOTSTRAP_GRACE_MS,
+    Math.max(1, wallTimeoutMs - PARSER_MEMORY_SAMPLE_INTERVAL_MS),
+  )
 }
 
 export function evaluateParserMemorySample(input: {
@@ -337,38 +341,74 @@ export class ParserSupervisor {
           if (settled) return
           settled = true
           if (memoryTimer) clearInterval(memoryTimer)
+          if (memoryPollTimer) clearTimeout(memoryPollTimer)
           responseBuffer?.fill(0)
           operation()
         }
         const rejectCode = (code: ParserErrorCode) => settle(() => reject(new ParserFailure(code)))
+        const rejectError = (error: unknown) => rejectCode(
+          error instanceof ParserFailure ? error.code : 'PARSER_INTERNAL_ERROR',
+        )
         cancelResponse = rejectCode
-        let checkingMemory = false
         const memoryStartedAt = performance.now()
+        const memoryWallTimeoutMs = Math.max(1, deadlineAt - memoryStartedAt)
         let memoryObserved = false
-        memoryTimer = setInterval(() => {
-          if (checkingMemory || settled || !parserWindow) return
-          checkingMemory = true
-          void Promise.resolve(this.dependencies.processMemoryBytes(parserWindow))
-            .then((bytes) => {
-              const sample = evaluateParserMemorySample({
-                startedAt: memoryStartedAt,
-                observed: memoryObserved,
-                now: performance.now(),
-                wallTimeoutMs: limits.timeoutMs,
-                bytes,
-              })
-              memoryObserved = sample.observed
-              if (sample.action === 'fail') {
-                rejectCode('PARSER_INTERNAL_ERROR')
-                return
-              }
-              if (bytes > limits.maxMemoryBytes) rejectCode('PARSER_LIMIT_EXCEEDED')
-            })
-            .catch(() => rejectCode('PARSER_INTERNAL_ERROR'))
-            .finally(() => { checkingMemory = false })
-        }, 25)
+        let memoryPollTimer: ReturnType<typeof setTimeout> | undefined
+        let checkingMemory: Promise<void> | undefined
+        const sampleMemory = async (): Promise<'skip' | 'observe'> => {
+          if (!parserWindow) throw new ParserFailure('PARSER_INTERNAL_ERROR')
+          let bytes: number
+          try {
+            bytes = await withinOperation(Promise.resolve(
+              this.dependencies.processMemoryBytes(parserWindow),
+            ))
+          } catch (error) {
+            if (error instanceof ParserFailure) throw error
+            throw new ParserFailure('PARSER_INTERNAL_ERROR')
+          }
+          const sample = evaluateParserMemorySample({
+            startedAt: memoryStartedAt,
+            observed: memoryObserved,
+            now: performance.now(),
+            wallTimeoutMs: memoryWallTimeoutMs,
+            bytes,
+          })
+          memoryObserved = sample.observed
+          if (sample.action === 'fail') throw new ParserFailure('PARSER_INTERNAL_ERROR')
+          if (bytes > limits.maxMemoryBytes) throw new ParserFailure('PARSER_LIMIT_EXCEEDED')
+          return sample.action
+        }
+        const waitForInitialMemory = async () => {
+          while (!memoryObserved) {
+            ensureWithinDeadline()
+            await sampleMemory()
+            if (memoryObserved) return
+            const graceEndsAt = memoryStartedAt + parserMemoryBootstrapGraceMs(memoryWallTimeoutMs)
+            const delayMs = Math.max(0, Math.min(
+              PARSER_MEMORY_SAMPLE_INTERVAL_MS,
+              graceEndsAt - performance.now(),
+            ))
+            if (delayMs === 0) continue
+            await withinOperation(new Promise<void>((resolvePoll) => {
+              memoryPollTimer = setTimeout(() => {
+                memoryPollTimer = undefined
+                resolvePoll()
+              }, delayMs)
+            }))
+          }
+        }
+        const startPeriodicMemoryChecks = () => {
+          memoryTimer = setInterval(() => {
+            if (checkingMemory || settled || !parserWindow) return
+            checkingMemory = sampleMemory()
+              .then(() => undefined)
+              .catch(rejectError)
+              .finally(() => { checkingMemory = undefined })
+          }, PARSER_MEMORY_SAMPLE_INTERVAL_MS)
+        }
+        let responseComplete = false
         port2?.on('message', (event: { data: unknown }) => {
-          if (settled || terminalCode) {
+          if (settled || terminalCode || responseComplete) {
             clearParserResponseChunkBytes(event.data)
             return
           }
@@ -415,6 +455,7 @@ export class ParserSupervisor {
             rejectCode('PARSER_PROTOCOL_INVALID')
             return
           }
+          responseComplete = true
           let parsed: ParserResponse
           try {
             parsed = parseParserResponseBytes(responseBuffer, {
@@ -427,29 +468,49 @@ export class ParserSupervisor {
             return
           } finally {
             responseBuffer.fill(0)
+            responseBuffer = undefined
           }
           if (parsed.type === 'error') rejectCode(parsed.code)
-          else settle(() => resolve(parsed))
+          else {
+            if (memoryTimer) clearInterval(memoryTimer)
+            memoryTimer = undefined
+            void (async () => {
+              try {
+                if (checkingMemory) await checkingMemory
+                if (settled || terminalCode) return
+                await sampleMemory()
+                if (!memoryObserved) throw new ParserFailure('PARSER_INTERNAL_ERROR')
+                settle(() => resolve(parsed))
+              } catch (error) {
+                rejectError(error)
+              }
+            })()
+          }
         })
         port2?.start()
         parserWindow?.webContents.on('render-process-gone', () => rejectCode('PARSER_INTERNAL_ERROR'))
         parserWindow?.webContents.on('unresponsive', () => rejectCode('PARSER_INTERNAL_ERROR'))
 
         parserWindow?.webContents.once('did-finish-load', () => {
-          ensureWithinDeadline()
-          if (settled || terminalCode || cancelled() || !encryptedSnapshot || !parserWindow || !port1) return
-          try {
-            request.encryptedSnapshot = Uint8Array.from(encryptedSnapshot).buffer
-            request.oneTimeKey = Uint8Array.from(input.oneTimeKey).buffer
-            encryptedSnapshot.fill(0)
-            input.oneTimeKey.fill(0)
-            parserWindow.webContents.postMessage('knowledge-parser:request', request, [port1])
-          } catch {
-            rejectCode('PARSER_INTERNAL_ERROR')
-          } finally {
-            clearArrayBuffer(request.encryptedSnapshot)
-            clearArrayBuffer(request.oneTimeKey)
-          }
+          void (async () => {
+            try {
+              ensureWithinDeadline()
+              if (settled || terminalCode || cancelled() || !encryptedSnapshot || !parserWindow || !port1) return
+              await waitForInitialMemory()
+              if (settled || terminalCode || cancelled() || !encryptedSnapshot || !parserWindow || !port1) return
+              startPeriodicMemoryChecks()
+              request.encryptedSnapshot = Uint8Array.from(encryptedSnapshot).buffer
+              request.oneTimeKey = Uint8Array.from(input.oneTimeKey).buffer
+              encryptedSnapshot.fill(0)
+              input.oneTimeKey.fill(0)
+              parserWindow.webContents.postMessage('knowledge-parser:request', request, [port1])
+            } catch (error) {
+              rejectError(error)
+            } finally {
+              clearArrayBuffer(request.encryptedSnapshot)
+              clearArrayBuffer(request.oneTimeKey)
+            }
+          })()
         })
         try {
           void parserWindow?.loadFile(this.dependencies.workerHtmlPath)
