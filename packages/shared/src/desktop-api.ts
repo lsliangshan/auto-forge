@@ -623,6 +623,7 @@ export const syncMutationKindSchema = z.enum([
   'message.append',
   'legacy.import',
   'privacy.consent',
+  'privacy.consent.revoke',
   'preferences.update',
   'usage.record',
 ])
@@ -684,6 +685,25 @@ export const privacyConsentSchema = z.object({
   clientVersion: nonEmptyStringSchema.max(64),
 }).strict()
 export type PrivacyConsent = z.infer<typeof privacyConsentSchema>
+
+export const privacyConsentRevokeSchema = z.object({
+  purpose: privacyConsentPurposeSchema,
+  revokedAt: timestampSchema,
+  clientVersion: nonEmptyStringSchema.max(64),
+}).strict()
+export type PrivacyConsentRevoke = z.infer<typeof privacyConsentRevokeSchema>
+
+export const privacyConsentStateSchema = z.discriminatedUnion('state', [
+  privacyConsentSchema.extend({
+    state: z.literal('accepted'),
+    revision: z.number().int().positive(),
+  }).strict(),
+  privacyConsentRevokeSchema.extend({
+    state: z.literal('revoked'),
+    revision: z.number().int().positive(),
+  }).strict(),
+])
+export type PrivacyConsentState = z.infer<typeof privacyConsentStateSchema>
 
 export const legacyImportConfirmRequestSchema = z.object({
   batchId: identifierSchema,
@@ -1244,6 +1264,11 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...syncMutationBaseShape,
+    kind: z.literal('privacy.consent.revoke'),
+    payload: privacyConsentRevokeSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
     kind: z.literal('preferences.update'),
     payload: accountDataPreferencesSchema,
   }).strict(),
@@ -1264,6 +1289,9 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
       break
     case 'privacy.consent':
       payloadEntityId = mutation.payload.documentVersion
+      break
+    case 'privacy.consent.revoke':
+      payloadEntityId = mutation.payload.purpose
       break
   }
   if (payloadEntityId !== undefined && mutation.entityId !== payloadEntityId) {
@@ -1333,6 +1361,11 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...pulledMutationBaseShape,
+    kind: z.literal('privacy.consent.revoke'),
+    payload: privacyConsentRevokeSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
     kind: z.literal('preferences.update'),
     payload: accountDataPreferencesSchema,
   }).strict(),
@@ -1353,6 +1386,9 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
       break
     case 'privacy.consent':
       payloadEntityId = mutation.payload.documentVersion
+      break
+    case 'privacy.consent.revoke':
+      payloadEntityId = mutation.payload.purpose
       break
   }
   if (payloadEntityId !== undefined && mutation.entityId !== payloadEntityId) {

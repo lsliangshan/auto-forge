@@ -48,6 +48,8 @@ import {
   parseProxyBypassText,
   permissionGrantSchema,
   privacyConsentSchema,
+  privacyConsentRevokeSchema,
+  privacyConsentStateSchema,
   remoteUsageSnapshotSchema,
   providerUsageModalitySchema,
   providerCredentialStatusSchema,
@@ -541,6 +543,49 @@ describe('cross-process contracts', () => {
     expect(legacyImportRequestSchema.safeParse({
       batchId: 'renderer-controlled', includeUnowned: false, cloudSyncConsent,
     }).success).toBe(false)
+  })
+
+  it('models privacy consent acceptance and revocation as one purpose-scoped revision chain', () => {
+    const accepted = {
+      purpose: 'cloud_sync' as const,
+      state: 'accepted' as const,
+      revision: 1,
+      documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-28T00:00:00.000Z',
+      clientVersion: '0.1.0',
+    }
+    const revoke = {
+      purpose: 'cloud_sync' as const,
+      revokedAt: '2026-08-28T01:00:00.000Z',
+      clientVersion: '0.1.0',
+    }
+    const revoked = { ...revoke, state: 'revoked' as const, revision: 2 }
+    expect(privacyConsentStateSchema.parse(accepted)).toEqual(accepted)
+    expect(privacyConsentRevokeSchema.parse(revoke)).toEqual(revoke)
+    expect(privacyConsentStateSchema.parse(revoked)).toEqual(revoked)
+
+    const revokeMutation = {
+      id: 'consent_revoke_1', kind: 'privacy.consent.revoke' as const,
+      entityId: 'cloud_sync', baseRevision: 1,
+      occurredAt: revoke.revokedAt, payload: revoke,
+    }
+    expect(syncMutationSchema.parse(revokeMutation)).toEqual(revokeMutation)
+    expect(pulledMutationSchema.parse({
+      id: revokeMutation.id, kind: revokeMutation.kind,
+      entityId: revokeMutation.entityId, baseRevision: revokeMutation.baseRevision,
+      payload: revokeMutation.payload, resultRevision: 2, receivedAt: revoke.revokedAt,
+    })).toMatchObject({ kind: 'privacy.consent.revoke', resultRevision: 2 })
+    for (const invalid of [
+      { ...revoke, ownerUserId: 'forged' },
+      { ...revoke, revision: 1 },
+      { ...revokeMutation, entityId: 'cloud-sync-2026-08' },
+      { ...revokeMutation, payload: { ...revoke, purpose: 'other' } },
+      { ...revoked, state: 'accepted', documentVersion: undefined, consentedAt: undefined },
+    ]) {
+      const schema = 'kind' in invalid ? syncMutationSchema
+        : 'state' in invalid ? privacyConsentStateSchema : privacyConsentRevokeSchema
+      expect(schema.safeParse(invalid).success).toBe(false)
+    }
   })
 
   it('defines strict account preferences and safe BYOK usage events', () => {
