@@ -7,6 +7,8 @@ import { isAbsolute, join, resolve, sep } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import {
   approvalDecisionSchema,
+  conversionTargetFormatSchema,
+  fileConvertRequestSchema,
   matchesHttpsUrlPattern,
   matchesHttpsUrlPatternOrigin,
   toSafeAppError,
@@ -17,6 +19,7 @@ import {
   type ApprovalDecision,
   type Capability,
   type CapabilityScope,
+  type ConversionTargetFormat,
   type ExecutionEvent,
   type WorkerCapabilityRequest,
   type WorkerRequest,
@@ -30,6 +33,11 @@ import type {
   ExecutionStep,
 } from '../database/repositories.js'
 import type { BrowserContinuationPolicy } from '../browser/browser-continuation-types.js'
+import type { ExecutionAttachmentBinding as ArtifactAttachmentBinding } from '../conversion/conversion-artifact-service.js'
+import type {
+  ConversionJobSubmission,
+  ConversionSubmissionReceipt,
+} from '../conversion/conversion-job-runner.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
 import { validateWorkflowOutput } from './output-validation.js'
 import {
@@ -156,6 +164,51 @@ export interface ExecutionStartInput {
   sourceSelector: WorkflowExecutionSourceSelector
   /** Present only for Agent starts whose manifest permissions were authorized in chat. */
   agentAuthorization?: AgentExecutionAuthorization
+  /** Ordered Main-only bindings. They are never serialized into the Worker start message. */
+  attachmentBindings?: readonly ExecutionAttachmentBinding[]
+  /** One-run Main authorization for exact attachment fingerprints and target formats. */
+  fileConvertAuthorization?: FileConvertAuthorization
+}
+
+export interface ExecutionAttachmentBinding extends ArtifactAttachmentBinding {
+  conversationId?: string
+  sourceFingerprint: string
+}
+
+export interface FileConvertAuthorization {
+  readonly executionId: string
+  readonly capability: 'file.convert'
+  readonly decision: 'once'
+  readonly attachments: readonly {
+    readonly index: number
+    readonly sourceFingerprint: string
+  }[]
+  readonly formats: readonly ConversionTargetFormat[]
+}
+
+export interface FileConversionTerminalResult {
+  readonly status: 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  readonly errorCode?: AppErrorCode
+  readonly outputs: readonly {
+    readonly displayName: string
+    readonly detectedFormat: string
+    readonly byteSize: number
+  }[]
+}
+
+/**
+ * Main-only composition over the artifact verifier, durable runner and owner-scoped repositories.
+ * inspectAttachment must re-read ownership, conversation metadata and source bytes/fingerprint.
+ */
+export interface FileConversionPort {
+  inspectAttachment(binding: ExecutionAttachmentBinding): Promise<ExecutionAttachmentBinding>
+  submit(input: ConversionJobSubmission): ConversionSubmissionReceipt
+  waitForTerminal(
+    jobId: string,
+    ownerUserId: string,
+    signal: AbortSignal,
+  ): Promise<FileConversionTerminalResult>
+  cancel(jobId: string): Promise<boolean>
 }
 
 export interface AgentAuthorizedPermissionBinding {
@@ -195,6 +248,11 @@ interface PendingCapability {
   requiresApproval: boolean
 }
 
+interface ForegroundConversion {
+  readonly jobId: string
+  readonly drained: Promise<void>
+}
+
 interface ActiveExecution {
   id: string
   userId: string
@@ -204,6 +262,11 @@ interface ActiveExecution {
   directory: string
   sensitivePaths: readonly string[]
   agentAuthorization?: AgentExecutionAuthorization
+  attachmentVault: readonly ExecutionAttachmentBinding[]
+  fileConvertAuthorization?: FileConvertAuthorization
+  usedFileConversions: Set<string>
+  lifetime: AbortController
+  foregroundConversions: Set<ForegroundConversion>
   buffer: Buffer
   messageQueue: Promise<void>
   pending?: PendingCapability
@@ -229,6 +292,7 @@ export interface ExecutionServiceDependencies {
   policy: PolicyEngine
   workers: WorkflowWorkerFactory
   capability: CapabilityPort
+  conversion?: FileConversionPort
   emit: (event: ExecutionEvent) => void
   temporaryDirectories?: TemporaryDirectoryPort
 }
@@ -277,6 +341,7 @@ function snapshotAgentAuthorization(
     const scope = structuredClone(permission.scope)
     if ('origins' in scope) Object.freeze(scope.origins)
     if ('paths' in scope) Object.freeze(scope.paths)
+    if ('formats' in scope) Object.freeze(scope.formats)
     Object.freeze(scope)
     return Object.freeze({
       permissionIndex: permission.permissionIndex,
@@ -291,6 +356,84 @@ function snapshotAgentAuthorization(
   })
 }
 
+function validFingerprint(value: string): boolean {
+  return /^[a-f0-9]{64}$/.test(value)
+}
+
+function snapshotAttachmentBindings(
+  bindings: readonly ExecutionAttachmentBinding[] | undefined,
+): readonly ExecutionAttachmentBinding[] {
+  if (bindings === undefined) return Object.freeze([])
+  if (bindings.length > 5) throw failure('INVALID_INPUT')
+  const snapshot = bindings.map((binding, index) => {
+    const sourceId = binding.source.kind === 'media'
+      ? binding.source.mediaAssetId
+      : binding.source.artifactId
+    if (binding.attachmentIndex !== index
+      || !Number.isInteger(binding.attachmentIndex)
+      || !binding.ownerUserId.trim()
+      || (binding.conversationId !== undefined && !binding.conversationId.trim())
+      || !binding.displayName.trim()
+      || !binding.mimeType.trim()
+      || !Number.isSafeInteger(binding.byteSize)
+      || binding.byteSize < 0
+      || !sourceId.trim()
+      || !validFingerprint(binding.sourceFingerprint)) {
+      throw failure('INVALID_INPUT')
+    }
+    return deepFreeze(structuredClone(binding))
+  })
+  return Object.freeze(snapshot)
+}
+
+function snapshotFileConvertAuthorization(
+  authorization: FileConvertAuthorization | undefined,
+  executionId: string,
+  attachmentVault: readonly ExecutionAttachmentBinding[],
+): FileConvertAuthorization | undefined {
+  if (authorization === undefined) return undefined
+  if (authorization.executionId !== executionId
+    || authorization.capability !== 'file.convert'
+    || authorization.decision !== 'once'
+    || authorization.attachments.length === 0
+    || authorization.formats.length === 0) {
+    throw failure('INVALID_INPUT')
+  }
+  const attachmentIndexes = new Set<number>()
+  const attachments = authorization.attachments.map((authorized) => {
+    if (!Number.isInteger(authorized.index)
+      || authorized.index < 0
+      || attachmentIndexes.has(authorized.index)
+      || !validFingerprint(authorized.sourceFingerprint)) {
+      throw failure('INVALID_INPUT')
+    }
+    const binding = attachmentVault[authorized.index]
+    if (!binding
+      || binding.attachmentIndex !== authorized.index
+      || binding.sourceFingerprint !== authorized.sourceFingerprint) {
+      throw failure('INVALID_INPUT')
+    }
+    attachmentIndexes.add(authorized.index)
+    return Object.freeze({
+      index: authorized.index,
+      sourceFingerprint: authorized.sourceFingerprint,
+    })
+  })
+  const formats = authorization.formats.map((format) => {
+    const parsed = conversionTargetFormatSchema.safeParse(format)
+    if (!parsed.success) throw failure('INVALID_INPUT')
+    return parsed.data
+  })
+  if (new Set(formats).size !== formats.length) throw failure('INVALID_INPUT')
+  return Object.freeze({
+    executionId,
+    capability: 'file.convert',
+    decision: 'once',
+    attachments: Object.freeze(attachments),
+    formats: Object.freeze(formats),
+  })
+}
+
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
   if (!value || typeof value !== 'object' || seen.has(value)) return value
   seen.add(value)
@@ -299,6 +442,59 @@ function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
     if (descriptor && 'value' in descriptor) deepFreeze(descriptor.value, seen)
   }
   return Object.freeze(value)
+}
+
+function sameAttachmentSource(
+  left: ExecutionAttachmentBinding['source'],
+  right: ExecutionAttachmentBinding['source'],
+): boolean {
+  if (left.kind !== right.kind) return false
+  return left.kind === 'media'
+    ? left.mediaAssetId === (right as Extract<ExecutionAttachmentBinding['source'], { kind: 'media' }>).mediaAssetId
+    : left.artifactId === (right as Extract<ExecutionAttachmentBinding['source'], { kind: 'artifact' }>).artifactId
+}
+
+function sameAttachmentBinding(
+  left: ExecutionAttachmentBinding,
+  right: ExecutionAttachmentBinding,
+): boolean {
+  return left.attachmentIndex === right.attachmentIndex
+    && left.ownerUserId === right.ownerUserId
+    && left.conversationId === right.conversationId
+    && left.displayName === right.displayName
+    && left.mimeType === right.mimeType
+    && left.byteSize === right.byteSize
+    && left.sourceFingerprint === right.sourceFingerprint
+    && sameAttachmentSource(left.source, right.source)
+}
+
+const conversionErrorCodes = new Set<AppErrorCode>([
+  'CONVERSION_FORMAT_UNSUPPORTED',
+  'CONVERSION_COMPONENT_UNAVAILABLE',
+  'CONVERSION_INPUT_INVALID',
+  'CONVERSION_OUTPUT_TOO_LARGE',
+  'CONVERSION_TIMEOUT',
+  'CONVERSION_CANCELLED',
+  'CONVERSION_INTERRUPTED',
+])
+
+function terminalConversionError(
+  terminal: FileConversionTerminalResult,
+): Extract<AppErrorCode, `CONVERSION_${string}`> {
+  if (terminal.errorCode && conversionErrorCodes.has(terminal.errorCode)) {
+    return terminal.errorCode as Extract<AppErrorCode, `CONVERSION_${string}`>
+  }
+  if (terminal.status === 'cancelled') return 'CONVERSION_CANCELLED'
+  return 'CONVERSION_INTERRUPTED'
+}
+
+function safeOutputDisplayName(value: string): boolean {
+  const normalized = value.trim()
+  return normalized.length > 0
+    && normalized.length <= 1_024
+    && normalized !== '.'
+    && normalized !== '..'
+    && !/[/\\\0]/.test(normalized)
 }
 
 function capabilityContext(
@@ -343,9 +539,14 @@ function permissionCoversRequest(
   declared: { capability: Capability; scope: CapabilityScope },
   request: WorkerCapabilityRequest,
 ): boolean {
-  if (declared.capability !== request.capability
-    || !('origins' in declared.scope)
-    || request.scope.origins.length !== 1) {
+  if (declared.capability !== request.capability) return false
+  if (request.capability === 'file.convert') {
+    return 'formats' in declared.scope
+      && request.scope.formats.length === 1
+      && request.scope.formats[0] === request.arguments.targetFormat
+      && declared.scope.formats.includes(request.arguments.targetFormat)
+  }
+  if (!('origins' in declared.scope) || !('origins' in request.scope) || request.scope.origins.length !== 1) {
     return false
   }
 
@@ -460,10 +661,21 @@ export class ExecutionService {
     }
     let startInput: ExecutionStartInput
     try {
+      const attachmentBindings = snapshotAttachmentBindings(input.attachmentBindings)
       startInput = {
         ...input,
+        attachmentBindings,
         ...(input.agentAuthorization
           ? { agentAuthorization: snapshotAgentAuthorization(input.agentAuthorization) }
+          : {}),
+        ...(input.fileConvertAuthorization
+          ? {
+              fileConvertAuthorization: snapshotFileConvertAuthorization(
+                input.fileConvertAuthorization,
+                record.executionId,
+                attachmentBindings,
+              ),
+            }
           : {}),
       }
     } catch {
@@ -559,6 +771,13 @@ export class ExecutionService {
       directory,
       sensitivePaths: input.sensitivePaths ?? [],
       ...(input.agentAuthorization ? { agentAuthorization: input.agentAuthorization } : {}),
+      attachmentVault: input.attachmentBindings ?? Object.freeze([]),
+      ...(input.fileConvertAuthorization
+        ? { fileConvertAuthorization: input.fileConvertAuthorization }
+        : {}),
+      usedFileConversions: new Set(),
+      lifetime: new AbortController(),
+      foregroundConversions: new Set(),
       buffer: Buffer.alloc(0),
       messageQueue: Promise.resolve(),
       timer: setTimeout(() => { void this.finish(id, 'failed', failure('WORKER_TIMEOUT')) }, input.timeoutMs ?? workflow.timeoutMs),
@@ -925,6 +1144,18 @@ export class ExecutionService {
     }
     const effectiveRequest = effectiveCapabilityRequest(active.workflow.permissions[permissionIndex]!, request)
 
+    if (effectiveRequest.capability === 'file.convert') {
+      const pending: PendingCapability = {
+        requestId,
+        request: effectiveRequest,
+        permissionIndex,
+        requiresApproval: false,
+      }
+      active.pending = pending
+      await this.dispatchCapability(active, pending)
+      return
+    }
+
     if (active.agentAuthorization) {
       const authorized = active.agentAuthorization.permissions[permissionIndex]
       if (!authorized
@@ -989,15 +1220,20 @@ export class ExecutionService {
 
   private async dispatchCapability(active: ActiveExecution, pending: PendingCapability): Promise<void> {
     try {
-      const context = {
-        ...active.capabilityContext,
+      let result: unknown
+      if (pending.request.capability === 'file.convert') {
+        result = await this.dispatchFileConversion(active, pending.request)
+      } else {
+        const context = {
+          ...active.capabilityContext,
+        }
+        const redirectScope = browserOpenRedirectScope(
+          active.workflow.permissions[pending.permissionIndex]!,
+        )
+        result = redirectScope
+          ? await this.dependencies.capability.request(context, pending.request, redirectScope)
+          : await this.dependencies.capability.request(context, pending.request)
       }
-      const redirectScope = browserOpenRedirectScope(
-        active.workflow.permissions[pending.permissionIndex]!,
-      )
-      const result = redirectScope
-        ? await this.dependencies.capability.request(context, pending.request, redirectScope)
-        : await this.dependencies.capability.request(context, pending.request)
       if (active.terminal) return
       this.write(active, { type: 'capability_result', requestId: pending.requestId, result: result ?? null })
     } catch (error) {
@@ -1006,6 +1242,110 @@ export class ExecutionService {
     } finally {
       if (active.pending === pending) active.pending = undefined
     }
+  }
+
+  private async dispatchFileConversion(
+    active: ActiveExecution,
+    request: Extract<WorkerCapabilityRequest, { capability: 'file.convert' }>,
+  ): Promise<unknown> {
+    const parsed = fileConvertRequestSchema.safeParse(request)
+    if (!parsed.success
+      || parsed.data.scope.formats.length !== 1
+      || parsed.data.scope.formats[0] !== parsed.data.arguments.targetFormat) {
+      throw failure('CAPABILITY_SCOPE_DENIED')
+    }
+    const conversion = this.dependencies.conversion
+    if (!conversion) throw failure('CONVERSION_COMPONENT_UNAVAILABLE')
+    const { attachmentIndex, targetFormat, preset, background } = parsed.data.arguments
+    const binding = active.attachmentVault[attachmentIndex]
+    if (!binding
+      || binding.attachmentIndex !== attachmentIndex
+      || binding.ownerUserId !== active.userId
+      || binding.conversationId !== active.capabilityContext.conversationId) {
+      throw failure('CAPABILITY_SCOPE_DENIED')
+    }
+    const authorization = active.fileConvertAuthorization
+    if (!authorization
+      || authorization.executionId !== active.id
+      || authorization.capability !== 'file.convert'
+      || authorization.decision !== 'once'
+      || !authorization.formats.includes(targetFormat)
+      || !authorization.attachments.some((authorized) => (
+        authorized.index === attachmentIndex
+        && authorized.sourceFingerprint === binding.sourceFingerprint
+      ))) {
+      throw failure('CAPABILITY_SCOPE_DENIED')
+    }
+    const useKey = `${attachmentIndex}:${targetFormat}:${binding.sourceFingerprint}`
+    if (active.usedFileConversions.has(useKey)) throw failure('CAPABILITY_SCOPE_DENIED')
+
+    const current = await conversion.inspectAttachment(binding)
+    if (active.terminal) throw failure('CANCELLED')
+    if (!sameAttachmentBinding(binding, current)
+      || current.ownerUserId !== active.userId
+      || current.conversationId !== active.capabilityContext.conversationId) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+
+    active.usedFileConversions.add(useKey)
+    const sourceKind = binding.source.kind
+    const sourceId = sourceKind === 'media'
+      ? binding.source.mediaAssetId
+      : binding.source.artifactId
+    const submission: ConversionJobSubmission = {
+      executionId: active.id,
+      sourceKind,
+      sourceId,
+      targetFormat,
+      ...(preset === undefined ? {} : { preset }),
+    }
+    const receipt = conversion.submit(submission)
+    if (!receipt.accepted || receipt.status !== 'queued' || receipt.epoch !== 0 || !receipt.jobId.trim()) {
+      throw failure('INTERNAL_ERROR')
+    }
+    if (background !== false) {
+      return { accepted: true, status: 'queued', outputs: [] }
+    }
+
+    const terminalTask = Promise.resolve().then(() => (
+      conversion.waitForTerminal(receipt.jobId, active.userId, active.lifetime.signal)
+    ))
+    const foreground: ForegroundConversion = {
+      jobId: receipt.jobId,
+      drained: terminalTask.then(() => undefined, () => undefined),
+    }
+    active.foregroundConversions.add(foreground)
+    let terminal: FileConversionTerminalResult
+    try {
+      terminal = await terminalTask
+    } finally {
+      active.foregroundConversions.delete(foreground)
+    }
+    if (active.terminal) throw failure('CANCELLED')
+    if (terminal.status !== 'completed') {
+      const code = terminalConversionError(terminal)
+      return {
+        accepted: false,
+        status: 'failed',
+        error: toSafeAppError({ code }),
+      }
+    }
+    const outputs = terminal.outputs.map((output) => {
+      const format = conversionTargetFormatSchema.safeParse(output.detectedFormat)
+      if (!safeOutputDisplayName(output.displayName)
+        || !format.success
+        || format.data !== targetFormat
+        || !Number.isSafeInteger(output.byteSize)
+        || output.byteSize < 0) {
+        throw failure('INTERNAL_ERROR')
+      }
+      return {
+        name: output.displayName,
+        format: format.data,
+        byteSize: output.byteSize,
+      }
+    })
+    return { accepted: true, status: 'completed', outputs }
   }
 
   private persistLog(active: ActiveExecution, message: Extract<WorkerResponse, { type: 'log' }>): void {
@@ -1068,6 +1408,7 @@ export class ExecutionService {
     if (!active) return
     if (active.finishing) return active.finishing
     active.terminal = true
+    active.lifetime.abort()
     active.finishing = (async () => {
       clearTimeout(active.timer)
       let updated: Execution | undefined
@@ -1097,6 +1438,7 @@ export class ExecutionService {
         } catch {
           // Cleanup continues even if a policy implementation rejects release.
         }
+        await this.drainForegroundConversions(active)
         try {
           await this.dependencies.capability.closeExecution(executionId)
         } catch {
@@ -1116,6 +1458,19 @@ export class ExecutionService {
       }
     })()
     return active.finishing
+  }
+
+  private async drainForegroundConversions(active: ActiveExecution): Promise<void> {
+    const conversion = this.dependencies.conversion
+    const foreground = [...active.foregroundConversions]
+    if (!conversion || foreground.length === 0) return
+    await Promise.allSettled(foreground.map(async (pending) => {
+      try {
+        await conversion.cancel(pending.jobId)
+      } finally {
+        await pending.drained
+      }
+    }))
   }
 
   private emit(event: ExecutionEvent): void {

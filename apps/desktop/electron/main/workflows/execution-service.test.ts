@@ -7,7 +7,15 @@ import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
-import type { ApprovalDecision, ExecutionEvent, WorkerCapabilityRequest, WorkerRequest, WorkerResponse, WorkflowDetail } from '@autoforge/shared'
+import type {
+  ApprovalDecision,
+  ConversionTargetFormat,
+  ExecutionEvent,
+  WorkerCapabilityRequest,
+  WorkerRequest,
+  WorkerResponse,
+  WorkflowDetail,
+} from '@autoforge/shared'
 import { workerRequestSchema } from '@autoforge/shared'
 import { describe, expect, it, vi } from 'vitest'
 import type { Execution, ExecutionLog, ExecutionStep, PermissionGrant } from '../database/repositories.js'
@@ -17,7 +25,9 @@ import {
   NodeWorkerFactory,
   type CapabilityPort,
   type CapabilityContext,
+  type ExecutionAttachmentBinding,
   type ExecutionRepositories,
+  type FileConversionPort,
   type WorkflowExecutionSourceResolver,
   type WorkflowWorker,
   type WorkflowWorkerFactory,
@@ -155,11 +165,76 @@ const capabilityRequest: WorkerCapabilityRequest = {
   arguments: { url: 'https://www.baidu.com' },
 }
 
+const conversionWorkflow: WorkflowDetail = {
+  ...workflow,
+  id: 'file.convert.test',
+  name: 'File converter',
+  category: 'files',
+  runtimeIdentity: { id: 'file.convert.test', version: workflow.version, source: 'installed' },
+  permissions: [{ capability: 'file.convert', scope: { formats: ['png'] } }],
+}
+
+const conversionRequest = (patch: {
+  attachmentIndex?: number
+  targetFormat?: ConversionTargetFormat
+  formats?: ConversionTargetFormat[]
+  background?: boolean
+} = {}): WorkerCapabilityRequest => ({
+  capability: 'file.convert',
+  scope: { formats: patch.formats ?? [patch.targetFormat ?? 'png'] },
+  arguments: {
+    attachmentIndex: patch.attachmentIndex ?? 0,
+    targetFormat: patch.targetFormat ?? 'png',
+    ...(patch.background === undefined ? {} : { background: patch.background }),
+  },
+})
+
+function attachmentBinding(
+  patch: Partial<Omit<ExecutionAttachmentBinding, 'source'>> & {
+    source?: ExecutionAttachmentBinding['source']
+  } = {},
+): ExecutionAttachmentBinding {
+  return {
+    attachmentIndex: 0,
+    ownerUserId: 'user_1',
+    conversationId: 'conversation_1',
+    displayName: 'source.png',
+    mimeType: 'image/png',
+    byteSize: 128,
+    sourceFingerprint: 'f'.repeat(64),
+    source: { kind: 'media', mediaAssetId: 'asset_1' },
+    ...patch,
+  }
+}
+
+function createFileConversionPort(options: {
+  inspect?: (binding: ExecutionAttachmentBinding) => Promise<ExecutionAttachmentBinding>
+  terminal?: Awaited<ReturnType<FileConversionPort['waitForTerminal']>>
+  waitForTerminal?: FileConversionPort['waitForTerminal']
+} = {}) {
+  const inspectAttachment = vi.fn(options.inspect ?? (async (binding) => structuredClone(binding)))
+  const submit = vi.fn<FileConversionPort['submit']>(() => ({
+    accepted: true,
+    jobId: 'job_1',
+    epoch: 0,
+    status: 'queued',
+  }))
+  const waitForTerminal = vi.fn<FileConversionPort['waitForTerminal']>(options.waitForTerminal ?? (async () => (
+    options.terminal ?? {
+      status: 'completed',
+      outputs: [{ displayName: 'result.png', detectedFormat: 'png', byteSize: 64 }],
+    }
+  )))
+  const cancel = vi.fn<FileConversionPort['cancel']>(async () => true)
+  return { inspectAttachment, submit, waitForTerminal, cancel }
+}
+
 const trustedRootPath = fileURLToPath(new URL('../../', import.meta.url))
 
 function createHarness(options: {
   timeoutMs?: number
   capability?: CapabilityPort
+  conversion?: FileConversionPort
   source?: {
     workflow: WorkflowDetail
     rootPath: string
@@ -196,6 +271,7 @@ function createHarness(options: {
     policy,
     workers: workerFactory,
     capability,
+    conversion: options.conversion,
     temporaryDirectories: options.temporaryDirectories,
     emit: options.emit ?? ((event: ExecutionEvent) => {
       expect(repositories.records.get(event.executionId)?.status).toBe(
@@ -238,6 +314,39 @@ function agentStartInput(
       })),
     },
   } as unknown as Parameters<ExecutionService['startReserved']>[1]
+}
+
+function conversionStartInput(
+  executionId: string,
+  sourceSelector: ReturnType<ReturnType<typeof createWorkflowSourceSelectorVault>['create']>,
+  bindings: readonly ExecutionAttachmentBinding[] = [attachmentBinding()],
+  options: {
+    authorize?: boolean
+    formats?: readonly ConversionTargetFormat[]
+    authorizationFingerprint?: string
+  } = {},
+): Parameters<ExecutionService['startReserved']>[1] {
+  return {
+    userId: 'user_1',
+    conversationId: 'conversation_1',
+    workflowId: conversionWorkflow.id,
+    workflowVersion: conversionWorkflow.version,
+    input: { files: [0], targetFormat: 'png' },
+    sourceSelector,
+    attachmentBindings: bindings,
+    ...(options.authorize === false ? {} : {
+      fileConvertAuthorization: {
+        executionId,
+        capability: 'file.convert',
+        decision: 'once',
+        attachments: bindings.map((binding) => ({
+          index: binding.attachmentIndex,
+          sourceFingerprint: options.authorizationFingerprint ?? binding.sourceFingerprint,
+        })),
+        formats: options.formats ?? ['png'],
+      },
+    }),
+  }
 }
 
 async function turn(): Promise<void> {
@@ -896,6 +1005,440 @@ describe('ExecutionService', () => {
       status: 'failed', errorCode: 'CAPABILITY_SCOPE_DENIED',
     })
     expect(harness.events.some((event) => event.type === 'approval_required')).toBe(false)
+  })
+
+  it('dispatches a foreground conversion from an immutable attachment vault and returns only safe output metadata', async () => {
+    const binding = attachmentBinding()
+    const conversion = createFileConversionPort({
+      terminal: {
+        status: 'completed',
+        outputs: [{
+          displayName: 'result.png', detectedFormat: 'png', byteSize: 64,
+          artifactId: 'artifact_secret', sourceId: 'asset_1', sha256: 'a'.repeat(64),
+          path: '/Users/alice/result.png', relativePath: 'results/secret.png',
+        } as never],
+      },
+    })
+    const browserCapability = {
+      request: vi.fn(async () => ({ browser: true })),
+      closeExecution: vi.fn(async () => undefined),
+    }
+    const harness = createHarness({
+      conversion,
+      capability: browserCapability,
+      source: {
+        workflow: conversionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      conversionStartInput(reservation.executionId, harness.sourceSelector, [binding]),
+    )
+    binding.displayName = 'mutated.png'
+    binding.sourceFingerprint = '0'.repeat(64)
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request', requestId: 'convert_foreground',
+      request: conversionRequest({ background: false }),
+    })
+    await vi.waitFor(() => expect(conversion.waitForTerminal).toHaveBeenCalledOnce())
+
+    expect(conversion.inspectAttachment).toHaveBeenCalledWith(expect.objectContaining({
+      attachmentIndex: 0,
+      displayName: 'source.png',
+      sourceFingerprint: 'f'.repeat(64),
+    }))
+    expect(Object.isFrozen(conversion.inspectAttachment.mock.calls[0]![0])).toBe(true)
+    expect(Object.isFrozen(conversion.inspectAttachment.mock.calls[0]![0].source)).toBe(true)
+    expect(conversion.submit).toHaveBeenCalledWith({
+      executionId: execution.id,
+      sourceKind: 'media',
+      sourceId: 'asset_1',
+      targetFormat: 'png',
+    })
+    expect(worker.requests).toContainEqual({
+      type: 'capability_result',
+      requestId: 'convert_foreground',
+      result: {
+        accepted: true,
+        status: 'completed',
+        outputs: [{ name: 'result.png', format: 'png', byteSize: 64 }],
+      },
+    })
+    const serialized = JSON.stringify(worker.requests)
+    expect(serialized).not.toMatch(/job_1|artifact_secret|asset_1|mediaAssetId|sourceId|ownerUserId|sha256|sourceFingerprint|attachmentBindings|fileConvertAuthorization|conversationId|Users|relativePath/)
+    expect(browserCapability.request).not.toHaveBeenCalled()
+    expect(harness.permissionRepository.upsert).not.toHaveBeenCalled()
+
+    worker.respond({ type: 'result', output: { converted: true } })
+    await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+  })
+
+  it.each([undefined, true])(
+    'returns a queued receipt without waiting when background is %s',
+    async (background) => {
+      const conversion = createFileConversionPort()
+      const harness = createHarness({
+        conversion,
+        source: {
+          workflow: conversionWorkflow,
+          rootPath: trustedRootPath,
+          entryPath: 'workers/workflow-runner.ts',
+          integrity: 'valid',
+        },
+      })
+      const reservation = harness.service.reserve()
+      const execution = await harness.service.startReserved(
+        reservation,
+        conversionStartInput(reservation.executionId, harness.sourceSelector),
+      )
+      const worker = harness.workerFactory.workers.get(execution.id)!
+      worker.respond({ type: 'ready', executionId: execution.id })
+      worker.respond({
+        type: 'capability_request', requestId: 'convert_background',
+        request: conversionRequest({ ...(background === undefined ? {} : { background }) }),
+      })
+      await vi.waitFor(() => expect(conversion.submit).toHaveBeenCalledOnce())
+
+      expect(conversion.waitForTerminal).not.toHaveBeenCalled()
+      expect(worker.requests).toContainEqual({
+        type: 'capability_result', requestId: 'convert_background',
+        result: { accepted: true, status: 'queued', outputs: [] },
+      })
+      await harness.service.cancel(execution.id)
+    },
+  )
+
+  it.each([
+    {
+      name: 'an out-of-range index',
+      request: conversionRequest({ attachmentIndex: 1 }),
+    },
+    {
+      name: 'a missing one-run authorization',
+      startOptions: { authorize: false },
+      request: conversionRequest(),
+    },
+    {
+      name: 'a target absent from the one-run authorization',
+      startOptions: { formats: ['jpeg'] as const },
+      request: conversionRequest(),
+    },
+    {
+      name: 'a conversation-mismatched binding',
+      bindings: [attachmentBinding({ conversationId: 'conversation_other' })],
+      request: conversionRequest(),
+    },
+    {
+      name: 'a cross-owner source snapshot',
+      inspect: async (binding: ExecutionAttachmentBinding) => ({ ...binding, ownerUserId: 'user_other' }),
+      request: conversionRequest(),
+    },
+    {
+      name: 'a changed source fingerprint',
+      inspect: async (binding: ExecutionAttachmentBinding) => ({ ...binding, sourceFingerprint: 'a'.repeat(64) }),
+      request: conversionRequest(),
+    },
+  ])('rejects $name before durable submission', async ({ bindings, inspect, request, startOptions }) => {
+    const conversion = createFileConversionPort({ ...(inspect ? { inspect } : {}) })
+    const harness = createHarness({
+      conversion,
+      source: {
+        workflow: conversionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      conversionStartInput(
+        reservation.executionId,
+        harness.sourceSelector,
+        bindings ?? [attachmentBinding()],
+        startOptions,
+      ),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'capability_request', requestId: 'convert_denied', request })
+    await vi.waitFor(() => expect(worker.requests.some((message) => (
+      message.type === 'capability_error' && message.requestId === 'convert_denied'
+    ))).toBe(true))
+
+    expect(conversion.submit).not.toHaveBeenCalled()
+    expect(harness.events.some((event) => event.type === 'approval_required')).toBe(false)
+    await harness.service.cancel(execution.id)
+  })
+
+  it.each([
+    {
+      name: 'a target not declared by the installed manifest',
+      workflow: conversionWorkflow,
+      request: conversionRequest({ targetFormat: 'jpeg' }),
+    },
+    {
+      name: 'a forged multi-format request scope',
+      workflow: {
+        ...conversionWorkflow,
+        permissions: [{ capability: 'file.convert' as const, scope: { formats: ['png', 'jpeg'] as ConversionTargetFormat[] } }],
+      },
+      request: conversionRequest({ formats: ['png', 'jpeg'] }),
+    },
+  ])('rejects $name before durable submission', async ({ workflow: selectedWorkflow, request }) => {
+    const conversion = createFileConversionPort()
+    const harness = createHarness({
+      conversion,
+      source: {
+        workflow: selectedWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      conversionStartInput(reservation.executionId, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'capability_request', requestId: 'convert_forged_scope', request })
+
+    await expect(execution.finished).resolves.toMatchObject({
+      status: 'failed', errorCode: 'CAPABILITY_SCOPE_DENIED',
+    })
+    expect(conversion.submit).not.toHaveBeenCalled()
+  })
+
+  it('rejects a one-run conversion authorization bound to another execution', async () => {
+    const conversion = createFileConversionPort()
+    const harness = createHarness({
+      conversion,
+      source: {
+        workflow: conversionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+
+    await expect(harness.service.startReserved(
+      reservation,
+      conversionStartInput('execution_other', harness.sourceSelector),
+    )).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+
+    expect(harness.workerFactory.workers.size).toBe(0)
+    expect(conversion.submit).not.toHaveBeenCalled()
+  })
+
+  it('consumes an attachment-format authorization on the first submit attempt', async () => {
+    const conversion = createFileConversionPort()
+    const harness = createHarness({
+      conversion,
+      source: {
+        workflow: conversionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      conversionStartInput(reservation.executionId, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'capability_request', requestId: 'convert_first', request: conversionRequest() })
+    await vi.waitFor(() => expect(conversion.submit).toHaveBeenCalledOnce())
+    worker.respond({ type: 'capability_request', requestId: 'convert_duplicate', request: conversionRequest() })
+    await vi.waitFor(() => expect(worker.requests).toContainEqual(expect.objectContaining({
+      type: 'capability_error', requestId: 'convert_duplicate',
+    })))
+
+    expect(conversion.submit).toHaveBeenCalledTimes(1)
+    await harness.service.cancel(execution.id)
+  })
+
+  it('returns an engine terminal failure as data so the workflow can continue', async () => {
+    const conversion = createFileConversionPort({
+      terminal: {
+        status: 'failed',
+        errorCode: 'CONVERSION_COMPONENT_UNAVAILABLE',
+        outputs: [],
+      },
+    })
+    const harness = createHarness({
+      conversion,
+      source: {
+        workflow: conversionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      conversionStartInput(reservation.executionId, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request', requestId: 'convert_failed',
+      request: conversionRequest({ background: false }),
+    })
+    await vi.waitFor(() => expect(worker.requests).toContainEqual({
+      type: 'capability_result',
+      requestId: 'convert_failed',
+      result: {
+        accepted: false,
+        status: 'failed',
+        error: {
+          code: 'CONVERSION_COMPONENT_UNAVAILABLE',
+          message: 'The required conversion component is unavailable.',
+        },
+      },
+    }))
+
+    expect(harness.repositories.records.get(execution.id)?.status).toBe('running')
+    expect(worker.killed).toBe(false)
+    await harness.service.cancel(execution.id)
+  })
+
+  it('rejects an output record whose display name contains a managed path', async () => {
+    const conversion = createFileConversionPort({
+      terminal: {
+        status: 'completed',
+        outputs: [{
+          displayName: '/Users/alice/conversion/results/artifact_secret.png',
+          detectedFormat: 'png',
+          byteSize: 64,
+        }],
+      },
+    })
+    const harness = createHarness({
+      conversion,
+      source: {
+        workflow: conversionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      conversionStartInput(reservation.executionId, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request', requestId: 'convert_path_name',
+      request: conversionRequest({ background: false }),
+    })
+    await vi.waitFor(() => expect(worker.requests).toContainEqual({
+      type: 'capability_error',
+      requestId: 'convert_path_name',
+      error: { code: 'INTERNAL_ERROR', message: 'Unexpected application error' },
+    }))
+
+    expect(JSON.stringify(worker.requests)).not.toContain('/Users/alice')
+    await harness.service.cancel(execution.id)
+  })
+
+  it('cancels and drains a submitted foreground conversion before execution cancellation settles', async () => {
+    let rejectWait!: (error: unknown) => void
+    let waitSignal: AbortSignal | undefined
+    const wait = new Promise<never>((_resolve, reject) => { rejectWait = reject })
+    const conversion = createFileConversionPort({
+      waitForTerminal: async (_jobId, _ownerUserId, signal) => {
+        waitSignal = signal
+        return wait
+      },
+    })
+    const harness = createHarness({
+      conversion,
+      source: {
+        workflow: conversionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      conversionStartInput(reservation.executionId, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request', requestId: 'convert_cancelled',
+      request: conversionRequest({ background: false }),
+    })
+    await vi.waitFor(() => expect(conversion.waitForTerminal).toHaveBeenCalledOnce())
+
+    let settled = false
+    const cancelling = harness.service.cancel(execution.id).then(() => { settled = true })
+    await vi.waitFor(() => expect(conversion.cancel).toHaveBeenCalledWith('job_1'))
+    expect(waitSignal?.aborted).toBe(true)
+    expect(settled).toBe(false)
+
+    rejectWait({ code: 'CONVERSION_CANCELLED' })
+    await cancelling
+    await expect(execution.finished).resolves.toMatchObject({ status: 'cancelled', errorCode: 'CANCELLED' })
+    expect(worker.requests.some((message) => message.type === 'capability_result')).toBe(false)
+  })
+
+  it('cancels and drains a submitted foreground conversion before execution timeout settles', async () => {
+    let rejectWait!: (error: unknown) => void
+    let waitSignal: AbortSignal | undefined
+    const wait = new Promise<never>((_resolve, reject) => { rejectWait = reject })
+    const conversion = createFileConversionPort({
+      waitForTerminal: async (_jobId, _ownerUserId, signal) => {
+        waitSignal = signal
+        return wait
+      },
+    })
+    const harness = createHarness({
+      conversion,
+      source: {
+        workflow: conversionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      { ...conversionStartInput(reservation.executionId, harness.sourceSelector), timeoutMs: 20 },
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request', requestId: 'convert_timed_out',
+      request: conversionRequest({ background: false }),
+    })
+    await vi.waitFor(() => expect(conversion.cancel).toHaveBeenCalledWith('job_1'))
+    expect(waitSignal?.aborted).toBe(true)
+    let settled = false
+    void execution.finished.then(() => { settled = true })
+    await turn()
+    expect(settled).toBe(false)
+
+    rejectWait({ code: 'CONVERSION_CANCELLED' })
+    await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode: 'WORKER_TIMEOUT' })
+    expect(worker.requests.some((message) => message.type === 'capability_result')).toBe(false)
   })
 
   it('persists invalid Worker output as failed without a completed terminal event', async () => {
@@ -2132,5 +2675,83 @@ describe('NodeWorkerFactory', () => {
     } finally {
       if (responseTimer) clearTimeout(responseTimer)
     }
+  })
+
+  it('exposes only the strict converter submit shim inside the isolated Worker', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({
+        async run(context) {
+          const result = await context.converter.submit({
+            attachmentIndex: 2,
+            targetFormat: 'ico',
+            preset: 'favicon',
+            background: false,
+          })
+          return {
+            result,
+            converterKeys: Object.keys(context.converter),
+            contextKeys: Object.keys(context),
+            processType: typeof process,
+          }
+        },
+      })
+    `, {
+      onMessage: (message, worker) => {
+        if (message.type !== 'capability_request') return
+        expect(message.request).toEqual({
+          capability: 'file.convert',
+          scope: { formats: ['ico'] },
+          arguments: {
+            attachmentIndex: 2,
+            targetFormat: 'ico',
+            preset: 'favicon',
+            background: false,
+          },
+        })
+        worker.stdin!.write(`${JSON.stringify({
+          type: 'capability_result',
+          requestId: message.requestId,
+          result: { accepted: true, status: 'queued', outputs: [] },
+        })}\n`)
+      },
+    })
+
+    expect(messages.at(-1)).toEqual({
+      type: 'result',
+      output: {
+        result: { accepted: true, status: 'queued', outputs: [] },
+        converterKeys: ['submit'],
+        contextKeys: ['browser', 'converter', 'logger'],
+        processType: 'undefined',
+      },
+    })
+  })
+
+  it('rejects converter paths and source identifiers before they cross the Worker bridge', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({
+        async run(context) {
+          try {
+            await context.converter.submit({
+              attachmentIndex: 0,
+              targetFormat: 'png',
+              sourceId: 'asset_secret',
+              path: '/Users/alice/private.png',
+            })
+          } catch (error) {
+            return { code: error.code, processType: typeof process }
+          }
+          return { unexpected: true }
+        },
+      })
+    `)
+
+    expect(messages.map((message) => message.type)).toEqual(['ready', 'result'])
+    expect(messages.at(-1)).toEqual({
+      type: 'result',
+      output: { code: 'WORKER_PROTOCOL_INVALID', processType: 'undefined' },
+    })
   })
 })

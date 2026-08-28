@@ -207,13 +207,19 @@ async function contextModule(
         currentOrigin = undefined
       },
     })
+    const converter = Object.freeze({
+      submit(input) {
+        const targetFormat = input && input.targetFormat
+        return request('file.convert', { formats: [targetFormat] }, input)
+      },
+    })
     const logger = Object.freeze({
       debug(message) { emitLog('debug', message) },
       info(message) { emitLog('info', message) },
       warn(message) { emitLog('warn', message) },
       error(message) { emitLog('error', message) },
     })
-    export default Object.freeze({ browser, logger })
+    export default Object.freeze({ browser, converter, logger })
   `, { context, identifier: 'autoforge:workflow-context' })
   await module.link((specifier) => rejectImport(specifier))
   await module.evaluate()
