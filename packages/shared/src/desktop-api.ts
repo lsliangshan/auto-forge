@@ -705,6 +705,13 @@ export const privacyConsentStateSchema = z.discriminatedUnion('state', [
 ])
 export type PrivacyConsentState = z.infer<typeof privacyConsentStateSchema>
 
+export const cloudSyncConsentRevokeRequestSchema = z.object({
+  confirmed: z.literal(true),
+}).strict()
+export type CloudSyncConsentRevokeRequest = z.infer<
+  typeof cloudSyncConsentRevokeRequestSchema
+>
+
 export const legacyImportConfirmRequestSchema = z.object({
   batchId: identifierSchema,
   includeUnowned: z.boolean(),
@@ -1660,6 +1667,8 @@ export const ipcChannels = {
   settingsListProviderModels: 'settings:list-provider-models',
   settingsGetTokenUsage: 'settings:get-token-usage',
   settingsRecordPrivacyConsent: 'settings:record-privacy-consent',
+  settingsGetCloudSyncConsentState: 'settings:get-cloud-sync-consent-state',
+  settingsRevokeCloudSyncConsent: 'settings:revoke-cloud-sync-consent',
   settingsPreviewLegacyImport: 'settings:preview-legacy-import',
   settingsImportLegacyData: 'settings:import-legacy-data',
   settingsGetAccountDataPreferences: 'settings:get-account-data-preferences',
@@ -1880,6 +1889,8 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsListProviderModels]: listProviderModelsRequestSchema,
   [ipcChannels.settingsGetTokenUsage]: z.undefined(),
   [ipcChannels.settingsRecordPrivacyConsent]: privacyConsentSchema,
+  [ipcChannels.settingsGetCloudSyncConsentState]: z.undefined(),
+  [ipcChannels.settingsRevokeCloudSyncConsent]: cloudSyncConsentRevokeRequestSchema,
   [ipcChannels.settingsPreviewLegacyImport]: z.undefined(),
   [ipcChannels.settingsImportLegacyData]: legacyImportRequestSchema,
   [ipcChannels.settingsGetAccountDataPreferences]: z.undefined(),
@@ -1981,6 +1992,8 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsListProviderModels]: z.array(modelInfoSchema),
   [ipcChannels.settingsGetTokenUsage]: tokenUsageSnapshotSchema,
   [ipcChannels.settingsRecordPrivacyConsent]: voidResponseSchema,
+  [ipcChannels.settingsGetCloudSyncConsentState]: privacyConsentStateSchema.nullable(),
+  [ipcChannels.settingsRevokeCloudSyncConsent]: privacyConsentStateSchema,
   [ipcChannels.settingsPreviewLegacyImport]: legacyImportPreviewSchema,
   [ipcChannels.settingsImportLegacyData]: z.array(legacyImportResultSchema),
   [ipcChannels.settingsGetAccountDataPreferences]: accountDataPreferencesSchema,
@@ -2103,6 +2116,8 @@ export interface DesktopAPI {
     listProviderModels(provider: ModelProviderId, refresh?: boolean): Promise<ModelInfo[]>
     getTokenUsage(): Promise<TokenUsageSnapshot>
     recordPrivacyConsent(input: PrivacyConsent): Promise<void>
+    getCloudSyncConsentState(): Promise<PrivacyConsentState | null>
+    revokeCloudSyncConsent(input: CloudSyncConsentRevokeRequest): Promise<PrivacyConsentState>
     previewLegacyImport(): Promise<LegacyImportPreview>
     importLegacyData(input: LegacyImportRequest): Promise<LegacyImportResult[]>
     getAccountDataPreferences(): Promise<AccountDataPreferences>

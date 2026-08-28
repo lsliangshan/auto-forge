@@ -588,6 +588,29 @@ describe('cross-process contracts', () => {
     }
   })
 
+  it('keeps the cloud-sync Settings revoke IPC owner- and revision-free', () => {
+    const revoked = {
+      purpose: 'cloud_sync' as const, state: 'revoked' as const, revision: 2,
+      revokedAt: '2026-08-28T01:00:00.000Z', clientVersion: '0.1.0',
+    }
+    expect(ipcRequestSchemas[ipcChannels.settingsGetCloudSyncConsentState]
+      .parse(undefined)).toBeUndefined()
+    expect(ipcRequestSchemas[ipcChannels.settingsRevokeCloudSyncConsent]
+      .parse({ confirmed: true })).toEqual({ confirmed: true })
+    expect(ipcResponseSchemas[ipcChannels.settingsGetCloudSyncConsentState]
+      .parse(null)).toBeNull()
+    expect(ipcResponseSchemas[ipcChannels.settingsRevokeCloudSyncConsent]
+      .parse(revoked)).toEqual(revoked)
+    for (const forged of [
+      {}, { confirmed: false }, { confirmed: true, userId: 'forged' },
+      { confirmed: true, purpose: 'cloud_sync' }, { confirmed: true, revision: 1 },
+      { confirmed: true, knowledgeEpoch: 7 },
+    ]) {
+      expect(ipcRequestSchemas[ipcChannels.settingsRevokeCloudSyncConsent]
+        .safeParse(forged).success).toBe(false)
+    }
+  })
+
   it('defines strict account preferences and safe BYOK usage events', () => {
     expect(accountDataPreferencesSchema.parse({})).toEqual({
       timezone: 'Asia/Shanghai',
