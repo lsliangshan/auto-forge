@@ -64,6 +64,25 @@ import {
 } from './index'
 
 describe('cross-process contracts', () => {
+  it('exposes stable, safe conversion errors', () => {
+    const conversionErrorCodes = [
+      'CONVERSION_FORMAT_UNSUPPORTED',
+      'CONVERSION_COMPONENT_UNAVAILABLE',
+      'CONVERSION_INPUT_INVALID',
+      'CONVERSION_OUTPUT_TOO_LARGE',
+      'CONVERSION_TIMEOUT',
+      'CONVERSION_CANCELLED',
+      'CONVERSION_INTERRUPTED',
+    ] as const
+
+    for (const code of conversionErrorCodes) {
+      expect(appErrorCodeSchema.parse(code)).toBe(code)
+      expect(toSafeAppError({ code, message: 'sensitive conversion detail' })).toMatchObject({ code })
+      expect(toSafeAppError({ code, message: 'sensitive conversion detail' }).message)
+        .not.toBe('sensitive conversion detail')
+    }
+  })
+
   it('requires an explicit typed discard confirmation for logout', () => {
     expect(logoutRequestSchema.parse(undefined)).toBeUndefined()
     expect(logoutRequestSchema.parse({ discardPending: true })).toEqual({ discardPending: true })

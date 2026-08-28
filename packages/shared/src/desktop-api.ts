@@ -618,6 +618,7 @@ export const workflowPermissionSchema = z.object({
 }).strict().superRefine(({ capability, scope }, context) => {
   const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
   const needsPaths = capability.startsWith('filesystem.')
+  const needsFormats = capability === 'file.convert'
 
   if (needsOrigins && !('origins' in scope)) {
     context.addIssue({ code: 'custom', message: 'This capability requires origin scope' })
@@ -625,7 +626,10 @@ export const workflowPermissionSchema = z.object({
   if (needsPaths && !('paths' in scope)) {
     context.addIssue({ code: 'custom', message: 'This capability requires path scope' })
   }
-  if (!needsOrigins && !needsPaths && Object.keys(scope).length !== 0) {
+  if (needsFormats && !('formats' in scope)) {
+    context.addIssue({ code: 'custom', message: 'This capability requires conversion format scope' })
+  }
+  if (!needsOrigins && !needsPaths && !needsFormats && Object.keys(scope).length !== 0) {
     context.addIssue({ code: 'custom', message: 'This capability requires an empty scope' })
   }
 })

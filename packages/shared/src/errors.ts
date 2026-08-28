@@ -74,6 +74,13 @@ export const appErrorCodeSchema = z.enum([
   'PAGE_CHANGED',
   'UNSUPPORTED_CONTROL',
   'ACTION_LIMIT_EXCEEDED',
+  'CONVERSION_FORMAT_UNSUPPORTED',
+  'CONVERSION_COMPONENT_UNAVAILABLE',
+  'CONVERSION_INPUT_INVALID',
+  'CONVERSION_OUTPUT_TOO_LARGE',
+  'CONVERSION_TIMEOUT',
+  'CONVERSION_CANCELLED',
+  'CONVERSION_INTERRUPTED',
 ])
 
 export type AppErrorCode = z.infer<typeof appErrorCodeSchema>
@@ -159,6 +166,13 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   PAGE_CHANGED: 'The browser page changed. Inspect it again before continuing.',
   UNSUPPORTED_CONTROL: 'This browser control is not supported.',
   ACTION_LIMIT_EXCEEDED: 'The browser operation exceeded a safety boundary.',
+  CONVERSION_FORMAT_UNSUPPORTED: 'The requested output format is not supported.',
+  CONVERSION_COMPONENT_UNAVAILABLE: 'The required conversion component is unavailable.',
+  CONVERSION_INPUT_INVALID: 'The input file cannot be converted.',
+  CONVERSION_OUTPUT_TOO_LARGE: 'The converted output is too large.',
+  CONVERSION_TIMEOUT: 'The conversion timed out.',
+  CONVERSION_CANCELLED: 'The conversion was cancelled.',
+  CONVERSION_INTERRUPTED: 'The conversion was interrupted.',
 }
 
 export function toSafeAppError(error: unknown): AppError {
