@@ -142,10 +142,10 @@ describe('KnowledgeSyncService', () => {
   })
 
   it('does not commit a held mutation result from an earlier access epoch after regrant', async () => {
-    const heldPush = deferred<{
-      mutationId: string; status: 'applied'; sequence: number; revision: string
-    }>()
-    const pushMutation = vi.fn(async () => heldPush.promise)
+    type PushResult = Awaited<ReturnType<CloudKnowledgeRemote['pushMutation']>>
+    let resolvePush!: (value: PushResult) => void
+    const heldPush = new Promise<PushResult>(resolve => { resolvePush = resolve })
+    const pushMutation = vi.fn<CloudKnowledgeRemote['pushMutation']>(async () => heldPush)
     const { database, remote, service } = fixture({ pushMutation })
     service.enqueue({
       mutationId: 'mutation_consent_epoch', knowledgeBaseId: 'kb_1',
@@ -158,7 +158,7 @@ describe('KnowledgeSyncService', () => {
     service.setCloudAccess(false)
     service.setCloudAccess(true)
     service.resume('kb_1')
-    heldPush.resolve({
+    resolvePush({
       mutationId: 'mutation_consent_epoch', status: 'applied', sequence: 1, revision: 'r1',
     })
 
