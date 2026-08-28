@@ -6,6 +6,7 @@ import {
   createMediaProtocolHandler,
   parseSingleRange,
 } from './media-protocol.js'
+import type { ResolvedMediaAsset } from './media-asset-service.js'
 
 const roots: string[] = []
 
@@ -17,7 +18,7 @@ async function fixture() {
   const path = join(directory, 'asset_1.png')
   const bytes = Buffer.from(Array.from({ length: 100 }, (_, index) => index))
   await writeFile(path, bytes)
-  const resolveReadyAsset = vi.fn(async (assetId: string) => {
+  const resolveReadyAsset = vi.fn(async (assetId: string): Promise<ResolvedMediaAsset> => {
     if (assetId !== 'asset_1') throw new Error('not available')
     return {
       id: assetId,
@@ -182,6 +183,25 @@ describe('createMediaProtocolHandler', () => {
 
     expect(response.status).toBe(404)
     expect(await response.text()).not.toContain('database path leaked')
+  })
+
+  it('returns 404 for generic file assets without serving their bytes', async () => {
+    const { resolveReadyAsset } = await fixture()
+    const asset = await resolveReadyAsset('asset_1')
+    resolveReadyAsset.mockResolvedValueOnce({
+      ...asset,
+      kind: 'file',
+      mimeType: 'application/octet-stream',
+      name: 'payload.bin',
+      inlineSafe: false,
+    })
+
+    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+      'autoforge-media://asset/asset_1',
+    ))
+
+    expect(response.status).toBe(404)
+    expect((await response.arrayBuffer()).byteLength).toBe(0)
   })
 
   it('rejects a resolver result whose stored relative path does not reconstruct its absolute path', async () => {

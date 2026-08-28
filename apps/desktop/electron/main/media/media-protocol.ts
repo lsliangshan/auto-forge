@@ -95,6 +95,7 @@ export function createMediaProtocolHandler(
     } catch {
       return notFound()
     }
+    if (asset.kind === 'file') return notFound()
     const assetPath = recheckAssetPath(asset)
     if (!assetPath) return notFound()
 

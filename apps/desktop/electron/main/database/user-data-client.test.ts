@@ -2032,11 +2032,109 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
       .toBeDefined()
+    inspection.close()
+  })
+
+  it('upgrades media assets for upload files without losing rows, indexes, foreign keys, or sync state', () => {
+    const root = temporaryRoot()
+    const path = cachePath(root, 'cloud-alice')
+    const sqlite = new Database(path)
+    const migrationNames = [
+      '0001_user_cache',
+      '0002_outbox_enqueue_sequence',
+      '0003_sync_receipt_evidence',
+      '0004_account_sync_projection',
+      '0005_legacy_import_identity',
+      '0006_legacy_import_identity_history',
+    ]
+    for (const [index, name] of migrationNames.entries()) {
+      sqlite.exec(readFileSync(new URL(
+        `../../../resources/user-cache-migrations/${name}.sql`,
+        import.meta.url,
+      ), 'utf8'))
+      sqlite.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(index + 1, index + 1)
+    }
+    sqlite.prepare(`
+      INSERT INTO conversations (
+        id, title, title_state, user_id, revision, sync_state,
+        created_at, updated_at, last_activity_at, metadata_updated_at
+      ) VALUES ('migration_conversation', 'Migration', 'user_named', 'cloud-alice', 7, 'pending', 1, 2, 3, 4)
+    `).run()
+    sqlite.prepare(`
+      INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at)
+      VALUES ('migration_message', 'migration_conversation', 'assistant', '[]', 1, 1)
+    `).run()
+    sqlite.prepare(`
+      INSERT INTO media_assets (
+        id, conversation_id, source, kind, mime_type, original_name, relative_path,
+        byte_size, sha256, status, created_at, updated_at
+      ) VALUES (
+        'migration_asset', 'migration_conversation', 'generated', 'video', 'video/mp4',
+        'existing.mp4', 'migration_conversation/migration_asset.mp4', 4,
+        '${'a'.repeat(64)}', 'ready', 1, 2
+      )
+    `).run()
+    sqlite.prepare(`
+      INSERT INTO media_generation_jobs (
+        id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id,
+        status, parameters_json, asset_id, created_at, updated_at
+      ) VALUES (
+        'migration_job', 'migration_conversation', 'migration_message', 'openrouter',
+        'video-model', 'video', 'provider_job', 'completed', '{}', 'migration_asset', 1, 2
+      )
+    `).run()
+    sqlite.close()
+
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    expect(store.mediaAssets.get('migration_asset')).toMatchObject({
+      kind: 'video',
+      status: 'ready',
+      relativePath: 'migration_conversation/migration_asset.mp4',
+    })
+    store.mediaAssets.insert({
+      id: 'migration_file',
+      conversationId: 'migration_conversation',
+      source: 'upload',
+      kind: 'file',
+      mimeType: 'text/plain',
+      originalName: 'notes.txt',
+      relativePath: 'migration_conversation/migration_file.bin',
+      byteSize: 5,
+      sha256: 'b'.repeat(64),
+      status: 'ready',
+      createdAt: 3,
+      updatedAt: 3,
+    })
+    manager.close()
+
+    const inspection = new Database(path)
+    expect(inspection.prepare('SELECT MAX(version) AS version FROM schema_migrations').get())
+      .toEqual({ version: 7 })
+    expect(inspection.prepare(`
+      SELECT revision, sync_state AS syncState, last_activity_at AS lastActivityAt,
+             metadata_updated_at AS metadataUpdatedAt
+      FROM conversations WHERE id = 'migration_conversation'
+    `).get()).toEqual({ revision: 7, syncState: 'pending', lastActivityAt: 3, metadataUpdatedAt: 4 })
+    expect(inspection.prepare('SELECT asset_id AS assetId FROM media_generation_jobs WHERE id = ?').get('migration_job'))
+      .toEqual({ assetId: 'migration_asset' })
+    expect(inspection.prepare('SELECT kind, relative_path AS relativePath FROM media_assets WHERE id = ?').get('migration_file'))
+      .toEqual({ kind: 'file', relativePath: 'migration_conversation/migration_file.bin' })
+    expect((inspection.prepare('PRAGMA index_list(media_assets)').all() as Array<{ name: string }>).map(({ name }) => name))
+      .toEqual(expect.arrayContaining(['media_assets_conversation_status_idx', 'media_assets_unclaimed_idx']))
+    expect((inspection.prepare('PRAGMA foreign_key_list(media_generation_jobs)').all() as Array<{ table: string }>))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ table: 'media_assets' })]))
+    expect(() => inspection.prepare(`
+      INSERT INTO media_assets (
+        id, conversation_id, source, kind, original_name, status, created_at, updated_at
+      ) VALUES ('generated_file', 'migration_conversation', 'generated', 'file', 'bad.bin', 'staging', 4, 4)
+    `).run()).toThrow(/CHECK constraint failed/)
     inspection.close()
   })
 

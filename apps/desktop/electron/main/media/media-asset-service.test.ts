@@ -154,6 +154,112 @@ describe('MediaAssetService imports', () => {
   })
 
   it.each([
+    ['notes.weird', Buffer.from('hello\n世界'), 'text/plain'],
+    ['README', Buffer.from('extensionless text'), 'text/plain'],
+    ['payload.bin', Buffer.from([0x00, 0xff, 0x00, 0x01]), 'application/octet-stream'],
+    ['report.pdf', Buffer.from('%PDF-1.7\n%binary\n'), 'application/pdf'],
+  ] as const)('imports %s as a managed file', async (name, bytes, mimeType) => {
+    const source = join(root, name)
+    await writeFile(source, bytes)
+    const service = createMediaAssetService({ database, mediaRoot, id: () => 'asset_file' })
+
+    const [asset] = await service.importPaths({
+      conversationId: 'conversation_1',
+      existingAssetIds: [],
+      paths: [source],
+    })
+
+    expect(asset).toEqual({
+      id: 'asset_file',
+      kind: 'file',
+      mimeType,
+      name,
+      byteSize: bytes.byteLength,
+    })
+    expect(database.mediaAssets.get('asset_file')).toMatchObject({
+      kind: 'file',
+      mimeType,
+      originalName: name,
+      relativePath: 'conversation_1/asset_file.bin',
+    })
+    expect(await readFile(join(mediaRoot, 'conversation_1', 'asset_file.bin'))).toEqual(bytes)
+  })
+
+  it.each([
+    ['document.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+    ['workbook.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+    ['slides.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+  ] as const)('classifies ZIP-signature %s by its OOXML suffix', async (name, mimeType) => {
+    const source = join(root, name)
+    const bytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xff])
+    await writeFile(source, bytes)
+    const service = createMediaAssetService({ database, mediaRoot, id: () => 'asset_ooxml' })
+
+    await expect(service.importPaths({
+      conversationId: 'conversation_1',
+      existingAssetIds: [],
+      paths: [source],
+    })).resolves.toEqual([{
+      id: 'asset_ooxml',
+      kind: 'file',
+      mimeType,
+      name,
+      byteSize: bytes.byteLength,
+    }])
+  })
+
+  it('rejects an empty regular file before creating a record or staging residue', async () => {
+    const source = join(root, 'empty.txt')
+    await writeFile(source, Buffer.alloc(0))
+    const service = createMediaAssetService({ database, mediaRoot, id: () => 'asset_empty' })
+
+    await expect(service.importPaths({
+      conversationId: 'conversation_1',
+      existingAssetIds: [],
+      paths: [source],
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(database.mediaAssets.get('asset_empty')).toBeUndefined()
+    expect(await stagingEntries()).toEqual([])
+  })
+
+  it('accepts the exact generic file cap and rejects one byte more before persistence', async () => {
+    const fileBytes = 100 * 1024 * 1024
+    const exact = await sparseMedia('exact.bin', Buffer.from([0xff]), fileBytes)
+    const tooLarge = await sparseMedia('too-large.bin', Buffer.from([0xff]), fileBytes + 1)
+    const service = createMediaAssetService({ database, mediaRoot, id: () => 'asset_file_limit' })
+
+    await expect(service.importPaths({
+      conversationId: 'conversation_1',
+      existingAssetIds: [],
+      paths: [exact],
+    })).resolves.toMatchObject([{ kind: 'file', byteSize: fileBytes }])
+    await expect(service.importPaths({
+      conversationId: 'conversation_1',
+      existingAssetIds: [],
+      paths: [tooLarge],
+    })).rejects.toMatchObject({ code: 'MEDIA_SIZE_LIMIT_EXCEEDED' })
+    expect(database.mediaAssets.listForConversation('conversation_1')).toHaveLength(1)
+    expect(await stagingEntries()).toEqual([])
+  })
+
+  it('classifies a file with invalid UTF-8 after the sniffing prefix as binary', async () => {
+    const source = join(root, 'late-invalid.txt')
+    const bytes = Buffer.concat([Buffer.alloc(64 * 1024, 0x61), Buffer.from([0xff])])
+    await writeFile(source, bytes)
+    const service = createMediaAssetService({ database, mediaRoot, id: () => 'asset_late_invalid' })
+
+    await expect(service.importPaths({
+      conversationId: 'conversation_1',
+      existingAssetIds: [],
+      paths: [source],
+    })).resolves.toMatchObject([{
+      id: 'asset_late_invalid',
+      kind: 'file',
+      mimeType: 'application/octet-stream',
+    }])
+  })
+
+  it.each([
     ['audio', 'oversized.mp3', mp3, MEDIA_LIMITS.audioBytes + 1],
     ['video', 'oversized.mp4', mp4, MEDIA_LIMITS.videoBytes + 1],
   ] as const)('rejects one byte beyond the %s cap before copying', async (_kind, name, bytes, size) => {
@@ -233,13 +339,11 @@ describe('MediaAssetService imports', () => {
     expect(await stagingEntries()).toEqual([])
   })
 
-  it('rejects symbolic links and unsupported content without staging residue', async () => {
+  it('rejects symbolic links without staging residue', async () => {
     const source = join(root, 'source.png')
     const link = join(root, 'source-link.png')
-    const unsupported = join(root, 'unsupported.png')
     await writeFile(source, png)
     await symlink(source, link)
-    await writeFile(unsupported, 'plain text')
     const service = createMediaAssetService({ database, mediaRoot })
 
     await expect(service.importPaths({
@@ -247,11 +351,6 @@ describe('MediaAssetService imports', () => {
       existingAssetIds: [],
       paths: [link],
     })).rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
-    await expect(service.importPaths({
-      conversationId: 'conversation_1',
-      existingAssetIds: [],
-      paths: [unsupported],
-    })).rejects.toMatchObject({ code: 'MEDIA_TYPE_UNSUPPORTED' })
     expect(await stagingEntries()).toEqual([])
   })
 
@@ -1131,6 +1230,7 @@ describe('MediaAssetService ready assets', () => {
       assetId: 'asset_ready',
       kind: 'image',
       mimeType: 'image/png',
+      name: 'ready.png',
       dataBase64: png.toString('base64'),
     }])
 
@@ -1138,6 +1238,26 @@ describe('MediaAssetService ready assets', () => {
     await expect(service.modelInput('conversation_1', [asset.id])).rejects.toMatchObject({
       code: 'MEDIA_ASSET_UNAVAILABLE',
     })
+  })
+
+  it('returns a generic model input with its safe name and no managed path', async () => {
+    const source = join(root, 'model-notes.weird')
+    const bytes = Buffer.from('model attachment text')
+    await writeFile(source, bytes)
+    const service = createMediaAssetService({ database, mediaRoot, id: () => 'asset_model_file' })
+    const [asset] = await service.importPaths({
+      conversationId: 'conversation_1',
+      existingAssetIds: [],
+      paths: [source],
+    })
+
+    await expect(service.modelInput('conversation_1', [asset.id])).resolves.toEqual([{
+      assetId: 'asset_model_file',
+      kind: 'file',
+      mimeType: 'text/plain',
+      name: 'model-notes.weird',
+      dataBase64: bytes.toString('base64'),
+    }])
   })
 
   it('rejects duplicate, wrong-conversation, and symlinked model inputs while preserving requested order', async () => {

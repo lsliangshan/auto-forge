@@ -15,6 +15,7 @@ import {
   toSafeAppError,
   type AppError,
   type AppErrorCode,
+  type AttachmentKind,
   type MediaAsset,
   type ModelProviderId,
 } from '@autoforge/shared'
@@ -26,13 +27,14 @@ export const MEDIA_LIMITS = {
   imageBytes: 20 * 1024 * 1024,
   audioBytes: 50 * 1024 * 1024,
   videoBytes: 200 * 1024 * 1024,
+  fileBytes: 100 * 1024 * 1024,
   requestBytes: 250 * 1024 * 1024,
   generatedBytes: 500 * 1024 * 1024,
 } as const
 
 const MAX_SNIFF_BYTES = 64 * 1024
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
-const SAFE_EXTENSIONS = new Set(['png', 'jpg', 'webp', 'gif', 'avif', 'svg', 'mp3', 'wav', 'ogg', 'flac', 'm4a', 'mp4', 'webm', 'mov'])
+const SAFE_EXTENSIONS = new Set(['png', 'jpg', 'webp', 'gif', 'avif', 'svg', 'mp3', 'wav', 'ogg', 'flac', 'm4a', 'mp4', 'webm', 'mov', 'bin'])
 const MAX_ENCODED_GENERATED_BYTES = Math.ceil(MEDIA_LIMITS.generatedBytes / 3) * 4
 const BASE64_BATCH_CHARACTERS = 64 * 1024
 
@@ -59,8 +61,9 @@ export interface ResolvedMediaAsset extends MediaAsset {
 
 export interface ModelMediaInput {
   assetId: string
-  kind: 'image' | 'audio' | 'video'
+  kind: AttachmentKind
   mimeType: string
+  name: string
   dataBase64: string
 }
 
@@ -132,10 +135,29 @@ export interface MediaAssetFileSystem {
   rename(source: string, destination: string): Promise<void>
 }
 
-interface StagedMedia {
+type FileMimeType =
+  | 'text/plain'
+  | 'application/pdf'
+  | 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  | 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  | 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  | 'application/octet-stream'
+
+type DetectedAsset = DetectedMedia | {
+  kind: 'file'
+  mimeType: FileMimeType
+  extension: 'bin'
+  inlineSafe: false
+}
+
+interface StagedAsset {
   path: string
   byteSize: number
   sha256: string
+  detected: DetectedAsset
+}
+
+interface StagedMedia extends StagedAsset {
   detected: DetectedMedia
 }
 
@@ -189,10 +211,40 @@ function publicAsset(record: MediaAssetRecord): MediaAsset {
   }
 }
 
-function byteLimit(kind: DetectedMedia['kind']): number {
+function byteLimit(kind: AttachmentKind): number {
   if (kind === 'image') return MEDIA_LIMITS.imageBytes
   if (kind === 'audio') return MEDIA_LIMITS.audioBytes
-  return MEDIA_LIMITS.videoBytes
+  if (kind === 'video') return MEDIA_LIMITS.videoBytes
+  return MEDIA_LIMITS.fileBytes
+}
+
+function hasSignature(bytes: Uint8Array, signature: readonly number[]): boolean {
+  return signature.every((value, index) => bytes[index] === value)
+}
+
+function detectedFile(mimeType: FileMimeType): DetectedAsset {
+  return { kind: 'file', mimeType, extension: 'bin', inlineSafe: false }
+}
+
+function detectKnownAsset(bytes: Uint8Array, name: string): DetectedAsset | undefined {
+  const media = detectMediaType(bytes)
+  if (media) return media
+  if (hasSignature(bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) {
+    return detectedFile('application/pdf')
+  }
+  if (hasSignature(bytes, [0x50, 0x4b, 0x03, 0x04])) {
+    const suffix = /\.([^.]+)$/.exec(name)?.[1]?.toLowerCase()
+    if (suffix === 'docx') {
+      return detectedFile('application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    }
+    if (suffix === 'xlsx') {
+      return detectedFile('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    }
+    if (suffix === 'pptx') {
+      return detectedFile('application/vnd.openxmlformats-officedocument.presentationml.presentation')
+    }
+  }
+  return undefined
 }
 
 function snapshot(stat: StableFile): StableFile {
@@ -615,7 +667,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
   const commitStage = async (
     input: GeneratedWriterInput | { conversationId: string; name: string },
     source: 'upload' | 'generated',
-    staged: StagedMedia,
+    staged: StagedAsset,
     fallback: AppErrorCode,
   ): Promise<MediaAsset> => {
     const id = 'assetId' in input && input.assetId !== undefined
@@ -634,8 +686,12 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       originalName: displayName(input.name),
       relativePath,
       byteSize: staged.byteSize,
-      ...(staged.detected.width === undefined ? {} : { width: staged.detected.width }),
-      ...(staged.detected.height === undefined ? {} : { height: staged.detected.height }),
+      ...(staged.detected.kind === 'file' || staged.detected.width === undefined
+        ? {}
+        : { width: staged.detected.width }),
+      ...(staged.detected.kind === 'file' || staged.detected.height === undefined
+        ? {}
+        : { height: staged.detected.height }),
       sha256: staged.sha256,
       ...('provider' in input ? { provider: input.provider, model: input.model } : {}),
       status: 'staging',
@@ -716,10 +772,10 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       if (!sameFile(initial, opened) || await filesystem.realpath(sourcePath) !== initialRealPath) {
         throw failure('MEDIA_IMPORT_FAILED')
       }
+      if (opened.size === 0) throw failure('INVALID_INPUT')
       const prefix = await readPrefix(sourceHandle, opened.size)
-      const detected = detectMediaType(prefix)
-      if (!detected) throw failure('MEDIA_TYPE_UNSUPPORTED')
-      if (opened.size > byteLimit(detected.kind) || opened.size > remainingRequestBytes) {
+      const knownDetected = detectKnownAsset(prefix, basename(sourcePath))
+      if (opened.size > byteLimit(knownDetected?.kind ?? 'file') || opened.size > remainingRequestBytes) {
         throw failure('MEDIA_SIZE_LIMIT_EXCEEDED')
       }
 
@@ -727,17 +783,34 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       stageHandle = stage.handle
       stagePath = stage.path
       const hash = createHash('sha256')
+      const decoder = knownDetected ? undefined : new TextDecoder('utf-8', { fatal: true })
+      let validUtf8 = true
       let byteSize = 0
       const stream = sourceHandle.createReadStream({ start: 0, autoClose: false })
       for await (const value of stream) {
         const chunk = value as Buffer
         byteSize += chunk.byteLength
-        if (byteSize > byteLimit(detected.kind) || byteSize > remainingRequestBytes) {
+        if (byteSize > byteLimit(knownDetected?.kind ?? 'file') || byteSize > remainingRequestBytes) {
           throw failure('MEDIA_SIZE_LIMIT_EXCEEDED')
         }
         hash.update(chunk)
+        if (decoder) {
+          try {
+            decoder.decode(chunk, { stream: true })
+          } catch {
+            validUtf8 = false
+          }
+        }
         await writeAll(stageHandle, chunk)
       }
+      if (decoder) {
+        try {
+          decoder.decode()
+        } catch {
+          validUtf8 = false
+        }
+      }
+      const detected = knownDetected ?? detectedFile(validUtf8 ? 'text/plain' : 'application/octet-stream')
       if (byteSize !== opened.size) throw failure('MEDIA_IMPORT_FAILED')
       const afterHandle = snapshot(await sourceHandle.stat())
       const afterPath = await filesystem.lstat(sourcePath)
@@ -823,8 +896,9 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       if (!sameFile(before, opened) || opened.size !== record.byteSize) throw failure('MEDIA_ASSET_UNAVAILABLE')
       const hash = createHash('sha256')
       const chunks: Buffer[] = []
-      const prefixParts: Buffer[] = []
-      let prefixBytes = 0
+      const knownDetected = detectKnownAsset(await readPrefix(handle, opened.size), record.originalName)
+      const decoder = knownDetected ? undefined : new TextDecoder('utf-8', { fatal: true })
+      let validUtf8 = true
       let byteSize = 0
       for await (const value of handle.createReadStream({ start: 0, autoClose: false })) {
         const chunk = value as Buffer
@@ -834,12 +908,22 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
         }
         hash.update(chunk)
         if (includeBytes) chunks.push(chunk)
-        if (prefixBytes < MAX_SNIFF_BYTES) {
-          const part = chunk.subarray(0, MAX_SNIFF_BYTES - prefixBytes)
-          prefixParts.push(part)
-          prefixBytes += part.byteLength
+        if (decoder) {
+          try {
+            decoder.decode(chunk, { stream: true })
+          } catch {
+            validUtf8 = false
+          }
         }
       }
+      if (decoder) {
+        try {
+          decoder.decode()
+        } catch {
+          validUtf8 = false
+        }
+      }
+      const detected = knownDetected ?? detectedFile(validUtf8 ? 'text/plain' : 'application/octet-stream')
       const after = snapshot(await handle.stat())
       const afterPath = await filesystem.lstat(absolutePath)
       if (
@@ -850,7 +934,6 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
         || !sameFile(after, snapshot(afterPath))
         || await filesystem.realpath(absolutePath) !== canonical
       ) throw failure('MEDIA_ASSET_UNAVAILABLE')
-      const detected = detectMediaType(Buffer.concat(prefixParts, prefixBytes))
       if (!detected || detected.kind !== record.kind || detected.mimeType !== record.mimeType) {
         throw failure('MEDIA_ASSET_UNAVAILABLE')
       }
@@ -970,6 +1053,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
           assetId: record.id,
           kind: record.kind,
           mimeType: record.mimeType!,
+          name: record.originalName,
           dataBase64: inspected.bytes!.toString('base64'),
         })
       }

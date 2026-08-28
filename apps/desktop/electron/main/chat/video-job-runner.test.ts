@@ -1621,6 +1621,7 @@ describe('VideoJobRunner', () => {
         assetId: 'reference_image',
         kind: 'image',
         mimeType: 'image/png',
+        name: 'reference.png',
         dataBase64: 'iVBORw0KGgo=',
       }]
     })
