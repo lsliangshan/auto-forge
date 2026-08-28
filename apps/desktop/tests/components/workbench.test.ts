@@ -2507,11 +2507,11 @@ describe('workbench', () => {
     await vi.waitFor(() => expect(wrapper.text()).toContain('清除会话与执行记录'))
     const button = wrapper.findAll('button').find((entry) => entry.text().includes('清除会话与执行记录'))
     await button?.trigger('click')
-    expect(confirm).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledWith(
       expect.stringContaining('凭证、设置、授权和工作流将保留'),
       '确认清理本地数据',
       expect.any(Object),
-    )
+    ))
     confirm.mockRestore()
   })
 
