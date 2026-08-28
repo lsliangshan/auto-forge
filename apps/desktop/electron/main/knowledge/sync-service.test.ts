@@ -412,6 +412,129 @@ describe('KnowledgeSyncService', () => {
     `).get()).toBeUndefined()
   })
 
+  it('prunes absent remote-only projections only after the complete owner catalog synchronizes', async () => {
+    const pullChanges = vi.fn(async ({ afterSequence }: { afterSequence: number }) => ({
+      kind: 'incremental' as const, nextSequence: afterSequence,
+      hasMore: false, changes: [],
+    }))
+    const { database, remote, service } = fixture({ pullChanges })
+    const listKnowledgeBases = vi.fn().mockResolvedValue(['remote_keep'])
+    Object.assign(remote, { listKnowledgeBases })
+    database.exec(`
+      INSERT INTO cloud_base_projections(
+        id, name, status, published_generation_id, revision, updated_at
+      ) VALUES
+        ('remote_keep', 'Keep', 'ready', NULL, 'r1', 1),
+        ('remote_prune', 'Prune', 'ready', NULL, 'r1', 1),
+        ('kb_1', 'Local shadow', 'ready', NULL, 'r1', 1);
+      INSERT INTO cloud_remote_entity_heads(
+        knowledge_base_id, entity_kind, entity_id, revision, payload_json, deleted, updated_at
+      ) VALUES
+        ('remote_keep', 'knowledge_base', 'remote_keep', 'r1', '{}', 0, 1),
+        ('remote_prune', 'knowledge_base', 'remote_prune', 'r1', '{}', 0, 1),
+        ('kb_1', 'knowledge_base', 'kb_1', 'r1', '{}', 0, 1);
+      INSERT INTO cloud_remote_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES
+        ('remote_keep', 'synced', NULL, 1, 1),
+        ('remote_prune', 'synced', NULL, 1, 1),
+        ('kb_1', 'synced', NULL, 1, 1);
+      INSERT INTO cloud_remote_sync_cursors(knowledge_base_id, sequence, updated_at)
+      VALUES ('remote_keep', 1, 1), ('remote_prune', 1, 1), ('kb_1', 1, 1);
+    `)
+
+    await expect(service.synchronizeOwnerCatalog()).resolves.toEqual(['remote_keep'])
+    expect(listKnowledgeBases).toHaveBeenCalledOnce()
+    expect(pullChanges).toHaveBeenCalledWith({
+      knowledgeBaseId: 'remote_keep', afterSequence: 1,
+    })
+    for (const table of [
+      'cloud_base_projections', 'cloud_remote_entity_heads',
+      'cloud_remote_sync_states', 'cloud_remote_sync_cursors',
+    ]) {
+      const id = table === 'cloud_base_projections' ? 'id' : 'knowledge_base_id'
+      expect(database.prepare(
+        `SELECT ${id} AS id FROM ${table} ORDER BY id`,
+      ).all()).toEqual([{ id: 'kb_1' }, { id: 'remote_keep' }])
+    }
+  })
+
+  it('keeps stale remote projections when catalog synchronization is partial or its access epoch changes', async () => {
+    const secondSnapshot = deferred()
+    const fullResync = vi.fn(async ({ knowledgeBaseId }: { knowledgeBaseId: string }) => {
+      if (knowledgeBaseId === 'remote_second') await secondSnapshot.promise
+      return { kind: 'snapshot' as const, nextSequence: 1, changes: [] }
+    })
+    const first = fixture({ fullResync })
+    Object.assign(first.remote, {
+      listKnowledgeBases: vi.fn().mockResolvedValue(['remote_first', 'remote_second']),
+    })
+    first.database.prepare(`
+      INSERT INTO cloud_base_projections(
+        id, name, status, published_generation_id, revision, updated_at
+      ) VALUES ('remote_stale', 'Stale', 'ready', NULL, 'r1', 1)
+    `).run()
+    const running = first.service.synchronizeOwnerCatalog()
+    await vi.waitFor(() => expect(fullResync).toHaveBeenCalledTimes(2))
+    first.service.setCloudAccess(false)
+    first.service.setCloudAccess(true)
+    secondSnapshot.resolve()
+
+    await expect(running).rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(first.database.prepare(
+      "SELECT id FROM cloud_base_projections WHERE id = 'remote_stale'",
+    ).get()).toEqual({ id: 'remote_stale' })
+
+    const rejected = fixture()
+    Object.assign(rejected.remote, {
+      listKnowledgeBases: vi.fn().mockRejectedValue(
+        Object.assign(new Error('expired'), { code: 'CURSOR_STALE' }),
+      ),
+    })
+    rejected.database.prepare(`
+      INSERT INTO cloud_base_projections(
+        id, name, status, published_generation_id, revision, updated_at
+      ) VALUES ('remote_stale', 'Stale', 'ready', NULL, 'r1', 1)
+    `).run()
+    await expect(rejected.service.synchronizeOwnerCatalog())
+      .rejects.toMatchObject({ code: 'CURSOR_STALE' })
+    expect(rejected.database.prepare(
+      "SELECT id FROM cloud_base_projections WHERE id = 'remote_stale'",
+    ).get()).toEqual({ id: 'remote_stale' })
+  })
+
+  it('rolls back every catalog prune table when one remote-only deletion fails', async () => {
+    const { database, remote, service } = fixture()
+    Object.assign(remote, { listKnowledgeBases: vi.fn().mockResolvedValue([]) })
+    database.exec(`
+      INSERT INTO cloud_base_projections(
+        id, name, status, published_generation_id, revision, updated_at
+      ) VALUES ('remote_stale', 'Stale', 'ready', NULL, 'r1', 1);
+      INSERT INTO cloud_remote_entity_heads(
+        knowledge_base_id, entity_kind, entity_id, revision, payload_json, deleted, updated_at
+      ) VALUES ('remote_stale', 'knowledge_base', 'remote_stale', 'r1', '{}', 0, 1);
+      INSERT INTO cloud_remote_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES ('remote_stale', 'synced', NULL, 1, 1);
+      INSERT INTO cloud_remote_sync_cursors(knowledge_base_id, sequence, updated_at)
+      VALUES ('remote_stale', 1, 1);
+      CREATE TRIGGER reject_catalog_head_prune
+      BEFORE DELETE ON cloud_remote_entity_heads
+      BEGIN SELECT RAISE(ABORT, 'catalog prune rejected'); END;
+    `)
+
+    await expect(service.synchronizeOwnerCatalog()).rejects.toThrow('catalog prune rejected')
+    expect(database.prepare(
+      "SELECT id FROM cloud_base_projections WHERE id = 'remote_stale'",
+    ).get()).toEqual({ id: 'remote_stale' })
+    expect(database.prepare(
+      "SELECT knowledge_base_id AS id FROM cloud_remote_sync_states WHERE knowledge_base_id = 'remote_stale'",
+    ).get()).toEqual({ id: 'remote_stale' })
+    expect(database.prepare(
+      "SELECT knowledge_base_id AS id FROM cloud_remote_sync_cursors WHERE knowledge_base_id = 'remote_stale'",
+    ).get()).toEqual({ id: 'remote_stale' })
+  })
+
   it('rolls back a remote-only snapshot projection when its cursor cannot commit', async () => {
     const replaceRemoteSnapshot = async (...args: unknown[]) => {
       const guard = args[1] as {

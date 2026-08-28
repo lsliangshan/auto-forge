@@ -33,6 +33,7 @@ function cloudRemote(overrides: Partial<CloudKnowledgeRemote> = {}): CloudKnowle
       changes: [],
     })),
     fullResync: vi.fn().mockResolvedValue({ kind: 'snapshot', nextSequence: 0, changes: [] }),
+    listKnowledgeBases: vi.fn().mockResolvedValue([]),
     publishGeneration: vi.fn().mockResolvedValue({
       generationId: 'unused', previousGenerationId: null, sequence: 1,
     }),
@@ -383,6 +384,116 @@ describe('local knowledge service', () => {
     `).get(base.id)).toEqual({ revision: 'remote_r1' })
   })
 
+  it('discovers and materializes every personal cloud base on a cold-start list', async () => {
+    const memory = memoryKnowledgeStore()
+    const listKnowledgeBases = vi.fn().mockResolvedValue(['cold_base_a', 'cold_base_b'])
+    const fullResync = vi.fn(async ({ knowledgeBaseId }: { knowledgeBaseId: string }) => {
+      const suffix = knowledgeBaseId === 'cold_base_a' ? 'a' : 'b'
+      return {
+        kind: 'snapshot' as const, nextSequence: 2,
+        changes: [{
+          sequence: 2, entityKind: 'document' as const,
+          entityId: `cold_document_${suffix}`, operation: 'upsert' as const,
+          revision: `document_r_${suffix}`, payload: {
+            name: `cold-${suffix}.txt`, mimeType: 'text/plain',
+            versionId: `cold_version_${suffix}`, versionNumber: 1,
+            contentHash: suffix.repeat(64), generationId: `cold_generation_${suffix}`,
+            createdAt: 1_000,
+          },
+        }, {
+          sequence: 2, entityKind: 'knowledge_base' as const,
+          entityId: knowledgeBaseId, operation: 'upsert' as const,
+          revision: `base_r_${suffix}`, payload: {
+            name: `Cold ${suffix.toUpperCase()}`,
+            publishedGenerationId: `cold_generation_${suffix}`,
+          },
+        }],
+      }
+    })
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({
+        parse: async () => parsedText('unused'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => false,
+    })
+    service.configureCloudRemote!({
+      ...cloudRemote({ fullResync }), listKnowledgeBases,
+    })
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId, true)
+    memory.database.prepare(`
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+        accepted_key_generation, verified, explicit_free, max_observed_at
+      ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1)
+    `).run()
+    expect(memory.database.prepare(
+      'SELECT count(*) AS count FROM knowledge_bases',
+    ).get()).toEqual({ count: 0 })
+    expect(memory.database.prepare(
+      'SELECT count(*) AS count FROM cloud_base_projections',
+    ).get()).toEqual({ count: 0 })
+
+    await expect(service.list(owner)).resolves.toEqual([
+      expect.objectContaining({ id: 'cold_base_a', name: 'Cold A', kind: 'cloud' }),
+      expect.objectContaining({ id: 'cold_base_b', name: 'Cold B', kind: 'cloud' }),
+    ])
+    expect(listKnowledgeBases).toHaveBeenCalledOnce()
+    expect(fullResync.mock.calls.map(([input]) => input.knowledgeBaseId))
+      .toEqual(['cold_base_a', 'cold_base_b'])
+    const scope = await service.captureSearchScope(owner, ['cold_base_a'])
+    expect(scope.entries).toEqual([expect.objectContaining({
+      baseId: 'cold_base_a', documentId: 'cold_document_a',
+      versionId: 'cold_version_a', cloudGenerationId: 'cold_generation_a',
+    })])
+    await expect(service.sourceAvailable(
+      owner, 'cold_document_a', 'cold_version_a', undefined, scope,
+    )).resolves.toBe(false)
+    expect(memory.database.prepare(`
+      SELECT local_object_available AS localObjectAvailable
+      FROM cloud_version_projections WHERE id = 'cold_version_a'
+    `).get()).toEqual({ localObjectAvailable: 0 })
+  })
+
+  it('does not discover or prune owner catalog projections without current cloud_sync consent', async () => {
+    const memory = memoryKnowledgeStore()
+    const listKnowledgeBases = vi.fn().mockResolvedValue([])
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({
+        parse: async () => parsedText('unused'), terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => true,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true,
+        betaEnabled: true, cloudEnabled: true,
+      }),
+      cloudKillSwitchEnabled: () => false,
+    })
+    service.configureCloudRemote!({ ...cloudRemote(), listKnowledgeBases })
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId, false)
+    memory.database.prepare(`
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+        accepted_key_generation, verified, explicit_free, max_observed_at
+      ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1)
+    `).run()
+
+    await expect(service.list(owner)).resolves.toEqual([])
+    expect(listKnowledgeBases).not.toHaveBeenCalled()
+  })
+
   it('materializes remote-only snapshots, stale replacement, incrementals, and tombstones without local objects', async () => {
     const memory = memoryKnowledgeStore()
     const saveExport = vi.fn()
@@ -476,7 +587,12 @@ describe('local knowledge service', () => {
       }),
       cloudKillSwitchEnabled: () => false,
     })
-    service.configureCloudRemote!(cloudRemote({ fullResync, pullChanges, search }))
+    service.configureCloudRemote!(cloudRemote({
+      fullResync, pullChanges, search,
+      listKnowledgeBases: vi.fn().mockRejectedValue(
+        Object.assign(new Error('temporarily unavailable'), { code: 'SERVICE_UNAVAILABLE' }),
+      ),
+    }))
     const owner = { userId: 'alice' }
     await service.bind(owner.userId, true)
     memory.database.prepare(`
@@ -621,9 +737,10 @@ describe('local knowledge service', () => {
     expect(getJob).toHaveBeenCalledTimes(3)
     observedAt = 2_000
     await service.list(owner)
-    await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(pushMutation).toHaveBeenCalledTimes(2))
 
     expect(beginGeneration).toHaveBeenCalledOnce()
+    expect(publishGeneration).toHaveBeenCalledOnce()
     expect(pushMutation).toHaveBeenCalledTimes(2)
     expect(uploadDocument).toHaveBeenCalledOnce()
     expect(getJob).toHaveBeenCalledTimes(4)

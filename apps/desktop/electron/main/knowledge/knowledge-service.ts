@@ -183,6 +183,7 @@ interface KnowledgeCloudLifecycle {
   enqueue(input: Parameters<KnowledgeSyncService['enqueue']>[0]): void
   synchronize(knowledgeBaseId: string): Promise<unknown>
   synchronizeRemoteProjection(knowledgeBaseId: string): Promise<unknown>
+  synchronizeOwnerCatalog(): Promise<readonly string[]>
   resume(knowledgeBaseId: string): void
   publishGeneration(input: {
     requestId: string
@@ -197,7 +198,7 @@ interface KnowledgeCloudLifecycle {
 }
 
 type ProductionCloudKnowledgeRemote = CloudKnowledgeRemote & Required<Pick<
-  CloudKnowledgeRemote, 'beginGeneration' | 'uploadDocument' | 'search'
+  CloudKnowledgeRemote, 'beginGeneration' | 'uploadDocument' | 'search' | 'listKnowledgeBases'
 >>
 
 function productionCloudRemote(
@@ -207,6 +208,7 @@ function productionCloudRemote(
     && typeof remote.beginGeneration === 'function'
     && typeof remote.uploadDocument === 'function'
     && typeof remote.search === 'function'
+    && typeof remote.listKnowledgeBases === 'function'
     ? remote as ProductionCloudKnowledgeRemote
     : undefined
 }
@@ -384,6 +386,7 @@ export function createLocalKnowledgeService(
     enqueue: () => fail('SERVICE_UNAVAILABLE'),
     synchronize: async () => fail('SERVICE_UNAVAILABLE'),
     synchronizeRemoteProjection: async () => fail('SERVICE_UNAVAILABLE'),
+    synchronizeOwnerCatalog: async () => fail('SERVICE_UNAVAILABLE'),
     resume: () => fail('SERVICE_UNAVAILABLE'),
     publishGeneration: async () => fail('SERVICE_UNAVAILABLE'),
     beginCloudRetention: (knowledgeBaseId, boundaryAt) => {
@@ -1846,6 +1849,14 @@ export function createLocalKnowledgeService(
       const active = current(owner)
       const state = entitlement(active)
       recoverDueCloudPublications(active)
+      if (ordinaryCloudAllowed(active)) {
+        try {
+          await active.cloud.synchronizeOwnerCatalog()
+          assertCurrentBinding(active)
+        } catch {
+          assertCurrentBinding(active)
+        }
+      }
       const kept = retention(active, state)
       const member = state.tier === 'member' && state.status !== 'expired'
       const ids = active.store.database.prepare(

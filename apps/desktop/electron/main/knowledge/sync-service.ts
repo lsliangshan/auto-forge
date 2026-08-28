@@ -28,6 +28,7 @@ export interface CloudKnowledgeRemote {
     nextSequence: number
     changes: CloudKnowledgeChange[]
   }>
+  listKnowledgeBases?(): Promise<readonly string[]>
   publishGeneration(input: PublishGenerationInput): Promise<{
     generationId: string
     previousGenerationId: string | null
@@ -153,6 +154,7 @@ export class KnowledgeSyncService {
   private readonly activeSynchronizations = new Map<string, Promise<SyncResult>>()
   private readonly activeConversions = new Map<string, Promise<void>>()
   private readonly activePurges = new Map<string, Promise<void>>()
+  private activeOwnerCatalog?: Promise<readonly string[]>
   private entitlementEpoch = 0
   private cloudAllowed = false
   private cloudAccessApplied = false
@@ -265,6 +267,43 @@ export class KnowledgeSyncService {
 
   synchronizeRemoteProjection(knowledgeBaseId: string): Promise<SyncResult> {
     return this.startSynchronization(knowledgeBaseId, true)
+  }
+
+  synchronizeOwnerCatalog(): Promise<readonly string[]> {
+    if (this.activeOwnerCatalog) return this.activeOwnerCatalog
+    const synchronization = this.runOwnerCatalogSynchronization()
+    this.activeOwnerCatalog = synchronization
+    const clear = () => {
+      if (this.activeOwnerCatalog === synchronization) this.activeOwnerCatalog = undefined
+    }
+    void synchronization.then(clear, clear)
+    return synchronization
+  }
+
+  private async runOwnerCatalogSynchronization(): Promise<readonly string[]> {
+    const entitlementEpoch = this.captureCloudAccess()
+    if (typeof this.remote.listKnowledgeBases !== 'function') {
+      throw syncError('SERVICE_UNAVAILABLE')
+    }
+    const received = await this.remote.listKnowledgeBases()
+    this.assertCloudAccess(entitlementEpoch)
+    if (!Array.isArray(received) || received.length > 10_000
+      || received.some(knowledgeBaseId => (
+        typeof knowledgeBaseId !== 'string' || knowledgeBaseId.length === 0
+        || knowledgeBaseId.length > 128 || knowledgeBaseId.trim() !== knowledgeBaseId
+        || !/^[A-Za-z0-9_-]+$/u.test(knowledgeBaseId)
+      )) || new Set(received).size !== received.length) {
+      throw syncError('INTERNAL_ERROR')
+    }
+    const knowledgeBaseIds = [...received]
+    for (const knowledgeBaseId of knowledgeBaseIds) {
+      this.assertCloudAccess(entitlementEpoch)
+      const result = await this.synchronizeRemoteProjection(knowledgeBaseId)
+      this.assertCloudAccess(entitlementEpoch)
+      if (result.status !== 'synced') throw syncError('SERVICE_UNAVAILABLE')
+    }
+    this.pruneRemoteOnlyProjections(knowledgeBaseIds, entitlementEpoch)
+    return knowledgeBaseIds
   }
 
   private startSynchronization(
@@ -974,7 +1013,38 @@ export class KnowledgeSyncService {
       ...this.activeSynchronizations.values(),
       ...this.activeConversions.values(),
       ...this.activePurges.values(),
+      ...(this.activeOwnerCatalog ? [this.activeOwnerCatalog] : []),
     ])
+  }
+
+  private pruneRemoteOnlyProjections(
+    knowledgeBaseIds: readonly string[],
+    entitlementEpoch: number,
+  ): void {
+    const catalog = JSON.stringify(knowledgeBaseIds)
+    this.database.transaction(() => {
+      this.assertCloudAccess(entitlementEpoch)
+      this.database.prepare(`
+        DELETE FROM cloud_base_projections
+        WHERE id NOT IN (SELECT value FROM json_each(?))
+          AND NOT EXISTS (
+            SELECT 1 FROM knowledge_bases local WHERE local.id = cloud_base_projections.id
+          )
+      `).run(catalog)
+      for (const table of [
+        'cloud_remote_sync_states', 'cloud_remote_sync_cursors', 'cloud_remote_entity_heads',
+      ]) {
+        this.database.prepare(`
+          DELETE FROM ${table}
+          WHERE knowledge_base_id NOT IN (SELECT value FROM json_each(?))
+            AND NOT EXISTS (
+              SELECT 1 FROM knowledge_bases local
+              WHERE local.id = ${table}.knowledge_base_id
+            )
+        `).run(catalog)
+      }
+      this.assertCloudAccess(entitlementEpoch)
+    })()
   }
 
   private claimMutation(knowledgeBaseId: string): MutationRow | undefined {
