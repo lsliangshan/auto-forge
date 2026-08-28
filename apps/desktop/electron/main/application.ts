@@ -1,6 +1,20 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFile, copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { constants, createWriteStream } from 'node:fs'
+import {
+  appendFile,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readdir,
+  realpath,
+  rename,
+  rm,
+} from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import {
   accountDataPreferencesDefaults,
   accountDataPreferencesRecordSchema,
@@ -9,6 +23,7 @@ import {
   chatFileSupport,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  conversionJobViewSchema,
   legacyImportRequestSchema,
   openExternalRequestSchema,
   privacyConsentSchema,
@@ -21,6 +36,8 @@ import {
   type AuthSession,
   type ChatBlock,
   type ChatEvent,
+  type ConversionJobEvent as DesktopConversionJobEvent,
+  type ConversionJobView,
   type DeveloperProject,
   type ExecutionDetail,
   type ExecutionEvent,
@@ -86,6 +103,8 @@ import { LegacyUserDataImporter } from './sync/legacy-user-data-import.js'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
+  type ConversionArtifact,
+  type ConversionJob,
   type Execution,
   type WorkflowProject,
 } from './database/repositories.js'
@@ -97,7 +116,7 @@ import { createMediaAssetService, type MediaAssetService } from './media/media-a
 import { ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { createProviderUsageReconciliationLoop } from './billing/provider-usage-reconciliation-loop.js'
 import { MediaLifecycle } from './media/media-lifecycle.js'
-import { resolveUserMediaRoot } from './media/user-media-root.js'
+import { resolveUserConversionRoot, resolveUserMediaRoot } from './media/user-media-root.js'
 import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pinned-media-transport.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
@@ -111,6 +130,8 @@ import {
   ExecutionService,
   NodeWorkerFactory,
   type ExecutionAttachmentBinding,
+  type FileConversionPort,
+  type FileConversionTerminalResult,
   type WorkflowExecutionSource,
   type WorkflowExecutionSourceResolver,
 } from './workflows/execution-service.js'
@@ -128,6 +149,17 @@ import {
   type WorkflowSourceSelectorVault,
 } from './workflows/workflow-source-selector.js'
 import type { DesktopIpcServices } from './ipc/register-ipc.js'
+import {
+  createConversionArtifactService,
+  type ConversionArtifactService,
+} from './conversion/conversion-artifact-service.js'
+import {
+  createConversionJobRunner,
+  type ConversionJobEvent as RunnerConversionJobEvent,
+  type ConversionJobRunner,
+  type ConversionJobRuntime,
+} from './conversion/conversion-job-runner.js'
+import { ConverterPackManager } from './conversion/converter-pack-manager.js'
 
 export interface ApplicationPaths {
   database: string
@@ -153,6 +185,7 @@ type ApplicationFailureSource =
   | 'media-cancel'
   | 'chat-drain'
   | 'execution-shutdown'
+  | 'conversion-stop'
   | 'continuation-shutdown'
   | 'browser-shutdown'
   | 'sync-pause'
@@ -205,6 +238,7 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'media-cancel': 50,
   'chat-drain': 60,
   'execution-shutdown': 70,
+  'conversion-stop': 75,
   'continuation-shutdown': 80,
   'browser-shutdown': 90,
   'sync-pause': 95,
@@ -266,6 +300,8 @@ export interface ApplicationRuntimeOptions {
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
   /** @internal Allows deterministic bounded-logout tests. */
   logoutSyncTimeoutMs?: number
+  /** @internal Trusted Main-only conversion runtime used by focused lifecycle tests and signed-pack integration. */
+  conversionRuntime?: ConversionJobRuntime
 }
 
 interface ObservedAuthService extends AuthService {
@@ -714,6 +750,187 @@ function executionSummary(execution: Execution): ExecutionSummary {
   }
 }
 
+const terminalConversionStatuses = new Set<ConversionJob['status']>([
+  'completed', 'failed', 'cancelled', 'interrupted',
+])
+const retryableConversionStatuses = new Set<ConversionJob['status']>([
+  'failed', 'cancelled', 'interrupted',
+])
+const conversionQuarantinePattern = /^(?<artifactId>[A-Za-z0-9][A-Za-z0-9._-]{0,255})\.quarantine-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+
+function insidePath(root: string, candidate: string): boolean {
+  const path = relative(root, candidate)
+  return path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path)
+}
+
+function safeManagedRelativePath(path: string): boolean {
+  if (!path || isAbsolute(path) || path.includes('\\') || path.includes('\0')) return false
+  const segments = path.split('/')
+  return segments.every((segment) => segment.length > 0 && segment !== '.' && segment !== '..')
+}
+
+function safeConversionDisplayName(value: string): boolean {
+  return value.length > 0
+    && value.length <= 255
+    && value.trim() === value
+    && !value.includes('/')
+    && !value.includes('\\')
+    && !Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 31 || codePoint === 127
+    })
+    && !/^(?:[A-Za-z]:|file:|https?:)/iu.test(value)
+}
+
+function sameFileMetadata(
+  left: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+  right: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
+}
+
+async function ensureManagedDirectory(path: string): Promise<string> {
+  await mkdir(path, { recursive: true, mode: 0o700 })
+  const metadata = await lstat(path)
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw failure('CONVERSION_INPUT_INVALID')
+  return realpath(path)
+}
+
+async function openVerifiedConversionArtifact(
+  dataRoot: string,
+  ownerUserId: string,
+  artifact: ConversionArtifact,
+) {
+  if (artifact.status !== 'ready' || artifact.role !== 'output') throw failure('NOT_FOUND')
+  if (!safeConversionDisplayName(artifact.displayName)) throw failure('CONVERSION_INPUT_INVALID')
+  if (!safeManagedRelativePath(artifact.relativePath)) throw failure('CONVERSION_INPUT_INVALID')
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    const dataRootRealPath = await realpath(dataRoot)
+    const root = resolveUserConversionRoot(dataRoot, ownerUserId)
+    const rootMetadata = await lstat(root)
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw failure('CONVERSION_INPUT_INVALID')
+    const rootRealPath = await realpath(root)
+    if (!insidePath(dataRootRealPath, rootRealPath)) throw failure('CONVERSION_INPUT_INVALID')
+    const path = resolve(root, artifact.relativePath)
+    const expectedCanonicalPath = resolve(rootRealPath, artifact.relativePath)
+    if (!insidePath(rootRealPath, expectedCanonicalPath)) throw failure('CONVERSION_INPUT_INVALID')
+    const before = await lstat(path)
+    if (before.isSymbolicLink() || !before.isFile() || before.size !== artifact.byteSize) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    const canonicalPath = await realpath(path)
+    if (canonicalPath !== expectedCanonicalPath || !insidePath(rootRealPath, canonicalPath)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const opened = await handle.stat()
+    if (!sameFileMetadata(before, opened)) throw failure('CONVERSION_INPUT_INVALID')
+    const digest = createHash('sha256')
+    for await (const chunk of handle.createReadStream({ autoClose: false, start: 0 })) digest.update(chunk)
+    const after = await handle.stat()
+    if (!sameFileMetadata(opened, after) || digest.digest('hex') !== artifact.sha256) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    return { artifact, handle, path, root: rootRealPath, metadata: after }
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+      const code = String((error as { code: unknown }).code)
+      if (code === 'NOT_FOUND' || code.startsWith('CONVERSION_')) throw error
+    }
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+}
+
+async function recoverOwnerConversionStorage(
+  dataRoot: string,
+  ownerUserId: string,
+  artifacts: AppRepositories['conversionArtifacts'],
+): Promise<void> {
+  const dataRootRealPath = await realpath(dataRoot)
+  const root = resolveUserConversionRoot(dataRoot, ownerUserId)
+  const rootRealPath = await ensureManagedDirectory(root)
+  if (!insidePath(dataRootRealPath, rootRealPath)) throw failure('CONVERSION_INPUT_INVALID')
+  const staging = await ensureManagedDirectory(join(rootRealPath, '.staging'))
+  const quarantine = await ensureManagedDirectory(join(rootRealPath, '.trash'))
+  if (!insidePath(rootRealPath, staging) || !insidePath(rootRealPath, quarantine)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  for (const name of await readdir(staging)) {
+    const candidate = join(staging, name)
+    if (!insidePath(staging, candidate)) throw failure('CONVERSION_INPUT_INVALID')
+    await rm(candidate, { recursive: true, force: true })
+  }
+  for (const name of await readdir(quarantine)) {
+    const match = conversionQuarantinePattern.exec(name)
+    if (!match?.groups?.artifactId) continue
+    const candidate = join(quarantine, name)
+    const metadata = await lstat(candidate)
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw failure('CONVERSION_INPUT_INVALID')
+    const artifact = artifacts.getOwned(match.groups.artifactId, ownerUserId)
+    if (!artifact || artifact.status === 'deleted' || !safeManagedRelativePath(artifact.relativePath)) {
+      await rm(candidate, { force: true })
+      continue
+    }
+    const destination = resolve(rootRealPath, artifact.relativePath)
+    if (!insidePath(rootRealPath, destination)) throw failure('CONVERSION_INPUT_INVALID')
+    try {
+      await lstat(destination)
+      await rm(candidate, { force: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      const destinationDirectory = await ensureManagedDirectory(dirname(destination))
+      if (!insidePath(rootRealPath, destinationDirectory)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      await rename(candidate, join(destinationDirectory, basename(destination)))
+    }
+  }
+}
+
+function conversionJobView(
+  database: Pick<AppRepositories, 'conversionArtifacts'>,
+  job: ConversionJob,
+): ConversionJobView {
+  return conversionJobViewSchema.parse({
+    jobId: job.id,
+    executionId: job.executionId,
+    targetFormat: job.targetFormat,
+    ...(job.preset === undefined ? {} : { preset: job.preset }),
+    status: job.status,
+    epoch: job.epoch,
+    progress: job.progress,
+    ...(job.errorCode === undefined ? {} : { errorCode: job.errorCode }),
+    artifacts: database.conversionArtifacts.listForJob(job.id, job.ownerUserId).map((artifact) => ({
+      artifactId: artifact.id,
+      status: artifact.status,
+      displayName: artifact.displayName,
+      detectedFormat: artifact.detectedFormat,
+      mimeType: artifact.mimeType,
+      byteSize: artifact.byteSize,
+      ...(artifact.metadata === undefined ? {} : { metadata: artifact.metadata }),
+    })),
+  })
+}
+
+function unavailableConversionRuntime(packManager: ConverterPackManager): ConversionJobRuntime {
+  const unavailable = async (): Promise<never> => {
+    await packManager.initialize()
+    throw failure('CONVERSION_COMPONENT_UNAVAILABLE')
+  }
+  return {
+    concurrencyClass: () => 'other',
+    acquirePack: unavailable,
+    createWriter: unavailable,
+    convert: unavailable,
+  }
+}
+
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
@@ -770,16 +987,21 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let bindUserMedia: (session: AuthSession) => Promise<void> = async () => undefined
   let pauseUserMedia = (): void => undefined
   let deleteUserMedia: (userId: string) => Promise<void> = async () => undefined
+  let bindUserConversion: (session: AuthSession) => Promise<void> = async () => undefined
+  let pauseUserConversion = async (): Promise<void> => undefined
+  let clearExecutionAttachmentVaults: (userId: string) => Promise<void> = async () => undefined
   const bindUserData = (session: AuthSession): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
         await bindUserMedia(session)
+        await bindUserConversion(session)
         activateUserReconciliation(runtimeRecovered)
         await activateVideoJobs(runtimeRecovered)
         return
       }
       await userDataSync.start(session.user.id, deviceId)
       await bindUserMedia(session)
+      await bindUserConversion(session)
       boundUserId = session.user.id
       const warningSince = userDataSync.status().warningSince
       if (warningSince !== undefined) {
@@ -794,6 +1016,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   }
   const pauseUserData = (): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
+      await pauseUserConversion()
+      if (boundUserId) await clearExecutionAttachmentVaults(boundUserId)
       await pauseVideoJobs()
       await pauseUserReconciliation()
       await userDataSync.pause()
@@ -806,6 +1030,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   }
   const prepareUserDataDiscard = (): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
+      await pauseUserConversion()
+      if (boundUserId) await clearExecutionAttachmentVaults(boundUserId)
       await pauseVideoJobs()
       await pauseUserReconciliation()
       userDataSync.discard()
@@ -1034,6 +1260,227 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   }
   deleteUserMedia = async (userId) => {
     await rm(resolveUserMediaRoot(options.paths.data, userId), { recursive: true, force: true })
+  }
+  type ConversionTerminalWaiter = {
+    ownerUserId: string
+    resolve(value: FileConversionTerminalResult): void
+    reject(error: unknown): void
+    signal: AbortSignal
+    onAbort(): void
+  }
+  type BoundConversionLifecycle = {
+    ownerUserId: string
+    artifacts: ConversionArtifactService
+    packManager: ConverterPackManager
+    runner: ConversionJobRunner
+  }
+  let boundConversion: BoundConversionLifecycle | undefined
+  const conversionEventListeners = new Set<(event: DesktopConversionJobEvent) => void>()
+  const conversionTerminalWaiters = new Map<string, Set<ConversionTerminalWaiter>>()
+
+  const currentConversion = (ownerUserId?: string): BoundConversionLifecycle => {
+    const lifecycle = boundConversion
+    if (!lifecycle || (ownerUserId !== undefined && lifecycle.ownerUserId !== ownerUserId)) {
+      throw failure('AUTH_REQUIRED')
+    }
+    return lifecycle
+  }
+  const terminalConversionResult = (job: ConversionJob): FileConversionTerminalResult => ({
+    status: job.status as 'completed' | 'failed' | 'cancelled' | 'interrupted',
+    ...(job.errorCode === undefined ? {} : { errorCode: job.errorCode }),
+    outputs: job.status !== 'completed' ? [] : database.conversionArtifacts
+      .listForJob(job.id, job.ownerUserId)
+      .filter((artifact) => artifact.status === 'ready' && artifact.role === 'output')
+      .map((artifact) => ({
+        displayName: artifact.displayName,
+        detectedFormat: artifact.detectedFormat,
+        byteSize: artifact.byteSize,
+      })),
+  })
+  const settleConversionWaiters = (job: ConversionJob): void => {
+    if (!terminalConversionStatuses.has(job.status)) return
+    const waiters = conversionTerminalWaiters.get(job.id)
+    if (!waiters) return
+    conversionTerminalWaiters.delete(job.id)
+    for (const waiter of waiters) {
+      waiter.signal.removeEventListener('abort', waiter.onAbort)
+      if (waiter.ownerUserId === job.ownerUserId) waiter.resolve(terminalConversionResult(job))
+      else waiter.reject(failure('NOT_FOUND'))
+    }
+  }
+  const emitConversionJob = (job: ConversionJob): void => {
+    if (job.ownerUserId !== boundConversion?.ownerUserId
+      || !auth.isAuthenticated()
+      || auth.currentUserId() !== job.ownerUserId) return
+    settleConversionWaiters(job)
+    let event: DesktopConversionJobEvent
+    try {
+      event = { type: 'job_updated', job: conversionJobView(database, job) }
+    } catch {
+      return
+    }
+    for (const listener of conversionEventListeners) {
+      try { listener(event) } catch { /* Renderer event listeners are observational. */ }
+    }
+  }
+  const replayConversionJobs = (
+    ownerUserId: string,
+    listener: (event: DesktopConversionJobEvent) => void,
+  ): void => {
+    if (ownerUserId !== boundConversion?.ownerUserId
+      || !auth.isAuthenticated()
+      || auth.currentUserId() !== ownerUserId) return
+    for (const execution of database.executions.listForUser(ownerUserId)) {
+      for (const job of database.conversionJobs.listForExecution(execution.id, ownerUserId)) {
+        try {
+          listener({ type: 'job_updated', job: conversionJobView(database, job) })
+        } catch {
+          // Invalid durable projections and listener failures do not widen the event boundary.
+        }
+      }
+    }
+  }
+  const runnerEvent = (event: RunnerConversionJobEvent): void => {
+    if (event.ownerUserId !== boundConversion?.ownerUserId) return
+    const job = database.conversionJobs.getOwned(event.jobId, event.ownerUserId)
+    if (job) emitConversionJob(job)
+  }
+  const rejectConversionWaiters = (ownerUserId: string): void => {
+    for (const [jobId, waiters] of conversionTerminalWaiters) {
+      const retained = new Set<ConversionTerminalWaiter>()
+      for (const waiter of waiters) {
+        if (waiter.ownerUserId !== ownerUserId) {
+          retained.add(waiter)
+          continue
+        }
+        waiter.signal.removeEventListener('abort', waiter.onAbort)
+        waiter.reject(failure('CONVERSION_INTERRUPTED'))
+      }
+      if (retained.size === 0) conversionTerminalWaiters.delete(jobId)
+      else conversionTerminalWaiters.set(jobId, retained)
+    }
+  }
+  pauseUserConversion = async () => {
+    const lifecycle = boundConversion
+    if (!lifecycle) return
+    try {
+      await lifecycle.runner.stop()
+    } finally {
+      rejectConversionWaiters(lifecycle.ownerUserId)
+      conversionEventListeners.clear()
+      if (boundConversion === lifecycle) boundConversion = undefined
+    }
+  }
+  bindUserConversion = async (session) => {
+    if (boundConversion?.ownerUserId === session.user.id) return
+    if (boundConversion) await pauseUserConversion()
+    const artifacts = createConversionArtifactService({
+      dataRoot: options.paths.data,
+      database: chatDatabase,
+    })
+    const packManager = new ConverterPackManager({
+      packsRoot: join(options.paths.data, 'converter-packs'),
+    })
+    await packManager.initialize()
+    await recoverOwnerConversionStorage(options.paths.data, session.user.id, database.conversionArtifacts)
+    const runner = createConversionJobRunner({
+      ownerUserId: session.user.id,
+      jobs: database.conversionJobs,
+      runtime: options.conversionRuntime ?? unavailableConversionRuntime(packManager),
+      onEvent: runnerEvent,
+    })
+    const lifecycle: BoundConversionLifecycle = {
+      ownerUserId: session.user.id,
+      artifacts,
+      packManager,
+      runner,
+    }
+    boundConversion = lifecycle
+    runner.start()
+    for (const execution of database.executions.listForUser(session.user.id)) {
+      for (const job of database.conversionJobs.listForExecution(execution.id, session.user.id)) {
+        emitConversionJob(job)
+      }
+    }
+  }
+  const conversionSourceFingerprint = (binding: ExecutionAttachmentBinding): string => {
+    let sourceId: string
+    let sha256: string | undefined
+    if (binding.source.kind === 'media') {
+      sourceId = binding.source.mediaAssetId
+      const record = chatDatabase.mediaAssets.get(sourceId)
+      const conversation = record && chatDatabase.conversations.get(record.conversationId)
+      if (!record || conversation?.userId !== binding.ownerUserId || record.status !== 'ready') {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      sha256 = record.sha256
+    } else {
+      sourceId = binding.source.artifactId
+      const record = database.conversionArtifacts.getOwned(sourceId, binding.ownerUserId)
+      if (!record || record.status !== 'ready' || record.role !== 'input') {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      sha256 = record.sha256
+    }
+    if (!sha256 || !/^[a-f0-9]{64}$/u.test(sha256)) throw failure('CONVERSION_INPUT_INVALID')
+    return createHash('sha256')
+      .update('autoforge-file-conversion-source-v1\0')
+      .update(binding.ownerUserId)
+      .update('\0')
+      .update(sourceId)
+      .update('\0')
+      .update(sha256)
+      .digest('hex')
+  }
+  const fileConversion: FileConversionPort = {
+    async inspectAttachment(binding) {
+      const lifecycle = currentConversion(binding.ownerUserId)
+      if (conversionSourceFingerprint(binding) !== binding.sourceFingerprint) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      const resolved = await lifecycle.artifacts.resolveOwnedInput(binding)
+      try {
+        if (conversionSourceFingerprint(binding) !== binding.sourceFingerprint) {
+          throw failure('CONVERSION_INPUT_INVALID')
+        }
+      } finally {
+        await resolved.close()
+      }
+      return Object.freeze({ ...binding, source: Object.freeze({ ...binding.source }) })
+    },
+    submit: (input) => currentConversion().runner.submit(input),
+    waitForTerminal: async (jobId, ownerUserId, signal) => {
+      currentConversion(ownerUserId)
+      const job = database.conversionJobs.getOwned(jobId, ownerUserId)
+      if (!job) throw failure('NOT_FOUND')
+      if (terminalConversionStatuses.has(job.status)) return terminalConversionResult(job)
+      if (signal.aborted) throw failure('CANCELLED')
+      return new Promise((resolvePromise, rejectPromise) => {
+        const waiters = conversionTerminalWaiters.get(jobId) ?? new Set<ConversionTerminalWaiter>()
+        const waiter: ConversionTerminalWaiter = {
+          ownerUserId,
+          resolve: resolvePromise,
+          reject: rejectPromise,
+          signal,
+          onAbort: () => {
+            signal.removeEventListener('abort', waiter.onAbort)
+            waiters.delete(waiter)
+            if (waiters.size === 0) conversionTerminalWaiters.delete(jobId)
+            rejectPromise(failure('CANCELLED'))
+          },
+        }
+        waiters.add(waiter)
+        conversionTerminalWaiters.set(jobId, waiters)
+        signal.addEventListener('abort', waiter.onAbort, { once: true })
+        if (signal.aborted) {
+          waiter.onAbort()
+          return
+        }
+        const current = database.conversionJobs.getOwned(jobId, ownerUserId)
+        if (current) settleConversionWaiters(current)
+      })
+    },
+    cancel: (jobId) => currentConversion().runner.cancel(jobId),
   }
   const providerCredentialEpoch = new Map<ModelProviderId, number>()
   const modelCatalog = new Map<ModelProviderId, {
@@ -1276,6 +1723,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     policy,
     workers: new NodeWorkerFactory(options.paths.workflowRunner),
     capability: browser,
+    conversion: fileConversion,
     emit: emitExecution,
     temporaryDirectories: {
       create: async () => { await mkdir(options.paths.temporary, { recursive: true }); return mkdtemp(join(options.paths.temporary, 'autoforge-execution-')) },
@@ -1283,6 +1731,22 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         ?? ((path) => rm(path, { recursive: true, force: true })),
     },
   })
+  clearExecutionAttachmentVaults = async (ownerUserId) => {
+    const activeStatuses = new Set([
+      'queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval',
+    ])
+    const executionIds = database.executions.listForUser(ownerUserId)
+      .filter((execution) => activeStatuses.has(execution.status))
+      .map((execution) => execution.id)
+    const results = await Promise.allSettled(executionIds.map((executionId) => (
+      executions.cancel(executionId)
+    )))
+    const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (rejected) throw rejected.reason
+    while (executions.hasActiveExecutions()) {
+      await new Promise<void>((resolvePromise) => { setImmediate(resolvePromise) })
+    }
+  }
   const conversationTitles = new ConversationTitleService({
     repositories: chatDatabase,
     emit: (event) => emitChat(event),
@@ -2256,6 +2720,128 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await browser.closeExecution(executionId)
       },
     },
+    conversion: {
+      listForExecution: async ({ executionId }) => {
+        const session = await requireAuthenticatedSession()
+        if (!database.executions.getForUser(executionId, session.user.id)) {
+          throw failure('NOT_FOUND')
+        }
+        currentConversion(session.user.id)
+        return database.conversionJobs.listForExecution(executionId, session.user.id)
+          .map((job) => conversionJobView(database, job))
+      },
+      cancel: async ({ jobId }) => {
+        const session = await requireAuthenticatedSession()
+        const lifecycle = currentConversion(session.user.id)
+        const job = database.conversionJobs.getOwned(jobId, session.user.id)
+        if (!job) throw failure('NOT_FOUND')
+        if (terminalConversionStatuses.has(job.status)) throw failure('CONFLICT')
+        if (!await lifecycle.runner.cancel(jobId)) throw failure('CONFLICT')
+      },
+      retry: async ({ jobId }) => {
+        const session = await requireAuthenticatedSession()
+        const lifecycle = currentConversion(session.user.id)
+        const job = database.conversionJobs.getOwned(jobId, session.user.id)
+        if (!job) throw failure('NOT_FOUND')
+        if (!retryableConversionStatuses.has(job.status)) throw failure('CONFLICT')
+        if (!lifecycle.runner.retry(jobId)) throw failure('CONFLICT')
+      },
+      saveCopy: async ({ artifactId }) => {
+        const session = await requireAuthenticatedSession()
+        const artifact = database.conversionArtifacts.getOwned(artifactId, session.user.id)
+        if (!artifact || artifact.status !== 'ready') throw failure('NOT_FOUND')
+        const verified = await openVerifiedConversionArtifact(
+          options.paths.data,
+          session.user.id,
+          artifact,
+        )
+        let temporaryPath: string | undefined
+        try {
+          const selected = await options.chooseMediaSavePath(artifact.displayName)
+          if (!selected) return { saved: false }
+          const destination = resolve(selected)
+          const destinationDirectory = await realpath(dirname(destination))
+          if (insidePath(verified.root, destinationDirectory)
+            || insidePath(verified.root, destination)) {
+            throw failure('INVALID_INPUT')
+          }
+          temporaryPath = join(
+            destinationDirectory,
+            `.${randomUUID()}.autoforge-conversion.partial`,
+          )
+          const digest = createHash('sha256')
+          await pipeline(
+            verified.handle.createReadStream({ autoClose: false, start: 0 }),
+            new Transform({
+              transform(chunk: Buffer, _encoding, callback) {
+                digest.update(chunk)
+                callback(null, chunk)
+              },
+            }),
+            createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 }),
+          )
+          const after = await verified.handle.stat()
+          const managed = await lstat(verified.path)
+          if (!sameFileMetadata(verified.metadata, after)
+            || !sameFileMetadata(after, managed)
+            || after.size !== artifact.byteSize
+            || digest.digest('hex') !== artifact.sha256) {
+            throw failure('CONVERSION_INPUT_INVALID')
+          }
+          await rename(temporaryPath, destination)
+          temporaryPath = undefined
+          return { saved: true }
+        } finally {
+          await verified.handle.close().catch(() => undefined)
+          if (temporaryPath) await rm(temporaryPath, { force: true }).catch(() => undefined)
+        }
+      },
+      reveal: async ({ artifactId }) => {
+        const session = await requireAuthenticatedSession()
+        const artifact = database.conversionArtifacts.getOwned(artifactId, session.user.id)
+        if (!artifact || artifact.status !== 'ready') throw failure('NOT_FOUND')
+        const verified = await openVerifiedConversionArtifact(
+          options.paths.data,
+          session.user.id,
+          artifact,
+        )
+        try {
+          options.revealPath(verified.path)
+        } finally {
+          await verified.handle.close().catch(() => undefined)
+        }
+      },
+      deleteArtifact: async ({ artifactId }) => {
+        const session = await requireAuthenticatedSession()
+        const artifact = database.conversionArtifacts.getOwned(artifactId, session.user.id)
+        if (!artifact || artifact.status !== 'ready') throw failure('NOT_FOUND')
+        const verified = await openVerifiedConversionArtifact(
+          options.paths.data,
+          session.user.id,
+          artifact,
+        )
+        await verified.handle.close()
+        const trash = await ensureManagedDirectory(join(verified.root, '.trash'))
+        if (!insidePath(verified.root, trash)) throw failure('CONVERSION_INPUT_INVALID')
+        const quarantined = join(trash, `${artifact.id}.quarantine-${randomUUID()}`)
+        await rename(verified.path, quarantined)
+        if (!database.conversionArtifacts.markDeleted(artifact.id, session.user.id)) {
+          await rename(quarantined, verified.path)
+          throw failure('CONFLICT')
+        }
+        if (artifact.conversionJobId) {
+          const job = database.conversionJobs.getOwned(artifact.conversionJobId, session.user.id)
+          if (job) emitConversionJob(job)
+        }
+        await rm(quarantined, { force: true }).catch(() => undefined)
+      },
+      onEvent: (listener) => {
+        conversionEventListeners.add(listener)
+        const ownerUserId = boundConversion?.ownerUserId
+        if (ownerUserId) replayConversionJobs(ownerUserId, listener)
+        return () => { conversionEventListeners.delete(listener) }
+      },
+    },
     permissions: {
       listGrants: async () => database.permissionGrants.list().map((grant): PermissionGrant => ({
         id: grant.id,
@@ -2582,6 +3168,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     chat: gateUserDataService(ungatedServices.chat),
     media: gateUserDataService(ungatedServices.media),
     executions: gateUserDataService(ungatedServices.executions),
+    conversion: {
+      ...gateUserDataService(ungatedServices.conversion),
+      onEvent: ungatedServices.conversion.onEvent,
+    },
     settings: {
       ...ungatedServices.settings,
       getTokenUsage: () => userDataAdmission.run(ungatedServices.settings.getTokenUsage),
@@ -2685,6 +3275,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           conversationTitleContexts.clear()
         })
         await capture('execution-shutdown', () => executions.shutdown())
+        await capture('conversion-stop', () => pauseUserConversion())
         await capture('continuation-shutdown', async () => {
           try { await browserContinuations.shutdown() } finally {
             browserLoginWait.dispose()

@@ -4,6 +4,11 @@ import { isHttpsUrlPattern } from './https-url-pattern.js'
 import { proxySettingsSchema } from './proxy-settings.js'
 import { appErrorCodeSchema } from './errors.js'
 import {
+  conversionJobStatusSchema,
+  conversionPresetSchema,
+  conversionTargetFormatSchema,
+} from './conversion.js'
+import {
   chatBlockSchema,
   attachmentKindSchema,
   type ChatBlock,
@@ -1398,6 +1403,59 @@ export const appInfoSchema = z.object({
 }).strict()
 export type AppInfo = z.infer<typeof appInfoSchema>
 
+const conversionOpaqueIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/)
+const conversionMimeTypeSchema = z.string().max(127).regex(
+  /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u,
+)
+const conversionDisplayNameSchema = z.string().trim().min(1).max(255).refine(
+  (value) => !/[\\/]/u.test(value)
+    && !Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 31 || codePoint === 127
+    })
+    && !/^(?:[A-Za-z]:|file:|https?:)/iu.test(value),
+  'A safe display name is required',
+)
+const conversionArtifactMetadataSchema = z.object({
+  iconRepresentations: z.array(z.union([
+    z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64),
+    z.literal(128), z.literal(256), z.literal(512), z.literal(1024),
+  ])).min(1).max(9).optional(),
+  pdfPage: z.number().int().min(1).max(100).optional(),
+  frameSelection: z.literal('first').optional(),
+  transparentPadding: z.literal(true).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0)
+
+export const conversionArtifactViewSchema = z.object({
+  artifactId: conversionOpaqueIdSchema,
+  status: z.enum(['ready', 'deleted']),
+  displayName: conversionDisplayNameSchema,
+  detectedFormat: conversionTargetFormatSchema,
+  mimeType: conversionMimeTypeSchema,
+  byteSize: z.number().int().nonnegative().max(500 * 1024 * 1024),
+  metadata: conversionArtifactMetadataSchema.optional(),
+}).strict()
+export type ConversionArtifactView = z.infer<typeof conversionArtifactViewSchema>
+
+export const conversionJobViewSchema = z.object({
+  jobId: conversionOpaqueIdSchema,
+  executionId: conversionOpaqueIdSchema,
+  targetFormat: conversionTargetFormatSchema,
+  preset: conversionPresetSchema.optional(),
+  status: conversionJobStatusSchema,
+  epoch: z.number().int().nonnegative(),
+  progress: z.number().int().min(0).max(100),
+  errorCode: appErrorCodeSchema.optional(),
+  artifacts: z.array(conversionArtifactViewSchema).max(256),
+}).strict()
+export type ConversionJobView = z.infer<typeof conversionJobViewSchema>
+
+export const conversionJobEventSchema = z.object({
+  type: z.literal('job_updated'),
+  job: conversionJobViewSchema,
+}).strict()
+export type ConversionJobEvent = z.infer<typeof conversionJobEventSchema>
+
 export const ipcChannels = {
   authGetSession: 'auth:get-session',
   authRefreshAuthorization: 'auth:refresh-authorization',
@@ -1453,6 +1511,13 @@ export const ipcChannels = {
   executionsDecide: 'executions:decide',
   executionsCancel: 'executions:cancel',
   executionsEvent: 'executions:event',
+  conversionListForExecution: 'conversion:list-for-execution',
+  conversionCancel: 'conversion:cancel',
+  conversionRetry: 'conversion:retry',
+  conversionSaveCopy: 'conversion:save-copy',
+  conversionReveal: 'conversion:reveal',
+  conversionDeleteArtifact: 'conversion:delete-artifact',
+  conversionEvent: 'conversion:event',
   permissionsListGrants: 'permissions:list-grants',
   permissionsRevoke: 'permissions:revoke',
   settingsGet: 'settings:get',
@@ -1545,6 +1610,9 @@ export const validateProjectRequestSchema = z.object({ projectId: identifierSche
 export const executionListRequestSchema = executionQuerySchema.optional()
 export const getExecutionRequestSchema = z.object({ executionId: identifierSchema }).strict()
 export const cancelExecutionRequestSchema = z.object({ executionId: identifierSchema }).strict()
+export const conversionExecutionRequestSchema = z.object({ executionId: conversionOpaqueIdSchema }).strict()
+export const conversionJobRequestSchema = z.object({ jobId: conversionOpaqueIdSchema }).strict()
+export const conversionArtifactRequestSchema = z.object({ artifactId: conversionOpaqueIdSchema }).strict()
 export const revokePermissionRequestSchema = z.object({ grantId: identifierSchema }).strict()
 export const settingsGetRequestSchema = z.undefined()
 export const settingsUpdateRequestSchema = appSettingsPatchSchema
@@ -1626,6 +1694,12 @@ export const ipcRequestSchemas = {
   [ipcChannels.executionsGet]: getExecutionRequestSchema,
   [ipcChannels.executionsDecide]: approvalDecisionSchema,
   [ipcChannels.executionsCancel]: cancelExecutionRequestSchema,
+  [ipcChannels.conversionListForExecution]: conversionExecutionRequestSchema,
+  [ipcChannels.conversionCancel]: conversionJobRequestSchema,
+  [ipcChannels.conversionRetry]: conversionJobRequestSchema,
+  [ipcChannels.conversionSaveCopy]: conversionArtifactRequestSchema,
+  [ipcChannels.conversionReveal]: conversionArtifactRequestSchema,
+  [ipcChannels.conversionDeleteArtifact]: conversionArtifactRequestSchema,
   [ipcChannels.permissionsListGrants]: z.undefined(),
   [ipcChannels.permissionsRevoke]: revokePermissionRequestSchema,
   [ipcChannels.settingsGet]: settingsGetRequestSchema,
@@ -1703,6 +1777,12 @@ export const ipcResponseSchemas = {
   [ipcChannels.executionsGet]: executionDetailSchema,
   [ipcChannels.executionsDecide]: voidResponseSchema,
   [ipcChannels.executionsCancel]: voidResponseSchema,
+  [ipcChannels.conversionListForExecution]: z.array(conversionJobViewSchema),
+  [ipcChannels.conversionCancel]: voidResponseSchema,
+  [ipcChannels.conversionRetry]: voidResponseSchema,
+  [ipcChannels.conversionSaveCopy]: z.object({ saved: z.boolean() }).strict(),
+  [ipcChannels.conversionReveal]: voidResponseSchema,
+  [ipcChannels.conversionDeleteArtifact]: voidResponseSchema,
   [ipcChannels.permissionsListGrants]: z.array(permissionGrantSchema),
   [ipcChannels.permissionsRevoke]: voidResponseSchema,
   [ipcChannels.settingsGet]: appSettingsSchema,
@@ -1797,6 +1877,15 @@ export interface DesktopAPI {
     decide(input: ApprovalDecision): Promise<void>
     cancel(executionId: string): Promise<void>
     onEvent(listener: (event: ExecutionEvent) => void): () => void
+  }
+  conversion: {
+    listForExecution(input: { executionId: string }): Promise<ConversionJobView[]>
+    cancel(input: { jobId: string }): Promise<void>
+    retry(input: { jobId: string }): Promise<void>
+    saveCopy(input: { artifactId: string }): Promise<{ saved: boolean }>
+    reveal(input: { artifactId: string }): Promise<void>
+    deleteArtifact(input: { artifactId: string }): Promise<void>
+    onEvent(listener: (event: ConversionJobEvent) => void): () => void
   }
   permissions: {
     listGrants(): Promise<PermissionGrant[]>

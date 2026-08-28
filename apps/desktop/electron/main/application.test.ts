@@ -63,6 +63,8 @@ import type { CredentialBoundModelProvider } from './chat/model-provider-registr
 import { openAppDatabase } from './database/client.js'
 import { ProviderUsageConsistencyError, type Execution } from './database/repositories.js'
 import { UserDataStoreManager } from './database/user-data-client.js'
+import type { ConversionJobRuntime } from './conversion/conversion-job-runner.js'
+import { resolveUserConversionRoot } from './media/user-media-root.js'
 import {
   NetworkProxyService,
   type NetworkProxyPort,
@@ -419,6 +421,44 @@ function userMediaScope(userId: string): string {
     .update('autoforge-user-media-v1\0')
     .update(userId)
     .digest('hex')
+}
+
+async function seedConversion(input: {
+  root: string
+  ownerUserId: string
+  executionId?: string
+  jobId?: string
+  status?: 'queued' | 'converting' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  artifact?: { id: string; bytes: Buffer; displayName?: string }
+}) {
+  const executionId = input.executionId ?? 'execution_conversion'
+  const jobId = input.jobId ?? 'job_conversion'
+  const database = openAppDatabase(join(input.root, 'autoforge.sqlite'))
+  database.executions.insert({
+    id: executionId, ownerUserId: input.ownerUserId,
+    workflowId: 'file.convert.universal', workflowVersion: '0.1.0', status: 'completed', input: {},
+  })
+  database.conversionJobs.create({
+    id: jobId, ownerUserId: input.ownerUserId, executionId,
+    sourceKind: 'artifact', sourceId: 'source_artifact', targetFormat: 'png',
+    status: input.status ?? 'completed', epoch: 0,
+    progress: input.status === 'completed' ? 100 : 0,
+  })
+  if (input.artifact) {
+    const relativePath = join('results', `${input.artifact.id}.png`)
+    database.conversionArtifacts.create({
+      id: input.artifact.id, ownerUserId: input.ownerUserId, executionId,
+      conversionJobId: jobId, role: 'output',
+      displayName: input.artifact.displayName ?? 'result.png', detectedFormat: 'png',
+      mimeType: 'image/png', byteSize: input.artifact.bytes.byteLength,
+      sha256: createHash('sha256').update(input.artifact.bytes).digest('hex'), relativePath,
+    })
+    const root = resolveUserConversionRoot(input.root, input.ownerUserId)
+    await mkdir(join(root, 'results'), { recursive: true })
+    await writeFile(join(root, relativePath), input.artifact.bytes)
+  }
+  database.close()
+  return { executionId, jobId }
 }
 
 async function authenticate(
@@ -8684,6 +8724,214 @@ describe('createApplicationRuntime', () => {
     await retrying
     expect((await runtime.services.chat.listConversations({ limit: 50 })).items)
       .toContainEqual(expect.objectContaining({ id: second.id, syncState: 'pending' }))
+    await runtime.close()
+  })
+
+  it('projects owner-scoped conversion snapshots and performs verified managed artifact actions', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-actions-'))
+    directories.push(root)
+    const aliceId = 'test_user_conversionalice'
+    const bobId = 'test_user_conversionbobby'
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+X3gXswAAAABJRU5ErkJggg==',
+      'base64',
+    )
+    const alice = await seedConversion({
+      root, ownerUserId: aliceId, executionId: 'execution_alice_conversion',
+      jobId: 'job_alice_conversion', status: 'completed',
+      artifact: { id: 'artifact_alice_conversion', bytes: png },
+    })
+    await seedConversion({
+      root, ownerUserId: aliceId, executionId: 'execution_alice_failed',
+      jobId: 'job_alice_failed', status: 'failed',
+    })
+    await seedConversion({
+      root, ownerUserId: aliceId, executionId: 'execution_alice_missing',
+      jobId: 'job_alice_missing', status: 'completed',
+      artifact: { id: 'artifact_alice_missing', bytes: png },
+    })
+    await rm(join(
+      resolveUserConversionRoot(root, aliceId), 'results', 'artifact_alice_missing.png',
+    ))
+    await seedConversion({
+      root, ownerUserId: bobId, executionId: 'execution_bob_conversion',
+      jobId: 'job_bob_conversion', status: 'completed',
+      artifact: { id: 'artifact_bob_conversion', bytes: png },
+    })
+    const destination = join(root, 'saved-copy.png')
+    const revealPath = vi.fn()
+    const chooseMediaSavePath = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValue(destination)
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaSavePath,
+      revealPath,
+    }))
+    await authenticate(runtime, 'ConversionAlice', false)
+    const events: unknown[] = []
+    runtime.services.conversion.onEvent((event) => { events.push(event) })
+
+    const snapshot = await runtime.services.conversion.listForExecution({
+      executionId: alice.executionId,
+    })
+    expect(snapshot).toEqual([expect.objectContaining({
+      jobId: alice.jobId,
+      executionId: alice.executionId,
+      status: 'completed',
+      artifacts: [expect.objectContaining({
+        artifactId: 'artifact_alice_conversion', status: 'ready', displayName: 'result.png',
+      })],
+    })])
+    expect(JSON.stringify(snapshot)).not.toMatch(/owner|userId|sourceId|relativePath|absolutePath|sha256/i)
+
+    await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_alice_conversion' }))
+      .resolves.toEqual({ saved: false })
+    await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_alice_conversion' }))
+      .resolves.toEqual({ saved: true })
+    await expect(readFile(destination)).resolves.toEqual(png)
+    await expect(runtime.services.conversion.reveal({ artifactId: 'artifact_alice_conversion' }))
+      .resolves.toBeUndefined()
+    expect(revealPath).toHaveBeenCalledWith(join(
+      resolveUserConversionRoot(root, aliceId), 'results', 'artifact_alice_conversion.png',
+    ))
+
+    await expect(runtime.services.conversion.cancel({ jobId: alice.jobId }))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.services.conversion.retry({ jobId: alice.jobId }))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.services.conversion.retry({ jobId: 'job_alice_failed' }))
+      .resolves.toBeUndefined()
+    await expect(runtime.services.conversion.cancel({ jobId: 'job_bob_conversion' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_bob_conversion' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(runtime.services.conversion.listForExecution({ executionId: 'execution_bob_conversion' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    for (const action of [
+      () => runtime.services.conversion.saveCopy({ artifactId: 'artifact_alice_missing' }),
+      () => runtime.services.conversion.reveal({ artifactId: 'artifact_alice_missing' }),
+      () => runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_alice_missing' }),
+    ]) {
+      await expect(action()).rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    }
+
+    await expect(runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_alice_conversion' }))
+      .resolves.toBeUndefined()
+    await expect(access(join(
+      resolveUserConversionRoot(root, aliceId), 'results', 'artifact_alice_conversion.png',
+    ))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_alice_conversion' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_alice_conversion' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'job_updated',
+      job: expect.objectContaining({
+        jobId: alice.jobId,
+        artifacts: [expect.objectContaining({ artifactId: 'artifact_alice_conversion', status: 'deleted' })],
+      }),
+    }))
+    expect(JSON.stringify(events)).not.toMatch(/owner|userId|relativePath|absolutePath|sha256/i)
+    await runtime.close()
+  })
+
+  it('recovers owner partials and interrupted jobs before broadcasting strict snapshots', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-recovery-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversionrecovery'
+    const seeded = await seedConversion({
+      root, ownerUserId, executionId: 'execution_conversion_recovery',
+      jobId: 'job_conversion_recovery', status: 'converting',
+    })
+    const packPartial = join(
+      root, 'converter-packs', '.partial-12345678-1234-4123-8123-123456789abc',
+    )
+    const artifactPartial = join(resolveUserConversionRoot(root, ownerUserId), '.staging', 'stale.partial')
+    await mkdir(packPartial, { recursive: true })
+    await mkdir(dirname(artifactPartial), { recursive: true })
+    await writeFile(artifactPartial, 'partial')
+
+    const runtime = createApplicationRuntime(options(root))
+    const events: unknown[] = []
+    runtime.services.conversion.onEvent((event) => { events.push(event) })
+    await authenticate(runtime, 'ConversionRecovery', false)
+
+    await expect(access(packPartial)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(access(artifactPartial)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(runtime.services.conversion.listForExecution({ executionId: seeded.executionId }))
+      .resolves.toEqual([expect.objectContaining({
+        jobId: seeded.jobId, status: 'interrupted', errorCode: 'CONVERSION_INTERRUPTED',
+      })])
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'job_updated', job: expect.objectContaining({ jobId: seeded.jobId, status: 'interrupted' }),
+    }))
+
+    const forwarded = events.length
+    await runtime.services.auth.logout({ discardPending: true })
+    await runtime.services.auth.loginWithPassword({ account: 'ConversionRecovery', password: 'password' })
+    expect(events).toHaveLength(forwarded)
+    await runtime.close()
+  })
+
+  it('aborts and fully drains the owner conversion runner before closing its user store', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-drain-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversiondrain'
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_conversion_drain',
+      jobId: 'job_conversion_drain', status: 'queued',
+    })
+    const started = deferred<AbortSignal>()
+    let released = false
+    let writerAborted = false
+    const conversionRuntime: ConversionJobRuntime = {
+      concurrencyClass: () => 'other',
+      acquirePack: async () => ({
+        name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
+        root: join(root, 'fake-pack'), executables: {},
+        release: () => { released = true },
+      }),
+      createWriter: async () => ({
+        tempPath: join(root, 'conversion-output.partial'),
+        commit: async () => { throw new Error('late commit') },
+        abort: async () => { writerAborted = true },
+      }),
+      convert: async (_job, _lease, _writer, { signal }) => {
+        started.resolve(signal)
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve()
+          else signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
+      },
+    }
+    const closeEvidence: Array<{ aborted: boolean; released: boolean; writerAborted: boolean }> = []
+    class ObservedUserDataStores extends UserDataStoreManager {
+      override close(): void {
+        if (this.current()) {
+          closeEvidence.push({
+            aborted: signal?.aborted ?? false,
+            released,
+            writerAborted,
+          })
+        }
+        super.close()
+      }
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores: new ObservedUserDataStores(join(root, 'user-caches')),
+      conversionRuntime,
+    }))
+    await authenticate(runtime, 'ConversionDrain', false)
+    const signal = await started.promise
+
+    await expect(runtime.services.auth.logout({ discardPending: true }))
+      .resolves.toEqual({ status: 'logged_out' })
+    expect(closeEvidence[0]).toEqual({ aborted: true, released: true, writerAborted: true })
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    expect(database.conversionJobs.getOwned('job_conversion_drain', ownerUserId))
+      .toMatchObject({ status: 'interrupted' })
+    database.close()
     await runtime.close()
   })
 })

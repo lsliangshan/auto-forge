@@ -1,5 +1,6 @@
 import {
   chatEventSchema,
+  conversionJobEventSchema,
   executionEventSchema,
   ipcChannels,
   toSafeAppError,
@@ -130,6 +131,20 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       decide: (input) => invoke(ipcRenderer, ipcChannels.executionsDecide, input),
       cancel: (executionId) => invoke(ipcRenderer, ipcChannels.executionsCancel, { executionId }),
       onEvent: (listener) => subscribe(ipcRenderer, ipcChannels.executionsEvent, (payload) => executionEventSchema.safeParse(payload), listener),
+    },
+    conversion: {
+      listForExecution: (input) => invoke(ipcRenderer, ipcChannels.conversionListForExecution, input),
+      cancel: (input) => invoke(ipcRenderer, ipcChannels.conversionCancel, input),
+      retry: (input) => invoke(ipcRenderer, ipcChannels.conversionRetry, input),
+      saveCopy: (input) => invoke(ipcRenderer, ipcChannels.conversionSaveCopy, input),
+      reveal: (input) => invoke(ipcRenderer, ipcChannels.conversionReveal, input),
+      deleteArtifact: (input) => invoke(ipcRenderer, ipcChannels.conversionDeleteArtifact, input),
+      onEvent: (listener) => subscribe(
+        ipcRenderer,
+        ipcChannels.conversionEvent,
+        (payload) => conversionJobEventSchema.safeParse(payload),
+        listener,
+      ),
     },
     permissions: {
       listGrants: () => invoke(ipcRenderer, ipcChannels.permissionsListGrants),

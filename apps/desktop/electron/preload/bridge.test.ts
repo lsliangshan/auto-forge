@@ -276,6 +276,51 @@ describe('preload desktop bridge', () => {
     expect(app.api).not.toHaveProperty('ipcRenderer')
   })
 
+  it('maps only opaque conversion identifiers and validates subscribed events', async () => {
+    const app = harness()
+
+    await app.api.conversion.listForExecution({ executionId: 'execution_1' })
+    await app.api.conversion.cancel({ jobId: 'job_1' })
+    await app.api.conversion.retry({ jobId: 'job_2' })
+    await app.api.conversion.saveCopy({ artifactId: 'artifact_1' })
+    await app.api.conversion.reveal({ artifactId: 'artifact_2' })
+    await app.api.conversion.deleteArtifact({ artifactId: 'artifact_3' })
+
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-6)).toEqual([
+      [ipcChannels.conversionListForExecution, { executionId: 'execution_1' }],
+      [ipcChannels.conversionCancel, { jobId: 'job_1' }],
+      [ipcChannels.conversionRetry, { jobId: 'job_2' }],
+      [ipcChannels.conversionSaveCopy, { artifactId: 'artifact_1' }],
+      [ipcChannels.conversionReveal, { artifactId: 'artifact_2' }],
+      [ipcChannels.conversionDeleteArtifact, { artifactId: 'artifact_3' }],
+    ])
+    expect(app.api.conversion).not.toHaveProperty('path')
+    expect(app.api.conversion).not.toHaveProperty('invoke')
+
+    const listener = vi.fn()
+    const unsubscribe = app.api.conversion.onEvent(listener)
+    const wrapped = [...app.listeners.get(ipcChannels.conversionEvent)!][0]!
+    const event = {
+      type: 'job_updated',
+      job: {
+        jobId: 'job_1', executionId: 'execution_1', targetFormat: 'png',
+        status: 'completed', epoch: 0, progress: 100,
+        artifacts: [{
+          artifactId: 'artifact_1', status: 'ready', displayName: 'result.png',
+          detectedFormat: 'png', mimeType: 'image/png', byteSize: 8,
+        }],
+      },
+    }
+    wrapped({}, event)
+    wrapped({}, { ...event, managedPath: '/private/conversion/result.png' })
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(event)
+
+    unsubscribe()
+    unsubscribe()
+    expect(app.ipcRenderer.removeListener).toHaveBeenCalledWith(ipcChannels.conversionEvent, wrapped)
+  })
+
   it('normalizes IPC errors without exposing resolved paths', async () => {
     const app = harness({ getPathForFile: () => '/private/photo.png' })
     vi.mocked(app.ipcRenderer.invoke).mockRejectedValueOnce(new Error('open /private/photo.png failed'))
