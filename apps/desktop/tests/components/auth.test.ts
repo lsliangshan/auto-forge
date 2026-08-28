@@ -180,6 +180,33 @@ describe('authentication store', () => {
     expect(settings.cloudSyncConsentState).toEqual(revokedCloudConsent)
   })
 
+  it('keeps a pending revoke authoritative when a consent load starts and resolves afterward', async () => {
+    const api = createApi()
+    const pendingRevoke = deferred<PrivacyConsentState>()
+    const staleLoad = deferred<PrivacyConsentState | null>()
+    vi.mocked(api.auth.loginWithPassword).mockResolvedValue(authSession)
+    vi.mocked(api.settings.revokeCloudSyncConsent).mockReturnValueOnce(pendingRevoke.promise)
+    vi.mocked(api.settings.getCloudSyncConsentState).mockReturnValueOnce(staleLoad.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const settings = useSettingsStore()
+
+    await auth.loginWithPassword({ account: 'Alice', password: 'password' })
+    settings.cloudSyncConsentState = acceptedCloudConsent
+    const revoking = settings.revokeCloudSyncConsent()
+    expect(settings.saving).toBe(true)
+
+    const loading = settings.loadCloudData()
+    staleLoad.resolve(acceptedCloudConsent)
+    await loading
+    expect(settings.saving).toBe(true)
+
+    pendingRevoke.resolve(revokedCloudConsent)
+    await revoking
+    expect(settings.cloudSyncConsentState).toEqual(revokedCloudConsent)
+    expect(settings.saving).toBe(false)
+  })
+
   it.each(['restore', 'password', 'otp'] as const)(
     'resets old-user chat before a direct UID replacement through %s',
     async (flow) => {

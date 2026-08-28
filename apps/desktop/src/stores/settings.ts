@@ -75,7 +75,9 @@ export const useSettingsStore = defineStore('settings', {
     remoteUsageError: '',
     cloudDataError: '',
     _cloudDataOwnerId: undefined as string | undefined,
-    _cloudDataVersion: 0,
+    _cloudDataReadVersion: 0,
+    _cloudConsentMutationVersion: 0,
+    _cloudConsentMutationPending: false,
     _loadVersion: 0,
     _tokenUsageVersion: 0,
     _credentialVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
@@ -112,7 +114,9 @@ export const useSettingsStore = defineStore('settings', {
     bindAccountOwner(ownerId: string | undefined) {
       if (ownerId === this._cloudDataOwnerId) return
       this._cloudDataOwnerId = ownerId
-      this._cloudDataVersion += 1
+      this._cloudDataReadVersion += 1
+      this._cloudConsentMutationVersion += 1
+      this._cloudConsentMutationPending = false
       this._tokenUsageVersion += 1
       this.tokenUsage = undefined
       this.remoteUsage = undefined
@@ -150,7 +154,9 @@ export const useSettingsStore = defineStore('settings', {
     async loadCloudData() {
       const ownerId = this._cloudDataOwnerId
       if (!ownerId) return
-      const version = ++this._cloudDataVersion
+      const readVersion = ++this._cloudDataReadVersion
+      const consentMutationVersion = this._cloudConsentMutationVersion
+      const consentMutationWasPending = this._cloudConsentMutationPending
       this.cloudDataError = ''
       this.remoteUsageError = ''
       const [remoteUsage, accountDataPreferences, legacyImportPreview, cloudSyncConsentState]
@@ -160,7 +166,8 @@ export const useSettingsStore = defineStore('settings', {
         Promise.resolve().then(() => getDesktopApi().settings.previewLegacyImport()),
         Promise.resolve().then(() => getDesktopApi().settings.getCloudSyncConsentState()),
       ])
-      if (ownerId !== this._cloudDataOwnerId || version !== this._cloudDataVersion) return
+      if (ownerId !== this._cloudDataOwnerId
+        || readVersion !== this._cloudDataReadVersion) return
       if (remoteUsage.status === 'fulfilled') {
         this.remoteUsage = remoteUsage.value
       } else {
@@ -176,10 +183,13 @@ export const useSettingsStore = defineStore('settings', {
       } else if (!this.cloudDataError) {
         this.cloudDataError = displayError(legacyImportPreview.reason, '历史会话迁移信息加载失败')
       }
-      if (cloudSyncConsentState.status === 'fulfilled') {
-        this.cloudSyncConsentState = cloudSyncConsentState.value
-      } else if (!this.cloudDataError) {
-        this.cloudDataError = displayError(cloudSyncConsentState.reason, '云同步授权状态加载失败')
+      if (!consentMutationWasPending
+        && consentMutationVersion === this._cloudConsentMutationVersion) {
+        if (cloudSyncConsentState.status === 'fulfilled') {
+          this.cloudSyncConsentState = cloudSyncConsentState.value
+        } else if (!this.cloudDataError) {
+          this.cloudDataError = displayError(cloudSyncConsentState.reason, '云同步授权状态加载失败')
+        }
       }
     },
     async updateAccountDataPreferences(input: AccountDataPreferences) {
@@ -201,22 +211,28 @@ export const useSettingsStore = defineStore('settings', {
     async revokeCloudSyncConsent() {
       const ownerId = this._cloudDataOwnerId
       if (!ownerId || this.cloudSyncConsentState?.state !== 'accepted') return
-      const version = ++this._cloudDataVersion
+      const mutationVersion = ++this._cloudConsentMutationVersion
+      this._cloudDataReadVersion += 1
+      this._cloudConsentMutationPending = true
       this.saving = true
       this.cloudDataError = ''
       try {
         const revoked = await getDesktopApi().settings
           .revokeCloudSyncConsent({ confirmed: true })
-        if (ownerId === this._cloudDataOwnerId && version === this._cloudDataVersion) {
+        if (ownerId === this._cloudDataOwnerId
+          && mutationVersion === this._cloudConsentMutationVersion) {
           this.cloudSyncConsentState = revoked
         }
       } catch (error) {
-        if (ownerId === this._cloudDataOwnerId && version === this._cloudDataVersion) {
+        if (ownerId === this._cloudDataOwnerId
+          && mutationVersion === this._cloudConsentMutationVersion) {
           this.cloudDataError = displayError(error, '云同步授权撤回失败')
         }
         throw error
       } finally {
-        if (ownerId === this._cloudDataOwnerId && version === this._cloudDataVersion) {
+        if (ownerId === this._cloudDataOwnerId
+          && mutationVersion === this._cloudConsentMutationVersion) {
+          this._cloudConsentMutationPending = false
           this.saving = false
         }
       }
