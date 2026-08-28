@@ -120,6 +120,7 @@ describe('CloudBase knowledge function', () => {
       if (name === 'autoforge_knowledge_assert_cloud_sync_consent') {
         throw { code: 'FORBIDDEN' }
       }
+      if (name === 'autoforge_knowledge_get_upload') throw { code: 'FORBIDDEN' }
       return {}
     })
     const storage = {
@@ -151,7 +152,11 @@ describe('CloudBase knowledge function', () => {
     expect(rpc).toHaveBeenCalledTimes(requests.length)
     expect(rpc.mock.calls.every(([name]) => (
       name === 'autoforge_knowledge_assert_cloud_sync_consent'
+        || name === 'autoforge_knowledge_get_upload'
     ))).toBe(true)
+    expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_get_upload', {
+      p_caller_user_id: context.auth.uid, p_upload_ticket: 'ticket',
+    })
     expect(storage.createUploadAuthorization).not.toHaveBeenCalled()
     expect(storage.statObject).not.toHaveBeenCalled()
   })
@@ -554,6 +559,7 @@ describe('CloudBase knowledge function', () => {
         ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
         objectId, storageReference,
         expectedByteSize: 42, expectedSha256: sha256, expectedMimeType: 'text/plain',
+        verified: false,
       })
       .mockResolvedValueOnce({
         ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
@@ -598,7 +604,35 @@ describe('CloudBase knowledge function', () => {
     })
   })
 
-  it('returns an atomically committed upload verification even if consent is revoked afterward', async () => {
+  it('replays an exact already-verified upload after revocation without another Storage read', async () => {
+    const sha256 = 'a'.repeat(64)
+    const objectId = expectedUploadObjectId()
+    const storageReference = expectedStorageReference(objectId)
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_assert_cloud_sync_consent') {
+        throw { code: 'FORBIDDEN' }
+      }
+      if (name === 'autoforge_knowledge_get_upload') return {
+        ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
+        objectId, storageReference, expectedByteSize: 42, expectedSha256: sha256,
+        expectedMimeType: 'text/plain', verified: true,
+      }
+      throw new Error(`unexpected RPC ${name}`)
+    })
+    const storage = {
+      createUploadAuthorization: vi.fn(), statObject: vi.fn(), deleteObjects: vi.fn(),
+    }
+    const handler = createProductionKnowledgeHandler({ rpc, storage })
+
+    await expect(handler({ action: 'completeUpload', uploadTicket: 'ticket_1' }, context))
+      .resolves.toEqual({
+        ok: true, data: { objectId, storageReference, verified: true },
+      })
+    expect(rpc.mock.calls.map(([name]) => name)).toEqual(['autoforge_knowledge_get_upload'])
+    expect(storage.statObject).not.toHaveBeenCalled()
+  })
+
+  it('delegates final consent linearization to the atomic upload verification RPC', async () => {
     const sha256 = 'a'.repeat(64)
     const objectId = expectedUploadObjectId()
     const storageReference = expectedStorageReference(objectId)
@@ -613,7 +647,7 @@ describe('CloudBase knowledge function', () => {
       if (name === 'autoforge_knowledge_get_upload') return {
         ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
         objectId, storageReference, expectedByteSize: 42, expectedSha256: sha256,
-        expectedMimeType: 'text/plain',
+        expectedMimeType: 'text/plain', verified: false,
       }
       if (name === 'autoforge_knowledge_verify_upload') {
         verifiedInDatabase = true
@@ -637,9 +671,9 @@ describe('CloudBase knowledge function', () => {
     await expect(handler({ action: 'completeUpload', uploadTicket: 'ticket_1' }, context))
       .resolves.toEqual({
         ok: true, data: { objectId, storageReference, verified: true },
-      })
+    })
     expect(verifiedInDatabase).toBe(true)
-    expect(consentChecks).toBe(2)
+    expect(consentChecks).toBe(0)
   })
 
   it('rejects reviewer-reproduced owner, base, object, or private-path drift before Storage authorization', async () => {
@@ -676,7 +710,7 @@ describe('CloudBase knowledge function', () => {
     const getUpload = {
       ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
       objectId, storageReference, expectedByteSize: 42, expectedSha256: sha256,
-      expectedMimeType: 'text/plain',
+      expectedMimeType: 'text/plain', verified: false,
     }
     const storage = {
       createUploadAuthorization: vi.fn(),

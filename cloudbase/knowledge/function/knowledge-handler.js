@@ -62,7 +62,7 @@ const actionKeys = {
   ],
 }
 const cloudSyncConsentActions = new Set([
-  'beginSync', 'beginGeneration', 'authorizeUpload', 'completeUpload',
+  'beginSync', 'beginGeneration', 'authorizeUpload',
   'pushMutation', 'pullChanges', 'fullResync', 'listKnowledgeBases',
   'publishGeneration', 'getJob', 'searchKnowledge', 'beginEmbeddingDriftProbe',
 ])
@@ -331,13 +331,13 @@ function validResponse(action, value) {
     case 'getUpload':
       return exactKeys(value, [
         'ownerId', 'knowledgeBaseId', 'uploadTicket', 'objectId', 'storageReference',
-        'expectedByteSize', 'expectedSha256', 'expectedMimeType',
+        'expectedByteSize', 'expectedSha256', 'expectedMimeType', 'verified',
       ]) && nonEmptyString(value.ownerId, 64) && nonEmptyString(value.knowledgeBaseId)
         && nonEmptyString(value.uploadTicket) && nonEmptyString(value.objectId)
         && validStorageReference(value.storageReference)
         && Number.isSafeInteger(value.expectedByteSize) && value.expectedByteSize > 0
         && typeof value.expectedSha256 === 'string' && /^[a-f0-9]{64}$/.test(value.expectedSha256)
-        && nonEmptyString(value.expectedMimeType, 200)
+        && nonEmptyString(value.expectedMimeType, 200) && typeof value.verified === 'boolean'
     case 'completeUpload':
       return exactKeys(value, [
         'ownerId', 'knowledgeBaseId', 'uploadTicket', 'objectId', 'storageReference',
@@ -1133,6 +1133,11 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           || !expectedReference || data.storageReference !== expectedReference) {
           throw { code: 'INTERNAL_ERROR' }
         }
+        if (data.verified) {
+          return boundedSuccess({
+            objectId: data.objectId, storageReference: data.storageReference, verified: true,
+          })
+        }
         const observed = await storage.statObject(data.storageReference)
         if (!exactKeys(observed, ['byteSize', 'sha256', 'mimeType'])
           || !Number.isSafeInteger(observed.byteSize) || observed.byteSize <= 0
@@ -1141,7 +1146,6 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           || observed.byteSize !== data.expectedByteSize
           || observed.sha256 !== data.expectedSha256
           || observed.mimeType !== data.expectedMimeType) throw { code: 'INTERNAL_ERROR' }
-        await assertCloudSyncConsent(rpc, uid)
         const verified = await rpc('autoforge_knowledge_verify_upload', {
           p_caller_user_id: uid, p_upload_ticket: event.uploadTicket,
           p_knowledge_base_id: data.knowledgeBaseId, p_object_id: data.objectId,

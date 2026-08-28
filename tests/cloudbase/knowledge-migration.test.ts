@@ -37,6 +37,18 @@ const catalogRollbackUrl = new URL(
   '../../cloudbase/knowledge/migrations/0003_owner_knowledge_catalog.rollback.sql',
   import.meta.url,
 )
+const correctiveCanonicalUrl = new URL(
+  '../../cloudbase/migrations/20260829040000_cloud_job_consent_upload_recovery.sql',
+  import.meta.url,
+)
+const correctiveFeatureUrl = new URL(
+  '../../cloudbase/knowledge/migrations/0004_cloud_job_consent_upload_recovery.sql',
+  import.meta.url,
+)
+const correctiveRollbackUrl = new URL(
+  '../../cloudbase/knowledge/migrations/0004_cloud_job_consent_upload_recovery.rollback.sql',
+  import.meta.url,
+)
 
 const tables = [
   'knowledge_bases',
@@ -96,6 +108,15 @@ function applyFunctionReplacements(definition: string, migration: string): strin
     expect(next, `replacement anchor was not found: ${replacement[1]}`).not.toBe(current)
     return next
   }, definition)
+}
+
+function applyMatchingFunctionReplacements(definition: string, migration: string): string {
+  const replacements = [...migration.matchAll(
+    /\$old\$([\s\S]*?)\$old\$,\s*\$new\$([\s\S]*?)\$new\$/g,
+  )]
+  return replacements.reduce((current, replacement) => (
+    current.includes(replacement[1]) ? current.replace(replacement[1], replacement[2]) : current
+  ), definition)
 }
 
 function canonical(value: unknown): string {
@@ -292,6 +313,150 @@ describe('CloudBase personal knowledge migration', () => {
         Math.min(...businessLockIndexes),
       )
     }
+  })
+
+  it('binds every non-cleanup job and permit to the accepted cloud consent revision', async () => {
+    const [foundation, workers, corrective] = await Promise.all([
+      readFile(featureUrl, 'utf8'), readFile(workerFeatureUrl, 'utf8'),
+      readFile(correctiveFeatureUrl, 'utf8'),
+    ])
+    expect(corrective).toContain('ADD COLUMN IF NOT EXISTS cloud_consent_revision bigint')
+    expect(corrective).toMatch(
+      /ALTER TABLE public\.knowledge_embedding_dispatch_permits\s+ADD COLUMN IF NOT EXISTS cloud_consent_revision bigint/,
+    )
+    const currentRevision = functionDefinition(
+      corrective, 'autoforge_knowledge_current_cloud_consent_revision',
+    )
+    expect(currentRevision).toMatch(
+      /FROM public\.app_privacy_consent_states[\s\S]+FOR SHARE/,
+    )
+    const requireRevision = functionDefinition(
+      corrective, 'autoforge_knowledge_require_job_cloud_revision',
+    )
+    expect(requireRevision).toContain('autoforge_knowledge_current_cloud_consent_revision')
+    expect(requireRevision).toContain(
+      'p_cloud_consent_revision IS DISTINCT FROM consent_revision',
+    )
+    expect(requireRevision).toContain("p_job_kind = 'purge'")
+
+    const directClaim = functionDefinition(corrective, 'autoforge_knowledge_claim_job')
+    expect(directClaim).toContain('autoforge_knowledge_require_job_cloud_revision')
+    expect(directClaim).toContain("state = 'paused'")
+
+    for (const [source, name] of [
+      [workers, 'autoforge_knowledge_get_upload_work'],
+      [workers, 'autoforge_knowledge_complete_upload_index'],
+      [workers, 'autoforge_knowledge_yield_job'],
+      [foundation, 'autoforge_knowledge_complete_embedding_generation'],
+      [foundation, 'autoforge_knowledge_claim_embedding_batch'],
+      [foundation, 'autoforge_knowledge_assert_worker_mutation_window'],
+      [foundation, 'autoforge_knowledge_validate_job_mutation_permit'],
+    ] as const) {
+      const effective = applyMatchingFunctionReplacements(
+        functionDefinition(source, name), corrective,
+      )
+      expect(effective, `${name} rechecks the captured consent`).toContain(
+        'autoforge_knowledge_require_job_cloud_revision',
+      )
+    }
+    const driftAdmission = applyMatchingFunctionReplacements(
+      functionDefinition(foundation, 'autoforge_knowledge_begin_embedding_drift_probe'),
+      corrective,
+    )
+    expect(driftAdmission).toContain(
+      'autoforge_knowledge_current_cloud_consent_revision(owner)',
+    )
+    expect(driftAdmission).toContain("'embedding', p_generation_id, 'queued', cloud_revision")
+
+    const issuePermit = applyMatchingFunctionReplacements(
+      functionDefinition(foundation, 'autoforge_knowledge_issue_embedding_dispatch_permit'),
+      corrective,
+    )
+    expect(issuePermit).toContain(
+      'cloud_revision := public.autoforge_knowledge_current_cloud_consent_revision(owner)',
+    )
+    expect(issuePermit).toMatch(
+      /configuration_version, cloud_consent_revision, expires_at[\s\S]+?p_configuration_version, cloud_revision, new_expiry/,
+    )
+    expect(issuePermit).not.toMatch(
+      /p_knowledge_base_id, p_generation_id, p_chunk_id,\s+p_knowledge_base_id, p_generation_id, p_chunk_id/,
+    )
+    for (const name of [
+      'autoforge_knowledge_reserve_embedding_dispatch_attempt',
+      'autoforge_knowledge_mark_embedding_dispatch_started',
+    ]) {
+      const effective = applyMatchingFunctionReplacements(
+        functionDefinition(foundation, name), corrective,
+      )
+      expect(effective, `${name} rechecks its persisted permit revision`).toContain(
+        "owner, 'embedding', permit.cloud_consent_revision",
+      )
+    }
+
+    const canRun = (jobRevision: number | null, currentRevision: number | null, input: {
+      entitlement: boolean; killSwitch: boolean; kind: 'upload' | 'embedding' | 'purge'
+    }) => input.kind === 'purge' || (
+      input.entitlement && !input.killSwitch
+      && jobRevision !== null && currentRevision === jobRevision
+    )
+    expect(canRun(7, 7, { entitlement: true, killSwitch: false, kind: 'upload' })).toBe(true)
+    expect(canRun(7, null, { entitlement: true, killSwitch: false, kind: 'upload' })).toBe(false)
+    expect(canRun(7, 8, { entitlement: true, killSwitch: false, kind: 'upload' })).toBe(false)
+    expect(canRun(7, 7, { entitlement: true, killSwitch: true, kind: 'embedding' })).toBe(false)
+    expect(canRun(null, null, { entitlement: false, killSwitch: true, kind: 'purge' })).toBe(true)
+  })
+
+  it('queues upload work only after exact verification and preserves exact verification replay', async () => {
+    const corrective = await readFile(correctiveFeatureUrl, 'utf8')
+    const authorize = functionDefinition(
+      corrective, 'autoforge_knowledge_authorize_upload',
+    )
+    const verify = functionDefinition(
+      corrective, 'autoforge_knowledge_verify_upload',
+    )
+    expect(authorize).not.toContain('INSERT INTO public.knowledge_jobs')
+    expect(authorize).toContain('cloud_consent_revision')
+    const getUpload = functionDefinition(corrective, 'autoforge_knowledge_get_upload')
+    expect(getUpload).toContain(
+      "'verified', authorization.consumed_at IS NOT NULL AND object.state = 'verified'",
+    )
+    expect(verify).toContain("object.state <> 'verified'")
+    expect(verify).toContain('authorization.consumed_at IS NOT NULL')
+    expect(verify).toContain('RETURN response')
+    expect(verify.indexOf("SET state = 'verified'")).toBeLessThan(
+      verify.indexOf('INSERT INTO public.knowledge_jobs'),
+    )
+    expect(verify).toContain("'upload', authorization.version_id, 'queued'")
+    expect(verify).toContain('cloud_consent_revision')
+
+    const attempts = new Map<string, number>()
+    const claim = (owner: string, verified: boolean) => {
+      if (!verified) return false
+      attempts.set(owner, (attempts.get(owner) ?? 0) + 1)
+      return true
+    }
+    expect(claim('alice', false)).toBe(false)
+    expect(claim('bob', true)).toBe(true)
+    expect(attempts.get('alice')).toBeUndefined()
+    expect(attempts.get('bob')).toBe(1)
+  })
+
+  it('ships the consent-bound upload recovery migration mirrored with a data-preserving rollback', async () => {
+    const [canonicalCorrective, featureCorrective, rollbackCorrective] = await Promise.all([
+      readFile(correctiveCanonicalUrl, 'utf8'), readFile(correctiveFeatureUrl, 'utf8'),
+      readFile(correctiveRollbackUrl, 'utf8'),
+    ])
+    expect(canonicalCorrective).toBe(featureCorrective)
+    expect(rollbackCorrective).not.toMatch(/DROP TABLE|DROP COLUMN|TRUNCATE|DELETE FROM/i)
+    expect(rollbackCorrective).toContain('cloud_consent_revision')
+    expect(featureCorrective).toContain(
+      'REVOKE ALL ON FUNCTION public.autoforge_knowledge_require_job_cloud_revision',
+    )
+    expect(featureCorrective).toContain(
+      'GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_require_job_cloud_revision',
+    )
+    expect(featureCorrective.trimEnd()).toMatch(/COMMIT;$/)
+    expect(rollbackCorrective.trimEnd()).toMatch(/COMMIT;$/)
   })
 
   it('uses owner-composite relationships, forced RLS, and default-deny grants', async () => {
