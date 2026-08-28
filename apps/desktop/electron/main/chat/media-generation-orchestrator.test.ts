@@ -121,6 +121,7 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
     importClipboardImage: vi.fn(),
     removeDraft: vi.fn(),
     resolveReadyAsset: vi.fn(),
+    resolveInlineAsset: vi.fn(),
     modelInput: vi.fn(async () => []),
     createGeneratedWriter: vi.fn(async () => writer),
     commitGeneratedBase64: vi.fn(async () => {

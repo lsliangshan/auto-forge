@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -6,7 +7,11 @@ import {
   createMediaProtocolHandler,
   parseSingleRange,
 } from './media-protocol.js'
-import type { ResolvedMediaAsset } from './media-asset-service.js'
+import { openTestUserDataDatabase } from '../../test-support/user-data-database.js'
+import {
+  createMediaAssetService,
+  type ResolvedMediaAsset,
+} from './media-asset-service.js'
 
 const roots: string[] = []
 
@@ -58,7 +63,7 @@ describe('parseSingleRange', () => {
 describe('createMediaProtocolHandler', () => {
   it('serves a bounded explicit range with safe response headers', async () => {
     const { bytes, resolveReadyAsset } = await fixture()
-    const handler = createMediaProtocolHandler({ resolveReadyAsset })
+    const handler = createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })
 
     const response = await handler(new Request('autoforge-media://asset/asset_1', {
       headers: { range: 'bytes=10-19' },
@@ -80,7 +85,7 @@ describe('createMediaProtocolHandler', () => {
     ['bytes=-10', Buffer.from(Array.from({ length: 10 }, (_, index) => index + 90))],
   ])('serves valid open-ended and suffix ranges', async (range, expected) => {
     const { resolveReadyAsset } = await fixture()
-    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+    const response = await createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })(new Request(
       'autoforge-media://asset/asset_1', { headers: { range } },
     ))
 
@@ -90,7 +95,7 @@ describe('createMediaProtocolHandler', () => {
 
   it('returns a full body for requests without a Range header and no body for HEAD', async () => {
     const { bytes, resolveReadyAsset } = await fixture()
-    const handler = createMediaProtocolHandler({ resolveReadyAsset })
+    const handler = createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })
     const full = await handler(new Request('autoforge-media://asset/asset_1'))
     const head = await handler(new Request('autoforge-media://asset/asset_1', { method: 'HEAD' }))
 
@@ -116,7 +121,7 @@ describe('createMediaProtocolHandler', () => {
       if (assetId !== 'empty_asset') throw new Error('not available')
       return empty
     })
-    const handler = createMediaProtocolHandler({ resolveReadyAsset })
+    const handler = createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })
 
     const get = await handler(new Request('autoforge-media://asset/empty_asset'))
     const head = await handler(new Request('autoforge-media://asset/empty_asset', { method: 'HEAD' }))
@@ -140,7 +145,7 @@ describe('createMediaProtocolHandler', () => {
       relativePath: 'conversation_1/empty_asset.png',
     })
 
-    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+    const response = await createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })(new Request(
       'autoforge-media://asset/empty_asset', { headers: { range: 'bytes=0-' } },
     ))
 
@@ -157,7 +162,7 @@ describe('createMediaProtocolHandler', () => {
     'autoforge-media://asset/asset_1#fragment',
   ])('denies non-canonical protocol URLs', async (url) => {
     const { resolveReadyAsset } = await fixture()
-    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(url))
+    const response = await createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })(new Request(url))
 
     expect(response.status).toBe(404)
     expect(resolveReadyAsset).not.toHaveBeenCalled()
@@ -165,7 +170,7 @@ describe('createMediaProtocolHandler', () => {
 
   it.each(['bytes=100-101', 'bytes=0-1,3-4', 'bytes=20-10'])('returns 416 for invalid range %s', async (range) => {
     const { resolveReadyAsset } = await fixture()
-    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+    const response = await createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })(new Request(
       'autoforge-media://asset/asset_1', { headers: { range } },
     ))
 
@@ -177,7 +182,7 @@ describe('createMediaProtocolHandler', () => {
   it('maps unknown and unavailable assets to safe not-found responses', async () => {
     const { resolveReadyAsset } = await fixture()
     resolveReadyAsset.mockRejectedValueOnce(new Error('database path leaked'))
-    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+    const response = await createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })(new Request(
       'autoforge-media://asset/missing_asset',
     ))
 
@@ -196,7 +201,7 @@ describe('createMediaProtocolHandler', () => {
       inlineSafe: false,
     })
 
-    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+    const response = await createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })(new Request(
       'autoforge-media://asset/asset_1',
     ))
 
@@ -204,12 +209,56 @@ describe('createMediaProtocolHandler', () => {
     expect((await response.arrayBuffer()).byteLength).toBe(0)
   })
 
+  it('rejects a generic file through the real service before opening its managed path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-media-protocol-file-'))
+    roots.push(root)
+    const mediaRoot = join(root, 'managed-media')
+    const directory = join(mediaRoot, 'conversation_1')
+    const path = join(directory, 'asset_file.bin')
+    const bytes = Buffer.from('managed file bytes')
+    await mkdir(directory, { recursive: true })
+    await writeFile(path, bytes)
+    const database = openTestUserDataDatabase(root, 'protocol_file_user')
+    database.conversations.insert({ id: 'conversation_1', title: 'Protocol file' })
+    database.mediaAssets.insert({
+      id: 'asset_file',
+      conversationId: 'conversation_1',
+      source: 'upload',
+      kind: 'file',
+      mimeType: 'text/plain',
+      originalName: 'notes.txt',
+      relativePath: 'conversation_1/asset_file.bin',
+      byteSize: bytes.byteLength,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      status: 'ready',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const openManagedFile = vi.fn(open)
+    const service = createMediaAssetService({
+      database,
+      mediaRoot,
+      filesystem: { open: openManagedFile },
+    })
+
+    try {
+      const response = await createMediaProtocolHandler(service)(new Request(
+        'autoforge-media://asset/asset_file',
+      ))
+
+      expect(response.status).toBe(404)
+      expect(openManagedFile).not.toHaveBeenCalled()
+    } finally {
+      database.close()
+    }
+  })
+
   it('rejects a resolver result whose stored relative path does not reconstruct its absolute path', async () => {
     const { resolveReadyAsset } = await fixture()
     const asset = await resolveReadyAsset('asset_1')
     resolveReadyAsset.mockResolvedValueOnce({ ...asset, relativePath: 'conversation_1/other_asset.png' })
 
-    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+    const response = await createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })(new Request(
       'autoforge-media://asset/asset_1',
     ))
 
@@ -222,7 +271,7 @@ describe('createMediaProtocolHandler', () => {
     resolveReadyAsset.mockResolvedValueOnce({
       ...asset, mimeType: 'image/svg+xml', name: 'unsafe.svg', inlineSafe: false,
     })
-    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+    const response = await createMediaProtocolHandler({ resolveInlineAsset: resolveReadyAsset })(new Request(
       'autoforge-media://asset/asset_1', { method: 'HEAD' },
     ))
 

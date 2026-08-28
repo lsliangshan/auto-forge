@@ -83,7 +83,7 @@ function rangeNotSatisfiable(size: number): Response {
 }
 
 export function createMediaProtocolHandler(
-  assets: Pick<MediaAssetService, 'resolveReadyAsset'>,
+  assets: Pick<MediaAssetService, 'resolveInlineAsset'>,
 ): (request: Request) => Promise<Response> {
   return async (request) => {
     const assetId = assetIdFromUrl(request.url)
@@ -91,7 +91,7 @@ export function createMediaProtocolHandler(
 
     let asset: ResolvedMediaAsset
     try {
-      asset = await assets.resolveReadyAsset(assetId)
+      asset = await assets.resolveInlineAsset(assetId)
     } catch {
       return notFound()
     }

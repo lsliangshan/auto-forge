@@ -2548,6 +2548,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         requireOwnedConversation(record.conversationId, session.user.id)
         return media.resolveReadyAsset(assetId)
       }),
+      resolveInlineAsset: (assetId: string) => userDataAdmission.run(async () => {
+        const session = await auth.requireSession()
+        const record = chatDatabase.mediaAssets.get(assetId)
+        if (!record) throw failure('NOT_FOUND')
+        requireOwnedConversation(record.conversationId, session.user.id)
+        return media.resolveInlineAsset(assetId)
+      }),
     },
     recover: async () => {
       if (closePromise) throw failure('CONFLICT')

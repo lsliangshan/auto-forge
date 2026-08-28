@@ -98,6 +98,7 @@ export interface MediaAssetService {
   importClipboardImage(input: MediaImportBytesInput): Promise<MediaAsset[]>
   removeDraft(assetId: string, conversationId: string): Promise<void>
   resolveReadyAsset(assetId: string, conversationId?: string): Promise<ResolvedMediaAsset>
+  resolveInlineAsset(assetId: string): Promise<ResolvedMediaAsset>
   modelInput(conversationId: string, assetIds: string[]): Promise<ModelMediaInput[]>
   createGeneratedWriter(input: GeneratedWriterInput): Promise<GeneratedAssetWriter>
   commitGeneratedBase64(input: GeneratedBase64Input): Promise<MediaAsset>
@@ -388,7 +389,10 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       || !segments[1]!.startsWith(`${record.id}.`)
     ) throw failure('MEDIA_ASSET_UNAVAILABLE')
     const extension = segments[1]!.slice(record.id.length + 1)
-    if (!SAFE_EXTENSIONS.has(extension)) throw failure('MEDIA_ASSET_UNAVAILABLE')
+    if (
+      !SAFE_EXTENSIONS.has(extension)
+      || (record.kind === 'file' && extension !== 'bin')
+    ) throw failure('MEDIA_ASSET_UNAVAILABLE')
     const root = await mediaRoot()
     const absolutePath = resolve(root, ...segments)
     if (!absolutePath.startsWith(`${root}${sep}`)) throw failure('MEDIA_ASSET_UNAVAILABLE')
@@ -949,6 +953,17 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     }
   }
 
+  const resolveReadyRecord = async (record: MediaAssetRecord): Promise<ResolvedMediaAsset> => {
+    const inspected = await inspectReady(record, false)
+    return {
+      ...publicAsset(record),
+      conversationId: record.conversationId,
+      absolutePath: inspected.absolutePath,
+      relativePath: record.relativePath!,
+      inlineSafe: inspected.detected.inlineSafe,
+    }
+  }
+
   const service: MediaAssetService = {
     async importPaths(input) {
       assertIdentifier(input.conversationId)
@@ -1016,14 +1031,14 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       if (!record || (conversationId !== undefined && record.conversationId !== conversationId)) {
         throw failure('MEDIA_ASSET_UNAVAILABLE')
       }
-      const inspected = await inspectReady(record, false)
-      return {
-        ...publicAsset(record),
-        conversationId: record.conversationId,
-        absolutePath: inspected.absolutePath,
-        relativePath: record.relativePath!,
-        inlineSafe: inspected.detected.inlineSafe,
-      }
+      return resolveReadyRecord(record)
+    },
+
+    async resolveInlineAsset(assetId) {
+      assertIdentifier(assetId)
+      const record = database.mediaAssets.get(assetId)
+      if (!record || record.kind === 'file') throw failure('MEDIA_ASSET_UNAVAILABLE')
+      return resolveReadyRecord(record)
     },
 
     async modelInput(conversationId, assetIds) {

@@ -1260,6 +1260,31 @@ describe('MediaAssetService ready assets', () => {
     }])
   })
 
+  it('rejects a persisted file record whose managed extension is not bin', async () => {
+    const bytes = Buffer.from('persisted text')
+    const path = join(mediaRoot, 'conversation_1', 'asset_wrong_extension.png')
+    await mkdir(join(mediaRoot, 'conversation_1'), { recursive: true })
+    await writeFile(path, bytes)
+    database.mediaAssets.insert({
+      id: 'asset_wrong_extension',
+      conversationId: 'conversation_1',
+      source: 'upload',
+      kind: 'file',
+      mimeType: 'text/plain',
+      originalName: 'notes.txt',
+      relativePath: 'conversation_1/asset_wrong_extension.png',
+      byteSize: bytes.byteLength,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      status: 'ready',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const service = createMediaAssetService({ database, mediaRoot })
+
+    await expect(service.resolveReadyAsset('asset_wrong_extension'))
+      .rejects.toMatchObject({ code: 'MEDIA_ASSET_UNAVAILABLE' })
+  })
+
   it('rejects duplicate, wrong-conversation, and symlinked model inputs while preserving requested order', async () => {
     database.conversations.insert({ id: 'conversation_2', title: 'Other' })
     const ids = ['asset_first', 'asset_second', 'asset_other']
