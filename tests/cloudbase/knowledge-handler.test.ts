@@ -890,6 +890,63 @@ describe('CloudBase embedding consent and retrieval', () => {
     }
   })
 
+  it('caps PostgreSQL RPC and TokenHub clients to the caller remaining deadline', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    try {
+      const signals: AbortSignal[] = []
+      const fetchImpl = vi.fn((_url: string, init: { signal: AbortSignal }) => {
+        signals.push(init.signal)
+        return new Promise<never>(() => undefined)
+      })
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-only',
+        fetchImpl, timeoutMs: 500,
+      })
+      const tokenHub = createTokenHubClient({
+        endpoint: 'https://tokenhub.example/v1/embeddings', apiKey: 'server-only',
+        fetchImpl, timeoutMs: 500,
+      })
+      const boundary = {
+        signal: new AbortController().signal,
+        deadlineAt: Date.now() + 50,
+        timeoutMs: 500,
+      }
+      const requests = [
+        rpc('autoforge_knowledge_get_entitlement', { p_caller_user_id: '1' }, boundary),
+        tokenHub.embed({
+          input: '合同条款', model: embedding.model, dimensions: 1024,
+          configurationVersion: embedding.configurationVersion, region: 'guangzhou',
+          dispatchPermit: 'permit_1', idempotencyKey: 'embed_attempt_1',
+        }, boundary),
+      ]
+      const earlyOutcomes = requests.map(request => Promise.race([
+        request.then(
+          () => ({ kind: 'resolved' as const }),
+          error => ({ kind: 'rejected' as const, error }),
+        ),
+        new Promise<{ kind: 'unsettled' }>(resolve => {
+          setTimeout(() => resolve({ kind: 'unsettled' }), 51)
+        }),
+      ]))
+
+      await vi.advanceTimersByTimeAsync(51)
+      const observed = await Promise.all(earlyOutcomes)
+      await vi.advanceTimersByTimeAsync(500)
+      await Promise.allSettled(requests)
+
+      expect(observed).toEqual([
+        { kind: 'rejected', error: { code: 'TRANSIENT_FAILURE' } },
+        { kind: 'rejected', error: { code: 'TRANSIENT_FAILURE' } },
+      ])
+      expect(signals).toHaveLength(2)
+      expect(signals.every(signal => signal.aborted)).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('binds separate embedding consent to the trusted owner and deletes vectors on revocation', async () => {
     const rpc = vi.fn()
       .mockResolvedValueOnce({
@@ -1791,11 +1848,19 @@ describe('CloudBase embedding consent and retrieval', () => {
       rpc, tokenHub, maximumChunksPerRun: 2,
     })
 
+    const requestBoundary = {
+      signal: new AbortController().signal,
+      deadlineAt: Date.now() + 5_000,
+      timeoutMs: 5_000,
+    }
+
     await expect(worker.run({
       workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1',
-    })).resolves.toEqual({ state: 'partial', embedded: 2 })
+    }, requestBoundary)).resolves.toEqual({ state: 'partial', embedded: 2 })
     expect(claims).toBe(2)
     expect(tokenHub.embed).toHaveBeenCalledTimes(2)
+    expect(tokenHub.embed.mock.calls.every(call => call[1] === requestBoundary)).toBe(true)
+    expect(rpc.mock.calls.every(call => call[2] === requestBoundary)).toBe(true)
     expect(rpc.mock.calls.some(([name]) => (
       name === 'autoforge_knowledge_complete_embedding_generation'
     ))).toBe(false)

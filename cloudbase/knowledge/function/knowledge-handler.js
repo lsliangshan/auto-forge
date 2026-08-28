@@ -148,28 +148,61 @@ async function readBoundedJson(response, allowEmpty = false, signal) {
   throw { code: 'INTERNAL_ERROR' }
 }
 
-function createNetworkDeadline(timeoutMs) {
+function validRequestBoundary(value) {
+  return exactKeys(value, ['signal', 'deadlineAt', 'timeoutMs'])
+    && isRecord(value.signal)
+    && typeof value.signal.aborted === 'boolean'
+    && typeof value.signal.addEventListener === 'function'
+    && typeof value.signal.removeEventListener === 'function'
+    && Number.isSafeInteger(value.deadlineAt)
+    && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0
+}
+
+function effectiveRequestTimeout(timeoutMs, requestBoundary) {
+  if (requestBoundary === undefined) return { timeoutMs }
+  if (!validRequestBoundary(requestBoundary)) throw { code: 'INVALID_INPUT' }
+  const remaining = requestBoundary.deadlineAt - Date.now()
+  if (remaining <= 0 || requestBoundary.signal.aborted) throw { code: 'TRANSIENT_FAILURE' }
+  return {
+    timeoutMs: Math.max(1, Math.min(timeoutMs, requestBoundary.timeoutMs, remaining)),
+    signal: requestBoundary.signal,
+  }
+}
+
+function createNetworkDeadline(timeoutMs, parentSignal) {
   const controller = new AbortController()
   const effectiveTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 10_000
   let timeoutId
+  let rejectExpired
+  let disposed = false
+  const expire = () => {
+    if (disposed) return
+    controller.abort()
+    rejectExpired?.({ code: 'TRANSIENT_FAILURE' })
+  }
   const promise = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      controller.abort()
-      reject({ code: 'TRANSIENT_FAILURE' })
-    }, effectiveTimeoutMs)
+    rejectExpired = reject
+    timeoutId = setTimeout(expire, effectiveTimeoutMs)
   })
+  if (parentSignal?.aborted) expire()
+  else parentSignal?.addEventListener('abort', expire, { once: true })
   return {
     signal: controller.signal,
     race: operation => Promise.race([operation, promise]),
     dispose() {
+      disposed = true
       clearTimeout(timeoutId)
+      parentSignal?.removeEventListener('abort', expire)
       controller.abort()
     },
   }
 }
 
-async function boundedPost({ url, headers, body, fetchImpl, timeoutMs, allowEmpty = false }) {
-  const deadline = createNetworkDeadline(timeoutMs)
+async function boundedPost({
+  url, headers, body, fetchImpl, timeoutMs, allowEmpty = false, requestBoundary,
+}) {
+  const requestLimit = effectiveRequestTimeout(timeoutMs, requestBoundary)
+  const deadline = createNetworkDeadline(requestLimit.timeoutMs, requestLimit.signal)
   try {
     let response
     try {
@@ -431,27 +464,43 @@ function dispatchResultHash(result) {
   return createHash('sha256').update(JSON.stringify(result)).digest('hex')
 }
 
-async function persistDispatchSettlement({ rpc, parameters, permit, result }) {
+function callRpc(rpc, name, parameters, requestBoundary) {
+  return requestBoundary === undefined
+    ? rpc(name, parameters)
+    : rpc(name, parameters, requestBoundary)
+}
+
+function callTokenHub(tokenHub, method, input, requestBoundary) {
+  return requestBoundary === undefined
+    ? tokenHub[method](input)
+    : tokenHub[method](input, requestBoundary)
+}
+
+async function persistDispatchSettlement({
+  rpc, parameters, permit, result, requestBoundary,
+}) {
   const outcome = result.state
   const responseHash = dispatchResultHash(result)
   const retryable = outcome === 'failed' && result.retryable
-  const recorded = await rpc('autoforge_knowledge_record_embedding_dispatch_settlement_intent', {
+  const recorded = await callRpc(
+    rpc, 'autoforge_knowledge_record_embedding_dispatch_settlement_intent', {
     ...parameters, p_permit_id: permit.permitId, p_outcome: outcome,
     p_provider_response_hash: responseHash, p_retryable: retryable,
-  })
+    }, requestBoundary,
+  )
   if (!exactKeys(recorded, ['recorded']) || recorded.recorded !== true) {
     throw { code: 'INTERNAL_ERROR' }
   }
-  const settled = await rpc('autoforge_knowledge_settle_embedding_dispatch_attempt', {
+  const settled = await callRpc(rpc, 'autoforge_knowledge_settle_embedding_dispatch_attempt', {
     ...parameters, p_permit_id: permit.permitId, p_outcome: outcome,
-  })
+  }, requestBoundary)
   if (!exactKeys(settled, ['settled']) || settled.settled !== true) {
     throw { code: 'INTERNAL_ERROR' }
   }
   return { outcome, responseHash, retryable }
 }
 
-async function reconcileRevocationAttempt({ rpc, tokenHub, attempt }) {
+async function reconcileRevocationAttempt({ rpc, tokenHub, attempt, requestBoundary }) {
   if (!exactKeys(attempt, [
     'ownerId', 'state', 'permitId', 'purpose', 'requestId', 'attemptId', 'consentEpoch',
     'providerRequestKey', 'outcome', 'responseHash', 'retryable',
@@ -477,13 +526,13 @@ async function reconcileRevocationAttempt({ rpc, tokenHub, attempt }) {
   if (!tokenHub || typeof tokenHub.recoverAttempt !== 'function') {
     throw { code: 'TRANSIENT_FAILURE' }
   }
-  const recovered = await tokenHub.recoverAttempt({
+  const recovered = await callTokenHub(tokenHub, 'recoverAttempt', {
     model: fixedEmbeddingConfiguration.model,
     dimensions: fixedEmbeddingConfiguration.dimensions,
     configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
     region: fixedEmbeddingConfiguration.region,
     idempotencyKey: attempt.providerRequestKey,
-  })
+  }, requestBoundary)
   if (!isRecord(recovered) || !['pending', 'completed', 'failed'].includes(recovered.state)
     || (recovered.state === 'completed' && (!Array.isArray(recovered.vector)
       || recovered.vector.length !== fixedEmbeddingConfiguration.dimensions
@@ -518,13 +567,14 @@ async function reconcileRevocationAttempt({ rpc, tokenHub, attempt }) {
     },
     permit: attempt,
     result,
+    requestBoundary,
   })
   return true
 }
 
 async function dispatchEmbedding({
   rpc, tokenHub, input, ownerId, purpose, requestId, consentEpoch,
-  knowledgeBaseId = null, generationId = null, chunkId = null,
+  knowledgeBaseId = null, generationId = null, chunkId = null, requestBoundary,
 }) {
   for (let attemptId = 1; attemptId <= 3; attemptId += 1) {
     const parameters = {
@@ -540,7 +590,9 @@ async function dispatchEmbedding({
       p_dimensions: fixedEmbeddingConfiguration.dimensions,
       p_configuration_version: fixedEmbeddingConfiguration.configurationVersion,
     }
-    const permit = await rpc('autoforge_knowledge_issue_embedding_dispatch_permit', parameters)
+    const permit = await callRpc(
+      rpc, 'autoforge_knowledge_issue_embedding_dispatch_permit', parameters, requestBoundary,
+    )
     if (exactKeys(permit, ['issued']) && permit.issued === false) continue
     if (exactKeys(permit, ['issued', 'recovery']) && permit.issued === false) {
       const recovery = permit.recovery
@@ -548,13 +600,13 @@ async function dispatchEmbedding({
         || !tokenHub || typeof tokenHub.recoverAttempt !== 'function') {
         throw { code: 'INTERNAL_ERROR' }
       }
-      const recovered = await tokenHub.recoverAttempt({
+      const recovered = await callTokenHub(tokenHub, 'recoverAttempt', {
         model: fixedEmbeddingConfiguration.model,
         dimensions: fixedEmbeddingConfiguration.dimensions,
         configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
         region: fixedEmbeddingConfiguration.region,
         idempotencyKey: recovery.providerRequestKey,
-      })
+      }, requestBoundary)
       if (!isRecord(recovered) || !['pending', 'completed', 'failed'].includes(recovered.state)
         || (recovered.state === 'completed' && (!Array.isArray(recovered.vector)
           || recovered.vector.length !== fixedEmbeddingConfiguration.dimensions
@@ -573,7 +625,7 @@ async function dispatchEmbedding({
         throw { code: 'INTERNAL_ERROR' }
       }
       await persistDispatchSettlement({
-        rpc, parameters, permit: recovery, result: recoveredResult,
+        rpc, parameters, permit: recovery, result: recoveredResult, requestBoundary,
       })
       if (recoveredResult.state === 'completed') {
         return { kind: 'sent', vector: recoveredResult.vector }
@@ -584,16 +636,16 @@ async function dispatchEmbedding({
     if (!validDispatchPermit(permit, purpose, requestId, attemptId, consentEpoch)) {
       throw { code: 'INTERNAL_ERROR' }
     }
-    const reservation = await rpc('autoforge_knowledge_reserve_embedding_dispatch_attempt', {
+    const reservation = await callRpc(rpc, 'autoforge_knowledge_reserve_embedding_dispatch_attempt', {
       ...parameters, p_permit_id: permit.permitId,
-    })
+    }, requestBoundary)
     if (!exactKeys(reservation, ['reserved']) || typeof reservation.reserved !== 'boolean') {
       throw { code: 'INTERNAL_ERROR' }
     }
     if (!reservation.reserved) continue
-    const start = await rpc('autoforge_knowledge_mark_embedding_dispatch_started', {
+    const start = await callRpc(rpc, 'autoforge_knowledge_mark_embedding_dispatch_started', {
       ...parameters, p_permit_id: permit.permitId,
-    })
+    }, requestBoundary)
     if (!exactKeys(start, ['started']) || typeof start.started !== 'boolean') {
       throw { code: 'INTERNAL_ERROR' }
     }
@@ -601,7 +653,7 @@ async function dispatchEmbedding({
     let vector
     let providerError
     try {
-      vector = await tokenHub.embed({
+      vector = await callTokenHub(tokenHub, 'embed', {
         input,
         model: fixedEmbeddingConfiguration.model,
         dimensions: fixedEmbeddingConfiguration.dimensions,
@@ -609,7 +661,7 @@ async function dispatchEmbedding({
         region: fixedEmbeddingConfiguration.region,
         dispatchPermit: permit.permitId,
         idempotencyKey: permit.providerRequestKey,
-      })
+      }, requestBoundary)
     } catch (error) {
       providerError = error
     }
@@ -618,7 +670,7 @@ async function dispatchEmbedding({
         && providerError.code === 'TRANSIENT_FAILURE' }
       : { state: 'completed', vector }
     await persistDispatchSettlement({
-      rpc, parameters, permit, result,
+      rpc, parameters, permit, result, requestBoundary,
     })
     if (!providerError) return { kind: 'sent', vector }
     if (!result.retryable) {
@@ -1101,14 +1153,14 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub, maximumChunksPerRun = 
     throw new Error('Embedding worker batch limit is invalid')
   }
   return {
-    async run({ workerId, jobId, leaseToken }) {
+    async run({ workerId, jobId, leaseToken }, requestBoundary) {
       if (![workerId, jobId, leaseToken].every(value => nonEmptyString(value))) {
         throw { code: 'INVALID_INPUT' }
       }
-      const batch = await rpc('autoforge_knowledge_claim_embedding_batch', {
+      const batch = await callRpc(rpc, 'autoforge_knowledge_claim_embedding_batch', {
         p_worker_id: workerId, p_job_id: jobId, p_lease_token: leaseToken,
         p_limit: maximumChunksPerRun,
-      })
+      }, requestBoundary)
       if (safeSerializedSize(batch) > maximumResponseBytes || !exactKeys(batch, [
         'ownerId', 'knowledgeBaseId', 'generationId', 'consentEpoch', 'chunks',
       ]) || !nonEmptyString(batch.ownerId, 64) || !nonEmptyString(batch.knowledgeBaseId)
@@ -1126,13 +1178,15 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub, maximumChunksPerRun = 
       const seenChunkIds = new Set()
       while (true) {
         if (currentBatch.chunks.length === 0) {
-          const completed = await rpc('autoforge_knowledge_complete_embedding_generation', {
+          const completed = await callRpc(
+            rpc, 'autoforge_knowledge_complete_embedding_generation', {
             p_worker_id: workerId, p_job_id: jobId, p_lease_token: leaseToken,
             p_owner_id: currentBatch.ownerId,
             p_knowledge_base_id: currentBatch.knowledgeBaseId,
             p_generation_id: currentBatch.generationId,
             p_consent_epoch: currentBatch.consentEpoch,
-          })
+            }, requestBoundary,
+          )
           if (!exactKeys(completed, ['ready']) || completed.ready !== true) {
             throw { code: 'INTERNAL_ERROR' }
           }
@@ -1148,6 +1202,7 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub, maximumChunksPerRun = 
             requestId: `${jobId}:${chunk.id}`, consentEpoch: batch.consentEpoch,
             knowledgeBaseId: batch.knowledgeBaseId,
             generationId: batch.generationId, chunkId: chunk.id,
+            requestBoundary,
           })
           if (dispatch.kind === 'denied') return { state: 'revoked', embedded }
           if (dispatch.kind !== 'sent') throw { code: 'TRANSIENT_FAILURE' }
@@ -1157,16 +1212,16 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub, maximumChunksPerRun = 
             || vector.some(value => !Number.isFinite(value))) {
             throw { code: 'INVALID_EMBEDDING_RESPONSE' }
           }
-          const after = await rpc('autoforge_knowledge_assert_embedding_consent', {
+          const after = await callRpc(rpc, 'autoforge_knowledge_assert_embedding_consent', {
             p_owner_id: batch.ownerId, p_consent_epoch: batch.consentEpoch,
-          })
+          }, requestBoundary)
           if (!exactKeys(after, ['enabled', 'consentEpoch'])
             || typeof after.enabled !== 'boolean'
             || !Number.isSafeInteger(after.consentEpoch)
             || !after.enabled || after.consentEpoch !== batch.consentEpoch) {
             return { state: 'revoked', embedded }
           }
-          const stored = await rpc('autoforge_knowledge_store_embedding', {
+          const stored = await callRpc(rpc, 'autoforge_knowledge_store_embedding', {
             p_owner_id: batch.ownerId, p_knowledge_base_id: batch.knowledgeBaseId,
             p_generation_id: batch.generationId, p_chunk_id: chunk.id,
             p_version_id: chunk.versionId,
@@ -1175,16 +1230,16 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub, maximumChunksPerRun = 
             p_dimensions: fixedEmbeddingConfiguration.dimensions,
             p_configuration_version: fixedEmbeddingConfiguration.configurationVersion,
             p_vector: vector,
-          })
+          }, requestBoundary)
           if (!exactKeys(stored, ['stored']) || stored.stored !== true) {
             throw { code: 'INTERNAL_ERROR' }
           }
           embedded += 1
         }
-        currentBatch = await rpc('autoforge_knowledge_claim_embedding_batch', {
+        currentBatch = await callRpc(rpc, 'autoforge_knowledge_claim_embedding_batch', {
           p_worker_id: workerId, p_job_id: jobId, p_lease_token: leaseToken,
           p_limit: maximumChunksPerRun,
-        })
+        }, requestBoundary)
         if (safeSerializedSize(currentBatch) > maximumResponseBytes || !exactKeys(currentBatch, [
           'ownerId', 'knowledgeBaseId', 'generationId', 'consentEpoch', 'chunks',
         ]) || currentBatch.ownerId !== batch.ownerId
@@ -1212,28 +1267,28 @@ function createPostgresStorageClient({
     throw new Error('CloudBase PostgreSQL Storage is not configured')
   }
   const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
-  async function request(path, body, allowEmpty = false) {
+  async function request(path, body, allowEmpty = false, requestBoundary) {
     const { response, result } = await boundedPost({
       url: `${normalizedBaseUrl}${path}`,
       headers: { authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json' },
-      body, fetchImpl, timeoutMs, allowEmpty,
+      body, fetchImpl, timeoutMs, allowEmpty, requestBoundary,
     })
     if (response.ok && (isRecord(result) || allowEmpty)) return result
     throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
   }
   return {
-    async createUploadAuthorization(input) {
-      const result = await request('/upload-authorizations', input)
+    async createUploadAuthorization(input, requestBoundary) {
+      const result = await request('/upload-authorizations', input, false, requestBoundary)
       if (!validUploadAuthorization(result, input, uploadUrlPrefix)) {
         throw { code: 'INTERNAL_ERROR' }
       }
       return result
     },
-    statObject(storageReference) {
-      return request('/objects/stat', { storageReference })
+    statObject(storageReference, requestBoundary) {
+      return request('/objects/stat', { storageReference }, false, requestBoundary)
     },
-    async deleteObjects(storageReferences) {
-      await request('/objects/delete', { storageReferences }, true)
+    async deleteObjects(storageReferences, requestBoundary) {
+      await request('/objects/delete', { storageReferences }, true, requestBoundary)
     },
   }
 }
@@ -1241,11 +1296,11 @@ function createPostgresStorageClient({
 function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch, timeoutMs = 10_000 }) {
   if (!baseUrl || !serviceKey) throw new Error('CloudBase PostgreSQL RPC is not configured')
   const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
-  return async (name, parameters) => {
+  return async (name, parameters, requestBoundary) => {
     const { response, result: body } = await boundedPost({
       url: `${normalizedBaseUrl}/rpc/${name}`,
       headers: { authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json' },
-      body: parameters, fetchImpl, timeoutMs,
+      body: parameters, fetchImpl, timeoutMs, requestBoundary,
     })
     if (response.ok && isRecord(body)) return body
     const code = safeErrorCode(body)
@@ -1271,7 +1326,7 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch, timeoutMs =
       && input.region === fixedEmbeddingConfiguration.region
   }
   return {
-    async embed(input) {
+    async embed(input, requestBoundary) {
       if (!exactKeys(input, [
         'input', 'model', 'dimensions', 'configurationVersion', 'region', 'dispatchPermit',
         'idempotencyKey',
@@ -1287,7 +1342,7 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch, timeoutMs =
           authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
           'idempotency-key': input.idempotencyKey,
         },
-        body: input, fetchImpl, timeoutMs,
+        body: input, fetchImpl, timeoutMs, requestBoundary,
       })
       if (!response.ok || !exactKeys(body, ['model', 'dimensions', 'embedding'])
         || body.model !== fixedEmbeddingConfiguration.model
@@ -1299,7 +1354,7 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch, timeoutMs =
       }
       return body.embedding
     },
-    async recoverAttempt(input) {
+    async recoverAttempt(input, requestBoundary) {
       if (!exactKeys(input, [
         'model', 'dimensions', 'configurationVersion', 'region', 'idempotencyKey',
       ]) || !validAttemptIdentity(input)) throw { code: 'INVALID_INPUT' }
@@ -1309,7 +1364,7 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch, timeoutMs =
           authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
           'idempotency-key': input.idempotencyKey,
         },
-        body: input, fetchImpl, timeoutMs,
+        body: input, fetchImpl, timeoutMs, requestBoundary,
       })
       if (!response.ok || !isRecord(body)) {
         throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
