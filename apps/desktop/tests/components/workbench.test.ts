@@ -1,4 +1,4 @@
-import { mount, type VueWrapper } from '@vue/test-utils'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
@@ -26,6 +26,33 @@ const mountedAppWrappers: VueWrapper[] = []
 const authSession: AuthSession = {
   user: { id: 'user_1', account: 'Alice' },
   authenticatedAt: '2026-08-17T00:00:00.000Z',
+}
+
+const acceptedCloudConsent = {
+  purpose: 'cloud_sync' as const,
+  state: 'accepted' as const,
+  revision: 1,
+  documentVersion: 'cloud-sync-2026-08',
+  consentedAt: '2026-08-28T00:00:00.000Z',
+  clientVersion: '0.1.0',
+}
+
+const revokedCloudConsent = {
+  purpose: 'cloud_sync' as const,
+  state: 'revoked' as const,
+  revision: 2,
+  revokedAt: '2026-08-28T01:00:00.000Z',
+  clientVersion: '0.1.0',
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']): ModelInfo {
@@ -339,6 +366,60 @@ describe('workbench', () => {
 
     expect(api.settings.revokeCloudSyncConsent).not.toHaveBeenCalled()
   })
+
+  it.each([
+    ['Alice to Bob', ['user_2']],
+    ['Alice to Bob to Alice ABA', ['user_2', 'user_1']],
+  ] as const)('drops a deferred revoke confirmation after %s', async (_name, owners) => {
+    const api = createApi()
+    vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue(acceptedCloudConsent)
+    const confirmation = deferred<unknown>()
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const settings = useSettingsStore(pinia)
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="revoke-cloud-sync-consent"]').exists())
+      .toBe(true))
+    success.mockClear()
+
+    await wrapper.get('[data-testid="revoke-cloud-sync-consent"]').trigger('click')
+    await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
+    for (const owner of owners) settings.bindAccountOwner(owner)
+    settings.cloudSyncConsentState = acceptedCloudConsent
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(api.settings.revokeCloudSyncConsent).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    expect(settings.cloudDataError).toBe('')
+  })
+
+  it.each(['resolve', 'reject'] as const)(
+    'drops a late revoke RPC %s after an account switch',
+    async (settlement) => {
+      const api = createApi()
+      const revoke = deferred<typeof revokedCloudConsent>()
+      vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue(acceptedCloudConsent)
+      vi.mocked(api.settings.revokeCloudSyncConsent).mockReturnValue(revoke.promise)
+      vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+      const success = vi.spyOn(ElMessage, 'success')
+      const { wrapper, pinia } = await mountApp('/settings', api)
+      const settings = useSettingsStore(pinia)
+      await vi.waitFor(() => expect(wrapper.find('[data-testid="revoke-cloud-sync-consent"]').exists())
+        .toBe(true))
+      success.mockClear()
+
+      await wrapper.get('[data-testid="revoke-cloud-sync-consent"]').trigger('click')
+      await vi.waitFor(() => expect(api.settings.revokeCloudSyncConsent).toHaveBeenCalledOnce())
+      settings.bindAccountOwner('user_2')
+      if (settlement === 'resolve') revoke.resolve(revokedCloudConsent)
+      else revoke.reject({ code: 'AUTH_REQUIRED' })
+      await flushPromises()
+
+      expect(success).not.toHaveBeenCalled()
+      expect(settings.cloudDataError).toBe('')
+    },
+  )
 
   it('does not persist either consent when unowned legacy import confirmation is cancelled', async () => {
     vi.spyOn(ElMessageBox, 'confirm')

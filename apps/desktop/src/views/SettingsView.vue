@@ -632,16 +632,21 @@ async function refreshUsage() {
   await Promise.all([settings.loadTokenUsage(), settings.loadCloudData()])
 }
 async function confirmRevokeCloudSyncConsent() {
+  const accountGeneration = settings.captureAccountGeneration()
   try {
     await ElMessageBox.confirm(
       '撤回后将暂停知识库云上传、跨设备发现与云检索；本地知识库与本地检索仍可继续使用。',
       '撤回账户云同步授权',
       { type: 'warning', confirmButtonText: '确认撤回', cancelButtonText: '取消' },
     )
-    await settings.revokeCloudSyncConsent()
+    if (!settings.isAccountGenerationCurrent(accountGeneration)) return
+    const result = await settings.revokeCloudSyncConsent(accountGeneration)
+    if (result !== 'applied' || !settings.isAccountGenerationCurrent(accountGeneration)) return
     ElMessage.success('账户云同步授权已撤回')
   } catch (error) {
-    if (error !== 'cancel' && error !== 'close' && !settings.cloudDataError) {
+    if (error !== 'cancel' && error !== 'close'
+      && settings.isAccountGenerationCurrent(accountGeneration)
+      && !settings.cloudDataError) {
       settings.cloudDataError = `云同步授权撤回失败：${displayError(error)}`
     }
   }

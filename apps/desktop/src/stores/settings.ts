@@ -20,6 +20,9 @@ import { useWorkflowStore } from './workflow'
 
 const updateQueues = new WeakMap<object, Promise<AppSettings | undefined>>()
 type ModelOutput = 'text' | 'image' | 'audio' | 'video'
+declare const accountGenerationBrand: unique symbol
+export type AccountGenerationToken = number & { readonly [accountGenerationBrand]: true }
+export type AccountMutationResult = 'applied' | 'stale'
 
 function supportsOutput(model: ModelInfo, output: ModelOutput): boolean {
   return model.inputModalities.includes('text')
@@ -75,6 +78,7 @@ export const useSettingsStore = defineStore('settings', {
     remoteUsageError: '',
     cloudDataError: '',
     _cloudDataOwnerId: undefined as string | undefined,
+    _accountGeneration: 0,
     _cloudDataReadVersion: 0,
     _cloudConsentMutationVersion: 0,
     _cloudConsentMutationPending: false,
@@ -111,19 +115,27 @@ export const useSettingsStore = defineStore('settings', {
     },
   },
   actions: {
+    captureAccountGeneration(): AccountGenerationToken {
+      return this._accountGeneration as AccountGenerationToken
+    },
+    isAccountGenerationCurrent(token: AccountGenerationToken): boolean {
+      return this._cloudDataOwnerId !== undefined
+        && token === this.captureAccountGeneration()
+    },
     bindAccountOwner(ownerId: string | undefined) {
-      if (ownerId === this._cloudDataOwnerId) return
-      this._cloudDataOwnerId = ownerId
+      this._accountGeneration += 1
       this._cloudDataReadVersion += 1
       this._cloudConsentMutationVersion += 1
       this._cloudConsentMutationPending = false
+      this.saving = false
+      if (ownerId === this._cloudDataOwnerId) return
+      this._cloudDataOwnerId = ownerId
       this._tokenUsageVersion += 1
       this.tokenUsage = undefined
       this.remoteUsage = undefined
       this.accountDataPreferences = undefined
       this.legacyImportPreview = undefined
       this.cloudSyncConsentState = undefined
-      this.saving = false
       this.tokenUsageError = ''
       this.remoteUsageError = ''
       this.cloudDataError = ''
@@ -208,9 +220,12 @@ export const useSettingsStore = defineStore('settings', {
         }
       }
     },
-    async revokeCloudSyncConsent() {
-      const ownerId = this._cloudDataOwnerId
-      if (!ownerId || this.cloudSyncConsentState?.state !== 'accepted') return
+    async revokeCloudSyncConsent(
+      accountGeneration?: AccountGenerationToken,
+    ): Promise<AccountMutationResult> {
+      const capturedGeneration = accountGeneration ?? this.captureAccountGeneration()
+      if (!this.isAccountGenerationCurrent(capturedGeneration)
+        || this.cloudSyncConsentState?.state !== 'accepted') return 'stale'
       const mutationVersion = ++this._cloudConsentMutationVersion
       this._cloudDataReadVersion += 1
       this._cloudConsentMutationPending = true
@@ -219,18 +234,17 @@ export const useSettingsStore = defineStore('settings', {
       try {
         const revoked = await getDesktopApi().settings
           .revokeCloudSyncConsent({ confirmed: true })
-        if (ownerId === this._cloudDataOwnerId
-          && mutationVersion === this._cloudConsentMutationVersion) {
-          this.cloudSyncConsentState = revoked
-        }
+        if (!this.isAccountGenerationCurrent(capturedGeneration)
+          || mutationVersion !== this._cloudConsentMutationVersion) return 'stale'
+        this.cloudSyncConsentState = revoked
+        return 'applied'
       } catch (error) {
-        if (ownerId === this._cloudDataOwnerId
-          && mutationVersion === this._cloudConsentMutationVersion) {
-          this.cloudDataError = displayError(error, '云同步授权撤回失败')
-        }
+        if (!this.isAccountGenerationCurrent(capturedGeneration)
+          || mutationVersion !== this._cloudConsentMutationVersion) return 'stale'
+        this.cloudDataError = displayError(error, '云同步授权撤回失败')
         throw error
       } finally {
-        if (ownerId === this._cloudDataOwnerId
+        if (this.isAccountGenerationCurrent(capturedGeneration)
           && mutationVersion === this._cloudConsentMutationVersion) {
           this._cloudConsentMutationPending = false
           this.saving = false
