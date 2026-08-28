@@ -134,6 +134,7 @@ function encodePayload(value: Record<string, unknown>): string {
 export class KnowledgeSyncService {
   private readonly activeSynchronizations = new Map<string, Promise<SyncResult>>()
   private readonly activeConversions = new Map<string, Promise<void>>()
+  private readonly activePurges = new Map<string, Promise<void>>()
   private entitlementEpoch = 0
   private cloudAllowed = false
   private cloudAccessApplied = false
@@ -325,13 +326,18 @@ export class KnowledgeSyncService {
     this.cloudAccessApplied = true
     this.entitlementEpoch += 1
     const now = this.dependencies.now()
-    this.database.prepare(`
-      INSERT INTO cloud_sync_states (
-        knowledge_base_id, mode, published_generation_id, epoch, updated_at
-      ) SELECT id, 'paused', NULL, 1, ? FROM knowledge_bases WHERE 1
-      ON CONFLICT(knowledge_base_id) DO UPDATE SET
-        mode = 'paused', epoch = cloud_sync_states.epoch + 1, updated_at = excluded.updated_at
-    `).run(now)
+    this.database.transaction(() => {
+      this.database.prepare(`
+        INSERT INTO cloud_sync_states (
+          knowledge_base_id, mode, published_generation_id, epoch, updated_at
+        ) SELECT id, 'paused', NULL, 1, ? FROM knowledge_bases WHERE 1
+        ON CONFLICT(knowledge_base_id) DO UPDATE SET
+          mode = 'paused', epoch = cloud_sync_states.epoch + 1, updated_at = excluded.updated_at
+      `).run(now)
+      this.database.prepare(`
+        UPDATE knowledge_cloud_retention SET epoch = epoch + 1, updated_at = ?
+      `).run(now)
+    })()
   }
 
   resume(knowledgeBaseId: string): void {
@@ -427,7 +433,21 @@ export class KnowledgeSyncService {
   }
 
   /** GDPR-style deletion remains available even while sync/search gates are closed. */
-  async purgeCloudImmediately(knowledgeBaseId: string): Promise<void> {
+  purgeCloudImmediately(knowledgeBaseId: string): Promise<void> {
+    const active = this.activePurges.get(knowledgeBaseId)
+    if (active) return active
+    const purge = this.runPurgeCloudImmediately(knowledgeBaseId)
+    this.activePurges.set(knowledgeBaseId, purge)
+    const clear = () => {
+      if (this.activePurges.get(knowledgeBaseId) === purge) {
+        this.activePurges.delete(knowledgeBaseId)
+      }
+    }
+    void purge.then(clear, clear)
+    return purge
+  }
+
+  private async runPurgeCloudImmediately(knowledgeBaseId: string): Promise<void> {
     const terminalReceipt = this.database.prepare(`
       SELECT 1 AS completed FROM knowledge_cloud_deletion_receipts
       WHERE knowledge_base_id = ?
@@ -450,6 +470,23 @@ export class KnowledgeSyncService {
         operationId: string; requestId: string; deletionJobId: string | null; epoch: number
       }
     })()
+    const ownerEpoch = this.entitlementEpoch
+    const claimed = this.database.prepare(`
+      UPDATE knowledge_cloud_retention SET epoch = epoch + 1, updated_at = ?
+      WHERE knowledge_base_id = ? AND epoch = ?
+    `).run(this.dependencies.now(), knowledgeBaseId, row.epoch)
+    if (claimed.changes !== 1) throw syncError('CONFLICT')
+    row = { ...row, epoch: row.epoch + 1 }
+    const assertPurgeCurrent = (deletionJobId: string | null): void => {
+      if (ownerEpoch !== this.entitlementEpoch) throw syncError('CONFLICT')
+      const current = this.database.prepare(`
+        SELECT epoch, deletion_job_id AS deletionJobId
+        FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+      `).get(knowledgeBaseId) as { epoch: number; deletionJobId: string | null } | undefined
+      if (!current || current.epoch !== row.epoch || current.deletionJobId !== deletionJobId) {
+        throw syncError('CONFLICT')
+      }
+    }
     if (!row.deletionJobId) {
       const expected = this.getState(knowledgeBaseId).publishedGenerationId
       const accepted = await this.remote.deleteKnowledgeBase({
@@ -457,26 +494,21 @@ export class KnowledgeSyncService {
         knowledgeBaseId,
         expectedPublishedGenerationId: expected,
       })
+      assertPurgeCurrent(null)
       const updated = this.database.prepare(`
         UPDATE knowledge_cloud_retention
-        SET stage = 'purging', deletion_job_id = ?, epoch = epoch + 1, updated_at = ?
-        WHERE knowledge_base_id = ? AND epoch = ?
+        SET stage = 'purging', deletion_job_id = ?, updated_at = ?
+        WHERE knowledge_base_id = ? AND epoch = ? AND deletion_job_id IS NULL
       `).run(accepted.deletionJobId, this.dependencies.now(), knowledgeBaseId, row.epoch)
       if (updated.changes !== 1) throw syncError('CONFLICT')
-      row = { ...row, deletionJobId: accepted.deletionJobId, epoch: row.epoch + 1 }
+      row = { ...row, deletionJobId: accepted.deletionJobId }
     }
     const deletionJobId = row.deletionJobId
     if (!deletionJobId) throw syncError('INTERNAL_ERROR')
     let completed = false
     for (let poll = 0; poll < 3; poll += 1) {
       const job = await this.remote.getJob({ jobId: deletionJobId })
-      const current = this.database.prepare(`
-        SELECT epoch, deletion_job_id AS deletionJobId
-        FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
-      `).get(knowledgeBaseId) as { epoch: number; deletionJobId: string | null } | undefined
-      if (!current || current.epoch !== row.epoch || current.deletionJobId !== row.deletionJobId) {
-        throw syncError('CONFLICT')
-      }
+      assertPurgeCurrent(deletionJobId)
       if (job.jobId !== deletionJobId) throw syncError('INTERNAL_ERROR')
       if (job.state === 'completed') { completed = true; break }
       if (job.state === 'failed' || job.state === 'cancelled') {
@@ -486,6 +518,7 @@ export class KnowledgeSyncService {
     if (!completed) throw Object.assign(new Error('TRANSIENT_FAILURE'), {
       code: 'TRANSIENT_FAILURE', retryable: true as const,
     })
+    assertPurgeCurrent(deletionJobId)
     this.database.transaction(() => {
       const receipt = this.database.prepare(`
         INSERT INTO knowledge_cloud_deletion_receipts(
@@ -820,6 +853,7 @@ export class KnowledgeSyncService {
     await Promise.allSettled([
       ...this.activeSynchronizations.values(),
       ...this.activeConversions.values(),
+      ...this.activePurges.values(),
     ])
   }
 

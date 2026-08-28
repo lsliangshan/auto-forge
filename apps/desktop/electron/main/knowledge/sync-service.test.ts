@@ -179,6 +179,35 @@ describe('KnowledgeSyncService', () => {
     expect(service.getState('kb_1')).toEqual({ mode: 'local_only', publishedGenerationId: null })
   })
 
+  it('fences and drains a purge callback after owner invalidation', async () => {
+    let resolveDelete!: (value: { deletionJobId: string }) => void
+    const deleteKnowledgeBase = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveDelete = resolve
+    }))
+    const { database, service } = fixture({ deleteKnowledgeBase })
+    service.beginCloudRetention('kb_1', 500)
+    service.setCloudAccess(false)
+
+    const purging = service.purgeCloudImmediately('kb_1')
+    await vi.waitFor(() => expect(deleteKnowledgeBase).toHaveBeenCalledOnce())
+    service.invalidateOwner()
+    let drained = false
+    const draining = service.drain().then(() => { drained = true })
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    expect(drained).toBe(false)
+
+    resolveDelete({ deletionJobId: 'delete_late' })
+    await expect(purging).rejects.toMatchObject({ code: 'CONFLICT' })
+    await draining
+    expect(database.prepare(`
+      SELECT 1 FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = 'kb_1'
+    `).get()).toBeUndefined()
+    expect(database.prepare(`
+      SELECT stage FROM knowledge_cloud_retention WHERE knowledge_base_id = 'kb_1'
+    `).get()).toEqual({ stage: 'download_window' })
+    expect(service.getState('kb_1').mode).toBe('paused')
+  })
+
   it('reuses the deletion request after a lost response and preserves a payload-free terminal receipt', async () => {
     const deleteKnowledgeBase = vi.fn()
       .mockRejectedValueOnce(new Error('lost response'))
