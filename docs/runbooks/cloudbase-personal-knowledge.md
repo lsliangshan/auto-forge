@@ -40,7 +40,10 @@ Stop if the two forward migrations are not byte-identical.
    inject the PostgreSQL RPC/Storage service credentials plus TokenHub endpoint
    and key only from the server-side secret manager. Its private Storage adapter
    additionally requires `POST /objects/read` with an exact byte-size/SHA-256
-   response contract. Never expose worker RPCs or worker credentials to Electron.
+   response contract. Preserve `worker/parser-process.js`, `worker/parser-child.js`,
+   and the version-aligned parser dependencies in `worker/package.json`; run a
+   package-resolution smoke with the release Node runtime before deployment.
+   Never expose worker RPCs or worker credentials to Electron.
 3. With anonymous, Alice, and Bob staging identities, probe every action.
    Anonymous and forged-owner events must fail; cross-owner reads, upload
    tickets, publications, jobs, cleanup, and deletion must expose and mutate
@@ -52,6 +55,17 @@ Stop if the two forward migrations are not byte-identical.
 5. Verify immutable staging generations: a failed parser/index job leaves the
    prior published generation active; publication requires both the expected
    prior generation and a ready candidate.
+   For every upload, verify the credentialed scheduler launches a fresh parser
+   child whose environment contains no RPC, Storage, TokenHub, proxy, service-role,
+   or provider credential and whose network APIs are denied. Exercise the exact
+   parser ceilings before or during accumulation: 64 MiB input, 32 MiB expanded
+   DOCX and 100x compression ratio, 1000 PDF pages, 16 MiB text, 10000 blocks or
+   chunks, 768 KiB result, 832 KiB response frame, 128 MiB V8 old-space, 192 MiB
+   RSS, and 110 seconds child wall-time. Cancellation, timeout, child crash,
+   malformed/duplicate/late frames, and parser dependency failure must kill and
+   close that request's process, zero its source bytes, fail closed, and never
+   complete a different lease. Confirm the scheduler's 120-second parser deadline
+   remains below its 600-second lease.
 6. Verify pull pages stay within both 512 rows and 768 KiB, use the page-last
    sequence, and make progress while `hasMore` is true. Verify a zero or
    retention-floor cursor receives one transactionally materialized,
