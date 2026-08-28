@@ -2281,19 +2281,40 @@ describe('openAppDatabase', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_file_attachment', title: 'File attachment' })
 
-    database.mediaAssets.insert({
+    const asset = {
       ...readyAsset('asset_file_attachment', 'conversation_file_attachment'),
       kind: 'file',
       mimeType: 'application/pdf',
       originalName: 'report.pdf',
-      relativePath: 'conversation_file_attachment/asset_file_attachment.pdf',
-    })
+      relativePath: 'conversation_file_attachment/asset_file_attachment.bin',
+    } as const
+    database.mediaAssets.insert(asset)
+    const block = {
+      type: 'media' as const,
+      blockId: 'block_file_attachment',
+      assetId: asset.id,
+      kind: asset.kind,
+      purpose: 'input' as const,
+      name: asset.originalName,
+      mimeType: asset.mimeType,
+      byteSize: asset.byteSize,
+    }
+    database.messages.insertWithAssets({
+      id: 'message_file_attachment',
+      conversationId: 'conversation_file_attachment',
+      role: 'user',
+      blocks: [block],
+      createdAt: 1,
+    }, [asset.id])
 
     expect(database.mediaAssets.get('asset_file_attachment')).toMatchObject({
       kind: 'file',
       mimeType: 'application/pdf',
       originalName: 'report.pdf',
     })
+    expect(database.messages.get('message_file_attachment')?.blocks).toEqual([block])
+    expect(JSON.stringify(database.messages.get('message_file_attachment')))
+      .not.toMatch(/dataBase64|\/Users\/|relativePath|asset_file_attachment\.bin/i)
   })
 
   it('migrates v14 media assets to support generic file attachments without losing media relationships', () => {

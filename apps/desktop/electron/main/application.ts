@@ -6,6 +6,7 @@ import {
   accountDataPreferencesRecordSchema,
   accountDataPreferencesSchema,
   byokUsageEventSchema,
+  chatFileSupport,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
   legacyImportRequestSchema,
@@ -54,7 +55,10 @@ import { BrowserPageInspector } from './browser/browser-page-inspector.js'
 import { EncryptedBrowserSessionStorageStore } from './browser/browser-session-storage-store.js'
 import type { ApplicationBrowserWorkspacePort } from './browser/electron-browser-workspace.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
-import { createConversationContextManager } from './chat/conversation-context.js'
+import {
+  createConversationContextManager,
+  type CurrentMediaMetadata,
+} from './chat/conversation-context.js'
 import { ConversationTitleService } from './chat/conversation-title-service.js'
 import type { ModelProvider, ModelProviderSnapshot } from './chat/model-provider.js'
 import { ProviderDiagnosticLog } from './chat/provider-diagnostic-log.js'
@@ -65,6 +69,7 @@ import {
 } from './chat/model-provider-registry.js'
 import { OpenRouterProvider } from './chat/openrouter-provider.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
+import { projectAttachmentInputs } from './chat/file-attachment-projection.js'
 import { resolveChatRoute } from './chat/multimodal-router.js'
 import type { ModelContentPart } from './chat/model-provider.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
@@ -1773,11 +1778,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const requestedOutput = input.outputType === 'auto'
             ? preferences.outputType
             : input.outputType
-          if (
-            snapshot.activeProvider === 'deepseek'
-            && (input.assetIds.length > 0
-              || (requestedOutput !== 'auto' && requestedOutput !== 'text'))
-          ) throw failure('MODEL_MODALITY_UNSUPPORTED')
           const credentialEpoch = providerCredentialEpoch.get(snapshot.activeProvider) ?? 0
           const providerSnapshot = await providerRegistry.acquire(snapshot.activeProvider)
           if (providerSnapshot.providerId !== snapshot.activeProvider) {
@@ -1785,8 +1785,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             recordFailure(error, 'preflight')
             throw error
           }
-          await requireValidCredential(providerSnapshot)
           const resolved = await resolvedInput(input.conversationId, input.assetIds)
+          if (resolved.assets.some((asset) => (
+            asset.kind === 'file'
+            && chatFileSupport(snapshot.activeProvider, asset.name, asset.mimeType).mode === 'unsupported'
+          ))) throw failure('MODEL_MODALITY_UNSUPPORTED')
+          if (
+            snapshot.activeProvider === 'deepseek'
+            && (resolved.assets.some((asset) => asset.kind !== 'file')
+              || (requestedOutput !== 'auto' && requestedOutput !== 'text'))
+          ) throw failure('MODEL_MODALITY_UNSUPPORTED')
+          await requireValidCredential(providerSnapshot)
           const route = resolveChatRoute({
             provider: snapshot.activeProvider,
             ...(input.model === undefined ? {} : { requestedModel: input.model }),
@@ -1829,16 +1838,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           }
           if (route.outputType === 'text') {
             const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
-            const modelContent: string | ModelContentPart[] = modelInputs.length === 0
+            const projectedAttachments = projectAttachmentInputs(route.provider, modelInputs)
+            const modelContent: string | ModelContentPart[] = projectedAttachments.length === 0
               ? input.content
               : [
-                  { type: 'text', text: input.content },
-                  ...modelInputs.map(({ kind, mimeType, dataBase64 }) => ({
-                    type: 'media' as const,
-                    kind,
-                    mimeType,
-                    dataBase64,
-                  })),
+                  ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
+                  ...projectedAttachments,
                 ]
             trackChatWork(requestId, input.conversationId, async () => {
               return agent.run({
@@ -1847,10 +1852,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 userBlocks,
                 modelContent,
                 assetIds: input.assetIds,
-                currentMedia: resolved.assets.map(({ kind, durationMs }) => ({
-                  kind,
-                  ...(durationMs === undefined ? {} : { durationMs }),
-                })),
+                currentMedia: resolved.assets.flatMap<CurrentMediaMetadata>(({
+                  kind, mimeType, byteSize, durationMs,
+                }) => {
+                  if (kind === 'file') {
+                    return mimeType === 'text/plain' ? [] : [{ kind, byteSize }]
+                  }
+                  return [{ kind, ...(durationMs === undefined ? {} : { durationMs }) }]
+                }),
                 allowTools: route.supportsTools,
                 supportsImageInput: route.supportsImageInput,
                 userId: session.user.id,

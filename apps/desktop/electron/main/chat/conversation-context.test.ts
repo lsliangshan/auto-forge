@@ -43,6 +43,7 @@ describe('conversation context primitives', () => {
         { type: 'workflow_proposal', workflowId: 'browser.search.baidu', workflowName: '百度搜索', args: { path: '/Users/private/query.json' } },
         { type: 'execution_result', executionId: 'e1', summary: 'Raw result at /Users/private/result.json' },
         { type: 'media', blockId: 'b1', assetId: 'asset-private-id', kind: 'image', purpose: 'output', name: 'weather.png', mimeType: 'image/png', byteSize: 2048, width: 4321, height: 5432, durationMs: 6543 },
+        { type: 'media', blockId: 'b2', assetId: 'file-private-id', kind: 'file', purpose: 'input', name: 'notes.txt', mimeType: 'text/plain', byteSize: 12 },
       ],
     }
 
@@ -54,11 +55,15 @@ describe('conversation context primitives', () => {
       content: expect.stringContaining('weather.png'),
     })
     expect(body).toContain('browser.search.baidu')
+    expect(serialized?.content).toContain(
+      '[历史附件: file; 名称: notes.txt; MIME: text/plain; 大小: 12 bytes]',
+    )
     expect(body).not.toContain('asset-private-id')
+    expect(body).not.toContain('file-private-id')
     expect(body).not.toContain('4321')
     expect(body).not.toContain('5432')
     expect(body).not.toContain('6543')
-    expect(body).not.toMatch(/base64|\/Users\/|file:\/\/|https?:\/\//i)
+    expect(body).not.toMatch(/dataBase64|base64|\/Users\/|file:\/\/|https?:\/\/|conversation-private\/notes\.bin/i)
   })
 
   it('serializes workflow status and provenance without build, input, result, path, or scope data', () => {
@@ -152,6 +157,8 @@ describe('conversation context primitives', () => {
         type: 'media', blockId: 'b5', assetId: 'a5', kind: 'image', purpose: 'input',
         name: 'safe.png', mimeType: 'image/png', byteSize: 1,
         dataBase64: 'base64-private-payload',
+        originalPath: '/Users/private/safe.png',
+        relativePath: 'conversation-private/safe.png',
       }],
     })).toThrow()
   })
