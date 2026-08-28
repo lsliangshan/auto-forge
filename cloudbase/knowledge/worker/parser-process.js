@@ -2,7 +2,7 @@
 
 const { execFile, spawn } = require('node:child_process')
 const { existsSync, realpathSync, statSync } = require('node:fs')
-const { isAbsolute, resolve } = require('node:path')
+const { dirname, isAbsolute, resolve } = require('node:path')
 
 const MAX_INPUT_BYTES = 64 * 1024 * 1024
 const MAX_HEADER_BYTES = 4 * 1024
@@ -16,6 +16,14 @@ const RSS_POLL_MS = 10
 const MAX_RSS_READ_FAILURES = 2
 const SANDBOX_EXECUTABLE = '/usr/bin/sandbox-exec'
 const PS_EXECUTABLE = '/bin/ps'
+const NODE_RUNTIME_FILES = Object.freeze([
+  '/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation',
+  '/System/Library/Frameworks/Security.framework/Versions/A/Security',
+  '/System/Library/OpenSSL/openssl.cnf',
+  '/usr/lib/dyld',
+  '/usr/lib/libc++.1.dylib',
+  '/usr/lib/libSystem.B.dylib',
+])
 const childEntryDefault = realpathSync(resolve(__dirname, 'parser-child.js'))
 const parserCodes = new Set([
   'INVALID_INPUT', 'PARSER_FAILED', 'PARSER_LIMIT_EXCEEDED',
@@ -85,6 +93,22 @@ function parserReadPaths(childEntry) {
   return paths
 }
 
+function parserMetadataPaths(childEntry) {
+  const paths = [dirname(childEntry)]
+  if (childEntry === childEntryDefault) {
+    paths.push(__dirname, resolve(__dirname, '..'), resolve(__dirname, '..', 'node_modules'))
+  }
+  const ancestors = new Set(['/'])
+  for (const path of paths) {
+    let current = path
+    while (current !== '/') {
+      ancestors.add(current)
+      current = dirname(current)
+    }
+  }
+  return [...ancestors]
+}
+
 function sandboxReadFilter(path) {
   return statSync(path).isDirectory()
     ? `(subpath "${sandboxLiteral(path)}")`
@@ -93,32 +117,32 @@ function sandboxReadFilter(path) {
 
 function sandboxProfile(nodeExecutable, childEntry) {
   const parserReads = parserReadPaths(childEntry).map(sandboxReadFilter).join(' ')
+  const runtimeReads = NODE_RUNTIME_FILES
+    .map(path => `(literal "${sandboxLiteral(path)}")`).join(' ')
+  const parserMetadata = parserMetadataPaths(childEntry)
+    .map(path => `(literal "${sandboxLiteral(path)}")`).join(' ')
   return [
     '(version 1)',
     '(deny default)',
+    '(deny dynamic-code-generation)',
     '(allow mach-bootstrap)',
     '(allow process-info* (target self))',
     '(allow signal (target self))',
     '(allow sysctl-read)',
-    '(allow file-read-metadata)',
     `(allow process-exec (literal "${sandboxLiteral(nodeExecutable)}"))`,
+    `(allow file-read-metadata file-test-existence ${parserMetadata})`,
     `(allow file-read* file-test-existence
       (literal "/")
       (literal "/dev/null")
       (literal "/dev/random")
       (literal "/dev/urandom")
       (literal "/dev/zero")
-      (subpath "/System")
-      (subpath "/usr/lib")
-      (subpath "/usr/share")
-      (subpath "/private/var/db/timezone")
       (literal "${sandboxLiteral(nodeExecutable)}")
+      ${runtimeReads}
       ${parserReads})`,
     `(allow file-map-executable
       (literal "${sandboxLiteral(nodeExecutable)}")
-      (subpath "/System/Library/Frameworks")
-      (subpath "/System/Library/PrivateFrameworks")
-      (subpath "/usr/lib"))`,
+      ${runtimeReads})`,
     '(allow file-read-data file-test-existence file-write-data (literal "/dev/fd/0") (literal "/dev/fd/1") (literal "/dev/fd/2"))',
     '(allow file-read-data file-test-existence file-write-data (literal "/dev/null") (literal "/dev/zero"))',
     '(deny network*)',
@@ -241,6 +265,7 @@ function createKnowledgeParserProcess({
           child = spawnImpl(SANDBOX_EXECUTABLE, [
             '-p', sandboxProfile(nodeExecutable, canonicalChildEntry),
             nodeExecutable,
+            '--jitless',
             '--permission',
             '--no-addons',
             '--preserve-symlinks-main',

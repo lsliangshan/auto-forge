@@ -201,6 +201,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         '-p',
         expect.stringContaining('(deny network*)'),
         process.execPath,
+        '--jitless',
         '--permission',
         '--no-addons',
         '--max-old-space-size=128',
@@ -210,6 +211,10 @@ describe('CloudBase knowledge scheduled worker', () => {
         env: { AUTOFORGE_PARSER_CHILD: '1' },
         stdio: ['pipe', 'pipe', 'pipe'],
       })
+      const profile = launches[0]?.args[1]
+      expect(profile).toContain('(deny dynamic-code-generation)')
+      expect(profile).toContain('(literal "/usr/lib/libSystem.B.dylib")')
+      expect(profile).not.toMatch(/\(subpath "\/(?:System|usr\/lib|usr\/share)"\)/u)
       expect(JSON.stringify(launches)).not.toContain('must-not-enter-parser-child')
     } finally {
       if (previousCredential === undefined) delete process.env.AUTOFORGE_PG_SERVICE_KEY
@@ -272,7 +277,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         catch (error) { results.childProcessDenied = ['ERR_ACCESS_DENIED', 'EPERM', 'EACCES'].includes(error.code) }
         try { process.kill(process.ppid, 0); results.parentSignalDenied = false }
         catch (error) { results.parentSignalDenied = ['EPERM', 'EACCES'].includes(error.code) }
-        try { require(${JSON.stringify(secretPath)}); results.nativeAddonDenied = false }
+        try { process.dlopen({ exports: {} }, ${JSON.stringify(secretPath)}); results.nativeAddonDenied = false }
         catch (error) { results.nativeAddonDenied = ['ERR_ACCESS_DENIED', 'ERR_DLOPEN_DISABLED', 'EPERM', 'EACCES'].includes(error.code) }
         const networkAttempt = (start) => new Promise(resolve => {
           let settled = false
@@ -340,29 +345,31 @@ describe('CloudBase knowledge scheduled worker', () => {
     }
   })
 
-  it('denies node:sqlite reads and extension loading outside the parser allowlist', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'autoforge-parser-sandbox-sqlite-'))
-    const databasePath = join(directory, 'parent-secret.sqlite')
-    const extensionBasePath = join(directory, 'parent-secret')
-    const extensionPath = `${extensionBasePath}.dylib`
+  it('denies real system SQLite and dylib access at the Seatbelt syscall boundary', async () => {
+    const databasePath = '/System/Library/Security/Certificates.bundle/Contents/Resources/valid.sqlite3'
+    const extensionBasePath = '/System/Library/Perl/5.34/darwin-thread-multi-2level/CORE/libperl'
     const { DatabaseSync } = await import('node:sqlite')
-    const database = new DatabaseSync(databasePath)
-    database.exec("CREATE TABLE secrets(value TEXT NOT NULL); INSERT INTO secrets VALUES ('parent credential material')")
+    const database = new DatabaseSync(databasePath, { readOnly: true })
+    expect(database.prepare('SELECT count(*) AS count FROM sqlite_master').get()).toMatchObject({
+      count: expect.any(Number),
+    })
     database.close()
-    await writeFile(extensionPath, 'not an approved SQLite extension', 'utf8')
-    try {
-      await withParserChild(`
+    const extensionProbe = new DatabaseSync(':memory:', { allowExtension: true })
+    extensionProbe.enableLoadExtension(true)
+    expect(() => extensionProbe.loadExtension(extensionBasePath)).toThrow(/symbol not found/iu)
+    extensionProbe.close()
+    await withParserChild(`
         const { DatabaseSync } = require('node:sqlite')
         const denied = error => ['ERR_ACCESS_DENIED', 'EPERM', 'EACCES'].includes(error?.code)
           || /(?:operation not permitted|permission denied|access denied)/iu.test(String(error?.message))
         const results = { nodePermissionDisabled: process.permission === undefined }
         try {
           const database = new DatabaseSync(${JSON.stringify(databasePath)}, { readOnly: true })
-          database.prepare('SELECT value FROM secrets').get()
+          database.prepare('SELECT count(*) AS count FROM sqlite_master').get()
           database.close()
-          results.sqliteReadDenied = false
+          results.systemDatabaseReadDenied = false
         } catch (error) {
-          results.sqliteReadDenied = denied(error)
+          results.systemDatabaseReadDenied = denied(error)
             || error?.code === 'ERR_SQLITE_ERROR' && error?.message === 'unable to open database file'
         }
         try {
@@ -370,11 +377,11 @@ describe('CloudBase knowledge scheduled worker', () => {
           database.enableLoadExtension(true)
           database.loadExtension(${JSON.stringify(extensionBasePath)})
           database.close()
-          results.sqliteExtensionDenied = false
+          results.systemLibraryOpenDenied = false
         } catch (error) {
-          results.sqliteExtensionDenied = denied(error)
+          results.systemLibraryOpenDenied = denied(error)
             || error?.code === 'ERR_LOAD_SQLITE_EXTENSION'
-              && /(?:file system sandbox blocked open|no such file)/iu.test(error?.message)
+              && /(?:file system sandbox blocked open|blocked by sandbox)/iu.test(error?.message)
         }
         const body = Buffer.from(JSON.stringify({ ok: true, result: results }))
         const prefix = Buffer.alloc(4); prefix.writeUInt32BE(body.length)
@@ -391,13 +398,10 @@ describe('CloudBase knowledge scheduled worker', () => {
           bytes: Buffer.from('sqlite probe'), mimeType: 'text/plain', versionId: 'sqlite_probe',
         })).resolves.toEqual({
           nodePermissionDisabled: true,
-          sqliteReadDenied: true,
-          sqliteExtensionDenied: true,
+          systemDatabaseReadDenied: true,
+          systemLibraryOpenDenied: true,
         })
       })
-    } finally {
-      await rm(directory, { recursive: true, force: true })
-    }
   })
 
   it('kills a child whose external-memory RSS crosses the parent-owned ceiling', async () => {
