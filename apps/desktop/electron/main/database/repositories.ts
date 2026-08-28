@@ -14,6 +14,9 @@ import {
   type AppErrorCode,
   type ByokUsageEvent,
   type ChatBlock,
+  type ConversionJobStatus,
+  type ConversionPreset,
+  type ConversionTargetFormat,
   type ConversationGenerationPreferences,
   type AttachmentKind,
   type ModelProviderId,
@@ -294,6 +297,57 @@ export interface Execution {
   startedAt?: number
   endedAt?: number
 }
+
+export interface ConversionJob {
+  id: string
+  ownerUserId: string
+  executionId: string
+  sourceKind: 'media' | 'artifact'
+  sourceId: string
+  targetFormat: ConversionTargetFormat
+  preset?: ConversionPreset
+  status: ConversionJobStatus
+  epoch: number
+  errorCode?: AppErrorCode
+  createdAt: number
+  updatedAt: number
+  startedAt?: number
+  endedAt?: number
+}
+
+export type NewConversionJob = Pick<
+  ConversionJob,
+  'id' | 'ownerUserId' | 'executionId' | 'sourceKind' | 'sourceId' | 'targetFormat'
+> & Partial<Pick<ConversionJob, 'preset' | 'status' | 'epoch' | 'errorCode' | 'createdAt' | 'updatedAt' | 'startedAt' | 'endedAt'>>
+
+export type ConversionJobTransition = Partial<Pick<
+  ConversionJob,
+  'status' | 'errorCode' | 'startedAt' | 'endedAt'
+>>
+
+export interface ConversionArtifact {
+  id: string
+  ownerUserId: string
+  executionId: string
+  conversionJobId?: string
+  role: 'input' | 'output'
+  displayName: string
+  detectedFormat: string
+  mimeType: string
+  byteSize: number
+  sha256: string
+  relativePath: string
+  metadata?: unknown
+  status: 'ready' | 'deleted'
+  createdAt: number
+  updatedAt: number
+  deletedAt?: number
+}
+
+export type NewConversionArtifact = Pick<
+  ConversionArtifact,
+  'id' | 'ownerUserId' | 'executionId' | 'role' | 'displayName' | 'detectedFormat' | 'mimeType' | 'byteSize' | 'sha256' | 'relativePath'
+> & Partial<Pick<ConversionArtifact, 'conversionJobId' | 'metadata' | 'status' | 'createdAt' | 'updatedAt' | 'deletedAt'>>
 
 export interface ExecutionStep {
   id: string
@@ -772,6 +826,26 @@ export interface AppRepositories {
     updateForUser(id: string, ownerUserId: string, value: Partial<Omit<Execution, 'id' | 'ownerUserId' | 'workflowId' | 'workflowVersion' | 'createdAt'>>): Execution | undefined
     markInterrupted(): number
   }
+  conversionJobs: {
+    create(input: NewConversionJob): ConversionJob
+    getOwned(jobId: string, ownerUserId: string): ConversionJob | null
+    listForExecution(executionId: string, ownerUserId: string): ConversionJob[]
+    claimNext(ownerUserId: string): ConversionJob | null
+    transition(input: {
+      jobId: string
+      ownerUserId: string
+      expectedEpoch: number
+      expectedStatuses: ConversionJobStatus[]
+      patch: ConversionJobTransition
+    }): boolean
+    interruptInFlight(ownerUserId: string): number
+  }
+  conversionArtifacts: {
+    create(input: NewConversionArtifact): ConversionArtifact
+    getOwned(artifactId: string, ownerUserId: string): ConversionArtifact | null
+    listForJob(jobId: string, ownerUserId: string): ConversionArtifact[]
+    markDeleted(artifactId: string, ownerUserId: string): boolean
+  }
   executionSteps: { insert(value: ExecutionStep): ExecutionStep; list(executionId: string): ExecutionStep[]; listForUser(executionId: string, ownerUserId: string): ExecutionStep[] }
   executionLogs: { insert(value: ExecutionLogInput): ExecutionLog; list(executionId: string): ExecutionLog[]; listForUser(executionId: string, ownerUserId: string): ExecutionLog[] }
   permissionGrants: { upsert(value: PermissionGrant): PermissionGrant; get(workflowId: string, workflowVersion: string, capability: string, scopeHash: string): PermissionGrant | undefined; list(): PermissionGrant[]; delete(id: string): void }
@@ -803,6 +877,8 @@ const providerUsageColumns = 'id, operation_key AS operationKey, user_id AS user
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
 const executionColumns = 'id, owner_user_id AS ownerUserId, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
+const conversionJobColumns = 'id, owner_user_id AS ownerUserId, execution_id AS executionId, source_kind AS sourceKind, source_id AS sourceId, target_format AS targetFormat, preset, status, epoch, error_code AS errorCode, created_at AS createdAt, updated_at AS updatedAt, started_at AS startedAt, ended_at AS endedAt'
+const conversionArtifactColumns = 'id, owner_user_id AS ownerUserId, execution_id AS executionId, conversion_job_id AS conversionJobId, role, display_name AS displayName, detected_format AS detectedFormat, mime_type AS mimeType, byte_size AS byteSize, sha256, relative_path AS relativePath, metadata_json AS metadataJson, status, created_at AS createdAt, updated_at AS updatedAt, deleted_at AS deletedAt'
 const browserTabBindingColumns = 'id, tab_id AS tabId, user_id AS userId, conversation_id AS conversationId, chat_run_id AS chatRunId, execution_id AS executionId, workflow_id AS workflowId, workflow_version AS workflowVersion, source, build_hash AS buildHash, security_fingerprint AS securityFingerprint, permission_matrix_json AS permissionMatrixJson, status, terminal_reason AS terminalReason, created_at AS createdAt, ended_at AS endedAt'
 const browserActionAuditColumns = 'id, binding_id AS bindingId, chat_run_id AS chatRunId, sequence, origin, action, target_summary AS targetSummary, risk, outcome, error_code AS errorCode, created_at AS createdAt'
 
@@ -1512,6 +1588,46 @@ function executionFromRow(row: Query): Execution {
     input: parse(row.inputJson as string),
     result: parse(row.resultJson as string | null),
   } as Execution
+}
+
+function conversionJobFromRow(row: Query): ConversionJob {
+  return {
+    id: row.id as string,
+    ownerUserId: row.ownerUserId as string,
+    executionId: row.executionId as string,
+    sourceKind: row.sourceKind as ConversionJob['sourceKind'],
+    sourceId: row.sourceId as string,
+    targetFormat: row.targetFormat as ConversionTargetFormat,
+    preset: optional<ConversionPreset>(row.preset),
+    status: row.status as ConversionJobStatus,
+    epoch: row.epoch as number,
+    errorCode: optional<AppErrorCode>(row.errorCode),
+    createdAt: row.createdAt as number,
+    updatedAt: row.updatedAt as number,
+    startedAt: optional<number>(row.startedAt),
+    endedAt: optional<number>(row.endedAt),
+  }
+}
+
+function conversionArtifactFromRow(row: Query): ConversionArtifact {
+  return {
+    id: row.id as string,
+    ownerUserId: row.ownerUserId as string,
+    executionId: row.executionId as string,
+    conversionJobId: optional<string>(row.conversionJobId),
+    role: row.role as ConversionArtifact['role'],
+    displayName: row.displayName as string,
+    detectedFormat: row.detectedFormat as string,
+    mimeType: row.mimeType as string,
+    byteSize: row.byteSize as number,
+    sha256: row.sha256 as string,
+    relativePath: row.relativePath as string,
+    metadata: parse(row.metadataJson as string | null),
+    status: row.status as ConversionArtifact['status'],
+    createdAt: row.createdAt as number,
+    updatedAt: row.updatedAt as number,
+    deletedAt: optional<number>(row.deletedAt),
+  }
 }
 
 function permissionFromRow(row: Query): PermissionGrant {
@@ -2669,6 +2785,183 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return row && executionFromRow(row)
       },
       markInterrupted: () => transaction(database, () => database.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = @endedAt WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run({ endedAt: now() }).changes),
+    },
+    conversionJobs: {
+      create(input) {
+        const createdAt = input.createdAt ?? now()
+        const updatedAt = input.updatedAt ?? createdAt
+        const status = input.status ?? 'queued'
+        const epoch = input.epoch ?? 0
+        const inserted = transaction(database, () => database.prepare(`
+          INSERT INTO conversion_jobs (
+            id, owner_user_id, execution_id, source_kind, source_id, target_format, preset,
+            status, epoch, error_code, created_at, updated_at, started_at, ended_at
+          )
+          SELECT
+            @id, @ownerUserId, @executionId, @sourceKind, @sourceId, @targetFormat, @preset,
+            @status, @epoch, @errorCode, @createdAt, @updatedAt, @startedAt, @endedAt
+          WHERE EXISTS (
+            SELECT 1 FROM executions WHERE id = @executionId AND owner_user_id = @ownerUserId
+          )
+        `).run({
+          ...input,
+          preset: input.preset ?? null,
+          status,
+          epoch,
+          errorCode: input.errorCode ?? null,
+          createdAt,
+          updatedAt,
+          startedAt: input.startedAt ?? null,
+          endedAt: input.endedAt ?? null,
+        }).changes)
+        if (inserted !== 1) throw new Error('Conversion execution ownership mismatch')
+        const row = one<Query>(database, `SELECT ${conversionJobColumns} FROM conversion_jobs WHERE id = @id`, { id: input.id })
+        if (!row) throw new Error('Conversion job was not created')
+        return conversionJobFromRow(row)
+      },
+      getOwned(jobId, ownerUserId) {
+        const row = one<Query>(database, `
+          SELECT ${conversionJobColumns} FROM conversion_jobs
+          WHERE id = @jobId AND owner_user_id = @ownerUserId
+        `, { jobId, ownerUserId })
+        return row ? conversionJobFromRow(row) : null
+      },
+      listForExecution(executionId, ownerUserId) {
+        return many<Query>(database, `
+          SELECT ${conversionJobColumns} FROM conversion_jobs
+          WHERE execution_id = @executionId AND owner_user_id = @ownerUserId
+          ORDER BY created_at, id
+        `, { executionId, ownerUserId }).map(conversionJobFromRow)
+      },
+      claimNext(ownerUserId) {
+        return transaction(database, () => {
+          const row = one<Query>(database, `
+            SELECT ${conversionJobColumns} FROM conversion_jobs
+            WHERE owner_user_id = @ownerUserId AND status = 'queued'
+            ORDER BY created_at, id
+            LIMIT 1
+          `, { ownerUserId })
+          if (!row) return null
+          const claimedAt = now()
+          const claimed = database.prepare(`
+            UPDATE conversion_jobs
+            SET status = 'downloading_component',
+                updated_at = @claimedAt,
+                started_at = COALESCE(started_at, @claimedAt)
+            WHERE id = @id AND owner_user_id = @ownerUserId AND status = 'queued'
+          `).run({ id: row.id, ownerUserId, claimedAt }).changes
+          if (claimed !== 1) return null
+          const updated = one<Query>(database, `
+            SELECT ${conversionJobColumns} FROM conversion_jobs WHERE id = @id AND owner_user_id = @ownerUserId
+          `, { id: row.id, ownerUserId })
+          return updated ? conversionJobFromRow(updated) : null
+        })
+      },
+      transition(input) {
+        if (input.expectedStatuses.length === 0) return false
+        const expectedParameters = Object.fromEntries(input.expectedStatuses.map((status, index) => [`status${index}`, status]))
+        const statuses = input.expectedStatuses.map((_, index) => `@status${index}`).join(', ')
+        const updatedAt = now()
+        return transaction(database, () => database.prepare(`
+          UPDATE conversion_jobs
+          SET status = COALESCE(@status, status),
+              error_code = COALESCE(@errorCode, error_code),
+              started_at = COALESCE(@startedAt, started_at),
+              ended_at = COALESCE(@endedAt, ended_at),
+              updated_at = @updatedAt
+          WHERE id = @jobId
+            AND owner_user_id = @ownerUserId
+            AND epoch = @expectedEpoch
+            AND status IN (${statuses})
+            AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+        `).run({
+          jobId: input.jobId,
+          ownerUserId: input.ownerUserId,
+          expectedEpoch: input.expectedEpoch,
+          status: input.patch.status ?? null,
+          errorCode: input.patch.errorCode ?? null,
+          startedAt: input.patch.startedAt ?? null,
+          endedAt: input.patch.endedAt ?? null,
+          updatedAt,
+          ...expectedParameters,
+        }).changes === 1)
+      },
+      interruptInFlight(ownerUserId) {
+        return transaction(database, () => {
+          const interruptedAt = now()
+          return database.prepare(`
+            UPDATE conversion_jobs
+            SET status = 'interrupted',
+                error_code = 'CONVERSION_INTERRUPTED',
+                updated_at = @interruptedAt,
+                ended_at = @interruptedAt
+            WHERE owner_user_id = @ownerUserId
+              AND status IN ('downloading_component', 'converting', 'verifying')
+          `).run({ ownerUserId, interruptedAt }).changes
+        })
+      },
+    },
+    conversionArtifacts: {
+      create(input) {
+        const createdAt = input.createdAt ?? now()
+        const updatedAt = input.updatedAt ?? createdAt
+        const status = input.status ?? 'ready'
+        const inserted = transaction(database, () => database.prepare(`
+          INSERT INTO conversion_artifacts (
+            id, owner_user_id, execution_id, conversion_job_id, role, display_name,
+            detected_format, mime_type, byte_size, sha256, relative_path, metadata_json,
+            status, created_at, updated_at, deleted_at
+          )
+          SELECT
+            @id, @ownerUserId, @executionId, @conversionJobId, @role, @displayName,
+            @detectedFormat, @mimeType, @byteSize, @sha256, @relativePath, @metadataJson,
+            @status, @createdAt, @updatedAt, @deletedAt
+          WHERE EXISTS (
+            SELECT 1 FROM executions WHERE id = @executionId AND owner_user_id = @ownerUserId
+          ) AND (
+            @conversionJobId IS NULL OR EXISTS (
+              SELECT 1 FROM conversion_jobs
+              WHERE id = @conversionJobId AND owner_user_id = @ownerUserId AND execution_id = @executionId
+            )
+          )
+        `).run({
+          ...input,
+          conversionJobId: input.conversionJobId ?? null,
+          metadataJson: input.metadata === undefined ? null : JSON.stringify(input.metadata),
+          status,
+          createdAt,
+          updatedAt,
+          deletedAt: input.deletedAt ?? (status === 'deleted' ? updatedAt : null),
+        }).changes)
+        if (inserted !== 1) throw new Error('Conversion artifact ownership mismatch')
+        const row = one<Query>(database, `SELECT ${conversionArtifactColumns} FROM conversion_artifacts WHERE id = @id`, { id: input.id })
+        if (!row) throw new Error('Conversion artifact was not created')
+        return conversionArtifactFromRow(row)
+      },
+      getOwned(artifactId, ownerUserId) {
+        const row = one<Query>(database, `
+          SELECT ${conversionArtifactColumns} FROM conversion_artifacts
+          WHERE id = @artifactId AND owner_user_id = @ownerUserId
+        `, { artifactId, ownerUserId })
+        return row ? conversionArtifactFromRow(row) : null
+      },
+      listForJob(jobId, ownerUserId) {
+        return many<Query>(database, `
+          SELECT ${conversionArtifactColumns} FROM conversion_artifacts
+          WHERE conversion_job_id = @jobId AND owner_user_id = @ownerUserId
+          ORDER BY created_at, id
+        `, { jobId, ownerUserId }).map(conversionArtifactFromRow)
+      },
+      markDeleted(artifactId, ownerUserId) {
+        return transaction(database, () => {
+          const deletedAt = now()
+          return database.prepare(`
+            UPDATE conversion_artifacts
+            SET status = 'deleted', updated_at = @deletedAt, deleted_at = @deletedAt
+            WHERE id = @artifactId AND owner_user_id = @ownerUserId AND status = 'ready'
+          `).run({ artifactId, ownerUserId, deletedAt }).changes === 1
+        })
+      },
     },
     executionSteps: {
       insert(value) { transaction(database, () => database.prepare('INSERT INTO execution_steps (id, execution_id, sequence, name, status, percent, started_at, ended_at) VALUES (@id, @executionId, @sequence, @name, @status, @percent, @startedAt, @endedAt)').run(value)); return value },

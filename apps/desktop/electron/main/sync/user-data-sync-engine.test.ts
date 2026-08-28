@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import type { SyncMutation } from '@autoforge/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { UserDataStoreManager, type UserDataStore } from '../database/user-data-client.js'
+import { openAppDatabase } from '../database/client.js'
 import type {
   CloudBaseUserDataCall,
   RemoteSyncMutation,
@@ -177,6 +178,32 @@ afterEach(() => {
 })
 
 describe('UserDataSyncEngine', () => {
+  it('does not turn local conversion rows into sync outbox mutations', async () => {
+    const manager = createManager()
+    const database = openAppDatabase(join(roots.at(-1)!, 'app.sqlite'))
+    try {
+      database.executions.insert({
+        id: 'conversion_execution', ownerUserId: 'alice', workflowId: 'file.convert.universal',
+        workflowVersion: '1.0.0', status: 'running', createdAt: 1,
+      })
+      database.conversionJobs.create({
+        id: 'conversion_job', ownerUserId: 'alice', executionId: 'conversion_execution',
+        sourceKind: 'media', sourceId: 'source_media', targetFormat: 'png', status: 'queued', createdAt: 1,
+      })
+      const call = vi.fn(async () => success({ mutations: [], cursor: null }))
+      const { engine } = createEngine(manager, call)
+
+      await engine.start('alice', 'device-a')
+      await engine.flush()
+
+      expect(manager.open('alice').outbox.countPending()).toBe(0)
+      expect(call).not.toHaveBeenCalledWith(expect.objectContaining({ action: 'syncPush' }))
+    } finally {
+      database.close()
+      manager.close()
+    }
+  })
+
   it('reports a 24-hour warning from durable outbox age and clears after recovery', async () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
     const manager = createManager()
