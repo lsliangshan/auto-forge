@@ -257,6 +257,57 @@ describe('resolveOwnedInput', () => {
     expect(read).not.toHaveBeenCalled()
     read.mockRestore()
   })
+
+  it.each([
+    {
+      label: 'generic MIME with stored PNG format and extension',
+      detectedFormat: 'png',
+      displayName: 'input.png',
+      mimeType: 'application/octet-stream',
+    },
+    {
+      label: 'uppercase image MIME',
+      detectedFormat: 'mp4',
+      displayName: 'input.mp4',
+      mimeType: 'IMAGE/PNG',
+    },
+    {
+      label: 'conflicting audio format, image extension, and video MIME',
+      detectedFormat: 'mp3',
+      displayName: 'input.png',
+      mimeType: 'video/mp4',
+    },
+  ])('applies the smallest trusted pre-read family limit for $label', async ({ detectedFormat, displayName, mimeType }) => {
+    const { dataRoot, db, service } = await fixture()
+    const root = resolveUserConversionRoot(dataRoot, 'user-a')
+    await mkdir(join(root, 'inputs'), { recursive: true })
+    const path = join(root, 'inputs/input-id.bin')
+    await writeFile(path, png())
+    await truncate(path, 20 * 1024 * 1024 + 1)
+    db.artifacts.set('input-id', {
+      id: 'input-id', ownerUserId: 'user-a', executionId: 'execution-a', role: 'input',
+      displayName, detectedFormat, mimeType, byteSize: 20 * 1024 * 1024 + 1,
+      sha256: 'a'.repeat(64), relativePath: 'inputs/input-id.bin', status: 'ready', createdAt: 1, updatedAt: 1,
+    })
+    const sample = await open(path, 'r')
+    const read = vi.spyOn(Object.getPrototypeOf(sample) as { read: typeof sample.read }, 'read')
+    read.mockRejectedValue(new Error('unexpected read'))
+    await sample.close()
+
+    try {
+      await expect(service.resolveOwnedInput({
+        attachmentIndex: 0,
+        ownerUserId: 'user-a',
+        displayName,
+        mimeType,
+        byteSize: 20 * 1024 * 1024 + 1,
+        source: { kind: 'artifact', artifactId: 'input-id' },
+      })).rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      expect(read).not.toHaveBeenCalled()
+    } finally {
+      read.mockRestore()
+    }
+  })
 })
 
 describe('managed output writer', () => {

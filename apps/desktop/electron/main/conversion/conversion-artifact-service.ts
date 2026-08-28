@@ -182,6 +182,47 @@ async function readStableHandle(handle: FileHandle, byteSize: number): Promise<B
   return bytes
 }
 
+const imageFamilyFormats = new Set(['png', 'jpeg', 'jpg', 'webp', 'avif', 'tiff', 'tif', 'bmp', 'gif', 'svg', 'ico', 'icns'])
+const audioFamilyFormats = new Set(['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'])
+const videoFamilyFormats = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi'])
+
+function formatFamilyLimit(value: string | undefined): number | undefined {
+  const format = value?.trim().toLowerCase()
+  if (!format) return undefined
+  if (imageFamilyFormats.has(format)) return CONVERSION_LIMITS.imageBytes
+  if (audioFamilyFormats.has(format)) return CONVERSION_LIMITS.audioBytes
+  if (videoFamilyFormats.has(format)) return CONVERSION_LIMITS.videoBytes
+  return undefined
+}
+
+function safeDisplayNameExtension(displayName: string): string | undefined {
+  if (!displayName || displayName.length > 1_024 || displayName.includes('/') || displayName.includes('\\') || displayName.includes('\0')) {
+    return undefined
+  }
+  const extension = posix.extname(displayName).slice(1).toLowerCase()
+  return /^[a-z0-9]{1,16}$/.test(extension) ? extension : undefined
+}
+
+function mimeFamilyLimit(mimeType: string): number | undefined {
+  const normalized = mimeType.trim().toLowerCase()
+  if (normalized.startsWith('image/')) return CONVERSION_LIMITS.imageBytes
+  if (normalized.startsWith('audio/')) return CONVERSION_LIMITS.audioBytes
+  if (normalized.startsWith('video/')) return CONVERSION_LIMITS.videoBytes
+  if (normalized.startsWith('text/') || (normalized.startsWith('application/') && normalized !== 'application/octet-stream')) {
+    return CONVERSION_LIMITS.fileBytes
+  }
+  return undefined
+}
+
+function artifactPreReadLimit(record: ConversionArtifact): number {
+  const indicators = [
+    formatFamilyLimit(record.detectedFormat),
+    formatFamilyLimit(safeDisplayNameExtension(record.displayName)),
+    mimeFamilyLimit(record.mimeType),
+  ].filter((limit): limit is number => limit !== undefined)
+  return indicators.length > 0 ? Math.min(...indicators) : CONVERSION_LIMITS.fileBytes
+}
+
 function sourceRecord(
   database: ConversionArtifactServiceDatabase,
   binding: ExecutionAttachmentBinding,
@@ -222,17 +263,13 @@ function sourceRecord(
   }
   if (!identifier(binding.source.artifactId)) throw failure('CONVERSION_INPUT_INVALID')
   const record = database.conversionArtifacts.getOwned(binding.source.artifactId, binding.ownerUserId)
-  const artifactLimit = record?.mimeType.startsWith('image/') ? CONVERSION_LIMITS.imageBytes
-    : record?.mimeType.startsWith('audio/') ? CONVERSION_LIMITS.audioBytes
-      : record?.mimeType.startsWith('video/') ? CONVERSION_LIMITS.videoBytes
-        : CONVERSION_LIMITS.fileBytes
   if (
     !record
     || record.status !== 'ready'
     || record.role !== 'input'
     || !/^[a-f0-9]{64}$/.test(record.sha256)
     || record.byteSize > CONVERSION_LIMITS.videoBytes
-    || record.byteSize > artifactLimit
+    || record.byteSize > artifactPreReadLimit(record)
   ) throw failure('CONVERSION_INPUT_INVALID')
   return {
     rootKind: 'conversion',

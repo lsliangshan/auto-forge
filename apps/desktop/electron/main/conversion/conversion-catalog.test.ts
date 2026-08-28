@@ -55,6 +55,19 @@ function gif(width: number, height: number, frames: number): Buffer {
   ])
 }
 
+function gifWithDescriptor(canvasWidth: number, canvasHeight: number, frameWidth: number, frameHeight: number): Buffer {
+  return Buffer.concat([
+    Buffer.from('GIF89a', 'ascii'),
+    Buffer.from([canvasWidth & 0xff, canvasWidth >> 8, canvasHeight & 0xff, canvasHeight >> 8, 0, 0, 0]),
+    Buffer.from([
+      0x2c, 0, 0, 0, 0,
+      frameWidth & 0xff, frameWidth >> 8, frameHeight & 0xff, frameHeight >> 8, 0,
+      2, 2, 0x44, 0x01, 0,
+      0x3b,
+    ]),
+  ])
+}
+
 function pdf(pageCount: number, streamDecoy = false): Buffer {
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
@@ -227,11 +240,34 @@ function mp3(): Buffer {
   return bytes
 }
 
-function ebml(docType: 'webm' | 'matroska'): Buffer {
+function ebmlHeader(docType: 'webm' | 'matroska'): Buffer {
   const value = Buffer.from(docType)
   const docTypeElement = Buffer.concat([Buffer.from([0x42, 0x82, 0x80 | value.length]), value])
-  const header = Buffer.concat([Buffer.from('1a45dfa3', 'hex'), Buffer.from([0x80 | docTypeElement.length]), docTypeElement])
-  return Buffer.concat([header, Buffer.from('1853806780', 'hex')])
+  return Buffer.concat([Buffer.from('1a45dfa3', 'hex'), Buffer.from([0x80 | docTypeElement.length]), docTypeElement])
+}
+
+function ebmlElement(id: string, data: Buffer): Buffer {
+  if (data.byteLength > 126) throw new Error('test EBML element too large')
+  return Buffer.concat([Buffer.from(id, 'hex'), Buffer.from([0x80 | data.byteLength]), data])
+}
+
+function emptyEbml(docType: 'webm' | 'matroska'): Buffer {
+  return Buffer.concat([ebmlHeader(docType), Buffer.from('1853806780', 'hex')])
+}
+
+function ebml(docType: 'webm' | 'matroska'): Buffer {
+  const info = ebmlElement('1549a966', Buffer.concat([
+    ebmlElement('4d80', Buffer.from('a')),
+    ebmlElement('5741', Buffer.from('a')),
+  ]))
+  const track = ebmlElement('ae', Buffer.concat([
+    ebmlElement('d7', Buffer.from([1])),
+    ebmlElement('73c5', Buffer.from([1])),
+    ebmlElement('83', Buffer.from([1])),
+    ebmlElement('86', Buffer.from('V_VP8')),
+  ]))
+  const tracks = ebmlElement('1654ae6b', track)
+  return Buffer.concat([ebmlHeader(docType), ebmlElement('18538067', Buffer.concat([info, tracks]))])
 }
 
 function cfb(streamName: 'WordDocument' | 'Workbook' | 'PowerPoint Document'): Buffer {
@@ -309,6 +345,11 @@ describe('conversion catalog input probing', () => {
     )
   })
 
+  it('accounts each GIF frame against its decoded logical screen canvas', () => {
+    expect(() => probe(gifWithDescriptor(60_000, 2_000, 1, 1), 'huge.gif', 'image/gif'))
+      .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+  })
+
   it('rejects a PDF with 101 pages rather than truncating it', () => {
     expect(() => probe(pdf(101), 'large.pdf', 'application/pdf')).toThrowError(
       expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }),
@@ -343,6 +384,11 @@ describe('conversion catalog input probing', () => {
 
   it('rejects AVIF dimensions forged as an ispe substring inside media payload', () => {
     expect(() => probe(avifWithPayloadIspe(), 'image.avif', 'image/avif'))
+      .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+  })
+
+  it('rejects an empty EBML Segment without mandatory metadata and tracks', () => {
+    expect(() => probe(emptyEbml('webm'), 'empty.webm', 'video/webm'))
       .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
   })
 

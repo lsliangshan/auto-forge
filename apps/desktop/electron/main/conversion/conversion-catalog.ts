@@ -213,12 +213,14 @@ function gifProbe(bytes: Uint8Array): StructuralProbe | undefined {
       continue
     }
     if (marker !== 0x2c || offset + 9 > bytes.length) return undefined
+    const left = buffer.readUInt16LE(offset)
+    const top = buffer.readUInt16LE(offset + 2)
     const width = buffer.readUInt16LE(offset + 4)
     const height = buffer.readUInt16LE(offset + 6)
     const packed = bytes[offset + 8]!
     offset += 9
-    if (!width || !height) return undefined
-    pixels.push(width * height)
+    if (!width || !height || left + width > canvasWidth || top + height > canvasHeight) return undefined
+    pixels.push(canvasWidth * canvasHeight)
     if ((packed & 0x80) !== 0) offset += 3 * (1 << ((packed & 0x07) + 1))
     if (offset >= bytes.length || bytes[offset]! < 2 || bytes[offset]! > 8) return undefined
     offset += 1
@@ -767,6 +769,34 @@ function readEbmlVint(bytes: Uint8Array, offset: number, maskMarker: boolean): {
   return Number.isSafeInteger(value) ? { length, value } : undefined
 }
 
+interface EbmlElement { id: number; dataOffset: number; end: number }
+
+function ebmlElements(bytes: Uint8Array, start: number, end: number): EbmlElement[] | undefined {
+  const elements: EbmlElement[] = []
+  let offset = start
+  while (offset < end) {
+    if (elements.length >= 10_000) return undefined
+    const id = readEbmlVint(bytes, offset, false)
+    if (!id) return undefined
+    offset += id.length
+    const size = readEbmlVint(bytes, offset, true)
+    if (!size || size.value === 2 ** (7 * size.length) - 1) return undefined
+    offset += size.length
+    const elementEnd = offset + size.value
+    if (elementEnd > end) return undefined
+    elements.push({ id: id.value, dataOffset: offset, end: elementEnd })
+    offset = elementEnd
+  }
+  return offset === end ? elements : undefined
+}
+
+function positiveEbmlInteger(bytes: Uint8Array, element: EbmlElement | undefined): number | undefined {
+  if (!element || element.end <= element.dataOffset || element.end - element.dataOffset > 6) return undefined
+  let value = 0
+  for (const byte of bytes.subarray(element.dataOffset, element.end)) value = value * 256 + byte
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
 function ebmlProbe(bytes: Uint8Array): StructuralProbe | undefined {
   if (!Buffer.from(bytes.subarray(0, 4)).equals(Buffer.from('1a45dfa3', 'hex'))) return undefined
   const headerSize = readEbmlVint(bytes, 4, true)
@@ -791,7 +821,31 @@ function ebmlProbe(bytes: Uint8Array): StructuralProbe | undefined {
   if (!segmentId || segmentId.value !== 0x18538067) return undefined
   offset += segmentId.length
   const segmentSize = readEbmlVint(bytes, offset, true)
-  if (!segmentSize || offset + segmentSize.length + segmentSize.value !== bytes.length) return undefined
+  if (!segmentSize || segmentSize.value === 2 ** (7 * segmentSize.length) - 1) return undefined
+  offset += segmentSize.length
+  if (offset + segmentSize.value !== bytes.length) return undefined
+  const segment = ebmlElements(bytes, offset, bytes.length)
+  const info = segment?.find(({ id }) => id === 0x1549a966)
+  const tracks = segment?.find(({ id }) => id === 0x1654ae6b)
+  if (!info || !tracks) return undefined
+  const infoChildren = ebmlElements(bytes, info.dataOffset, info.end)
+  if (
+    !infoChildren?.some(({ id, dataOffset, end }) => id === 0x4d80 && end > dataOffset)
+    || !infoChildren.some(({ id, dataOffset, end }) => id === 0x5741 && end > dataOffset)
+  ) return undefined
+  const trackEntries = ebmlElements(bytes, tracks.dataOffset, tracks.end)?.filter(({ id }) => id === 0xae)
+  if (!trackEntries?.length) return undefined
+  for (const entry of trackEntries) {
+    const fields = ebmlElements(bytes, entry.dataOffset, entry.end)
+    if (!fields) return undefined
+    const number = positiveEbmlInteger(bytes, fields.find(({ id }) => id === 0xd7))
+    const uid = positiveEbmlInteger(bytes, fields.find(({ id }) => id === 0x73c5))
+    const type = positiveEbmlInteger(bytes, fields.find(({ id }) => id === 0x83))
+    const codecElement = fields.find(({ id }) => id === 0x86)
+    const codec = codecElement ? ascii(bytes.subarray(codecElement.dataOffset, codecElement.end)) : ''
+    if (!number || !uid || (type !== 1 && type !== 2) || !/^[A-Z]_[A-Za-z0-9_.-]{1,62}$/.test(codec)) return undefined
+    if ((type === 1 && !codec.startsWith('V_')) || (type === 2 && !codec.startsWith('A_'))) return undefined
+  }
   return { format: docType === 'webm' ? 'webm' : 'mkv', frameCount: 1 }
 }
 
