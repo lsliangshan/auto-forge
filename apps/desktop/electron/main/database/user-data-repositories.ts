@@ -17,6 +17,7 @@ import {
   syncMutationResultSchema,
   syncMutationSchema,
   privacyConsentSchema,
+  privacyConsentStateSchema,
   type ConversationPage,
   type ConversationGenerationPreferences,
   type AppErrorCode,
@@ -28,6 +29,7 @@ import {
   type AccountDataPreferencesRecord,
   type PrivacyConsent,
   type PrivacyConsentPurpose,
+  type PrivacyConsentState,
 } from '@autoforge/shared'
 import {
   createRepositories,
@@ -120,6 +122,7 @@ export interface UserDataRepositories {
   providerUsage: AppRepositories['providerUsage']
   account: {
     getConsent(purpose: PrivacyConsentPurpose): PrivacyConsent | undefined
+    getConsentState(purpose: PrivacyConsentPurpose): PrivacyConsentState | undefined
     getPreferences(): AccountDataPreferencesRecord | undefined
     projectPreferences(preferences: AccountDataPreferencesRecord): void
     resolveLegacyImportBatch(input: {
@@ -139,7 +142,9 @@ export interface UserDataRepositories {
     record(mutation: SyncMutation): void
     recordWithConversation(mutation: SyncMutation): void
     recordWithMessage(mutation: SyncMutation, assetIds?: readonly string[]): void
-    recordWithConsent(mutation: Extract<SyncMutation, { kind: 'privacy.consent' }>): void
+    recordWithConsent(mutation: Extract<
+      SyncMutation, { kind: 'privacy.consent' | 'privacy.consent.revoke' }
+    >): void
     recordWithPreferences(mutation: Extract<SyncMutation, { kind: 'preferences.update' }>): void
     listReady(now: number, limit: number): OutboxMutationRecord[]
     find(id: string): OutboxMutationRecord | undefined
@@ -220,13 +225,36 @@ function storedConsent(
   database: SqliteDatabase,
   purpose: PrivacyConsentPurpose,
 ): PrivacyConsent | undefined {
+  const state = storedConsentState(database, purpose)
+  if (state?.state !== 'accepted') return undefined
+  return privacyConsentSchema.parse({
+    purpose: state.purpose,
+    documentVersion: state.documentVersion,
+    consentedAt: state.consentedAt,
+    clientVersion: state.clientVersion,
+  })
+}
+
+function storedConsentState(
+  database: SqliteDatabase,
+  purpose: PrivacyConsentPurpose,
+): PrivacyConsentState | undefined {
   const row = database.prepare(`
-    SELECT purpose, document_version AS documentVersion,
-           consented_at AS consentedAt, client_version AS clientVersion
-    FROM privacy_consents WHERE purpose = @purpose
+    SELECT purpose, state, revision, document_version AS documentVersion,
+           consented_at AS consentedAt, revoked_at AS revokedAt,
+           client_version AS clientVersion
+    FROM privacy_consent_states WHERE purpose = @purpose
   `).get({ purpose }) as Query | undefined
-  return row === undefined ? undefined : parsePersisted(() => privacyConsentSchema.parse({
-    ...row, consentedAt: isoTimestamp(z.number().int().nonnegative().parse(row.consentedAt)),
+  if (row === undefined) return undefined
+  return parsePersisted(() => privacyConsentStateSchema.parse(row.state === 'accepted' ? {
+    purpose: row.purpose, state: row.state, revision: row.revision,
+    documentVersion: row.documentVersion,
+    consentedAt: isoTimestamp(z.number().int().nonnegative().parse(row.consentedAt)),
+    clientVersion: row.clientVersion,
+  } : {
+    purpose: row.purpose, state: row.state, revision: row.revision,
+    revokedAt: isoTimestamp(z.number().int().nonnegative().parse(row.revokedAt)),
+    clientVersion: row.clientVersion,
   }))
 }
 
@@ -240,6 +268,78 @@ function projectConsent(database: SqliteDatabase, consent: PrivacyConsent): void
       consented_at = excluded.consented_at,
       client_version = excluded.client_version
   `).run({ ...value, consentedAt: timestamp(value.consentedAt) })
+}
+
+type ConsentMutationKind = 'privacy.consent' | 'privacy.consent.revoke'
+type ConsentMutation = {
+  [Kind in ConsentMutationKind]: Pick<
+    Extract<SyncMutation, { kind: Kind }>, 'kind' | 'baseRevision' | 'payload'
+  >
+}[ConsentMutationKind]
+
+function consentStateFromMutation(
+  mutation: ConsentMutation,
+  revision: number,
+): PrivacyConsentState {
+  return mutation.kind === 'privacy.consent'
+    ? privacyConsentStateSchema.parse({ ...mutation.payload, state: 'accepted', revision })
+    : privacyConsentStateSchema.parse({ ...mutation.payload, state: 'revoked', revision })
+}
+
+function writeConsentState(database: SqliteDatabase, state: PrivacyConsentState): void {
+  database.prepare(`
+    INSERT INTO privacy_consent_states(
+      purpose, state, revision, document_version, consented_at, revoked_at, client_version
+    ) VALUES (
+      @purpose, @state, @revision, @documentVersion, @consentedAt, @revokedAt, @clientVersion
+    )
+    ON CONFLICT(purpose) DO UPDATE SET
+      state = excluded.state,
+      revision = excluded.revision,
+      document_version = excluded.document_version,
+      consented_at = excluded.consented_at,
+      revoked_at = excluded.revoked_at,
+      client_version = excluded.client_version
+  `).run(state.state === 'accepted' ? {
+    ...state, consentedAt: timestamp(state.consentedAt), revokedAt: null,
+  } : {
+    ...state, documentVersion: null, consentedAt: null, revokedAt: timestamp(state.revokedAt),
+  })
+}
+
+function optimisticallyProjectConsent(
+  database: SqliteDatabase,
+  mutation: ConsentMutation,
+): void {
+  const currentRevision = storedConsentState(database, mutation.payload.purpose)?.revision ?? 0
+  if (currentRevision !== mutation.baseRevision) throw new UserDataConsistencyError()
+  if (mutation.kind === 'privacy.consent') projectConsent(database, mutation.payload)
+  writeConsentState(database, consentStateFromMutation(mutation, mutation.baseRevision + 1))
+}
+
+function applyRemoteConsent(
+  database: SqliteDatabase,
+  mutation: ConsentMutation,
+  resultRevision: number,
+): void {
+  if (mutation.kind === 'privacy.consent') projectConsent(database, mutation.payload)
+  const current = storedConsentState(database, mutation.payload.purpose)
+  if (mutation.kind === 'privacy.consent' && resultRevision === 0) {
+    if (current === undefined || (current.revision === 1 && current.state === 'accepted')) {
+      writeConsentState(database, consentStateFromMutation(mutation, 1))
+    }
+    return
+  }
+  const next = consentStateFromMutation(mutation, resultRevision)
+  if (current !== undefined && current.revision > resultRevision) return
+  if (current !== undefined && current.revision === resultRevision) {
+    if (!isDeepStrictEqual(current, next)) throw new UserDataConsistencyError()
+    return
+  }
+  if ((current?.revision ?? 0) !== mutation.baseRevision) {
+    throw new UserDataConsistencyError()
+  }
+  writeConsentState(database, next)
 }
 
 function storedPreferences(database: SqliteDatabase): AccountDataPreferencesRecord | undefined {
@@ -534,7 +634,11 @@ function requireValidRemoteResult(mutation: MutationReceipt): number {
       case 'message.append':
         return result === mutation.baseRevision || result === mutation.baseRevision + 1
       case 'legacy.import':
+        return result === 0
       case 'privacy.consent':
+        return result === 0 || result === mutation.baseRevision + 1
+      case 'privacy.consent.revoke':
+        return result === mutation.baseRevision + 1
       case 'usage.record':
         return result === 0
     }
@@ -709,7 +813,8 @@ function acknowledgeLocalMutation(
       }
       break
     case 'privacy.consent':
-      projectConsent(database, local.payload)
+    case 'privacy.consent.revoke':
+      applyRemoteConsent(database, local, resultRevision)
       break
     case 'preferences.update':
       if ((storedPreferences(database)?.revision ?? 0) <= resultRevision) {
@@ -996,7 +1101,8 @@ function applyRemoteMutation(
       break
     }
     case 'privacy.consent':
-      projectConsent(database, mutation.payload)
+    case 'privacy.consent.revoke':
+      applyRemoteConsent(database, mutation, revision)
       break
     case 'preferences.update':
       projectPreferences(database, mutation.payload, revision, mutation.receivedAt)
@@ -1900,6 +2006,7 @@ export function createUserDataRepositories(
     providerUsage,
     account: {
       getConsent: (purpose) => storedConsent(database, purpose),
+      getConsentState: (purpose) => storedConsentState(database, purpose),
       getPreferences: () => storedPreferences(database),
       projectPreferences(preferences) {
         const value = accountDataPreferencesRecordSchema.parse(preferences)
@@ -2010,8 +2117,11 @@ export function createUserDataRepositories(
       recordWithConsent: (mutation) => recordMutation(
         mutation,
         (validated) => {
-          if (validated.kind !== 'privacy.consent') throw new UserDataConsistencyError()
-          projectConsent(database, validated.payload)
+          if (validated.kind !== 'privacy.consent'
+            && validated.kind !== 'privacy.consent.revoke') {
+            throw new UserDataConsistencyError()
+          }
+          optimisticallyProjectConsent(database, validated)
         },
       ),
       recordWithPreferences: (mutation) => recordMutation(

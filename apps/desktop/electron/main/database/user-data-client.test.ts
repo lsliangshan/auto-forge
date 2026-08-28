@@ -2085,7 +2085,10 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }])
+      .toEqual([
+        { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 },
+        { version: 5 }, { version: 6 }, { version: 7 },
+      ])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
@@ -2168,6 +2171,69 @@ describe('UserDataStoreManager', () => {
     manager.open('cloud-bob')
     expect(manager.current()?.account.getConsent('cloud_sync')).toBeUndefined()
     expect(manager.current()?.account.getPreferences()).toBeUndefined()
+    manager.close()
+  })
+
+  it('keeps accepted history while consent state advances through revoke and reaccept OCC', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const accepted: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      id: 'consent_accept_1', kind: 'privacy.consent', entityId: 'cloud-sync-2026-08',
+      baseRevision: 0, occurredAt: '2026-08-28T00:00:00.000Z', payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    const revoked: Extract<SyncMutation, { kind: 'privacy.consent.revoke' }> = {
+      id: 'consent_revoke_1', kind: 'privacy.consent.revoke', entityId: 'cloud_sync',
+      baseRevision: 1, occurredAt: '2026-08-28T01:00:00.000Z', payload: {
+        purpose: 'cloud_sync', revokedAt: '2026-08-28T01:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    store.outbox.recordWithConsent(accepted)
+    expect(store.account.getConsentState('cloud_sync')).toEqual({
+      ...accepted.payload, state: 'accepted', revision: 1,
+    })
+    store.outbox.recordWithConsent(revoked)
+    expect(store.account.getConsent('cloud_sync')).toBeUndefined()
+    expect(store.account.getConsentState('cloud_sync')).toEqual({
+      ...revoked.payload, state: 'revoked', revision: 2,
+    })
+
+    const staleAccepted = {
+      ...accepted, id: 'consent_accept_stale',
+      occurredAt: '2026-08-28T02:00:00.000Z',
+    }
+    expect(() => store.outbox.recordWithConsent(staleAccepted))
+      .toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.outbox.find(staleAccepted.id)).toBeUndefined()
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_consent_stale_accept',
+      mutations: [pulledMutation(staleAccepted, 1)],
+    }, 3)
+    expect(store.account.getConsentState('cloud_sync')).toMatchObject({
+      state: 'revoked', revision: 2,
+    })
+
+    const reaccepted: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      ...accepted, id: 'consent_accept_2', baseRevision: 2,
+      occurredAt: '2026-08-28T03:00:00.000Z',
+      payload: {
+        ...accepted.payload, consentedAt: '2026-08-28T03:00:00.000Z',
+      },
+    }
+    store.outbox.recordWithConsent(reaccepted)
+    expect(store.account.getConsentState('cloud_sync')).toEqual({
+      ...reaccepted.payload, state: 'accepted', revision: 3,
+    })
+
+    const inspection = new Database(cachePath(root, 'cloud-alice'), { readonly: true })
+    expect(inspection.prepare(`
+      SELECT purpose, document_version AS documentVersion
+      FROM privacy_consents WHERE purpose = 'cloud_sync'
+    `).all()).toEqual([{ purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08' }])
+    inspection.close()
     manager.close()
   })
 

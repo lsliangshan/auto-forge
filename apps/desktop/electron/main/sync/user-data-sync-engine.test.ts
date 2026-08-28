@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { SyncMutation } from '@autoforge/shared'
+import type { PrivacyConsentState, SyncMutation } from '@autoforge/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { UserDataStoreManager, type UserDataStore } from '../database/user-data-client.js'
 import type {
@@ -158,6 +158,9 @@ function createEngine(
   onConversationChanged: (conversationIds: readonly string[]) => void = () => undefined,
   onWarningChanged: (binding: { userId: string; generation: number }, warningSince?: number) => void
     = () => undefined,
+  onConsentChanged: (
+    binding: { userId: string; generation: number }, state: PrivacyConsentState | undefined,
+  ) => void = () => undefined,
 ) {
   return {
     clock,
@@ -168,6 +171,7 @@ function createEngine(
       jitter: (delay) => delay,
       onConversationChanged,
       onWarningChanged,
+      onConsentChanged,
     }),
   }
 }
@@ -177,6 +181,59 @@ afterEach(() => {
 })
 
 describe('UserDataSyncEngine', () => {
+  it('publishes a pulled consent revision synchronously and fences a late prior owner callback', async () => {
+    const manager = createManager()
+    const alice = manager.open('alice')
+    const accepted: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      id: 'consent_accept_engine', kind: 'privacy.consent', entityId: 'cloud-sync-2026-08',
+      baseRevision: 0, occurredAt: '2026-08-28T00:00:00.000Z', payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    alice.outbox.recordWithConsent(accepted)
+    const revoke: Extract<SyncMutation, { kind: 'privacy.consent.revoke' }> = {
+      id: 'consent_revoke_engine', kind: 'privacy.consent.revoke', entityId: 'cloud_sync',
+      baseRevision: 1, occurredAt: '2026-08-28T01:00:00.000Z', payload: {
+        purpose: 'cloud_sync', revokedAt: '2026-08-28T01:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    let releasePull!: () => void
+    const heldPull = new Promise<void>((resolve) => { releasePull = resolve })
+    let hold = false
+    const consentEvents: Array<{
+      userId: string; generation: number; state: PrivacyConsentState | undefined
+    }> = []
+    const { engine } = createEngine(
+      manager,
+      async (input) => {
+        if (input.action !== 'syncPull') return success({ results: [], cursor: 'unused' })
+        if (hold) await heldPull
+        return success({ mutations: [remoteReceipt(revoke, 2)], cursor: 'consent_cursor_2' })
+      },
+      new FakeClock(),
+      undefined,
+      undefined,
+      (binding, state) => consentEvents.push({ ...binding, state }),
+    )
+    await engine.start('alice', 'device-a')
+    await engine.pull()
+    expect(consentEvents).toEqual([{
+      userId: 'alice', generation: 2,
+      state: { ...revoke.payload, state: 'revoked', revision: 2 },
+    }])
+
+    hold = true
+    const latePull = engine.pull()
+    await vi.waitFor(() => expect(engine.status().state).toBe('running'))
+    const handoff = engine.start('bob', 'device-b')
+    releasePull()
+    await Promise.all([latePull, handoff])
+    expect(consentEvents).toHaveLength(1)
+    expect(manager.current()?.account.getConsentState('cloud_sync')).toBeUndefined()
+    manager.close()
+  })
+
   it('reports a 24-hour warning from durable outbox age and clears after recovery', async () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
     const manager = createManager()
