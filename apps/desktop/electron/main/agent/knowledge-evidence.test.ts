@@ -180,6 +180,34 @@ describe('knowledge tool and answer validation', () => {
     })
   })
 
+  it.each([
+    {
+      name: 'English cross-subject publication timing',
+      snippet: 'project a starts after launch, project b report is published before launch.',
+      answer: 'after project a starts, project a report is published.[[kb:evidence:0]]',
+    },
+    {
+      name: 'Chinese cross-subject effective condition',
+      snippet: '甲协议由甲方签署之日起生效，乙协议由乙方签署之日起生效。',
+      answer: '甲方签署后，乙协议即开始生效。[[kb:evidence:0]]',
+    },
+  ])('rejects temporal reordering that borrows across independent facts: $name', ({ snippet, answer }) => {
+    expect(validateKnowledgeAnswer(answer, [evidence(0, { snippet })], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [evidence(0, { snippet })], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it('accepts an English temporal reorder only when one evidence fact supports the full tuple', () => {
+    expect(validateKnowledgeAnswer(
+      'after project a starts, project a report is published.[[kb:evidence:0]]',
+      [evidence(0, { snippet: 'project a report is published after project a starts.' })],
+      'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
   it('accepts bounded English paraphrases only after canonical terms still meet high coverage', () => {
     const contract = evidence(0, { snippet: 'The agreement takes effect when both parties sign it.' })
     expect(validateKnowledgeAnswer(
@@ -519,6 +547,9 @@ describe('knowledge tool and answer validation', () => {
     ['一般结论 [[kb:evidence:forged]]', '【一般信息】一般结论'],
     ['一般结论 [[kb:evidence:forged', '【一般信息】一般结论'],
     ['一般结论 [[kb:', '【一般信息】一般结论'],
+    ['一般结论 [[kb:\nforged]]', '【一般信息】一般结论'],
+    ['一般结论 [[ kb ： forged ]]', '【一般信息】一般结论'],
+    ['一般结论 [[\u200bkb：forged]]', '【一般信息】一般结论'],
   ])('strips complete or malformed markers from mixed no-evidence output: %s', (answer, expected) => {
     expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
       kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: expected,
@@ -529,6 +560,9 @@ describe('knowledge tool and answer validation', () => {
     '[[kb:evidence:forged]]',
     '[[kb:evidence:forged',
     '[[kb:',
+    '[[kb:\nforged]]',
+    '[[ kb ： forged ]]',
+    '[[\u200bkb：forged]]',
   ])('fails mixed no-evidence output closed when marker cleanup leaves no answer: %s', (answer) => {
     expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
       kind: 'insufficient', reason: 'no-evidence',
@@ -543,6 +577,24 @@ describe('knowledge tool and answer validation', () => {
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
       text: '【知识库依据】合同生效。',
+    })
+  })
+
+  it('removes a cross-line malformed marker while retaining an admitted mixed citation', () => {
+    expect(validateKnowledgeAnswer(
+      '合同生效。[[kb:evidence:0]] [[kb:\nforged]]',
+      [evidence(0, { snippet: '合同生效。' })],
+      'mixed', 1,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: '【知识库依据】合同生效。',
+    })
+  })
+
+  it('does not remove ordinary double-bracket text in mixed mode', () => {
+    expect(validateKnowledgeAnswer('一般说明 [[not-kb]]', [], 'mixed', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: '【一般信息】一般说明 [[not-kb]]',
     })
   })
 

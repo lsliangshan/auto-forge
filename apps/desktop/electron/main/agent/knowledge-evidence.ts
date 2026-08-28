@@ -121,7 +121,7 @@ export type KnowledgeAnswerValidation =
   | { kind: 'insufficient'; reason: 'no-evidence' | 'uncited' | 'invalid-citation' | 'unsupported-claim' }
 
 const KNOWLEDGE_MARKER = /\[\[kb:([^\]\r\n]{1,512})\]\]/gu
-const KNOWLEDGE_MARKER_MATERIAL = /\[\[\s*kb\s*:[^\r\n]*?(?:\]\]|$)/gimu
+const SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX = /\[\[[\s\u200b-\u200d\u2060\ufeff]*kb[\s\u200b-\u200d\u2060\ufeff]*[:：]/gimu
 const KNOWLEDGE_MARKER_PLACEHOLDER_START = '\u{e200}'
 const KNOWLEDGE_MARKER_PLACEHOLDER_END = '\u{e201}'
 const KNOWLEDGE_MARKER_PLACEHOLDER = /\u{e200}(\d+)\u{e201}/gu
@@ -195,6 +195,21 @@ function normalizedSupportText(value: string): string {
     .slice(0, 4_000)
 }
 
+function stripSuspiciousKnowledgeMarkers(answer: string): string {
+  let cursor = 0
+  let sanitized = ''
+  while (cursor < answer.length) {
+    SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX.lastIndex = cursor
+    const prefix = SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX.exec(answer)
+    if (!prefix) return `${sanitized}${answer.slice(cursor)}`
+    sanitized += answer.slice(cursor, prefix.index)
+    const close = answer.indexOf(']]', SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX.lastIndex)
+    if (close === -1) return sanitized
+    cursor = close + 2
+  }
+  return sanitized
+}
+
 function sanitizeMixedKnowledgeAnswer(answer: string, preserveCanonicalMarkers: boolean): string {
   const canonicalMarkers: string[] = []
   const protectedAnswer = preserveCanonicalMarkers
@@ -203,8 +218,7 @@ function sanitizeMixedKnowledgeAnswer(answer: string, preserveCanonicalMarkers: 
         return `${KNOWLEDGE_MARKER_PLACEHOLDER_START}${canonicalMarkers.length - 1}${KNOWLEDGE_MARKER_PLACEHOLDER_END}`
       })
     : answer
-  return protectedAnswer
-    .replace(KNOWLEDGE_MARKER_MATERIAL, '')
+  return stripSuspiciousKnowledgeMarkers(protectedAnswer)
     .replace(
       KNOWLEDGE_MARKER_PLACEHOLDER,
       (_placeholder, index: string) => canonicalMarkers[Number(index)] ?? '',
@@ -261,6 +275,74 @@ function normalizedTupleObject(value: string): string {
   return canonicalSupportText(value).trim()
 }
 
+function temporalConditionObject(condition: string, subject?: string): string {
+  const normalizedCondition = normalizedTupleObject(condition).replace(/\s+/gu, ' ').trim()
+  if (!subject) return normalizedCondition
+  const normalizedSubject = normalizedTupleObject(subject).replace(/\s+/gu, ' ').trim()
+  return normalizedCondition.length > normalizedSubject.length && normalizedCondition.endsWith(normalizedSubject)
+    ? normalizedCondition.slice(0, -normalizedSubject.length).trim()
+    : normalizedCondition
+}
+
+function temporalFactTuple(value: string): FactTuple | undefined {
+  const chineseReorderedEffective = value.match(
+    /^(.{1,160}?)(?:之日起|以后|之后|后)[，,]\s*(.{1,160}?)(?:即开始|开始|即)?(?:生效|起效)$/u,
+  )
+  if (chineseReorderedEffective) {
+    const subject = chineseReorderedEffective[2]!
+    return {
+      subject: normalizedTuplePart(subject),
+      relation: 'effective-after',
+      object: temporalConditionObject(chineseReorderedEffective[1]!, subject),
+    }
+  }
+
+  const chineseEffective = value.match(
+    /^(.{1,160}?)(?:由|经)(.{1,160}?)(?:之日起|以后|之后|后)(?:即开始|开始|即)?(?:生效|起效)$/u,
+  )
+  if (chineseEffective) {
+    return {
+      subject: normalizedTuplePart(chineseEffective[1]!),
+      relation: 'effective-after',
+      object: temporalConditionObject(chineseEffective[2]!, chineseEffective[1]!),
+    }
+  }
+
+  const englishReordered = value.match(
+    /^(after|before|when|once|upon)\s+(.{1,160}?)[，,]\s*(.{1,160}?)\s+(?:is|are|was|were|will be|shall be)\s+(published|released|started|ended|completed|approved|signed|submitted|delivered)$/iu,
+  )
+  if (englishReordered) {
+    return {
+      subject: normalizedTuplePart(englishReordered[3]!),
+      relation: `${englishReordered[4]!.toLowerCase()}-${englishReordered[1]!.toLowerCase()}`,
+      object: temporalConditionObject(englishReordered[2]!),
+    }
+  }
+
+  const englishPassive = value.match(
+    /^(.{1,160}?)\s+(?:is|are|was|were|will be|shall be)\s+(published|released|started|ended|completed|approved|signed|submitted|delivered)\s+(after|before|when|once|upon)\s+(.{1,160})$/iu,
+  )
+  if (englishPassive) {
+    return {
+      subject: normalizedTuplePart(englishPassive[1]!),
+      relation: `${englishPassive[2]!.toLowerCase()}-${englishPassive[3]!.toLowerCase()}`,
+      object: temporalConditionObject(englishPassive[4]!),
+    }
+  }
+
+  const englishActive = value.match(
+    /^(.{1,160}?)\s+(starts?|begins?|launches?|ends?|finishes?|publishes?|releases?)\s+(after|before|when|once|upon)\s+(.{1,160})$/iu,
+  )
+  if (englishActive) {
+    return {
+      subject: normalizedTuplePart(englishActive[1]!),
+      relation: `${englishActive[2]!.toLowerCase()}-${englishActive[3]!.toLowerCase()}`,
+      object: temporalConditionObject(englishActive[4]!),
+    }
+  }
+  return undefined
+}
+
 function commaFieldTuple(value: string): FactTuple | undefined {
   const field = value.match(/^([^，,]{1,160}?)[，,]\s*(.{1,240})$/u)
   if (!field) return undefined
@@ -275,20 +357,15 @@ function commaFieldTuple(value: string): FactTuple | undefined {
   }
 }
 
-function temporalCommaClaimGroup(value: string): boolean {
-  const group = value.match(/^([^，,]{2,160})[，,]\s*(.{1,240})$/u)
-  if (!group) return false
-  const condition = group[1]!.trim()
-  return /(?:签订|签字|签署|完成|通过|收到|到达|提交|导入|创建|更新|删除|发布|支付|交付|验收|开始|结束).*(?:后|以后|之后|之日起|时)$/u.test(condition)
-    || /^(?:after|before|when|once|upon|while)\b/iu.test(condition)
-}
-
 function factTuple(rawValue: string): FactTuple | undefined {
   const value = normalizedSupportText(rawValue)
     .replace(/^(?:(?:但是|但|然而|不过|而且|并且|同时|以及|且)|\b(?:and|also|moreover)\b)\s*/iu, '')
     .replace(/[。！？.!?]+$/gu, '')
     .trim()
   if (!value) return undefined
+
+  const temporal = temporalFactTuple(value)
+  if (temporal) return temporal
 
   const effective = value.match(/^(.{1,160}?)(?:于\s*([0-9][0-9./:-]{3,31})\s*生效|生效日期(?:为|是)\s*([0-9][0-9./:-]{3,31}))$/u)
   if (effective) {
@@ -569,7 +646,6 @@ function tupleObjectSupportingClauseIndexes(
 
 function evidenceSupportsTupleGroup(rawGroup: string, evidence: KnowledgeEvidence): boolean {
   const answerGroup = rawGroup.replace(KNOWLEDGE_MARKER, '')
-  if (temporalCommaClaimGroup(answerGroup)) return true
   const answerTuples = splitIndependentFacts(answerGroup)
     .map(factTuple)
     .filter((tuple): tuple is FactTuple => tuple !== undefined)
