@@ -9,4 +9,3 @@ DROP FUNCTION IF EXISTS public.autoforge_knowledge_list_bases(varchar, varchar, 
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_cleanup_owner_catalog(varchar, integer);
 
 COMMIT;
-
