@@ -166,6 +166,8 @@
 
 ## Task 6: Whole corrective review, final verification and delivery
 
+- Before the whole-corrective review, close the two Task 5 breaker findings as one settlement-containment prerequisite. Every job child must own a distinct POSIX process group/session; cancellation or timeout signals and waits for the whole group so a nested parser cannot survive authoritative job settlement. Add a real nested parser-stall process-tree regression.
+- Move `complete_job` and low-budget `abandon_claimed_job` transports into independently killable settlement containment. The trusted scheduler must wait for OS close, then use exact job/worker/lease/permit idempotent replay or authoritative state reconciliation before it returns. Add default-entry stalled-settlement and stalled-abandon regressions without injected promise rejection.
 - Run a fresh whole-corrective independent review from `6031dfb` to final HEAD. Fix every Critical/Important finding under the corrective plan's normal per-task review loops.
 - Invoke `superpowers:verification-before-completion`; personally run build, typecheck, lint, focused suites, full tests, evaluation, Electron smoke, 100-page benchmark, parser package smoke, migration/security scans and `git diff --check` on final HEAD.
 - Reproduce and separate the recorded origin/v2 baseline failures where needed; no new/changed overlap may be waived.
