@@ -6753,6 +6753,28 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(JSON.stringify(terminal.blocks)).not.toContain('合同经双方签字后生效')
   })
 
+  it('rechecks Provider consent before a continuation can resend admitted evidence', async () => {
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '不得在撤销后收到此轮内容' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+    const consent = vi.fn()
+      .mockResolvedValueOnce('granted' as const)
+      .mockResolvedValueOnce('unknown' as const)
+    dependencies.knowledge!.getProviderConsent = consent
+
+    await new AgentOrchestrator(dependencies).run(knowledgeRunInput('合同何时生效？'))
+
+    expect(consent).toHaveBeenCalledTimes(2)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('授权')
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).not.toContain('不得在撤销后收到此轮内容')
+  })
+
   it('fails strict mode closed when the cited current source becomes unavailable', async () => {
     const dependencies = harness([[
       { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
@@ -6836,7 +6858,9 @@ describe('AgentOrchestrator knowledge grounding', () => {
       allowTools: false,
     })
     await new AgentOrchestrator(mixedDependencies).run(mixedInput)
-    expect(JSON.stringify(mixedDependencies.records.terminal.at(-1))).toContain('一般合同知识')
+    const mixedTerminal = JSON.stringify(mixedDependencies.records.terminal.at(-1))
+    expect(mixedTerminal).toContain('【一般信息】一般合同知识')
+    expect(mixedTerminal).not.toContain('【知识库依据】一般合同知识')
 
     const strictDependencies = harness([[
       { type: 'text_delta', choiceIndex: 0, text: '模型猜测' },

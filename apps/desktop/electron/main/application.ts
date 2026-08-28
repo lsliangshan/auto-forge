@@ -94,7 +94,7 @@ import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
-import type { LocalKnowledgeService } from './knowledge/knowledge-service.js'
+import type { KnowledgeSearchScope, LocalKnowledgeService } from './knowledge/knowledge-service.js'
 import { createTokenUsageSnapshot } from './token-usage.js'
 import { QiniuAvatarUploader } from './profile/avatar-uploader.js'
 import { ProfileService } from './profile/profile-service.js'
@@ -1413,23 +1413,27 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     ...(knowledge === undefined ? {} : {
       knowledge: {
-        search: ({ ownerId, baseIds, query, signal }: {
+        search: ({ ownerId, baseIds, query, signal, scope }: {
           ownerId: string
           conversationId: string
           baseIds: readonly string[]
           query: string
           signal: AbortSignal
-        }) => knowledge.searchSelected({ userId: ownerId }, query, baseIds, signal),
+          scope?: KnowledgeSearchScope
+        }) => knowledge.searchSelected({ userId: ownerId }, query, baseIds, signal, scope),
         getProviderConsent: async ({ ownerId, provider }: { ownerId: string; provider: ModelProviderId }) => {
           const consent = await knowledge.getConsent({ userId: ownerId }, provider)
           return consent.status
         },
-        sourceAvailable: ({ ownerId, documentId, versionId, signal }: {
+        sourceAvailable: ({ ownerId, documentId, versionId, signal, scope }: {
           ownerId: string
           documentId: string
           versionId: string
           signal: AbortSignal
-        }) => knowledge.sourceAvailable({ userId: ownerId }, documentId, versionId, signal),
+          scope?: KnowledgeSearchScope
+        }) => knowledge.sourceAvailable(
+          { userId: ownerId }, documentId, versionId, signal, scope,
+        ),
       },
     }),
   })
@@ -1894,30 +1898,43 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                     dataBase64,
                   })),
                 ]
+            const knowledgeSelection = {
+              baseIds: [...(preferences.knowledgeBaseIds ?? [])],
+              mode: preferences.knowledgeMode ?? 'mixed',
+            } as const
+            const knowledgeSearchScope = knowledge && knowledgeSelection.baseIds.length > 0
+              ? await knowledge.captureSearchScope(
+                  { userId: session.user.id }, knowledgeSelection.baseIds,
+                )
+              : undefined
             trackChatWork(requestId, input.conversationId, async () => {
-              return agent.run({
-                conversationId: input.conversationId,
-                content: input.content,
-                userBlocks,
-                modelContent,
-                assetIds: input.assetIds,
-                currentMedia: resolved.assets.map(({ kind, durationMs }) => ({
-                  kind,
-                  ...(durationMs === undefined ? {} : { durationMs }),
-                })),
-                allowTools: route.supportsTools,
-                supportsImageInput: route.supportsImageInput,
-                userId: session.user.id,
-                providerSnapshot,
-                provider: route.provider,
-                model: route.model,
-                ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
-                requestId,
-                knowledgeSelection: {
-                  baseIds: [...(preferences.knowledgeBaseIds ?? [])],
-                  mode: preferences.knowledgeMode ?? 'mixed',
-                },
-              })
+              try {
+                return await agent.run({
+                  conversationId: input.conversationId,
+                  content: input.content,
+                  userBlocks,
+                  modelContent,
+                  assetIds: input.assetIds,
+                  currentMedia: resolved.assets.map(({ kind, durationMs }) => ({
+                    kind,
+                    ...(durationMs === undefined ? {} : { durationMs }),
+                  })),
+                  allowTools: route.supportsTools,
+                  supportsImageInput: route.supportsImageInput,
+                  userId: session.user.id,
+                  providerSnapshot,
+                  provider: route.provider,
+                  model: route.model,
+                  ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
+                  requestId,
+                  knowledgeSelection: knowledgeSelection
+                    ? { baseIds: [...knowledgeSelection.baseIds], mode: knowledgeSelection.mode }
+                    : undefined,
+                  ...(knowledgeSearchScope === undefined ? {} : { knowledgeSearchScope }),
+                })
+              } finally {
+                if (knowledgeSearchScope) knowledge?.releaseSearchScope(knowledgeSearchScope)
+              }
             })
           } else if (route.outputType === 'image') {
             trackChatWork(requestId, input.conversationId, async () => {
@@ -2542,7 +2559,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
       },
     },
-    knowledge: knowledge ?? createUnavailableKnowledgeService(),
+    knowledge: knowledge ? {
+      ...knowledge,
+      revokeConsent: async (owner, provider) => {
+        await agent.onKnowledgeProviderConsentRevoked(owner.userId, provider)
+        return knowledge.revokeConsent(owner, provider)
+      },
+    } : createUnavailableKnowledgeService(),
     system: {
       openExternal: async (url) => {
         const parsed = openExternalRequestSchema.safeParse({ url })

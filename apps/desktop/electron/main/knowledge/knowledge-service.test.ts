@@ -782,6 +782,57 @@ describe('local knowledge service', () => {
     })
   })
 
+  it('pins the admitted version scope across replace and recycle until the run releases it', async () => {
+    const memory = memoryKnowledgeStore()
+    let pick = 0
+    let parse = 0
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [pick++ === 0
+        ? { name: '合同-v1.txt', mimeType: 'text/plain', bytes: Buffer.from('第一版唯一条款') }
+        : { name: '合同-v2.txt', mimeType: 'text/plain', bytes: Buffer.from('第二版替换条款') }],
+      createParser: () => ({
+        parse: async () => parsedText(parse++ === 0 ? '第一版唯一条款' : '第二版替换条款'),
+        terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+    })
+    await service.bind('alice')
+    const owner = { userId: 'alice' }
+    const base = await service.create(owner, '合同库')
+    const [firstHandle] = await service.pickImportFiles(owner)
+    const document = (await service.importDocument(owner, base.id, firstHandle!.id))!
+    await vi.waitFor(async () => {
+      const result = await service.searchSelected(owner, '第一版唯', [base.id])
+      expect(result.kind === 'results' ? result.evidence : []).toHaveLength(1)
+    })
+    const scoped = service as typeof service & {
+      captureSearchScope(owner: { userId: string }, baseIds: readonly string[]): Promise<unknown>
+      releaseSearchScope(scope: unknown): void
+      searchSelected(
+        owner: { userId: string }, query: string, baseIds: readonly string[],
+        signal: AbortSignal | undefined, scope: unknown,
+      ): ReturnType<typeof service.searchSelected>
+    }
+    const scope = await scoped.captureSearchScope(owner, [base.id])
+    const [replacement] = await service.pickImportFiles(owner)
+    await service.replaceDocument(owner, document.id, replacement!.id)
+    await vi.waitFor(async () => {
+      const result = await service.searchSelected(owner, '第二版替', [base.id])
+      expect(result.kind === 'results' ? result.evidence : []).toHaveLength(1)
+    })
+    await service.recycleDocument(owner, document.id)
+
+    const admitted = await scoped.searchSelected(owner, '第一版唯', [base.id], undefined, scope)
+    expect(admitted).toMatchObject({
+      kind: 'results', evidence: [expect.objectContaining({ snippet: '第一版唯一条款' })],
+    })
+    await expect(service.purgeDocument(owner, document.id)).rejects.toMatchObject({ code: 'CONFLICT' })
+    scoped.releaseSearchScope(scope)
+    await expect(service.purgeDocument(owner, document.id)).resolves.toBeUndefined()
+  })
+
   it('acknowledges a durable import without awaiting parsing and rejects a late owner callback', async () => {
     // Catches imports that block on parsing or publish after owner invalidation.
     const memory = memoryKnowledgeStore()

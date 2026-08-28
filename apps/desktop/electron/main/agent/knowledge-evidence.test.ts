@@ -347,6 +347,36 @@ describe('knowledge tool and answer validation', () => {
 
   it.each([
     {
+      name: 'arbitrary Chinese material field',
+      snippet: 'A设备材质为钢制且B设备材质为铝制。',
+      answer: 'A设备材质，铝制。[[kb:evidence:0]]',
+    },
+    {
+      name: 'arbitrary Chinese weight field',
+      snippet: 'A设备重量为100千克且B设备重量为200千克。',
+      answer: 'A设备重量，200千克。[[kb:evidence:0]]',
+    },
+    {
+      name: 'arbitrary English material field',
+      snippet: 'Device A material is steel and Device B material is aluminum.',
+      answer: 'Device A material, aluminum. [[kb:evidence:0]]',
+    },
+  ])('fails $name closed without extending a field-name allowlist', ({ snippet, answer }) => {
+    const splitFacts = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it.each([
+    {
       name: 'standalone number from another party field',
       snippet: '乙方编号为 7。',
       answer: '7。[[kb:evidence:0]]',

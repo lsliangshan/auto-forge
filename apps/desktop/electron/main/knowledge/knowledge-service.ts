@@ -20,6 +20,7 @@ import {
 import { KnowledgeExportService } from './export-service.js'
 import { ImportJobRunner, type KnowledgeParserPort } from './import-job-runner.js'
 import { LocalKnowledgeRetriever } from './local-retriever.js'
+import type { LocalKnowledgeVersionScope } from './local-retriever.js'
 import { sanitizeKnowledgeText } from './knowledge-sanitizer.js'
 import type { KnowledgeOwner, KnowledgeService } from './knowledge-types.js'
 import { PARSER_MEDIA_TYPES, type ParserMediaType } from './parser-protocol.js'
@@ -105,8 +106,28 @@ export interface LocalKnowledgeService extends KnowledgeService {
   restoreDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
   restoreBase(owner: KnowledgeOwner, baseId: string): Promise<void>
   /** Main-only Agent retrieval over the conversation selection captured before the run. */
-  searchSelected(owner: KnowledgeOwner, query: string, baseIds: readonly string[], signal?: AbortSignal): Promise<KnowledgeSearchResult>
-  sourceAvailable(owner: KnowledgeOwner, documentId: string, versionId: string, signal?: AbortSignal): Promise<boolean>
+  captureSearchScope(owner: KnowledgeOwner, baseIds: readonly string[]): Promise<KnowledgeSearchScope>
+  releaseSearchScope(scope: KnowledgeSearchScope): void
+  searchSelected(
+    owner: KnowledgeOwner, query: string, baseIds: readonly string[], signal?: AbortSignal,
+    scope?: KnowledgeSearchScope,
+  ): Promise<KnowledgeSearchResult>
+  sourceAvailable(
+    owner: KnowledgeOwner, documentId: string, versionId: string, signal?: AbortSignal,
+    scope?: KnowledgeSearchScope,
+  ): Promise<boolean>
+}
+
+export interface KnowledgeSearchScopeEntry extends LocalKnowledgeVersionScope {
+  readonly cloudGenerationId: string | null
+}
+
+export interface KnowledgeSearchScope {
+  readonly scopeId: string
+  readonly ownerId: string
+  readonly ownerEpoch: number
+  readonly baseIds: readonly string[]
+  readonly entries: readonly KnowledgeSearchScopeEntry[]
 }
 
 interface RetentionSelection {
@@ -226,6 +247,7 @@ export function createLocalKnowledgeService(
   let lifecycleTail = Promise.resolve()
   let refreshedEntitlement: { ownerId: string; epoch: number; state: KnowledgeEntitlementState } | undefined
   let cloudRemote: CloudKnowledgeRemote | undefined
+  const activeSearchScopes = new Map<string, KnowledgeSearchScope>()
   let lifecycleFailure: unknown
   let hasLifecycleFailure = false
   const retiring = new Set<Promise<void>>()
@@ -568,6 +590,7 @@ export function createLocalKnowledgeService(
     query: string,
     baseIds: readonly string[],
     signal?: AbortSignal,
+    admittedScope?: KnowledgeSearchScope,
   ): Promise<KnowledgeSearchResult> => {
     if (signal?.aborted) fail('CANCELLED')
     const normalized = query.normalize('NFC').trim()
@@ -577,11 +600,18 @@ export function createLocalKnowledgeService(
     if (unique.length === 0) {
       return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
     }
-    const state = entitlement(active)
-    const kept = retention(active, state)
-    const allowedBases = state.tier === 'member' && state.status !== 'expired'
-      ? unique
-      : kept && unique.includes(kept.baseId) ? [kept.baseId] : []
+    const captured = admittedScope === undefined ? undefined : activeSearchScopes.get(admittedScope.scopeId)
+    if (admittedScope !== undefined && (captured !== admittedScope
+      || admittedScope.ownerId !== active.ownerId || admittedScope.ownerEpoch !== active.epoch)) {
+      fail('CONFLICT')
+    }
+    const state = admittedScope === undefined ? entitlement(active) : undefined
+    const kept = state === undefined ? undefined : retention(active, state)
+    const allowedBases = admittedScope
+      ? unique.filter(baseId => admittedScope.baseIds.includes(baseId))
+      : state!.tier === 'member' && state!.status !== 'expired'
+        ? unique
+        : kept && unique.includes(kept.baseId) ? [kept.baseId] : []
     if (allowedBases.length === 0) {
       return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
     }
@@ -592,6 +622,7 @@ export function createLocalKnowledgeService(
       normalized,
       allowedBases,
       kept?.documentId ? [kept.documentId] : undefined,
+      admittedScope?.entries,
     )
     if (signal?.aborted) fail('CANCELLED')
     return result
@@ -678,6 +709,7 @@ export function createLocalKnowledgeService(
     binding = undefined
     unavailable = undefined
     refreshedEntitlement = undefined
+    activeSearchScopes.clear()
     if (current) {
       current.runner.invalidate()
       pendingRetirements.add(current)
@@ -929,6 +961,42 @@ export function createLocalKnowledgeService(
         !member && kept?.baseId !== row.id,
       )!)
     },
+    captureSearchScope: async (owner, requestedBaseIds) => {
+      const active = current(owner)
+      const unique = [...new Set(requestedBaseIds)]
+      if (unique.length === 0 || unique.length > 32
+        || unique.some(baseId => !baseId || baseId.length > 512)) fail('INVALID_INPUT')
+      const state = entitlement(active)
+      const kept = retention(active, state)
+      const allowed = state.tier === 'member' && state.status !== 'expired'
+        ? unique
+        : kept && unique.includes(kept.baseId) ? [kept.baseId] : []
+      const entries = allowed.length === 0 ? [] : active.store.database.prepare(`
+        SELECT base.id AS baseId, document.id AS documentId,
+          version.id AS versionId, version.publication_generation AS publicationGeneration,
+          sync.published_generation_id AS cloudGenerationId
+        FROM knowledge_bases AS base
+        JOIN documents AS document ON document.knowledge_base_id = base.id
+        JOIN document_versions AS version ON version.id = document.active_version_id
+          AND version.document_id = document.id
+        LEFT JOIN cloud_sync_states AS sync ON sync.knowledge_base_id = base.id
+        WHERE base.id IN (${allowed.map(() => '?').join(', ')})
+          AND base.recycled_at IS NULL AND document.recycled_at IS NULL
+          AND version.status = 'ready'
+          ${kept?.documentId ? 'AND document.id = ?' : ''}
+        ORDER BY base.id, document.id, version.id
+      `).all(...allowed, ...(kept?.documentId ? [kept.documentId] : [])) as KnowledgeSearchScopeEntry[]
+      const scope = Object.freeze({
+        scopeId: id(), ownerId: active.ownerId, ownerEpoch: active.epoch,
+        baseIds: Object.freeze([...allowed]),
+        entries: Object.freeze(entries.map(entry => Object.freeze({ ...entry }))),
+      })
+      activeSearchScopes.set(scope.scopeId, scope)
+      return scope
+    },
+    releaseSearchScope: (scope) => {
+      if (activeSearchScopes.get(scope.scopeId) === scope) activeSearchScopes.delete(scope.scopeId)
+    },
     create: async (owner, rawName) => {
       const active = current(owner)
       const name = rawName.trim()
@@ -1103,6 +1171,9 @@ export function createLocalKnowledgeService(
     },
     purgeDocument: async (owner, documentId) => {
       const active = current(owner)
+      if ([...activeSearchScopes.values()].some(scope => scope.ownerId === active.ownerId
+        && scope.ownerEpoch === active.epoch
+        && scope.entries.some(entry => entry.documentId === documentId))) fail('CONFLICT')
       const document = active.store.database.prepare(
         'SELECT id FROM documents WHERE id = ? AND recycled_at IS NOT NULL',
       ).get(documentId)
@@ -1165,6 +1236,8 @@ export function createLocalKnowledgeService(
     },
     purgeBase: async (owner, baseId) => {
       const active = current(owner)
+      if ([...activeSearchScopes.values()].some(scope => scope.ownerId === active.ownerId
+        && scope.ownerEpoch === active.epoch && scope.baseIds.includes(baseId))) fail('CONFLICT')
       const exists = active.store.database.prepare(
         'SELECT recycled_at AS recycledAt FROM knowledge_bases WHERE id = ?',
       ).get(baseId) as { recycledAt: number | null } | undefined
@@ -1220,13 +1293,20 @@ export function createLocalKnowledgeService(
       `).all() as Array<{ id: string }>
       return searchBases(active, query, bases.map(base => base.id))
     },
-    searchSelected: async (owner, query, baseIds, signal) => searchBases(current(owner), query, baseIds, signal),
-    sourceAvailable: async (owner, documentId, versionId, signal) => {
+    searchSelected: async (owner, query, baseIds, signal, scope) => (
+      searchBases(current(owner), query, baseIds, signal, scope)
+    ),
+    sourceAvailable: async (owner, documentId, versionId, signal, scope) => {
       if (signal?.aborted) fail('CANCELLED')
       const active = current(owner)
-      const state = entitlement(active)
-      const kept = retention(active, state)
-      if ((state.tier !== 'member' || state.status === 'expired')
+      const captured = scope === undefined ? undefined : activeSearchScopes.get(scope.scopeId)
+      if (scope !== undefined && (captured !== scope || scope.ownerId !== active.ownerId
+        || scope.ownerEpoch !== active.epoch
+        || !scope.entries.some(entry => entry.documentId === documentId
+          && entry.versionId === versionId))) return false
+      const state = scope === undefined ? entitlement(active) : undefined
+      const kept = state === undefined ? undefined : retention(active, state)
+      if (scope === undefined && (state!.tier !== 'member' || state!.status === 'expired')
         && kept?.documentId !== documentId) return false
       const row = active.store.database.prepare(`
         SELECT 1 AS available
@@ -1235,10 +1315,10 @@ export function createLocalKnowledgeService(
         JOIN document_versions AS version
           ON version.id = ? AND version.document_id = document.id
         WHERE document.id = ?
-          AND document.recycled_at IS NULL
+          ${scope === undefined ? `AND document.recycled_at IS NULL
           AND base.recycled_at IS NULL
           AND document.active_version_id = version.id
-          AND version.status = 'ready'
+          AND version.status = 'ready'` : ''}
         LIMIT 1
       `).get(versionId, documentId)
       if (signal?.aborted) fail('CANCELLED')

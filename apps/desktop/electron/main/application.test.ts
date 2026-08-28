@@ -1406,6 +1406,8 @@ describe('createApplicationRuntime', () => {
       bind: vi.fn(async (ownerId: string) => { lifecycle.push(`bind:${ownerId}`) }),
       invalidate: vi.fn(() => { lifecycle.push('invalidate') }),
       drain: vi.fn(async () => { lifecycle.push('drain') }),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
       searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
       sourceAvailable: vi.fn(async () => false),
       list: vi.fn(async () => {
@@ -1454,6 +1456,8 @@ describe('createApplicationRuntime', () => {
       refreshEntitlement,
       invalidate: vi.fn(),
       drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
       searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
       sourceAvailable: vi.fn(async () => false),
     })
@@ -1536,6 +1540,8 @@ describe('createApplicationRuntime', () => {
       bind: vi.fn(async () => undefined),
       invalidate: vi.fn(),
       drain: vi.fn(async () => { throw drainFailure }),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
       searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
       sourceAvailable: vi.fn(async () => false),
     })
@@ -1550,6 +1556,16 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-agent-'))
     directories.push(root)
     const emitted: ChatEvent[] = []
+    const admittedScope = Object.freeze({
+      scopeId: 'scope_1', ownerId: 'test_user_testuser', ownerEpoch: 1,
+      baseIds: Object.freeze(['base_selected']),
+      entries: Object.freeze([Object.freeze({
+        baseId: 'base_selected', documentId: 'document_1', versionId: 'version_1',
+        publicationGeneration: 1, cloudGenerationId: null,
+      })]),
+    })
+    const captureSearchScope = vi.fn(async () => admittedScope)
+    const releaseSearchScope = vi.fn()
     const searchSelected = vi.fn(async () => ({
       kind: 'results' as const,
       strategy: 'trigram' as const,
@@ -1564,6 +1580,8 @@ describe('createApplicationRuntime', () => {
     }))
     const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
       bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
+      captureSearchScope,
+      releaseSearchScope,
       searchSelected,
       sourceAvailable: vi.fn(async () => true),
       getConsent: vi.fn(async () => ({
@@ -1614,7 +1632,12 @@ describe('createApplicationRuntime', () => {
 
     expect(searchSelected).toHaveBeenCalledWith(
       { userId: 'test_user_testuser' }, '合同何时生效', ['base_selected'], expect.any(AbortSignal),
+      admittedScope,
     )
+    expect(captureSearchScope).toHaveBeenCalledWith(
+      { userId: 'test_user_testuser' }, ['base_selected'],
+    )
+    expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
     expect(emitted).toContainEqual(expect.objectContaining({
       type: 'block', conversationId: conversation.id,
       block: expect.objectContaining({ type: 'knowledge_citation', evidenceId: 'evidence:contract' }),

@@ -241,8 +241,7 @@ function commaFieldTuple(value: string): FactTuple | undefined {
   if (!field) return undefined
   const subject = field[1]!.trim()
   const object = field[2]!.trim()
-  const attributeField = /(?:颜色|日期|时间|金额|编号|名称|型号|地点|位置|版本|状态|数量|期限|币种|color|date|time|amount|number|name|model|location|version|status|quantity|term|currency)$/iu
-  if (!subject || !object || !attributeField.test(subject)) return undefined
+  if (!subject || !object || /(?:之前|以后|之日起|之时|时起|[前后时])$/u.test(subject)) return undefined
   const effectiveDate = subject.match(/^(.{1,160}?)生效日期$/u)
   return {
     subject: normalizedTuplePart(effectiveDate?.[1] ?? subject),

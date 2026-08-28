@@ -13,6 +13,13 @@ interface ChunkRow {
   coordinates_json: string
 }
 
+export interface LocalKnowledgeVersionScope {
+  readonly baseId: string
+  readonly documentId: string
+  readonly versionId: string
+  readonly publicationGeneration: number
+}
+
 function searchResult(
   rows: ChunkRow[],
   strategy: Extract<KnowledgeSearchResult, { kind: 'results' }>['strategy'],
@@ -71,12 +78,28 @@ export class LocalKnowledgeRetriever {
     query: string,
     baseIds: readonly string[],
     documentIds?: readonly string[],
+    versionScope?: readonly LocalKnowledgeVersionScope[],
   ): Promise<KnowledgeSearchResult> {
     const normalized = query.normalize('NFC').trim()
     const length = Array.from(normalized).length
     if (length < 2) return { kind: 'query-too-short' }
     const scope = selectedScope(baseIds)
     const documentScope = documentIds === undefined ? undefined : selectedScope(documentIds)
+    if (versionScope !== undefined && versionScope.length === 0) {
+      return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
+    }
+    const versionValues = versionScope?.flatMap(entry => [
+      entry.baseId, entry.documentId, entry.versionId, entry.publicationGeneration,
+    ]) ?? []
+    const versionPredicate = versionScope === undefined
+      ? `AND base.recycled_at IS NULL
+        AND document.recycled_at IS NULL
+        AND document.active_version_id = chunk.version_id
+        AND version.status = 'ready'`
+      : `AND (${versionScope.map(() => `(
+          chunk.knowledge_base_id = ? AND chunk.document_id = ?
+          AND chunk.version_id = ? AND version.publication_generation = ?
+        )`).join(' OR ')})`
     const documentPredicate = documentScope
       ? `AND chunk.document_id IN (${documentScope.clause})`
       : ''
@@ -92,10 +115,7 @@ export class LocalKnowledgeRetriever {
         ON version.id = chunk.version_id
        AND version.document_id = chunk.document_id
       WHERE chunk.knowledge_base_id IN (${scope.clause})
-        AND base.recycled_at IS NULL
-        AND document.recycled_at IS NULL
-        AND document.active_version_id = chunk.version_id
-        AND version.status = 'ready'
+        ${versionPredicate}
         ${documentPredicate}
     `
     if (length === 2) {
@@ -110,7 +130,7 @@ export class LocalKnowledgeRetriever {
         WHERE instr(body, ?) > 0
         ORDER BY version_id, ordinal
         LIMIT ${MAX_RESULTS}
-      `).all(...scope.values, ...(documentScope?.values ?? []), normalized) as ChunkRow[]
+      `).all(...scope.values, ...versionValues, ...(documentScope?.values ?? []), normalized) as ChunkRow[]
       return searchResult(rows, 'bounded-instr')
     }
 
@@ -129,14 +149,11 @@ export class LocalKnowledgeRetriever {
        AND version.document_id = chunk.document_id
       WHERE kb_chunks_fts MATCH ?
         AND chunk.knowledge_base_id IN (${scope.clause})
-        AND base.recycled_at IS NULL
-        AND document.recycled_at IS NULL
-        AND document.active_version_id = chunk.version_id
-        AND version.status = 'ready'
+        ${versionPredicate}
         ${documentPredicate}
       ORDER BY bm25(kb_chunks_fts), chunk.version_id, chunk.ordinal
       LIMIT ${MAX_RESULTS}
-    `).all(literal, ...scope.values, ...(documentScope?.values ?? [])) as ChunkRow[]
+    `).all(literal, ...scope.values, ...versionValues, ...(documentScope?.values ?? [])) as ChunkRow[]
     return searchResult(rows, 'trigram')
   }
 }

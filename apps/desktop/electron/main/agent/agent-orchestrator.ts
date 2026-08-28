@@ -87,6 +87,7 @@ import {
   sanitizeKnowledgeCoordinate,
   validateKnowledgeAnswer,
 } from './knowledge-evidence.js'
+import type { KnowledgeSearchScope } from '../knowledge/knowledge-service.js'
 
 const AUTOFORGE_ASSISTANT_PROMPT = [
   '你是 AutoForge 的内置 AI 助手。',
@@ -431,6 +432,7 @@ export interface AgentOrchestratorDependencies {
       baseIds: readonly string[]
       query: string
       signal: AbortSignal
+      scope?: KnowledgeSearchScope
     }): Promise<KnowledgeSearchResult>
     getProviderConsent(input: { ownerId: string; provider: ModelProviderId }): Promise<'granted' | 'denied' | 'unknown'>
     sourceAvailable?(input: {
@@ -438,6 +440,7 @@ export interface AgentOrchestratorDependencies {
       documentId: string
       versionId: string
       signal: AbortSignal
+      scope?: KnowledgeSearchScope
     }): Promise<boolean>
   }
   emit: (event: ChatEvent) => void
@@ -467,6 +470,8 @@ export interface AgentRunInput extends UsageAttribution {
   requestId?: string
   providerSnapshot: ModelProviderSnapshot
   knowledgeSelection?: KnowledgeSelection
+  /** Main-captured immutable document/version/generation scope; never Renderer supplied. */
+  knowledgeSearchScope?: KnowledgeSearchScope
 }
 
 export interface AgentRunResult {
@@ -561,6 +566,7 @@ interface ActiveAgentRun {
     costUsd?: string
   }
   knowledgeSelection: Readonly<KnowledgeSelection>
+  knowledgeSearchScope?: KnowledgeSearchScope
   knowledgeEvidence: CurrentTurnKnowledgeEvidence
   knowledgeSearches: number
   knowledgeCitationRepairs: number
@@ -953,6 +959,8 @@ export class AgentOrchestrator {
         actualExecutions: [],
         finalToolNoticeAdded: false,
         knowledgeSelection,
+        ...(input.knowledgeSearchScope === undefined
+          ? {} : { knowledgeSearchScope: input.knowledgeSearchScope }),
         knowledgeEvidence: new CurrentTurnKnowledgeEvidence(knowledgeSelection.baseIds),
         knowledgeSearches: 0,
         knowledgeCitationRepairs: 0,
@@ -1121,6 +1129,19 @@ export class AgentOrchestrator {
     if (!active.terminal) await this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
   }
 
+  async onKnowledgeProviderConsentRevoked(
+    userId: string,
+    provider: ModelProviderId,
+  ): Promise<void> {
+    const affected = [...this.activeByRequest.values()].filter(active => (
+      active.userId === userId
+      && active.providerSnapshot.providerId === provider
+      && active.knowledgeSelection.baseIds.length > 0
+      && !active.terminal
+    ))
+    await Promise.all(affected.map(active => this.cancel(active.requestId)))
+  }
+
   async takeOverBrowser(requestId: string, bindingId: string, runId: string): Promise<boolean> {
     const active = this.activeByRequest.get(requestId)
     if (!active
@@ -1259,6 +1280,22 @@ export class AgentOrchestrator {
       if (!canOfferWorkflowTools && !active.finalToolNoticeAdded) {
         active.messages.push({ role: 'system', content: FINAL_FROM_RESULTS })
         active.finalToolNoticeAdded = true
+      }
+      if (active.knowledgeDisclosedEvidenceIds.size > 0 && this.dependencies.knowledge) {
+        const consent = await this.dependencies.knowledge.getProviderConsent({
+          ownerId: active.userId,
+          provider: active.providerSnapshot.providerId,
+        })
+        if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+        if (consent !== 'granted') {
+          active.knowledgeConsentBlocked = consent === 'denied' ? 'consent_denied' : 'consent_required'
+          this.setKnowledgeStatus(active, active.knowledgeConsentBlocked, active.knowledgeEvidence.snapshot().length)
+          this.appendText(active, consent === 'denied'
+            ? '你已拒绝向当前模型供应商发送知识库依据，因此本次不生成知识库答案。'
+            : '需要你先授权向当前模型供应商发送最小知识库依据，然后重新发送问题。')
+          this.appendWorkflowProvenance(active)
+          return this.terminalize(active, 'completed')
+        }
       }
       for await (const event of trackProviderStream({
         operationKey,
@@ -1552,6 +1589,8 @@ export class AgentOrchestrator {
         baseIds: active.knowledgeSelection.baseIds,
         query: argumentsValue.rewrite ?? argumentsValue.query,
         signal: active.controller.signal,
+        ...(active.knowledgeSearchScope === undefined
+          ? {} : { scope: active.knowledgeSearchScope }),
       })
       if (active.cancelled || active.controller.signal.aborted || active.terminal) throw appFailure('CANCELLED')
       result = knowledgeSearchResultSchema.parse(rawResult)
@@ -2124,6 +2163,8 @@ export class AgentOrchestrator {
             documentId: evidence.documentId,
             versionId: evidence.versionId,
             signal: active.controller.signal,
+            ...(active.knowledgeSearchScope === undefined
+              ? {} : { scope: active.knowledgeSearchScope }),
           })
         : false
       if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
@@ -2154,7 +2195,12 @@ export class AgentOrchestrator {
     if (active.knowledgeSelection.baseIds.length === 0) return { kind: 'answer', text: answer }
     const allEvidence = active.knowledgeEvidence.snapshot()
     if (active.knowledgeSearches === 0 && allEvidence.length === 0) {
-      if (!active.knowledgeRequired) return { kind: 'answer', text: answer }
+      if (!active.knowledgeRequired) {
+        const validation = validateKnowledgeAnswer(
+          answer, [], active.knowledgeSelection.mode, active.knowledgeCitationRepairs,
+        )
+        return { kind: 'answer', text: validation.kind === 'valid' ? validation.text : answer }
+      }
       this.setKnowledgeStatus(active, 'insufficient', 0)
       return { kind: 'answer', text: KNOWLEDGE_INSUFFICIENT_TEXT }
     }
