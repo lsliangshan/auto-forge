@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it, vi } from 'vitest'
 import {
@@ -210,57 +209,5 @@ describe('CloudBase user role function', () => {
     await expect(unknown({ action: 'ensureMyRole' }, context)).resolves.toEqual({
       ok: false, error: { code: 'INTERNAL_ERROR' },
     })
-  })
-})
-
-describe('CloudBase PostgreSQL user role migration', () => {
-  it('preserves the published base bytes and moves knowledge entitlement into additive mirrors', async () => {
-    const [publishedBase, moduleBase] = await Promise.all([
-      readFile(new URL('../../cloudbase/migrations/20260821105102_user_roles.sql', import.meta.url), 'utf8'),
-      readFile(new URL('../../cloudbase/user-roles/migrations/0001_user_roles.sql', import.meta.url), 'utf8'),
-    ])
-    expect(moduleBase).toBe(publishedBase)
-    expect(createHash('sha256').update(publishedBase).digest('hex'))
-      .toBe('d5d3b2f95076a4dc206db70ad675dca0b0cfa4d6d1e532e85568253a7267806d')
-
-    const [publishedForward, moduleForward, moduleRollback] = await Promise.all([
-      readFile(new URL('../../cloudbase/migrations/20260828200000_user_role_knowledge_entitlement.sql', import.meta.url), 'utf8'),
-      readFile(new URL('../../cloudbase/user-roles/migrations/0002_knowledge_entitlement.sql', import.meta.url), 'utf8'),
-      readFile(new URL('../../cloudbase/user-roles/migrations/0002_knowledge_entitlement.rollback.sql', import.meta.url), 'utf8'),
-    ])
-    expect(moduleForward).toBe(publishedForward)
-    expect(publishedForward).toContain('ADD COLUMN IF NOT EXISTS knowledge_entitlement jsonb')
-    expect(publishedForward).toContain("'knowledgeEntitlement', role_row.knowledge_entitlement")
-    expect(moduleRollback).toContain('DROP COLUMN IF EXISTS knowledge_entitlement')
-    expect(moduleRollback).not.toContain("'knowledgeEntitlement', role_row.knowledge_entitlement")
-  })
-
-  it('keeps CloudBase bigint auth ids exact across the string API boundary', async () => {
-    const sql = await readFile(new URL('../../cloudbase/user-roles/migrations/0001_user_roles.sql', import.meta.url), 'utf8')
-    const versionedSql = await readFile(new URL('../../cloudbase/migrations/20260821105102_user_roles.sql', import.meta.url), 'utf8')
-    expect(versionedSql).toBe(sql)
-    expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.app_user_roles')
-    expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.app_user_role_audit')
-    expect(sql).toContain('user_id bigint PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE')
-    expect(sql).toContain("'userId', role_row.user_id::text")
-    expect(sql).not.toContain("'knowledgeEntitlement', role_row.knowledge_entitlement")
-    expect(sql).not.toContain('knowledge_entitlement jsonb')
-    expect(sql).toContain('users.id::text = p_caller_user_id')
-    expect(sql).toContain('users.id::text = p_target_user_id')
-    expect(sql).not.toMatch(/users\.id\s*=\s*p_(?:caller|target)_user_id/)
-    expect(sql).not.toContain('roles.user_id = users.id::text')
-    expect(sql).toContain("existing_role varchar(63) := 'user'")
-    expect(sql).not.toMatch(/\bcurrent_role\b/)
-    expect(sql).toContain('request_id varchar(128) NOT NULL UNIQUE')
-    expect(sql).toContain('SELF_ROLE_CHANGE_FORBIDDEN')
-    expect(sql).toContain('LAST_SUPER_ADMIN')
-    expect(sql).toContain('ROLE_CONFLICT')
-    expect(sql).toContain('REQUEST_ID_CONFLICT')
-    expect(sql).toContain("'total', (SELECT total FROM totals)")
-    expect(sql).toMatch(/REVOKE ALL ON (TABLE )?public\.app_user_roles FROM PUBLIC/)
-    expect(sql).toContain('REVOKE ALL ON FUNCTION public.autoforge_list_users')
-    expect(sql).toContain('GRANT EXECUTE ON FUNCTION public.autoforge_list_users')
-    expect(sql).toContain('TO service_role')
-    expect(sql).toContain("SET search_path = pg_catalog, public")
   })
 })

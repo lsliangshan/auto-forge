@@ -1,3 +1,5 @@
+-- Data-preserving rollback: restore the previous RPC projection while retaining the
+-- additive knowledge_entitlement column, constraint, and accepted values for re-apply.
 BEGIN;
 
 CREATE OR REPLACE FUNCTION public.autoforge_ensure_my_role(p_caller_user_id varchar)
@@ -41,9 +43,7 @@ BEGIN
 END;
 $$;
 
-ALTER TABLE public.app_user_roles
-  DROP CONSTRAINT IF EXISTS app_user_roles_knowledge_entitlement_check;
-ALTER TABLE public.app_user_roles
-  DROP COLUMN IF EXISTS knowledge_entitlement;
+REVOKE ALL ON FUNCTION public.autoforge_ensure_my_role(varchar) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.autoforge_ensure_my_role(varchar) TO service_role;
 
 COMMIT;
