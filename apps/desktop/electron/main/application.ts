@@ -1786,6 +1786,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             throw error
           }
           const resolved = await resolvedInput(input.conversationId, input.assetIds)
+          if (
+            resolved.assets.some((asset) => asset.kind === 'file')
+            && requestedOutput !== 'auto'
+            && requestedOutput !== 'text'
+          ) throw failure('MODEL_MODALITY_UNSUPPORTED')
           if (resolved.assets.some((asset) => (
             asset.kind === 'file'
             && chatFileSupport(snapshot.activeProvider, asset.name, asset.mimeType).mode === 'unsupported'

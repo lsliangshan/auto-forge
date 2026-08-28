@@ -4923,6 +4923,76 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('rejects file attachments for every explicit media output before Provider work', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-file-media-output-'))
+    directories.push(root)
+    const source = join(root, 'report.pdf')
+    await writeFile(source, Buffer.from('%PDF-1.7\n'))
+    const validateCredential = vi.fn(async () => ({ valid: true }))
+    const listModels = vi.fn(async () => [
+      modelInfo('openrouter/text', 'OpenRouter text'),
+      imageModelInfo('openrouter/image'),
+      audioModelInfo('openrouter/audio'),
+      videoModelInfo('openrouter/video'),
+    ])
+    const providerFetch = vi.fn(async () => new Response())
+    const provider = new OpenRouterProvider({
+      credential: { get: async () => 'sk-openrouter' },
+      fetch: providerFetch,
+    })
+    const generateImage = vi.fn(async () => ({ outputs: [] }))
+    const submitVideo = vi.fn(async () => ({
+      providerJobId: 'provider_file_video',
+      status: 'pending' as const,
+    }))
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source],
+      modelProviders: snapshotProviders({
+        openrouter: {
+          listModels,
+          validateCredential,
+          stream: (request) => provider.stream(request),
+          generateImage,
+          submitVideo,
+        },
+      }),
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: {
+          text: 'openrouter/text',
+          image: 'openrouter/image',
+          audio: 'openrouter/audio',
+          video: 'openrouter/video',
+        },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id,
+      existingAssetIds: [],
+    })
+
+    for (const outputType of ['image', 'audio', 'video'] as const) {
+      await expect(runtime.services.chat.send({
+        ...chatInput(conversation.id, `make ${outputType}`),
+        assetIds: [asset!.id],
+        outputType,
+      })).rejects.toMatchObject({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+    }
+
+    expect(validateCredential).not.toHaveBeenCalled()
+    expect(listModels).not.toHaveBeenCalled()
+    expect(providerFetch).not.toHaveBeenCalled()
+    expect(generateImage).not.toHaveBeenCalled()
+    expect(submitVideo).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
   it('propagates image-input support from the selected text route to the agent run', async () => {
     const run = vi.spyOn(AgentOrchestrator.prototype, 'run').mockResolvedValue({
       requestId: 'vision_request', status: 'completed',
