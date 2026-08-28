@@ -161,6 +161,7 @@ describe('authentication store', () => {
     const rejectedLogin = deferred<AuthSession>()
     const rejectedConsentLoad = deferred<PrivacyConsentState | null>()
     vi.mocked(api.auth.loginWithPassword).mockReturnValue(rejectedLogin.promise)
+    vi.mocked(api.auth.getSession).mockResolvedValue(authSession)
     vi.mocked(api.settings.getCloudSyncConsentState).mockReturnValue(rejectedConsentLoad.promise)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
@@ -231,6 +232,7 @@ describe('authentication store', () => {
     const api = createApi()
     const rejectedLogin = deferred<AuthSession>()
     vi.mocked(api.auth.loginWithPassword).mockReturnValue(rejectedLogin.promise)
+    vi.mocked(api.auth.getSession).mockResolvedValue(authSession)
     vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue(revokedCloudConsent)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
@@ -248,6 +250,76 @@ describe('authentication store', () => {
     expect(settings.isAccountGenerationCurrent(aliceGeneration)).toBe(false)
     expect(settings.cloudSyncConsentState).toEqual(revokedCloudConsent)
     expect(api.settings.getCloudSyncConsentState).toHaveBeenCalledOnce()
+  })
+
+  it('reconciles a rejected login to the authoritative Main owner before reopening admission', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.loginWithPassword)
+      .mockRejectedValue(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
+    vi.mocked(api.auth.getSession).mockResolvedValue(bobSession)
+    vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue(revokedCloudConsent)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const settings = useSettingsStore()
+    auth.session = authSession
+    bindSettingsOwner(settings, authSession.user.id)
+    settings.cloudSyncConsentState = acceptedCloudConsent
+    const aliceGeneration = settings.captureAccountGeneration()
+
+    await expect(auth.loginWithPassword({ account: 'Bob', password: 'password' }))
+      .resolves.toBeUndefined()
+
+    expect(api.auth.getSession).toHaveBeenCalledOnce()
+    expect(api.auth.getSession.mock.invocationCallOrder[0]).toBeLessThan(
+      api.settings.getCloudSyncConsentState.mock.invocationCallOrder[0]!,
+    )
+    expect(auth.session).toEqual(bobSession)
+    expect(settings.cloudSyncConsentState).toEqual(revokedCloudConsent)
+    expect(settings.isAccountGenerationCurrent(aliceGeneration)).toBe(false)
+    expect(settings.isAccountGenerationCurrent(settings.captureAccountGeneration())).toBe(true)
+  })
+
+  it('closes the old Renderer owner when rejected login reconciles to no Main session', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.loginWithPassword)
+      .mockRejectedValue(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
+    vi.mocked(api.auth.getSession).mockResolvedValue(null)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const settings = useSettingsStore()
+    auth.session = authSession
+    bindSettingsOwner(settings, authSession.user.id)
+    settings.cloudSyncConsentState = acceptedCloudConsent
+
+    await expect(auth.loginWithPassword({ account: 'Bob', password: 'password' }))
+      .resolves.toBeUndefined()
+
+    expect(api.auth.getSession).toHaveBeenCalledOnce()
+    expect(api.settings.getCloudSyncConsentState).not.toHaveBeenCalled()
+    expect(auth.session).toBeNull()
+    expect(settings.cloudSyncConsentState).toBeUndefined()
+    expect(settings.isAccountGenerationCurrent(settings.captureAccountGeneration())).toBe(false)
+  })
+
+  it('fails closed when rejected login cannot reconcile the authoritative Main session', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.loginWithPassword)
+      .mockRejectedValue(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
+    vi.mocked(api.auth.getSession).mockRejectedValue(toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const settings = useSettingsStore()
+    auth.session = authSession
+    bindSettingsOwner(settings, authSession.user.id)
+    settings.cloudSyncConsentState = acceptedCloudConsent
+
+    await expect(auth.loginWithPassword({ account: 'Bob', password: 'password' }))
+      .resolves.toBeUndefined()
+
+    expect(api.auth.getSession).toHaveBeenCalledOnce()
+    expect(auth.session).toBeNull()
+    expect(settings.cloudSyncConsentState).toBeUndefined()
+    expect(settings.isAccountGenerationCurrent(settings.captureAccountGeneration())).toBe(false)
   })
 
   it('does not retain or repopulate Alice cloud consent after switching to Bob', async () => {
@@ -724,6 +796,7 @@ describe('authentication store', () => {
   it('keeps the current session when logout fails', async () => {
     const api = createApi()
     vi.mocked(api.auth.logout).mockRejectedValue(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+    vi.mocked(api.auth.getSession).mockResolvedValue(authSession)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
     auth.session = authSession
@@ -740,6 +813,7 @@ describe('authentication store', () => {
     vi.mocked(api.auth.logout)
       .mockResolvedValueOnce({ status: 'pending_sync', pendingCount: 3 })
       .mockResolvedValueOnce({ status: 'logged_out' })
+    vi.mocked(api.auth.getSession).mockResolvedValue(authSession)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
     auth.session = authSession
@@ -759,6 +833,7 @@ describe('authentication store', () => {
   it('keeps the session and reports an actionable sync-timeout logout result', async () => {
     const api = createApi()
     vi.mocked(api.auth.logout).mockResolvedValue({ status: 'sync_timeout' })
+    vi.mocked(api.auth.getSession).mockResolvedValue(authSession)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
     auth.session = authSession
@@ -1634,6 +1709,7 @@ describe('workbench authentication entry', () => {
   it('keeps the account visible on failed logout and navigates only after success', async () => {
     const api = createApi()
     vi.mocked(api.auth.logout).mockRejectedValueOnce(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+    vi.mocked(api.auth.getSession).mockResolvedValue(authSession)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const pinia = createPinia()
     setActivePinia(pinia)

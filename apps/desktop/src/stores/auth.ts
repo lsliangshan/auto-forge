@@ -61,9 +61,18 @@ async function settleFailedAccountTransition(
   attempt: AccountOperationAttemptToken,
 ): Promise<boolean> {
   const settings = useSettingsStore()
-  const ownerId = store.session?.user.id
-  if (!ownerId) return settings.bindAccountOwner(undefined, attempt) === 'applied'
-  return await settings.recoverAccountOperationAdmission(ownerId, attempt) !== 'stale'
+  let session: AuthSession | null
+  try {
+    session = await getDesktopApi().auth.getSession()
+  } catch {
+    session = null
+  }
+  const recovery = await settings.recoverAccountOperationAdmission(
+    session?.user.id,
+    attempt,
+  )
+  if (recovery === 'stale') return false
+  return replaceSession(store, session, attempt)
 }
 
 function replaceSession(

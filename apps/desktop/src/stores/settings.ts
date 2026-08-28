@@ -264,17 +264,32 @@ export const useSettingsStore = defineStore('settings', {
       return cloudSyncConsentState.status === 'rejected' ? 'failure' : 'stale'
     },
     async recoverAccountOperationAdmission(
-      ownerId: string,
+      ownerId: string | undefined,
       attempt: AccountOperationAttemptToken,
     ): Promise<AccountRecoveryResult> {
-      if (ownerId !== this._cloudDataOwnerId
-        || !this.isAccountOperationAttemptCurrent(attempt)) return 'stale'
+      if (!this.isAccountOperationAttemptCurrent(attempt)) return 'stale'
+      if (ownerId !== this._cloudDataOwnerId) {
+        this._cloudDataOwnerId = ownerId
+        this._tokenUsageVersion += 1
+        this.tokenUsage = undefined
+        this.remoteUsage = undefined
+        this.accountDataPreferences = undefined
+        this.legacyImportPreview = undefined
+        this.cloudSyncConsentState = undefined
+        this.tokenUsageError = ''
+        this.remoteUsageError = ''
+        this.cloudDataError = ''
+      }
+      if (!ownerId) {
+        this.cloudSyncConsentState = undefined
+        return 'success'
+      }
       const result = await this.loadCloudData(attempt)
       if (result === 'stale'
         || ownerId !== this._cloudDataOwnerId
         || !this.isAccountOperationAttemptCurrent(attempt)) return 'stale'
       if (result === 'failure') this.cloudSyncConsentState = undefined
-      return this.bindAccountOwner(ownerId, attempt) === 'applied' ? result : 'stale'
+      return result
     },
     async updateAccountDataPreferences(input: AccountDataPreferences) {
       const accountGeneration = this.captureAccountGeneration()
