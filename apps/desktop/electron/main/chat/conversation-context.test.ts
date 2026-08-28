@@ -222,7 +222,7 @@ describe('conversation context primitives', () => {
     expect(withReserve - withoutReserve).toBe(2_048)
   })
 
-  it('reserves exact media budgets, including duration caps', () => {
+  it('reserves exact media and valid file budgets, including caps', () => {
     expect(currentMediaTokenReserve({ kind: 'image' })).toBe(2_048)
     expect(currentMediaTokenReserve({ kind: 'audio', durationMs: 10_000 })).toBe(2_048)
     expect(currentMediaTokenReserve({ kind: 'audio' })).toBe(8_192)
@@ -230,9 +230,21 @@ describe('conversation context primitives', () => {
     expect(currentMediaTokenReserve({ kind: 'video', durationMs: 60_000 })).toBe(7_680)
     expect(currentMediaTokenReserve({ kind: 'video' })).toBe(16_384)
     expect(currentMediaTokenReserve({ kind: 'video', durationMs: 300_000 })).toBe(16_384)
+    expect(currentMediaTokenReserve({ kind: 'file', byteSize: 0 })).toBe(2_048)
+    expect(currentMediaTokenReserve({ kind: 'file', byteSize: 8_192 })).toBe(2_048)
     expect(currentMediaTokenReserve({ kind: 'file', byteSize: 8_193 })).toBe(2_049)
     expect(currentMediaTokenReserve({ kind: 'file', byteSize: 131_072 })).toBe(32_768)
-    expect(currentMediaTokenReserve({ kind: 'file', byteSize: 250 * 1024 * 1024 })).toBe(32_768)
+    expect(currentMediaTokenReserve({ kind: 'file', byteSize: 131_073 })).toBe(32_768)
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['NaN', Number.NaN],
+    ['positive infinity', Number.POSITIVE_INFINITY],
+    ['negative infinity', Number.NEGATIVE_INFINITY],
+    ['negative', -1],
+  ] as const)('conservatively reserves the maximum for a %s file size', (_description, byteSize) => {
+    expect(currentMediaTokenReserve({ kind: 'file', byteSize })).toBe(32_768)
   })
 })
 

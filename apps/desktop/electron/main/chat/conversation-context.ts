@@ -167,7 +167,10 @@ function messageForEstimate(message: ModelMessage): unknown {
 
 export function currentMediaTokenReserve(media: CurrentMediaMetadata): number {
   if (media.kind === 'file') {
-    return Math.min(MAX_FILE_TOKENS, Math.max(2_048, Math.ceil((media.byteSize ?? 0) / 4)))
+    if (media.byteSize === undefined || !Number.isFinite(media.byteSize) || media.byteSize < 0) {
+      return MAX_FILE_TOKENS
+    }
+    return Math.min(MAX_FILE_TOKENS, Math.max(2_048, Math.ceil(media.byteSize / 4)))
   }
   if (media.kind === 'image') return 2_048
   if (media.durationMs === undefined) return media.kind === 'audio' ? 8_192 : MAX_MEDIA_TOKENS
