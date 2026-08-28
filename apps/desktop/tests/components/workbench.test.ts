@@ -169,6 +169,11 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
       getTokenUsage: vi.fn().mockResolvedValue(usageSnapshot(0)),
       recordPrivacyConsent: vi.fn().mockResolvedValue(undefined),
+      getCloudSyncConsentState: vi.fn().mockResolvedValue(null),
+      revokeCloudSyncConsent: vi.fn().mockResolvedValue({
+        purpose: 'cloud_sync', state: 'revoked', revision: 2,
+        revokedAt: '2026-08-28T01:00:00.000Z', clientVersion: '0.1.0',
+      }),
       previewLegacyImport: vi.fn().mockResolvedValue({
         ownedCount: 2, unownedCount: 1, requiresUnownedConfirmation: true,
       }),
@@ -262,6 +267,49 @@ describe('workbench', () => {
       cloudSyncConsent: expect.objectContaining({ purpose: 'cloud_sync' }),
       unownedImportConsent: expect.objectContaining({ purpose: 'legacy_unowned_import' }),
     }))
+  })
+
+  it('loads authoritative cloud-sync consent and confirms revocation without renderer revision data', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue({
+      purpose: 'cloud_sync', state: 'accepted', revision: 1,
+      documentVersion: 'cloud-sync-2026-08', consentedAt: '2026-08-28T00:00:00.000Z',
+      clientVersion: '0.1.0',
+    })
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    const { wrapper } = await mountApp('/settings', api)
+
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="cloud-sync-consent-state"]').text())
+      .toContain('已同意'))
+    await wrapper.get('[data-testid="revoke-cloud-sync-consent"]').trigger('click')
+
+    await vi.waitFor(() => expect(api.settings.revokeCloudSyncConsent)
+      .toHaveBeenCalledWith({ confirmed: true }))
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining('本地知识库'),
+      '撤回账户云同步授权',
+      expect.objectContaining({ confirmButtonText: '确认撤回' }),
+    )
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="cloud-sync-consent-state"]').text())
+      .toContain('已撤回'))
+  })
+
+  it('does not request cloud-sync revocation when confirmation is cancelled', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue({
+      purpose: 'cloud_sync', state: 'accepted', revision: 1,
+      documentVersion: 'cloud-sync-2026-08', consentedAt: '2026-08-28T00:00:00.000Z',
+      clientVersion: '0.1.0',
+    })
+    vi.spyOn(ElMessageBox, 'confirm').mockRejectedValue('cancel')
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="revoke-cloud-sync-consent"]').exists())
+      .toBe(true))
+
+    await wrapper.get('[data-testid="revoke-cloud-sync-consent"]').trigger('click')
+    await Promise.resolve()
+
+    expect(api.settings.revokeCloudSyncConsent).not.toHaveBeenCalled()
   })
 
   it('does not persist either consent when unowned legacy import confirmation is cancelled', async () => {

@@ -8,6 +8,7 @@ import type {
   ModelInfo,
   ModelProviderId,
   PermissionGrant,
+  PrivacyConsentState,
   ProviderCredentialStatus,
   TokenUsageSnapshot,
   RemoteUsageSnapshot,
@@ -64,6 +65,7 @@ export const useSettingsStore = defineStore('settings', {
     remoteUsage: undefined as RemoteUsageSnapshot | undefined,
     accountDataPreferences: undefined as AccountDataPreferences | undefined,
     legacyImportPreview: undefined as LegacyImportPreview | undefined,
+    cloudSyncConsentState: undefined as PrivacyConsentState | null | undefined,
     loading: false,
     modelsLoading: false,
     tokenUsageLoading: false,
@@ -131,10 +133,12 @@ export const useSettingsStore = defineStore('settings', {
     async loadCloudData() {
       this.cloudDataError = ''
       this.remoteUsageError = ''
-      const [remoteUsage, accountDataPreferences, legacyImportPreview] = await Promise.allSettled([
+      const [remoteUsage, accountDataPreferences, legacyImportPreview, cloudSyncConsentState]
+        = await Promise.allSettled([
         Promise.resolve().then(() => getDesktopApi().settings.getRemoteUsage()),
         Promise.resolve().then(() => getDesktopApi().settings.getAccountDataPreferences()),
         Promise.resolve().then(() => getDesktopApi().settings.previewLegacyImport()),
+        Promise.resolve().then(() => getDesktopApi().settings.getCloudSyncConsentState()),
       ])
       if (remoteUsage.status === 'fulfilled') {
         this.remoteUsage = remoteUsage.value
@@ -151,6 +155,11 @@ export const useSettingsStore = defineStore('settings', {
       } else if (!this.cloudDataError) {
         this.cloudDataError = displayError(legacyImportPreview.reason, '历史会话迁移信息加载失败')
       }
+      if (cloudSyncConsentState.status === 'fulfilled') {
+        this.cloudSyncConsentState = cloudSyncConsentState.value
+      } else if (!this.cloudDataError) {
+        this.cloudDataError = displayError(cloudSyncConsentState.reason, '云同步授权状态加载失败')
+      }
     },
     async updateAccountDataPreferences(input: AccountDataPreferences) {
       this.cloudDataError = ''
@@ -160,6 +169,19 @@ export const useSettingsStore = defineStore('settings', {
         await this.loadCloudData()
       } catch (error) {
         this.cloudDataError = displayError(error, '账户数据偏好保存失败')
+      }
+    },
+    async revokeCloudSyncConsent() {
+      this.saving = true
+      this.cloudDataError = ''
+      try {
+        this.cloudSyncConsentState = await getDesktopApi().settings
+          .revokeCloudSyncConsent({ confirmed: true })
+      } catch (error) {
+        this.cloudDataError = displayError(error, '云同步授权撤回失败')
+        throw error
+      } finally {
+        this.saving = false
       }
     },
     async load() {
