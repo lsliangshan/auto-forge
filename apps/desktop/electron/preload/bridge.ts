@@ -160,8 +160,13 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       getAccountDataPreferences: () => invoke(ipcRenderer, ipcChannels.settingsGetAccountDataPreferences),
       updateAccountDataPreferences: (input) => invoke(ipcRenderer, ipcChannels.settingsUpdateAccountDataPreferences, input),
       getRemoteUsage: () => invoke(ipcRenderer, ipcChannels.settingsGetRemoteUsage),
-      clearLocalData: (scope) => invoke(ipcRenderer, ipcChannels.settingsClearLocalData, { scope }),
-      clearBrowserData: () => invoke(ipcRenderer, ipcChannels.settingsClearBrowserData),
+      captureDataClearToken: () => invoke(ipcRenderer, ipcChannels.settingsCaptureDataClearToken),
+      clearLocalData: (scope, token) => invoke(
+        ipcRenderer, ipcChannels.settingsClearLocalData, { scope, token },
+      ),
+      clearBrowserData: (token) => invoke(
+        ipcRenderer, ipcChannels.settingsClearBrowserData, { token },
+      ),
     },
     knowledge: {
       list: () => invoke(ipcRenderer, ipcChannels.knowledgeList),

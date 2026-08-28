@@ -786,12 +786,14 @@ async function saveProxyDraft() {
 async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
   const accountGeneration = settings.captureAccountGeneration()
   try {
+    const clearToken = await settings.captureDataClearToken(accountGeneration)
+    if (!clearToken || !settings.isAccountGenerationCurrent(accountGeneration)) return
     const message = scope === 'all'
       ? '此操作会永久删除本机的会话与执行记录，无法撤销。凭证、设置、授权和工作流将保留。'
       : '此操作会永久删除所选本地数据，无法撤销。'
     await ElMessageBox.confirm(message, '确认清理本地数据', { type: 'warning', confirmButtonText: '确认清理', cancelButtonText: '取消' })
     if (!settings.isAccountGenerationCurrent(accountGeneration)) return
-    const result = await settings.clearLocalData(scope, accountGeneration)
+    const result = await settings.clearLocalData(scope, accountGeneration, clearToken)
     if (result !== 'applied' || !settings.isAccountGenerationCurrent(accountGeneration)) return
     ElMessage.success('本地数据已清理')
   } catch (error) { if (error !== 'cancel' && error !== 'close') return }
@@ -799,13 +801,15 @@ async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
 async function confirmClearBrowserData() {
   const accountGeneration = settings.captureAccountGeneration()
   try {
+    const clearToken = await settings.captureDataClearToken(accountGeneration)
+    if (!clearToken || !settings.isAccountGenerationCurrent(accountGeneration)) return
     await ElMessageBox.confirm(
       '此操作会清除 AutoForge 浏览器中的 Cookie、缓存和站点数据，站点登录状态将被移除，需要重新登录。会话与执行记录不会被删除。此操作不可撤销。',
       '清除浏览器数据',
       { type: 'warning', confirmButtonText: '确认清除', cancelButtonText: '取消' },
     )
     if (!settings.isAccountGenerationCurrent(accountGeneration)) return
-    const result = await settings.clearBrowserData(accountGeneration)
+    const result = await settings.clearBrowserData(accountGeneration, clearToken)
     if (result !== 'applied' || !settings.isAccountGenerationCurrent(accountGeneration)) return
     ElMessage.success('浏览器数据已清除')
   } catch (error) { if (error !== 'cancel' && error !== 'close') return }

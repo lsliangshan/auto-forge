@@ -486,6 +486,7 @@ class UserDataAdmissionGate {
   private closed = false
   private stopped = false
   private active = 0
+  private generation = 0
   private readonly drainWaiters = new Set<() => void>()
 
   private resolveDrainWaiters(): void {
@@ -496,6 +497,15 @@ class UserDataAdmissionGate {
 
   acceptsNewWork(): boolean {
     return !this.closed && !this.stopped
+  }
+
+  captureGeneration(): number {
+    if (!this.acceptsNewWork()) throw failure('CONFLICT')
+    return this.generation
+  }
+
+  isCurrent(generation: number): boolean {
+    return this.acceptsNewWork() && this.generation === generation
   }
 
   async run<T>(operation: () => T | Promise<T>): Promise<T> {
@@ -512,6 +522,7 @@ class UserDataAdmissionGate {
   async transition<T>(operation: (waitForActive: () => Promise<void>) => Promise<T>): Promise<T> {
     if (this.closed || this.stopped) throw failure('CONFLICT')
     this.closed = true
+    this.generation += 1
     try {
       return await operation(async () => {
         if (this.active === 0) return
@@ -525,6 +536,7 @@ class UserDataAdmissionGate {
   async stopAndDrain(): Promise<void> {
     this.stopped = true
     this.closed = true
+    this.generation += 1
     if (this.active === 0) return
     await new Promise<void>((resolve) => { this.drainWaiters.add(resolve) })
   }
@@ -895,6 +907,31 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   const maintenance = new MaintenanceGate()
   const userDataAdmission = new UserDataAdmissionGate()
+  const issuedDataClearTokens = new Map<string, { userId: string; generation: number }>()
+  const issueDataClearToken = (userId: string): string => {
+    while (issuedDataClearTokens.size >= 64) {
+      issuedDataClearTokens.delete(issuedDataClearTokens.keys().next().value as string)
+    }
+    const token = `${randomUUID().replaceAll('-', '')}${randomUUID().replaceAll('-', '')}`
+    issuedDataClearTokens.set(token, { userId, generation: userDataAdmission.captureGeneration() })
+    return token
+  }
+  const consumeCurrentDataClearToken = async (
+    token: string,
+  ): Promise<{ userId: string; generation: number } | undefined> => {
+    const binding = issuedDataClearTokens.get(token)
+    issuedDataClearTokens.delete(token)
+    if (!binding || !userDataAdmission.isCurrent(binding.generation)) return undefined
+    const session = await auth.getSession()
+    return session?.user.id === binding.userId ? binding : undefined
+  }
+  const dataClearBindingIsCurrent = async (
+    binding: { userId: string; generation: number },
+  ): Promise<boolean> => {
+    if (!userDataAdmission.isCurrent(binding.generation)) return false
+    const session = await auth.getSession().catch(() => null)
+    return session?.user.id === binding.userId
+  }
   const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
@@ -2641,7 +2678,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           ...(checkpoint ? { lastSyncAt: new Date(checkpoint.updatedAt).toISOString() } : {}),
         })
       },
-      clearLocalData: async (scope) => {
+      captureDataClearToken: async () => {
+        const session = await requireAuthenticatedSession()
+        return issueDataClearToken(session.user.id)
+      },
+      clearLocalData: async (scope, token) => {
+        const binding = await consumeCurrentDataClearToken(token)
+        if (!binding) return 'stale' as const
         await maintenance.runExclusive(
           () => activeRequests.size > 0
             || activeChatWork.size > 0
@@ -2661,22 +2704,25 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             }
           },
         )
+        return await dataClearBindingIsCurrent(binding) ? 'applied' as const : 'stale' as const
       },
-      clearBrowserData: async () => {
-        const session = await auth.requireSession()
+      clearBrowserData: async (token) => {
+        const binding = await consumeCurrentDataClearToken(token)
+        if (!binding) return 'stale' as const
         await maintenance.runExclusive(
           () => activeRequests.size > 0
             || activeChatWork.size > 0
             || activeExecutions.size > 0
             || agent.hasActiveRuns()
-            || browserContinuations.hasActiveLease(session.user.id)
+            || browserContinuations.hasActiveLease(binding.userId)
             || executions.hasActiveExecutions()
             || browser.hasActiveContexts(),
           async () => {
-            await browserContinuations.revokeUser(session.user.id, 'CANCELLED')
-            await options.browserWorkspace.clearUserData(session.user.id)
+            await browserContinuations.revokeUser(binding.userId, 'CANCELLED')
+            await options.browserWorkspace.clearUserData(binding.userId)
           },
         )
+        return await dataClearBindingIsCurrent(binding) ? 'applied' as const : 'stale' as const
       },
     },
     knowledge: knowledge ? {
@@ -2755,10 +2801,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         () => ungatedServices.settings.updateAccountDataPreferences(input),
       ),
       getRemoteUsage: () => userDataAdmission.run(ungatedServices.settings.getRemoteUsage),
-      clearLocalData: (scope) => userDataAdmission.run(
-        () => ungatedServices.settings.clearLocalData(scope),
+      captureDataClearToken: () => userDataAdmission.run(
+        ungatedServices.settings.captureDataClearToken,
       ),
-      clearBrowserData: () => userDataAdmission.run(ungatedServices.settings.clearBrowserData),
+      clearLocalData: (scope, token) => userDataAdmission.run(
+        () => ungatedServices.settings.clearLocalData(scope, token),
+      ),
+      clearBrowserData: (token) => userDataAdmission.run(
+        () => ungatedServices.settings.clearBrowserData(token),
+      ),
     },
   }
 

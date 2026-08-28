@@ -14,6 +14,7 @@ import type {
   ProviderCredentialStatus,
   TokenUsageSnapshot,
   RemoteUsageSnapshot,
+  DataClearToken,
 } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
@@ -537,9 +538,17 @@ export const useSettingsStore = defineStore('settings', {
         return { defaultModels }
       })
     },
+    async captureDataClearToken(
+      accountGeneration: AccountGenerationToken,
+    ): Promise<DataClearToken | undefined> {
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return undefined
+      const token = await getDesktopApi().settings.captureDataClearToken()
+      return this.isAccountGenerationCurrent(accountGeneration) ? token : undefined
+    },
     async clearLocalData(
       scope: 'conversations' | 'executions' | 'all',
       accountGeneration: AccountGenerationToken,
+      clearToken: DataClearToken,
     ): Promise<AccountMutationResult> {
       if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
       const mutationVersion = ++this._accountMaintenanceVersion
@@ -549,7 +558,8 @@ export const useSettingsStore = defineStore('settings', {
       this.saving = true
       this.error = ''
       try {
-        await getDesktopApi().settings.clearLocalData(scope)
+        const result = await getDesktopApi().settings.clearLocalData(scope, clearToken)
+        if (result !== 'applied') return 'stale'
         if (!mutationIsCurrent()) return 'stale'
         if (scope === 'conversations' || scope === 'all') useChatStore().resetLocalData()
         if (scope === 'executions' || scope === 'all') useExecutionStore().resetLocalData()
@@ -572,6 +582,7 @@ export const useSettingsStore = defineStore('settings', {
     },
     async clearBrowserData(
       accountGeneration: AccountGenerationToken,
+      clearToken: DataClearToken,
     ): Promise<AccountMutationResult> {
       if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
       const mutationVersion = ++this._accountMaintenanceVersion
@@ -581,8 +592,8 @@ export const useSettingsStore = defineStore('settings', {
       this.saving = true
       this.error = ''
       try {
-        await getDesktopApi().settings.clearBrowserData()
-        return mutationIsCurrent() ? 'applied' : 'stale'
+        const result = await getDesktopApi().settings.clearBrowserData(clearToken)
+        return result === 'applied' && mutationIsCurrent() ? 'applied' : 'stale'
       } catch (error) {
         if (!mutationIsCurrent()) return 'stale'
         this.error = displayError(error, '浏览器数据清除失败')

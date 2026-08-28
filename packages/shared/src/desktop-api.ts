@@ -1674,6 +1674,7 @@ export const ipcChannels = {
   settingsGetAccountDataPreferences: 'settings:get-account-data-preferences',
   settingsUpdateAccountDataPreferences: 'settings:update-account-data-preferences',
   settingsGetRemoteUsage: 'settings:get-remote-usage',
+  settingsCaptureDataClearToken: 'settings:capture-data-clear-token',
   settingsClearLocalData: 'settings:clear-local-data',
   settingsClearBrowserData: 'settings:clear-browser-data',
   knowledgeList: 'knowledge:list',
@@ -1784,9 +1785,15 @@ export const saveProviderApiKeyRequestSchema = providerRequestSchema.extend({ ap
 export const listProviderModelsRequestSchema = providerRequestSchema.extend({
   refresh: z.boolean().optional().default(false),
 }).strict()
+export const dataClearTokenSchema = z.string().regex(/^[a-f0-9]{64}$/)
+export type DataClearToken = z.infer<typeof dataClearTokenSchema>
+export const dataClearResultSchema = z.enum(['applied', 'stale'])
+export type DataClearResult = z.infer<typeof dataClearResultSchema>
 export const clearLocalDataRequestSchema = z.object({
   scope: z.enum(['conversations', 'executions', 'all']),
+  token: dataClearTokenSchema,
 }).strict()
+export const clearBrowserDataRequestSchema = z.object({ token: dataClearTokenSchema }).strict()
 export const knowledgeListRequestSchema = z.undefined()
 export const knowledgeBaseRequestSchema = z.object({ baseId: identifierSchema }).strict()
 export const knowledgeDocumentRequestSchema = z.object({ documentId: identifierSchema }).strict()
@@ -1896,8 +1903,9 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsGetAccountDataPreferences]: z.undefined(),
   [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
   [ipcChannels.settingsGetRemoteUsage]: z.undefined(),
+  [ipcChannels.settingsCaptureDataClearToken]: z.undefined(),
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
-  [ipcChannels.settingsClearBrowserData]: z.undefined(),
+  [ipcChannels.settingsClearBrowserData]: clearBrowserDataRequestSchema,
   [ipcChannels.knowledgeList]: knowledgeListRequestSchema,
   [ipcChannels.knowledgeCreateBase]: knowledgeCreateBaseRequestSchema,
   [ipcChannels.knowledgeListDocuments]: knowledgeBaseRequestSchema,
@@ -1999,8 +2007,9 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsGetAccountDataPreferences]: accountDataPreferencesSchema,
   [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
   [ipcChannels.settingsGetRemoteUsage]: remoteUsageSnapshotSchema,
-  [ipcChannels.settingsClearLocalData]: voidResponseSchema,
-  [ipcChannels.settingsClearBrowserData]: voidResponseSchema,
+  [ipcChannels.settingsCaptureDataClearToken]: dataClearTokenSchema,
+  [ipcChannels.settingsClearLocalData]: dataClearResultSchema,
+  [ipcChannels.settingsClearBrowserData]: dataClearResultSchema,
   [ipcChannels.knowledgeList]: z.array(knowledgeBaseSummarySchema),
   [ipcChannels.knowledgeCreateBase]: knowledgeBaseSummarySchema,
   [ipcChannels.knowledgeListDocuments]: z.array(knowledgeDocumentSummarySchema),
@@ -2123,8 +2132,9 @@ export interface DesktopAPI {
     getAccountDataPreferences(): Promise<AccountDataPreferences>
     updateAccountDataPreferences(input: AccountDataPreferences): Promise<AccountDataPreferences>
     getRemoteUsage(): Promise<RemoteUsageSnapshot>
-    clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
-    clearBrowserData(): Promise<void>
+    captureDataClearToken(): Promise<DataClearToken>
+    clearLocalData(scope: 'conversations' | 'executions' | 'all', token: DataClearToken): Promise<DataClearResult>
+    clearBrowserData(token: DataClearToken): Promise<DataClearResult>
   }
   knowledge: {
     list(): Promise<KnowledgeBaseSummary[]>

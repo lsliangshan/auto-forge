@@ -1253,7 +1253,20 @@ describe('cross-process contracts', () => {
       .toEqual({ requestId: 'request_1', bindingId: 'binding_1' })
     expect(ipcRequestSchemas[ipcChannels.chatListBrowserAudit].parse({ bindingId: 'binding_1' }))
       .toEqual({ bindingId: 'binding_1' })
-    expect(ipcRequestSchemas[ipcChannels.settingsClearBrowserData].parse(undefined)).toBeUndefined()
+    const clearToken = 'a'.repeat(64)
+    expect(ipcChannels.settingsCaptureDataClearToken).toBe('settings:capture-data-clear-token')
+    expect(ipcRequestSchemas[ipcChannels.settingsCaptureDataClearToken].parse(undefined)).toBeUndefined()
+    expect(ipcResponseSchemas[ipcChannels.settingsCaptureDataClearToken].parse(clearToken)).toBe(clearToken)
+    expect(ipcRequestSchemas[ipcChannels.settingsClearLocalData].parse({
+      scope: 'all', token: clearToken,
+    })).toEqual({ scope: 'all', token: clearToken })
+    expect(ipcRequestSchemas[ipcChannels.settingsClearBrowserData].parse({ token: clearToken }))
+      .toEqual({ token: clearToken })
+    expect(ipcResponseSchemas[ipcChannels.settingsClearLocalData].parse('applied')).toBe('applied')
+    expect(ipcResponseSchemas[ipcChannels.settingsClearBrowserData].parse('stale')).toBe('stale')
+    expect(ipcRequestSchemas[ipcChannels.settingsClearBrowserData].safeParse({
+      token: clearToken, owner: 'user_1', revision: 3,
+    }).success).toBe(false)
     expect(ipcResponseSchemas[ipcChannels.chatListBrowserAudit].parse([{
       id: 'audit_1', bindingId: 'binding_1', sequence: 1, origin: 'https://fw.bjrcgz.gov.cn',
       action: 'inspect', targetSummary: '工作居住证信息', risk: 'sensitive_read', outcome: 'completed', createdAt: 11,

@@ -16,8 +16,9 @@ function createApi(): DesktopAPI {
     permissions: { listGrants: vi.fn().mockResolvedValue([]), revoke: vi.fn() },
     settings: {
       getTokenUsage: vi.fn().mockResolvedValue(undefined),
-      clearLocalData: vi.fn().mockResolvedValue(undefined),
-      clearBrowserData: vi.fn().mockResolvedValue(undefined),
+      captureDataClearToken: vi.fn().mockResolvedValue('a'.repeat(64)),
+      clearLocalData: vi.fn().mockResolvedValue('applied'),
+      clearBrowserData: vi.fn().mockResolvedValue('applied'),
     },
   } as unknown as DesktopAPI
 }
@@ -57,7 +58,10 @@ describe('browser data settings', () => {
       '清除浏览器数据',
       expect.objectContaining({ confirmButtonText: '确认清除', cancelButtonText: '取消' }),
     )
-    expect(api.settings.clearBrowserData).toHaveBeenCalledOnce()
+    expect(api.settings.captureDataClearToken).toHaveBeenCalledOnce()
+    expect(vi.mocked(api.settings.captureDataClearToken).mock.invocationCallOrder[0])
+      .toBeLessThan(confirm.mock.invocationCallOrder[0]!)
+    expect(api.settings.clearBrowserData).toHaveBeenCalledWith('a'.repeat(64))
     expect(api.settings.clearLocalData).not.toHaveBeenCalled()
   })
 
@@ -69,6 +73,7 @@ describe('browser data settings', () => {
     await wrapper.get('[data-testid="clear-browser-data"]').trigger('click')
     await flushPromises()
 
+    expect(api.settings.captureDataClearToken).toHaveBeenCalledOnce()
     expect(api.settings.clearBrowserData).not.toHaveBeenCalled()
   })
 })

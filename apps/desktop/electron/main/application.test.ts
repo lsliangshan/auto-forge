@@ -2109,7 +2109,9 @@ describe('createApplicationRuntime', () => {
             })
         await expect(failingOperation).rejects.toBe(persistenceFailure)
         expect(inspectedAgent.hasActiveRuns()).toBe(false)
-        await expect(runtime.services.settings.clearLocalData('conversations')).resolves.toBeUndefined()
+        const clearToken = await runtime.services.settings.captureDataClearToken()
+        await expect(runtime.services.settings.clearLocalData('conversations', clearToken))
+          .resolves.toBe('applied')
         await expect(runtime.close()).rejects.toBe(persistenceFailure)
       } finally {
         await runtime.close().catch(() => undefined)
@@ -6164,11 +6166,13 @@ describe('createApplicationRuntime', () => {
       existingAssetIds: [],
     })
     const preservedDirectory = join(mediaRoot, preserved.id)
-    await runtime.services.settings.clearLocalData('executions')
+    const executionClearToken = await runtime.services.settings.captureDataClearToken()
+    await runtime.services.settings.clearLocalData('executions', executionClearToken)
     await expect(access(preservedDirectory)).resolves.toBeUndefined()
     expect(await listConversations(runtime)).toHaveLength(1)
 
-    await runtime.services.settings.clearLocalData('all')
+    const allClearToken = await runtime.services.settings.captureDataClearToken()
+    await runtime.services.settings.clearLocalData('all', allClearToken)
     await expect(access(preservedDirectory)).rejects.toMatchObject({ code: 'ENOENT' })
     expect(await listConversations(runtime)).toEqual([])
     await runtime.close()
@@ -7354,7 +7358,8 @@ describe('createApplicationRuntime', () => {
     const conversation = await runtime.services.chat.createConversation()
     await runtime.services.chat.send(chatInput(conversation.id, 'hello'))
 
-    await expect(runtime.services.settings.clearLocalData('conversations'))
+    const blockedClearToken = await runtime.services.settings.captureDataClearToken()
+    await expect(runtime.services.settings.clearLocalData('conversations', blockedClearToken))
       .rejects.toMatchObject({ code: 'CONFLICT' })
     await expect(runtime.services.workflows.remove('workflow.active', '1.0.0'))
       .rejects.toMatchObject({ code: 'CONFLICT' })
@@ -7365,7 +7370,8 @@ describe('createApplicationRuntime', () => {
       await Promise.resolve()
     }
     await new Promise<void>((resolve) => { setImmediate(resolve) })
-    await runtime.services.settings.clearLocalData('conversations')
+    const clearToken = await runtime.services.settings.captureDataClearToken()
+    await runtime.services.settings.clearLocalData('conversations', clearToken)
     expect(await listConversations(runtime)).toEqual([])
     await runtime.close()
   })
@@ -8304,16 +8310,83 @@ describe('createApplicationRuntime', () => {
       userId: alice.user.id, conversationId: aliceConversation.id, runId: 'active_clear_run',
     })
 
-    await expect(runtime.services.settings.clearBrowserData())
+    const blockedClearToken = await runtime.services.settings.captureDataClearToken()
+    await expect(runtime.services.settings.clearBrowserData(blockedClearToken))
       .rejects.toMatchObject({ code: 'CONFLICT' })
     expect(workspace.clearUserData).not.toHaveBeenCalled()
     await lease.release()
 
-    await runtime.services.settings.clearBrowserData()
+    const clearToken = await runtime.services.settings.captureDataClearToken()
+    await runtime.services.settings.clearBrowserData(clearToken)
 
     expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
     expect(registry.list(alice.user.id, aliceConversation.id)).toEqual([])
     expect(registry.list(bob.user.id, bobConversation.id)).toHaveLength(1)
+    await runtime.close()
+  })
+
+  it('rejects Main-issued destructive-clear tokens after owner switch and UID ABA', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-token-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    await authenticate(runtime, 'ClearAlice')
+    const aliceConversation = await runtime.services.chat.createConversation()
+    const aliceLocalToken = await runtime.services.settings.captureDataClearToken()
+    const aliceBrowserToken = await runtime.services.settings.captureDataClearToken()
+    const aliceAbaLocalToken = await runtime.services.settings.captureDataClearToken()
+    const aliceAbaBrowserToken = await runtime.services.settings.captureDataClearToken()
+
+    await authenticate(runtime, 'ClearBobby')
+    const bobConversation = await runtime.services.chat.createConversation()
+    await expect(runtime.services.settings.clearLocalData('all', aliceLocalToken))
+      .resolves.toBe('stale')
+    await expect(runtime.services.settings.clearBrowserData(aliceBrowserToken))
+      .resolves.toBe('stale')
+    expect(await listConversations(runtime)).toEqual([
+      expect.objectContaining({ id: bobConversation.id }),
+    ])
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+
+    await runtime.services.auth.loginWithPassword({ account: 'ClearAlice', password: 'password' })
+    await expect(runtime.services.settings.clearLocalData('all', aliceAbaLocalToken))
+      .resolves.toBe('stale')
+    await expect(runtime.services.settings.clearBrowserData(aliceAbaBrowserToken))
+      .resolves.toBe('stale')
+    expect(await listConversations(runtime)).toEqual([
+      expect.objectContaining({ id: aliceConversation.id }),
+    ])
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('settles an in-flight browser clear as stale when Main begins an owner transition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-transition-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const clearStarted = deferred<void>()
+    const releaseClear = deferred<void>()
+    vi.mocked(workspace.clearUserData).mockImplementation(async () => {
+      clearStarted.resolve()
+      await releaseClear.promise
+    })
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    const alice = await authenticate(runtime, 'ClearRaceAlice')
+    await authenticate(runtime, 'ClearRaceBobby')
+    await runtime.services.auth.loginWithPassword({ account: 'ClearRaceAlice', password: 'password' })
+    const token = await runtime.services.settings.captureDataClearToken()
+
+    const clearing = runtime.services.settings.clearBrowserData(token)
+    await clearStarted.promise
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'ClearRaceBobby', password: 'password',
+    })
+    await Promise.resolve()
+    releaseClear.resolve()
+
+    await expect(clearing).resolves.toBe('stale')
+    await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_clearracebobby' } })
+    expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
     await runtime.close()
   })
 

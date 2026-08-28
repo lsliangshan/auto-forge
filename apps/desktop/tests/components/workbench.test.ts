@@ -220,8 +220,10 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       validateProviderCredential: vi.fn().mockImplementation(async (provider) => ({
         provider, configured: false, validation: 'unchecked',
       })),
-      listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
-      clearBrowserData: vi.fn(),
+      listProviderModels: vi.fn().mockResolvedValue([]),
+      captureDataClearToken: vi.fn().mockResolvedValue('a'.repeat(64)),
+      clearLocalData: vi.fn().mockResolvedValue('applied'),
+      clearBrowserData: vi.fn().mockResolvedValue('applied'),
       getTokenUsage: vi.fn().mockResolvedValue(usageSnapshot(0)),
       recordPrivacyConsent: vi.fn().mockResolvedValue(undefined),
       getCloudSyncConsentState: vi.fn().mockResolvedValue(null),
@@ -1774,11 +1776,13 @@ describe('workbench', () => {
     const executions = useExecutionStore(); executions.items = [{ id: 'e', workflowId: 'w', workflowVersion: '1.0.0', status: 'completed', createdAt: '2026-07-19T00:00:00.000Z' }]
     const settings = useSettingsStore()
     bindSettingsOwner(settings, authSession.user.id)
-    await expect(settings.clearLocalData('all', settings.captureAccountGeneration()))
+    const accountGeneration = settings.captureAccountGeneration()
+    const clearToken = await settings.captureDataClearToken(accountGeneration)
+    await expect(settings.clearLocalData('all', accountGeneration, clearToken!))
       .resolves.toBe('applied')
     expect(chat.conversations).toEqual([])
     expect(executions.items).toEqual([])
-    expect(api.settings.clearLocalData).toHaveBeenCalledWith('all')
+    expect(api.settings.clearLocalData).toHaveBeenCalledWith('all', clearToken)
     expect(api.workflows.list).toHaveBeenCalled()
     expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
   })
@@ -1812,11 +1816,15 @@ describe('workbench', () => {
     const store = useSettingsStore()
     bindSettingsOwner(store, authSession.user.id)
 
-    await store.clearLocalData('conversations', store.captureAccountGeneration())
+    let accountGeneration = store.captureAccountGeneration()
+    let clearToken = await store.captureDataClearToken(accountGeneration)
+    await store.clearLocalData('conversations', accountGeneration, clearToken!)
     expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
 
     vi.mocked(api.settings.getTokenUsage).mockClear()
-    await store.clearLocalData('executions', store.captureAccountGeneration())
+    accountGeneration = store.captureAccountGeneration()
+    clearToken = await store.captureDataClearToken(accountGeneration)
+    await store.clearLocalData('executions', accountGeneration, clearToken!)
     expect(api.settings.getTokenUsage).not.toHaveBeenCalled()
   })
 
@@ -1831,11 +1839,12 @@ describe('workbench', () => {
     const settings = useSettingsStore()
     bindSettingsOwner(settings, authSession.user.id)
     const accountGeneration = settings.captureAccountGeneration()
+    const clearToken = await settings.captureDataClearToken(accountGeneration)
     for (const owner of owners) bindSettingsOwner(settings, owner)
 
     const result = kind === 'local'
-      ? await settings.clearLocalData('all', accountGeneration)
-      : await settings.clearBrowserData(accountGeneration)
+      ? await settings.clearLocalData('all', accountGeneration, clearToken!)
+      : await settings.clearBrowserData(accountGeneration, clearToken!)
 
     expect(result).toBe('stale')
     expect(api.settings.clearLocalData).not.toHaveBeenCalled()
@@ -1845,7 +1854,7 @@ describe('workbench', () => {
 
   it('drops local reset and reload work when clearLocalData resolves after an owner switch', async () => {
     const api = createApi()
-    const cleared = deferred<void>()
+    const cleared = deferred<'applied' | 'stale'>()
     vi.mocked(api.settings.clearLocalData).mockReturnValue(cleared.promise)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const chat = useChatStore()
@@ -1853,11 +1862,12 @@ describe('workbench', () => {
     const settings = useSettingsStore()
     bindSettingsOwner(settings, authSession.user.id)
     const accountGeneration = settings.captureAccountGeneration()
+    const clearToken = await settings.captureDataClearToken(accountGeneration)
 
-    const clearing = settings.clearLocalData('all', accountGeneration)
-    await vi.waitFor(() => expect(api.settings.clearLocalData).toHaveBeenCalledWith('all'))
+    const clearing = settings.clearLocalData('all', accountGeneration, clearToken!)
+    await vi.waitFor(() => expect(api.settings.clearLocalData).toHaveBeenCalledWith('all', clearToken))
     bindSettingsOwner(settings, bobSession.user.id)
-    cleared.resolve(undefined)
+    cleared.resolve('applied')
 
     await expect(clearing).resolves.toBe('stale')
     expect(chat.conversations).toHaveLength(1)
@@ -1867,14 +1877,15 @@ describe('workbench', () => {
 
   it('drops a late clearBrowserData rejection after UID ABA', async () => {
     const api = createApi()
-    const cleared = deferred<void>()
+    const cleared = deferred<'applied' | 'stale'>()
     vi.mocked(api.settings.clearBrowserData).mockReturnValue(cleared.promise)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const settings = useSettingsStore()
     bindSettingsOwner(settings, authSession.user.id)
     const accountGeneration = settings.captureAccountGeneration()
+    const clearToken = await settings.captureDataClearToken(accountGeneration)
 
-    const clearing = settings.clearBrowserData(accountGeneration)
+    const clearing = settings.clearBrowserData(accountGeneration, clearToken!)
     await vi.waitFor(() => expect(api.settings.clearBrowserData).toHaveBeenCalledOnce())
     bindSettingsOwner(settings, bobSession.user.id)
     bindSettingsOwner(settings, authSession.user.id)

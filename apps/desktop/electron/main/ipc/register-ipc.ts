@@ -236,8 +236,15 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsGetAccountDataPreferences, () => options.services.settings.getAccountDataPreferences())
   register(ipcChannels.settingsUpdateAccountDataPreferences, (input) => options.services.settings.updateAccountDataPreferences(input))
   register(ipcChannels.settingsGetRemoteUsage, () => options.services.settings.getRemoteUsage())
-  register(ipcChannels.settingsClearLocalData, (input) => options.services.settings.clearLocalData(input.scope))
-  register(ipcChannels.settingsClearBrowserData, () => options.services.settings.clearBrowserData())
+  register(ipcChannels.settingsCaptureDataClearToken, () => options.services.settings.captureDataClearToken())
+  register(
+    ipcChannels.settingsClearLocalData,
+    (input) => options.services.settings.clearLocalData(input.scope, input.token),
+  )
+  register(
+    ipcChannels.settingsClearBrowserData,
+    (input) => options.services.settings.clearBrowserData(input.token),
+  )
   registerKnowledge(ipcChannels.knowledgeList, (owner) => options.services.knowledge.list(owner))
   registerKnowledge(ipcChannels.knowledgeCreateBase, (owner, input) => options.services.knowledge.create(owner, input.name))
   registerKnowledge(ipcChannels.knowledgeListDocuments, (owner, input) => options.services.knowledge.listDocuments(owner, input.baseId))

@@ -1642,7 +1642,10 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     await runtime.services.auth.logout()
     return runtime.services.auth.loginWithPassword({ account, password })
   }
-  if (name === 'clearBrowserData') return runtime.services.settings.clearBrowserData()
+  if (name === 'clearBrowserData') {
+    const token = await runtime.services.settings.captureDataClearToken()
+    return runtime.services.settings.clearBrowserData(token)
+  }
   if (name === 'pagePath') {
     const target = [...targets().values()].reverse().find((candidate) => !candidate.closed)
     return target ? new URL(target.view.webContents.getURL()).pathname : ''

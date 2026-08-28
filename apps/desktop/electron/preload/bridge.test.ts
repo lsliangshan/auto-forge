@@ -186,10 +186,13 @@ describe('preload desktop bridge', () => {
 
   it('maps browser continuation takeover, redacted audit, and explicit data clearing to fixed channels', async () => {
     const app = harness()
+    const clearToken = 'a'.repeat(64)
 
     await app.api.chat.takeOverBrowser({ requestId: 'request_1', bindingId: 'binding_1' })
     await app.api.chat.listBrowserAudit('binding_1')
-    await app.api.settings.clearBrowserData()
+    await app.api.settings.captureDataClearToken()
+    await app.api.settings.clearLocalData('all', clearToken)
+    await app.api.settings.clearBrowserData(clearToken)
 
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.chatTakeOverBrowser, {
       requestId: 'request_1', bindingId: 'binding_1',
@@ -197,7 +200,13 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.chatListBrowserAudit, {
       bindingId: 'binding_1',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.settingsClearBrowserData, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.settingsCaptureDataClearToken, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.settingsClearLocalData, {
+      scope: 'all', token: clearToken,
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(5, ipcChannels.settingsClearBrowserData, {
+      token: clearToken,
+    })
     expect(app.api.chat).not.toHaveProperty('invoke')
     expect(app.api.settings).not.toHaveProperty('clearStorageData')
   })
