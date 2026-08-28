@@ -718,6 +718,7 @@ describe('conversation knowledge selection', () => {
     vi.mocked(api.chat.getGenerationPreferences).mockResolvedValue(generationPreferences())
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const chat = useChatStore()
+    useSettingsStore().bindAccountOwner('user_1')
     await chat.createConversation()
 
     expect(chat.preferences).toMatchObject({ knowledgeBaseIds: [], knowledgeMode: 'mixed' })

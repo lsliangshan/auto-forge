@@ -12,6 +12,7 @@ import type {
 } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { ElMessageBox } from 'element-plus'
+import { useSettingsStore } from './settings'
 
 export type UiChatBlock = ChatBlock & { id: string }
 export interface UiChatMessage {
@@ -471,32 +472,48 @@ export const useChatStore = defineStore('chat', {
       }
     },
     async createConversation() {
+      const settings = useSettingsStore()
+      const accountGeneration = settings.captureAccountGeneration()
+      const dataGeneration = this._dataGeneration
+      const operationIsCurrent = () => dataGeneration === this._dataGeneration
+        && settings.isAccountGenerationCurrent(accountGeneration)
+      if (!operationIsCurrent()) return
       this.error = ''
       try {
         const api = getDesktopApi()
         let conversation: ConversationSummary
         try {
+          if (!operationIsCurrent()) return
           conversation = await api.chat.createConversation()
+          if (!operationIsCurrent()) return
         } catch (error) {
+          if (!operationIsCurrent()) return
           if (typeof error !== 'object' || error === null
             || !('code' in error) || error.code !== 'IMPORT_CONFIRMATION_REQUIRED') throw error
           try {
+            if (!operationIsCurrent()) return
             await ElMessageBox.confirm(
               '开启云同步后，新会话会保存到当前 AutoForge 账户。',
               '开启账户云同步',
               { type: 'warning', confirmButtonText: '同意并创建', cancelButtonText: '取消' },
             )
           } catch (confirmationError) {
+            if (!operationIsCurrent()) return
             if (confirmationError === 'cancel' || confirmationError === 'close') return
             throw confirmationError
           }
+          if (!operationIsCurrent()) return
           const appInfo = await api.system.getAppInfo()
-          await api.settings.recordPrivacyConsent({
+          if (!operationIsCurrent()) return
+          const consentResult = await settings.recordPrivacyConsent({
             purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
             consentedAt: new Date().toISOString(), clientVersion: appInfo.version,
-          })
+          }, accountGeneration)
+          if (consentResult !== 'applied' || !operationIsCurrent()) return
           conversation = await api.chat.createConversation()
+          if (!operationIsCurrent()) return
         }
+        if (!operationIsCurrent()) return
         this._loadVersion += 1
         this.loading = false
         this.conversations = mergeConversationPages(this.conversations, [conversation])
@@ -504,7 +521,10 @@ export const useChatStore = defineStore('chat', {
         this.selectedConversationId = conversation.id
         this._selectionVersion += 1
         await this.loadGenerationPreferences(conversation.id)
-      } catch (error) { this.error = displayError(error, '创建会话失败') }
+        if (!operationIsCurrent()) return
+      } catch (error) {
+        if (operationIsCurrent()) this.error = displayError(error, '创建会话失败')
+      }
     },
     async renameConversation(id: string, title: string) {
       const clean = title.trim()

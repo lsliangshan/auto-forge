@@ -50,6 +50,13 @@ const revokedCloudConsent = {
   clientVersion: '0.1.0',
 }
 
+const cloudSyncConsentInput = {
+  purpose: 'cloud_sync' as const,
+  documentVersion: 'cloud-sync-2026-08',
+  consentedAt: '2026-08-28T00:00:00.000Z',
+  clientVersion: '0.1.0',
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason?: unknown) => void
@@ -852,6 +859,7 @@ describe('workbench', () => {
     })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
+    useSettingsStore().bindAccountOwner(authSession.user.id)
     const loading = store.loadConversations()
     await store.createConversation()
     resolveList({ items: [{
@@ -875,6 +883,7 @@ describe('workbench', () => {
     const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValueOnce('confirm')
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
+    useSettingsStore().bindAccountOwner(authSession.user.id)
 
     await store.createConversation()
 
@@ -886,6 +895,168 @@ describe('workbench', () => {
     expect(store.selectedConversationId).toBe('new')
   })
 
+  it('requires a current account token before recording cloud-sync consent', async () => {
+    const api = createApi()
+    const { pinia } = await mountApp('/chat', api)
+    const settings = useSettingsStore(pinia)
+    const aliceGeneration = settings.captureAccountGeneration()
+    settings.bindAccountOwner(bobSession.user.id)
+
+    await expect(settings.recordPrivacyConsent(cloudSyncConsentInput, aliceGeneration))
+      .resolves.toBe('stale')
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['Alice to Bob', ['user_2']],
+    ['Alice to Bob to Alice ABA', ['user_2', 'user_1']],
+  ] as const)('drops a deferred first-conversation confirmation after %s', async (_name, owners) => {
+    const api = createApi()
+    const confirmation = deferred<unknown>()
+    vi.mocked(api.chat.createConversation).mockRejectedValueOnce({
+      code: 'IMPORT_CONFIRMATION_REQUIRED',
+      message: 'Importing this local history requires confirmation.',
+    })
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+    const { pinia } = await mountApp('/chat', api)
+    const chat = useChatStore(pinia)
+    const settings = useSettingsStore(pinia)
+
+    const creating = chat.createConversation()
+    await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
+    for (const owner of owners) {
+      settings.bindAccountOwner(owner)
+      chat.resetLocalData()
+    }
+    confirmation.resolve('confirm')
+    await creating
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.chat.createConversation).toHaveBeenCalledOnce()
+    expect(chat.conversations).toEqual([])
+    expect(chat.error).toBe('')
+  })
+
+  it('does not record consent when app-info resolves after an account switch', async () => {
+    const api = createApi()
+    const appInfo = deferred<Awaited<ReturnType<DesktopAPI['system']['getAppInfo']>>>()
+    vi.mocked(api.chat.createConversation).mockRejectedValueOnce({
+      code: 'IMPORT_CONFIRMATION_REQUIRED',
+      message: 'Importing this local history requires confirmation.',
+    })
+    vi.mocked(api.system.getAppInfo).mockReturnValue(appInfo.promise)
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    const { pinia } = await mountApp('/chat', api)
+    const chat = useChatStore(pinia)
+    const settings = useSettingsStore(pinia)
+
+    const creating = chat.createConversation()
+    await vi.waitFor(() => expect(api.system.getAppInfo).toHaveBeenCalledOnce())
+    settings.bindAccountOwner(bobSession.user.id)
+    chat.resetLocalData()
+    appInfo.resolve({ version: '0.1.0', platform: 'darwin' })
+    await creating
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.chat.createConversation).toHaveBeenCalledOnce()
+    expect(chat.error).toBe('')
+  })
+
+  it.each(['resolve', 'reject'] as const)(
+    'drops a late cloud-consent %s after an account switch',
+    async (settlement) => {
+      const api = createApi()
+      const consent = deferred<void>()
+      vi.mocked(api.chat.createConversation).mockRejectedValueOnce({
+        code: 'IMPORT_CONFIRMATION_REQUIRED',
+        message: 'Importing this local history requires confirmation.',
+      })
+      vi.mocked(api.settings.recordPrivacyConsent).mockReturnValue(consent.promise)
+      vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+      const { pinia } = await mountApp('/chat', api)
+      const chat = useChatStore(pinia)
+      const settings = useSettingsStore(pinia)
+
+      const creating = chat.createConversation()
+      await vi.waitFor(() => expect(api.settings.recordPrivacyConsent).toHaveBeenCalledOnce())
+      settings.bindAccountOwner(bobSession.user.id)
+      chat.resetLocalData()
+      if (settlement === 'resolve') consent.resolve(undefined)
+      else consent.reject({ code: 'AUTH_REQUIRED' })
+      await creating
+
+      expect(api.chat.createConversation).toHaveBeenCalledOnce()
+      expect(chat.conversations).toEqual([])
+      expect(chat.selectedConversationId).toBe('')
+      expect(chat.error).toBe('')
+    },
+  )
+
+  it.each(['resolve', 'reject'] as const)(
+    'drops a late retried conversation create %s after an account switch',
+    async (settlement) => {
+      const api = createApi()
+      const retry = deferred<ConversationSummary>()
+      vi.mocked(api.chat.createConversation)
+        .mockRejectedValueOnce({
+          code: 'IMPORT_CONFIRMATION_REQUIRED',
+          message: 'Importing this local history requires confirmation.',
+        })
+        .mockReturnValueOnce(retry.promise)
+      vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+      const { pinia } = await mountApp('/chat', api)
+      const chat = useChatStore(pinia)
+      const settings = useSettingsStore(pinia)
+
+      const creating = chat.createConversation()
+      await vi.waitFor(() => expect(api.chat.createConversation).toHaveBeenCalledTimes(2))
+      settings.bindAccountOwner(bobSession.user.id)
+      chat.resetLocalData()
+      if (settlement === 'resolve') {
+        retry.resolve({
+          ...conversationSummary('alice_new', '2026-08-28T00:00:00.000Z', 'pending'),
+          title: 'Alice new',
+        })
+      } else {
+        retry.reject({ code: 'AUTH_REQUIRED' })
+      }
+      await creating
+
+      expect(chat.conversations).toEqual([])
+      expect(chat.selectedConversationId).toBe('')
+      expect(chat.error).toBe('')
+    },
+  )
+
+  it.each(['resolve', 'reject'] as const)(
+    'drops a late initial conversation create %s after chat data is reset',
+    async (settlement) => {
+      const api = createApi()
+      const firstCreate = deferred<ConversationSummary>()
+      vi.mocked(api.chat.createConversation).mockReturnValue(firstCreate.promise)
+      const { pinia } = await mountApp('/chat', api)
+      const chat = useChatStore(pinia)
+
+      const creating = chat.createConversation()
+      await vi.waitFor(() => expect(api.chat.createConversation).toHaveBeenCalledOnce())
+      chat.resetLocalData()
+      if (settlement === 'resolve') {
+        firstCreate.resolve({
+          ...conversationSummary('stale_new', '2026-08-28T00:00:00.000Z', 'pending'),
+          title: 'Stale new',
+        })
+      } else {
+        firstCreate.reject({ code: 'AUTH_REQUIRED' })
+      }
+      await creating
+
+      expect(chat.conversations).toEqual([])
+      expect(chat.selectedConversationId).toBe('')
+      expect(chat.error).toBe('')
+    },
+  )
+
   it('leaves the first conversation unwritten when cloud-sync consent is cancelled', async () => {
     const api = createApi()
     vi.mocked(api.chat.createConversation).mockRejectedValueOnce({
@@ -895,6 +1066,7 @@ describe('workbench', () => {
     vi.spyOn(ElMessageBox, 'confirm').mockRejectedValueOnce('cancel')
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
+    useSettingsStore().bindAccountOwner(authSession.user.id)
 
     await store.createConversation()
 

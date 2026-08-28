@@ -9,6 +9,7 @@ import type {
   ModelInfo,
   ModelProviderId,
   PermissionGrant,
+  PrivacyConsent,
   PrivacyConsentState,
   ProviderCredentialStatus,
   TokenUsageSnapshot,
@@ -235,14 +236,30 @@ export const useSettingsStore = defineStore('settings', {
       if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
       this.cloudDataError = ''
       try {
-        await getDesktopApi().settings.recordPrivacyConsent(input.cloudSyncConsent)
-        if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
+        const consentResult = await this.recordPrivacyConsent(
+          input.cloudSyncConsent,
+          capturedGeneration,
+        )
+        if (consentResult !== 'applied') return 'stale'
         await getDesktopApi().settings.importLegacyData(input)
         if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
         return 'applied'
       } catch (error) {
         if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
         this.cloudDataError = `历史会话迁移失败：${displayError(error)}`
+        throw error
+      }
+    },
+    async recordPrivacyConsent(
+      input: PrivacyConsent,
+      accountGeneration: AccountGenerationToken,
+    ): Promise<AccountMutationResult> {
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
+      try {
+        await getDesktopApi().settings.recordPrivacyConsent(input)
+        return this.isAccountGenerationCurrent(accountGeneration) ? 'applied' : 'stale'
+      } catch (error) {
+        if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
         throw error
       }
     },
