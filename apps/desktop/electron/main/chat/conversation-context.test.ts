@@ -193,6 +193,35 @@ describe('conversation context primitives', () => {
     expect(estimate).toBe(2_106)
   })
 
+  it('excludes file Base64 from estimation and reserves binary bytes exactly once', () => {
+    const messages = [{
+      role: 'user' as const,
+      content: [{
+        type: 'file' as const,
+        name: 'report.pdf',
+        mimeType: 'application/pdf',
+        dataBase64: 'JVBERi0xLjc=',
+      }],
+    }]
+    const withoutReserve = estimateRequestTokens({ messages, tools: [], currentMedia: [] })
+    const withLargePayload = estimateRequestTokens({
+      messages: [{
+        ...messages[0],
+        content: [{ ...messages[0].content[0], dataBase64: 'A'.repeat(1_000_000) }],
+      }],
+      tools: [],
+      currentMedia: [],
+    })
+    const withReserve = estimateRequestTokens({
+      messages,
+      tools: [],
+      currentMedia: [{ kind: 'file', byteSize: 8_192 }],
+    })
+
+    expect(withLargePayload).toBe(withoutReserve)
+    expect(withReserve - withoutReserve).toBe(2_048)
+  })
+
   it('reserves exact media budgets, including duration caps', () => {
     expect(currentMediaTokenReserve({ kind: 'image' })).toBe(2_048)
     expect(currentMediaTokenReserve({ kind: 'audio', durationMs: 10_000 })).toBe(2_048)
@@ -201,6 +230,9 @@ describe('conversation context primitives', () => {
     expect(currentMediaTokenReserve({ kind: 'video', durationMs: 60_000 })).toBe(7_680)
     expect(currentMediaTokenReserve({ kind: 'video' })).toBe(16_384)
     expect(currentMediaTokenReserve({ kind: 'video', durationMs: 300_000 })).toBe(16_384)
+    expect(currentMediaTokenReserve({ kind: 'file', byteSize: 8_193 })).toBe(2_049)
+    expect(currentMediaTokenReserve({ kind: 'file', byteSize: 131_072 })).toBe(32_768)
+    expect(currentMediaTokenReserve({ kind: 'file', byteSize: 250 * 1024 * 1024 })).toBe(32_768)
   })
 })
 

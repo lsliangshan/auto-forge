@@ -1,4 +1,5 @@
 import {
+  chatFileSupport,
   toSafeAppError,
   type AppError,
   type ConversationGenerationPreferences,
@@ -62,6 +63,10 @@ function failure(code: AppError['code']): never {
 
 function isOutput(value: unknown): value is ConcreteOutput {
   return typeof value === 'string' && (OUTPUTS as readonly string[]).includes(value)
+}
+
+function isAssetKind(value: unknown): value is ResolvedMediaAsset['kind'] {
+  return value === 'image' || value === 'audio' || value === 'video' || value === 'file'
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -159,8 +164,7 @@ function assertAssets(assets: readonly ResolvedMediaAsset[]): void {
       !asset
       || typeof asset.id !== 'string'
       || asset.id.trim().length === 0
-      || !isOutput(asset.kind)
-      || asset.kind === 'text'
+      || !isAssetKind(asset.kind)
       || typeof asset.mimeType !== 'string'
       || asset.mimeType.trim().length === 0
       || !Number.isSafeInteger(asset.byteSize)
@@ -179,7 +183,23 @@ function assertAssets(assets: readonly ResolvedMediaAsset[]): void {
   }
 }
 
-function supportsRequest(model: ModelInfo, output: ConcreteOutput, assets: readonly ResolvedMediaAsset[]): boolean {
+function supportsAsset(
+  provider: ModelProviderId,
+  output: ConcreteOutput,
+  model: ModelInfo,
+  asset: ResolvedMediaAsset,
+): boolean {
+  if (asset.kind !== 'file') return model.inputModalities.includes(asset.kind)
+  if (output !== 'text') return false
+  return chatFileSupport(provider, asset.name, asset.mimeType).mode !== 'unsupported'
+}
+
+function supportsRequest(
+  provider: ModelProviderId,
+  model: ModelInfo,
+  output: ConcreteOutput,
+  assets: readonly ResolvedMediaAsset[],
+): boolean {
   if (
     !model.outputModalities.includes(output)
     || !model.inputModalities.includes('text')
@@ -187,7 +207,7 @@ function supportsRequest(model: ModelInfo, output: ConcreteOutput, assets: reado
   ) return false
   if ((output === 'image' || output === 'video') && assets.some((asset) => asset.kind !== 'image')) return false
   if (output === 'video' && assets.length > videoImageCapacity(model)) return false
-  return assets.every((asset) => model.inputModalities.includes(asset.kind))
+  return assets.every((asset) => supportsAsset(provider, output, model, asset))
 }
 
 function supportsGeneration(model: ModelInfo, output: ConcreteOutput): boolean {
@@ -195,13 +215,22 @@ function supportsGeneration(model: ModelInfo, output: ConcreteOutput): boolean {
   return model.generation[output] !== undefined
 }
 
-function compatibleOutputs(model: ModelInfo, assets: readonly ResolvedMediaAsset[]): ConcreteOutput[] {
-  return OUTPUTS.filter((output) => supportsRequest(model, output, assets))
+function compatibleOutputs(
+  provider: ModelProviderId,
+  model: ModelInfo,
+  assets: readonly ResolvedMediaAsset[],
+): ConcreteOutput[] {
+  return OUTPUTS.filter((output) => supportsRequest(provider, model, output, assets))
 }
 
-function compatibleModels(models: readonly ModelInfo[], output: ConcreteOutput, assets: readonly ResolvedMediaAsset[]): ModelInfo[] {
+function compatibleModels(
+  provider: ModelProviderId,
+  models: readonly ModelInfo[],
+  output: ConcreteOutput,
+  assets: readonly ResolvedMediaAsset[],
+): ModelInfo[] {
   return models
-    .filter((candidate) => supportsRequest(candidate, output, assets))
+    .filter((candidate) => supportsRequest(provider, candidate, output, assets))
     .slice()
     .sort((left, right) => compareStrings(left.id, right.id))
 }
@@ -221,7 +250,7 @@ function preferredModel(
   for (const id of preferredIds) {
     if (!id) continue
     const candidate = modelForId(input.models, id)
-    if (candidate && supportsRequest(candidate, output, input.assets)) return candidate
+    if (candidate && supportsRequest(input.provider, candidate, output, input.assets)) return candidate
   }
   return undefined
 }
@@ -329,7 +358,7 @@ function selectNumber(requested: number, advertised: readonly number[]): number 
 }
 
 function route(input: ResolveChatRouteInput, model: ModelInfo, output: ConcreteOutput): ResolvedChatRoute {
-  if (!supportsRequest(model, output, input.assets)) failure('MODEL_MODALITY_UNSUPPORTED')
+  if (!supportsRequest(input.provider, model, output, input.assets)) failure('MODEL_MODALITY_UNSUPPORTED')
   const imageCapability = output === 'image' ? model.generation.image : undefined
   return {
     provider: input.provider,
@@ -371,7 +400,7 @@ export function resolveChatRoute(input: ResolveChatRouteInput): ChatRouteResolut
     if (!selected) failure('NOT_FOUND')
     if (input.requestedOutput !== 'auto') return route(input, selected, input.requestedOutput)
 
-    const outputs = compatibleOutputs(selected, input.assets)
+    const outputs = compatibleOutputs(input.provider, selected, input.assets)
     const remembered = input.conversationPreferences.outputType
     if (isOutput(remembered) && outputs.includes(remembered)) return route(input, selected, remembered)
     if (outputs.length === 1) return route(input, selected, outputs[0]!)
@@ -386,7 +415,7 @@ export function resolveChatRoute(input: ResolveChatRouteInput): ChatRouteResolut
   const selected = preferredModel(input, output)
   if (selected) return route(input, selected, output)
 
-  const candidates = compatibleModels(input.models, output, input.assets)
+  const candidates = compatibleModels(input.provider, input.models, output, input.assets)
   if (candidates.length === 0) failure('MODEL_MODALITY_UNSUPPORTED')
   return { modelRequired: true, outputType: output, compatibleModels: candidates }
 }

@@ -109,6 +109,65 @@ describe('resolveChatRoute', () => {
     expect(resolve()).toMatchObject({ provider, model: `${expected}/model`, outputType: expected })
   })
 
+  it('routes text files to DeepSeek text output', () => {
+    const deepseek = model({ id: 'deepseek-chat', supportsTools: true })
+
+    expect(resolveChatRoute(input({
+      provider: 'deepseek',
+      requestedModel: deepseek.id,
+      requestedOutput: 'text',
+      models: [deepseek],
+      assets: [asset('file', { name: 'notes.anything', mimeType: 'text/plain' })],
+    }))).toMatchObject({ provider: 'deepseek', model: 'deepseek-chat', outputType: 'text' })
+  })
+
+  it('routes supported binary files only to OpenRouter text output', () => {
+    const pdf = asset('file', { name: 'report.pdf', mimeType: 'application/pdf' })
+    const text = model({ id: 'text/model', supportsTools: true })
+
+    expect(resolveChatRoute(input({
+      requestedModel: text.id,
+      requestedOutput: 'text',
+      models: [text],
+      assets: [pdf],
+    }))).toMatchObject({ provider: 'openrouter', model: 'text/model', outputType: 'text' })
+
+    expect(() => resolveChatRoute(input({
+      provider: 'deepseek',
+      requestedModel: 'deepseek-chat',
+      requestedOutput: 'text',
+      models: [model({ id: 'deepseek-chat', supportsTools: true })],
+      assets: [pdf],
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
+  it('rejects unknown binary files when no compatible route exists', () => {
+    expect(() => resolveChatRoute(input({
+      requestedOutput: 'text',
+      assets: [asset('file', { name: 'archive.zip', mimeType: 'application/octet-stream' })],
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
+  it.each(['image', 'audio', 'video'] as const)('never treats a file as a %s-generation reference', (requestedOutput) => {
+    const modelGeneration: ModelInfo['generation'] = requestedOutput === 'image'
+      ? { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } }
+      : requestedOutput === 'audio'
+        ? { audio: { voices: ['alloy'], formats: ['mp3'] } }
+        : { video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false, frameImages: [] } }
+    const generationModel = model({
+      id: `${requestedOutput}/model`,
+      outputModalities: [requestedOutput],
+      generation: modelGeneration,
+    })
+
+    expect(() => resolveChatRoute(input({
+      requestedModel: generationModel.id,
+      requestedOutput,
+      models: [generationModel],
+      assets: [asset('file', { name: 'report.pdf', mimeType: 'application/pdf' })],
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
   it('automatically resolves a single-output selected model', () => {
     expect(resolveChatRoute(input({
       requestedModel: 'image/model',

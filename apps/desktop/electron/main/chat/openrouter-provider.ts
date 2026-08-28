@@ -354,6 +354,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       mergeModels: mergeOpenRouterModels,
       includeUsageStreamOption: true,
       supportsMediaInput: true,
+      supportsFileInput: true,
       supportsAudioOutput: true,
       serializeEndUser: (id) => `autoforge:${id}`,
     }, {

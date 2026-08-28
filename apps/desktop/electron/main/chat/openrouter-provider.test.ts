@@ -3,6 +3,7 @@ import {
   OpenRouterProvider,
   type OpenRouterStreamEvent,
 } from './openrouter-provider.js'
+import { DeepSeekProvider } from './deepseek-provider.js'
 import {
   mergeOpenRouterModels,
   parseOpenRouterImageModels,
@@ -1885,6 +1886,59 @@ describe('OpenRouterProvider', () => {
       modalities: ['text', 'audio'],
       audio: { voice: 'alloy', format: 'mp3' },
     })
+  })
+
+  it('converts a verified file part to the exact OpenRouter wire format', async () => {
+    const fetch = vi.fn(async (...request: Parameters<typeof globalThis.fetch>) => {
+      void request
+      return sseResponse(['data: [DONE]\n\n'])
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await collect(provider.stream({
+      model: 'file-model',
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'file',
+          name: 'report.pdf',
+          mimeType: 'application/pdf',
+          dataBase64: 'JVBERi0xLjc=',
+        }],
+      }],
+    }))
+
+    const body = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))
+    expect(body.messages[0].content).toEqual([{
+      type: 'file',
+      file: {
+        filename: 'report.pdf',
+        file_data: 'data:application/pdf;base64,JVBERi0xLjc=',
+      },
+    }])
+  })
+
+  it('keeps omitted file support fail-closed before DeepSeek credential access or fetch', async () => {
+    const localCredential = { get: vi.fn(async () => 'sk-private') }
+    const fetch = vi.fn(async () => sseResponse([]))
+    const provider = new DeepSeekProvider({ credential: localCredential, fetch })
+
+    const error = await rejection(provider.stream({
+      model: 'deepseek-chat',
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'file',
+          name: 'report.pdf',
+          mimeType: 'application/pdf',
+          dataBase64: 'JVBERi0xLjc=',
+        }],
+      }],
+    }))
+
+    expect(error).toMatchObject({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+    expect(localCredential.get).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
   })
 
   it.each([

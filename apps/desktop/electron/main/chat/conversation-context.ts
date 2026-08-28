@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto'
-import { toSafeAppError, chatBlockSchema, type ChatBlock } from '@autoforge/shared'
+import {
+  toSafeAppError,
+  chatBlockSchema,
+  type AttachmentKind,
+  type ChatBlock,
+} from '@autoforge/shared'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
@@ -21,6 +26,7 @@ const REQUEST_OVERHEAD = 12
 const MESSAGE_OVERHEAD = 8
 const TOOL_OVERHEAD = 12
 const MAX_MEDIA_TOKENS = 16_384
+const MAX_FILE_TOKENS = 32_768
 
 const SUMMARY_SYSTEM_PROMPT = [
   '你正在维护同一聊天会话的内部记忆摘要。',
@@ -31,8 +37,9 @@ const SUMMARY_SYSTEM_PROMPT = [
 ].join('\n')
 
 export interface CurrentMediaMetadata {
-  kind: 'image' | 'audio' | 'video'
+  kind: AttachmentKind
   durationMs?: number
+  byteSize?: number
 }
 
 export interface EstimateRequestTokensInput {
@@ -151,12 +158,17 @@ function messageForEstimate(message: ModelMessage): unknown {
     content: message.content.map((part) => (
       part.type === 'text'
         ? part
-        : { type: 'media', kind: part.kind, mimeType: part.mimeType }
+        : part.type === 'file'
+          ? { type: 'file', name: part.name, mimeType: part.mimeType }
+          : { type: 'media', kind: part.kind, mimeType: part.mimeType }
     )),
   }
 }
 
 export function currentMediaTokenReserve(media: CurrentMediaMetadata): number {
+  if (media.kind === 'file') {
+    return Math.min(MAX_FILE_TOKENS, Math.max(2_048, Math.ceil((media.byteSize ?? 0) / 4)))
+  }
   if (media.kind === 'image') return 2_048
   if (media.durationMs === undefined) return media.kind === 'audio' ? 8_192 : MAX_MEDIA_TOKENS
 

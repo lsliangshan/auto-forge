@@ -29,6 +29,7 @@ const VIDEO_FRAME_TYPES = ['first_frame', 'last_frame'] as const
 export type ModelContentPart =
   | { type: 'text'; text: string }
   | ({ type: 'media' } & Pick<ModelMediaInput, 'kind' | 'mimeType' | 'dataBase64'>)
+  | { type: 'file'; name: string; mimeType: string; dataBase64: string }
 
 export type ModelMessage =
   | { role: 'system' | 'user'; content: string | ModelContentPart[] }
@@ -154,6 +155,7 @@ export interface OpenAiCompatibleProviderConfig {
   mergeModels?(general: ModelInfo[], optional: ModelInfo[][]): ModelInfo[]
   includeUsageStreamOption: boolean
   supportsMediaInput: boolean
+  supportsFileInput?: boolean
   supportsAudioOutput: boolean
   serializeEndUser?: (id: string) => string
 }
@@ -253,6 +255,12 @@ const modelContentPartSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('media'),
     kind: z.enum(['image', 'audio', 'video']),
+    mimeType: z.string().min(1),
+    dataBase64: z.string(),
+  }).strict(),
+  z.object({
+    type: z.literal('file'),
+    name: z.string().min(1),
     mimeType: z.string().min(1),
     dataBase64: z.string(),
   }).strict(),
@@ -837,6 +845,10 @@ function assertSupportedRequest(request: ModelStreamRequest, config: OpenAiCompa
     if (!parsed.success) throw failure('INVALID_INPUT')
     for (const part of parsed.data) {
       if (part.type === 'text') continue
+      if (part.type === 'file') {
+        if (config.supportsFileInput !== true) throw failure('MODEL_MODALITY_UNSUPPORTED')
+        continue
+      }
       if (!config.supportsMediaInput) throw failure('MODEL_MODALITY_UNSUPPORTED')
       const compatible = part.kind === 'image'
         ? IMAGE_MIME_TYPES.has(part.mimeType)
@@ -870,6 +882,14 @@ function wireContentPart(part: ModelContentPart): unknown {
           return { type: 'video_url', video_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` } }
       }
       throw failure('INVALID_INPUT')
+    case 'file':
+      return {
+        type: 'file',
+        file: {
+          filename: part.name,
+          file_data: `data:${part.mimeType};base64,${part.dataBase64}`,
+        },
+      }
     }
   throw failure('INVALID_INPUT')
 }
