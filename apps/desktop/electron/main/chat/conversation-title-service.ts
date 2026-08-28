@@ -24,6 +24,7 @@ export interface GenerateConversationTitleInput {
   requestId: string
   providerSnapshot: ModelProviderSnapshot
   model?: string
+  omitAttachmentProjections?: boolean
   signal?: AbortSignal
 }
 
@@ -53,15 +54,19 @@ function boundedTitleContext(value: string): string {
   return `${characters.slice(0, MAX_TITLE_CONTEXT_CHARACTERS).join('')}…`
 }
 
-function completedTurn(repositories: ConversationTitleRepositories, conversationId: string) {
+function completedTurn(
+  repositories: ConversationTitleRepositories,
+  conversationId: string,
+  omitAttachmentProjections = false,
+) {
   const messages = repositories.messages.listForConversation(conversationId)
   const assistantIndex = messages.map(({ role }) => role).lastIndexOf('assistant')
   if (assistantIndex < 1) return undefined
   const user = [...messages.slice(0, assistantIndex)].reverse().find((message) => message.role === 'user')
   const assistant = messages[assistantIndex]
   if (!user || !assistant) return undefined
-  const serializedUser = serializeHistoricalMessage(user)
-  const serializedAssistant = serializeHistoricalMessage(assistant)
+  const serializedUser = serializeHistoricalMessage(user, omitAttachmentProjections)
+  const serializedAssistant = serializeHistoricalMessage(assistant, omitAttachmentProjections)
   if (!serializedUser || !serializedAssistant) return undefined
   return {
     user: boundedTitleContext(serializedUser.content as string),
@@ -77,7 +82,11 @@ export class ConversationTitleService {
       return undefined
     }
     try {
-      const turn = completedTurn(this.dependencies.repositories, input.conversationId)
+      const turn = completedTurn(
+        this.dependencies.repositories,
+        input.conversationId,
+        input.omitAttachmentProjections,
+      )
       if (!turn) throw new Error('The first completed turn is unavailable')
       if (!input.model) throw new Error('The text model for conversation titles is unavailable')
       let response = ''

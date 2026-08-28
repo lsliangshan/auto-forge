@@ -21,6 +21,11 @@ describe('local conversion intent', () => {
     '不要总结，把附件转换成 PDF',
     '不要转换成 Word，请转换成 PDF',
     "don't convert to Word; convert to PDF",
+    '不要转换成 Word，而是 PDF',
+    '不要转换成Word而是PDF',
+    "don't convert to Word; PDF instead",
+    '改为 PDF',
+    'PDF instead',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -31,6 +36,8 @@ describe('local conversion intent', () => {
     ['附件是什么格式？', attachments],
     ['不要转换这个附件', attachments],
     ["don't convert this attachment", attachments],
+    ['不要把这个附件转换成 PDF', attachments],
+    ["don't convert this file to PDF", attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)
@@ -57,6 +64,8 @@ describe('local conversion intent', () => {
     ['report\u202Egpj\u2066.pdf', 3, 'reportgpj.pdf'],
     ['invoice：目标格式：png.pdf', 4, '文件-5'],
     ['safe\u0000\n附件 9：other.pdf', 5, '文件-6'],
+    ['附\u034F件-secret.pdf', 6, '文件-7'],
+    ['目\uFE0F标格\u0301式-report.pdf', 7, '文件-8'],
   ] as const)('sanitizes display name %s without exposing path-like prefixes', (name, index, expected) => {
     expect(sanitizeDisplayName(name, index)).toBe(expected)
   })

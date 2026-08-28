@@ -1211,6 +1211,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerSnapshot: ModelProviderSnapshot
     providerCredentialEpoch: number
     model?: string
+    omitAttachmentProjections?: boolean
   }>()
   let acceptingWork = true
   const failureRecorder = createApplicationFailureRecorder(() => { acceptingWork = false })
@@ -1335,6 +1336,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           requestId: event.requestId,
           providerSnapshot: context.providerSnapshot,
           ...(context.model === undefined ? {} : { model: context.model }),
+          ...(context.omitAttachmentProjections ? { omitAttachmentProjections: true } : {}),
           signal: controller.signal,
         }).then(() => undefined).finally(() => {
           activeConversationTitleWork.delete(event.requestId)
@@ -1844,6 +1846,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             providerSnapshot,
             providerCredentialEpoch: credentialEpoch,
             ...(titleModel === undefined ? {} : { model: titleModel }),
+            ...(localConversionIntent ? { omitAttachmentProjections: true } : {}),
           })
           const userBlocks: ChatBlock[] = [
             ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),

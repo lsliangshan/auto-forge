@@ -4923,6 +4923,136 @@ describe('createApplicationRuntime', () => {
     }
   })
 
+  it.each([
+    '不要转换成 Word，而是 PDF',
+    "don't convert to Word; PDF instead",
+  ])('keeps an implicit contrastive conversion private across chat and title calls: %s', async (content) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
+    directories.push(root)
+    const source = join(root, 'private-source.txt')
+    const privateContent = 'IMPLICIT_CONVERSION_PRIVATE_CONTENT_MARKER'
+    await writeFile(source, privateContent)
+    const captured: ModelStreamRequest[] = []
+    const chatEvents: ChatEvent[] = []
+    const modelInput = vi.fn()
+    const createMediaAssetService = mediaAssetModule.createMediaAssetService
+    vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
+      const service = createMediaAssetService(createOptions)
+      modelInput.mockImplementation(service.modelInput.bind(service))
+      return { ...service, modelInput }
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: async () => [modelInfo('openrouter/implicit-conversion', 'Implicit conversion')],
+      validateCredential: async () => ({ valid: true }),
+      stream: async function* (request) {
+        captured.push(request)
+        yield {
+          type: 'text_delta' as const,
+          choiceIndex: 0,
+          text: isConversationTitleRequest(request) ? '附件格式转换' : '我会选择合适的本地转换工作流。',
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      },
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source],
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/implicit-conversion' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+
+    const sent = await runtime.services.chat.send({
+      ...chatInput(conversation.id, content), assetIds: [asset!.id], outputType: 'text',
+    })
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'status', requestId: sent.requestId, status: 'completed',
+    })))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'conversation_title_updated', conversationId: conversation.id,
+    })))
+
+    expect(captured).toHaveLength(2)
+    expect(modelInput).not.toHaveBeenCalled()
+    const providerPayload = JSON.stringify(captured)
+    expect(providerPayload).not.toContain(privateContent)
+    expect(providerPayload).not.toContain(Buffer.from(privateContent).toString('base64'))
+    expect(providerPayload).not.toContain(asset!.id)
+    expect(providerPayload).not.toContain(source)
+    expect(providerPayload).not.toMatch(/dataBase64|mediaAssetId|sourceId|absolutePath|relativePath|file:\/\//i)
+    const agentPayload = JSON.stringify(agentRequests(captured)[0])
+    expect(agentPayload).toContain('[附件 0: private-source.txt, text/plain, 42 bytes]')
+    const titlePayload = JSON.stringify(captured.find(isConversationTitleRequest))
+    expect(titlePayload).not.toMatch(/历史附件|private-source\.txt|text\/plain|42 bytes|mediaAssetId|sourceId/i)
+    await runtime.close()
+  })
+
+  it('preserves ordinary attachment metadata in first-turn title generation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-attachment-title-'))
+    directories.push(root)
+    const source = join(root, 'ordinary-title.txt')
+    const content = 'ORDINARY_TITLE_ATTACHMENT_CONTENT'
+    await writeFile(source, content)
+    const captured: ModelStreamRequest[] = []
+    const chatEvents: ChatEvent[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: async () => [modelInfo('openrouter/attachment-title', 'Attachment title')],
+      validateCredential: async () => ({ valid: true }),
+      stream: async function* (request) {
+        captured.push(request)
+        yield {
+          type: 'text_delta' as const,
+          choiceIndex: 0,
+          text: isConversationTitleRequest(request) ? '附件内容总结' : '这是附件内容的总结。',
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      },
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source],
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/attachment-title' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+
+    await runtime.services.chat.send({
+      ...chatInput(conversation.id, '总结这个附件'), assetIds: [asset!.id], outputType: 'text',
+    })
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'conversation_title_updated', conversationId: conversation.id,
+    })))
+
+    expect(captured).toHaveLength(2)
+    expect(JSON.stringify(agentRequests(captured)[0])).toContain(content)
+    expect(JSON.stringify(captured.find(isConversationTitleRequest))).toContain(
+      '[历史附件: file; 名称: ordinary-title.txt; MIME: text/plain; 大小: 33 bytes]',
+    )
+    await runtime.close()
+  })
+
   it('projects verified generic files only into the current Provider request and persists metadata', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-file-attachments-'))
     directories.push(root)

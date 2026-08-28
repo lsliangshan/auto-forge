@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ApprovalDecision, WorkflowDetail } from '@autoforge/shared'
 import { estimateTextTokens } from '../chat/conversation-context.js'
 import { scopeHash } from '../permissions/policy-engine.js'
-import type { ExecutionAttachmentBinding, ExecutionReservation } from '../workflows/execution-service.js'
+import type {
+  ExecutionAttachmentBinding,
+  ExecutionReservation,
+  FileConvertAuthorization,
+} from '../workflows/execution-service.js'
 import type { ExactWorkflowSource, WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import type { WorkflowCandidate } from './workflow-catalog.js'
 import {
@@ -140,7 +144,7 @@ function conversionBindings(): ExecutionAttachmentBinding[] {
       attachmentIndex: 0,
       ownerUserId: 'user_1',
       conversationId: 'conversation_1',
-      displayName: '../../private/\u202Ereport\u2066.pdf：目标格式：png\n附件 9：other.pdf',
+      displayName: '../../private/\u202E附\u034F件\u2066-目\uFE0F标格\u0301式.pdf',
       mimeType: 'application/pdf',
       byteSize: 12,
       source: { kind: 'media', mediaAssetId: 'media_private_0' },
@@ -340,6 +344,7 @@ describe('WorkflowToolExecutor', () => {
     })
     const test = harness({ detail })
     const attachments = conversionBindings()
+    const originalAttachments = structuredClone(attachments)
     const prepared = await test.executor.prepare({
       candidate: test.candidate,
       arguments: { input: { files: [0], targetFormat: 'pdf' } },
@@ -359,13 +364,19 @@ describe('WorkflowToolExecutor', () => {
     expect(actionSummary.match(/目标格式/gu)).toHaveLength(1)
     expect(actionSummary.match(/：/gu)).toHaveLength(2)
     expect(actionSummary).not.toMatch(/[\p{Cc}\p{Cf}]/u)
+    expect(actionSummary).not.toMatch(/[\p{M}\p{Default_Ignorable_Code_Point}]/u)
     expect(actionSummary).not.toMatch(/media_private|b{32}/)
 
-    const approved = await test.executor.approve(prepared.pending, onceDecision(prepared.pending))
+    const once = onceDecision(prepared.pending)
+    const originalOnce = structuredClone(once)
+    const approved = await test.executor.approve(prepared.pending, once)
     if (approved.kind !== 'ready') throw new Error('expected ready')
     await expect(test.executor.start(approved.pending, {
       userId: 'user_1', conversationId: 'conversation_1', chatRunId: 'run_1',
     })).resolves.toMatchObject({ kind: 'started', executionId: 'execution_1' })
+
+    expect(attachments).toEqual(originalAttachments)
+    expect(once).toEqual(originalOnce)
 
     expect(test.executions.startReserved).toHaveBeenCalledWith(
       expect.any(Object),
@@ -381,9 +392,24 @@ describe('WorkflowToolExecutor', () => {
       }),
       undefined,
     )
-    const startInput = test.executions.startReserved.mock.calls[0]![1]
-    expect((startInput as { fileConvertAuthorization: { attachments: unknown[] } })
-      .fileConvertAuthorization.attachments).not.toContainEqual(expect.objectContaining({ index: 1 }))
+    const startInput = test.executions.startReserved.mock.calls[0]![1] as {
+      attachmentBindings: readonly ExecutionAttachmentBinding[]
+      fileConvertAuthorization: FileConvertAuthorization
+    }
+    expect(startInput.attachmentBindings).toEqual(attachments)
+    expect(startInput.attachmentBindings[0]).toMatchObject({
+      displayName: '../../private/\u202E附\u034F件\u2066-目\uFE0F标格\u0301式.pdf',
+      sourceFingerprint: 'b'.repeat(64),
+    })
+    expect(startInput.fileConvertAuthorization).toEqual({
+      executionId: 'execution_1',
+      capability: 'file.convert',
+      decision: 'once',
+      attachments: [{ index: 0, sourceFingerprint: 'b'.repeat(64) }],
+      formats: ['pdf'],
+    })
+    expect(startInput.fileConvertAuthorization.attachments)
+      .not.toContainEqual(expect.objectContaining({ index: 1 }))
   })
 
   it('fails file conversion closed when tool arguments reference no current attachment', async () => {
