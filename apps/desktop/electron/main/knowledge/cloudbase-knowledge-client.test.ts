@@ -250,6 +250,93 @@ describe('CloudBaseKnowledgeClient', () => {
     })).resolves.toEqual({ removed: 1 })
   })
 
+  it('aggregates every page from one bounded owner catalog snapshot', async () => {
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 3,
+        nextOrdinal: 2, hasMore: true, knowledgeBaseIds: ['kb_1', 'kb_2'],
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 3,
+        nextOrdinal: 3, hasMore: false, knowledgeBaseIds: ['kb_3'],
+      } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.listKnowledgeBases()).resolves.toEqual(['kb_1', 'kb_2', 'kb_3'])
+    expect(callFunction).toHaveBeenNthCalledWith(1, {
+      name: 'autoforge-knowledge', signal: expect.any(AbortSignal), data: {
+        action: 'listKnowledgeBases', snapshotId: null, afterOrdinal: 0,
+        limit: 512, maxBytes: 786_432,
+      },
+    })
+    expect(callFunction).toHaveBeenNthCalledWith(2, {
+      name: 'autoforge-knowledge', signal: expect.any(AbortSignal), data: {
+        action: 'listKnowledgeBases', snapshotId: 'catalog_1', afterOrdinal: 2,
+        limit: 512, maxBytes: 786_432,
+      },
+    })
+  })
+
+  it('rejects catalog snapshot identity, count, ordinal, and duplicate drift', async () => {
+    const cases = [
+      [
+        { kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+          nextOrdinal: 1, hasMore: true, knowledgeBaseIds: ['kb_1'] },
+        { kind: 'catalog_page', snapshotId: 'catalog_other', totalCount: 2,
+          nextOrdinal: 2, hasMore: false, knowledgeBaseIds: ['kb_2'] },
+      ],
+      [
+        { kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+          nextOrdinal: 1, hasMore: true, knowledgeBaseIds: ['kb_1'] },
+        { kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 3,
+          nextOrdinal: 2, hasMore: true, knowledgeBaseIds: ['kb_2'] },
+        { kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 3,
+          nextOrdinal: 3, hasMore: false, knowledgeBaseIds: ['kb_3'] },
+      ],
+      [
+        { kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+          nextOrdinal: 0, hasMore: true, knowledgeBaseIds: ['kb_1'] },
+        { kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+          nextOrdinal: 2, hasMore: false, knowledgeBaseIds: ['kb_2'] },
+      ],
+      [
+        { kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+          nextOrdinal: 1, hasMore: true, knowledgeBaseIds: ['kb_1'] },
+        { kind: 'catalog_page', snapshotId: 'catalog_1', totalCount: 2,
+          nextOrdinal: 2, hasMore: false, knowledgeBaseIds: ['kb_1'] },
+      ],
+    ]
+    for (const pages of cases) {
+      const callFunction = vi.fn()
+      for (const page of pages) {
+        callFunction.mockResolvedValueOnce({ result: { ok: true, data: page } })
+      }
+      const client = new CloudBaseKnowledgeClient({ callFunction })
+      await expect(client.listKnowledgeBases())
+        .rejects.toMatchObject({ code: 'INTERNAL_ERROR', retryable: false })
+    }
+  })
+
+  it('rejects an otherwise well-formed catalog larger than 10000 bases', async () => {
+    const totalCount = 10_001
+    const callFunction = vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+      const afterOrdinal = Number(data.afterOrdinal)
+      const nextOrdinal = Math.min(totalCount, afterOrdinal + 512)
+      return { result: { ok: true, data: {
+        kind: 'catalog_page', snapshotId: 'catalog_large', totalCount,
+        nextOrdinal, hasMore: nextOrdinal < totalCount,
+        knowledgeBaseIds: Array.from(
+          { length: nextOrdinal - afterOrdinal },
+          (_, index) => `kb_${afterOrdinal + index}`,
+        ),
+      } } }
+    })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.listKnowledgeBases())
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR', retryable: false })
+  })
+
   it('rejects mismatched operation identities and duplicate snapshot entities', async () => {
     const callFunction = vi.fn()
       .mockResolvedValueOnce({ result: { ok: true, data: {

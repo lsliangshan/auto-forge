@@ -102,6 +102,14 @@ const snapshotSchema = z.object({
   kind: z.literal('snapshot'), nextSequence: z.number().int().nonnegative(),
   changes: z.array(changeSchema).max(maximumSnapshotItems),
 }).strict()
+const catalogPageSchema = z.object({
+  kind: z.literal('catalog_page'),
+  snapshotId: identifier,
+  totalCount: z.number().int().nonnegative().max(maximumSnapshotItems),
+  nextOrdinal: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  knowledgeBaseIds: z.array(identifier.regex(/^[A-Za-z0-9_-]+$/)).max(512),
+}).strict()
 
 const publishedSchema = z.object({
   generationId: identifier,
@@ -412,6 +420,44 @@ export class CloudBaseKnowledgeClient {
         return snapshotSchema.parse({
           kind: 'snapshot', nextSequence: snapshotSequence, changes,
         })
+      }
+    }
+    throw new CloudKnowledgeError('INTERNAL_ERROR')
+  }
+
+  async listKnowledgeBases(): Promise<readonly string[]> {
+    let snapshotId: string | null = null
+    let totalCount: number | undefined
+    let afterOrdinal = 0
+    const knowledgeBaseIds: string[] = []
+    const identities = new Set<string>()
+    for (let pageNumber = 0; pageNumber < 1_000; pageNumber += 1) {
+      const page = await this.invoke('listKnowledgeBases', {
+        snapshotId, afterOrdinal, limit: 512, maxBytes: maximumKnowledgePageBytes,
+      }, catalogPageSchema)
+      if ((snapshotId !== null && page.snapshotId !== snapshotId)
+        || (totalCount !== undefined && page.totalCount !== totalCount)
+        || page.nextOrdinal !== afterOrdinal + page.knowledgeBaseIds.length
+        || page.hasMore !== (page.nextOrdinal < page.totalCount)
+        || (page.hasMore && page.knowledgeBaseIds.length === 0)) {
+        throw new CloudKnowledgeError('INTERNAL_ERROR')
+      }
+      snapshotId = page.snapshotId
+      totalCount = page.totalCount
+      for (const knowledgeBaseId of page.knowledgeBaseIds) {
+        if (identities.has(knowledgeBaseId)
+          || knowledgeBaseIds.length >= maximumSnapshotItems) {
+          throw new CloudKnowledgeError('INTERNAL_ERROR')
+        }
+        identities.add(knowledgeBaseId)
+        knowledgeBaseIds.push(knowledgeBaseId)
+      }
+      afterOrdinal = page.nextOrdinal
+      if (!page.hasMore) {
+        if (knowledgeBaseIds.length !== totalCount || afterOrdinal !== totalCount) {
+          throw new CloudKnowledgeError('INTERNAL_ERROR')
+        }
+        return knowledgeBaseIds
       }
     }
     throw new CloudKnowledgeError('INTERNAL_ERROR')
