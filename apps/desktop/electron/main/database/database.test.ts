@@ -2261,6 +2261,22 @@ describe('openAppDatabase', () => {
     expect(database.mediaAssets.get('asset_staging_validation')).toMatchObject({ status: 'staging' })
   })
 
+  it('rejects generated generic file assets before persistence', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_generated_file', title: 'Generated file' })
+
+    expect(() => database.mediaAssets.insert({
+      ...readyAsset('asset_generated_file', 'conversation_generated_file'),
+      source: 'generated',
+      kind: 'file',
+      mimeType: 'application/pdf',
+      originalName: 'report.pdf',
+      relativePath: 'conversation_generated_file/asset_generated_file.pdf',
+    })).toThrow()
+
+    expect(database.mediaAssets.get('asset_generated_file')).toBeUndefined()
+  })
+
   it('persists a ready generic file attachment after the attachment-kind migration', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_file_attachment', title: 'File attachment' })
@@ -2343,7 +2359,12 @@ describe('openAppDatabase', () => {
     })
     database.close()
 
-    const inspection = new Database(path, { readonly: true })
+    const inspection = new Database(path)
+    expect(() => inspection.prepare(`
+      INSERT INTO media_assets (
+        id, conversation_id, source, kind, original_name, status, created_at, updated_at
+      ) VALUES (?, ?, 'generated', 'file', 'generated.pdf', 'ready', 1, 1)
+    `).run('asset_v15_generated_file', 'conversation_v14_file_attachment')).toThrow()
     expect((inspection.prepare('PRAGMA index_list(media_assets)').all() as Array<{ name: string }>).map(({ name }) => name))
       .toEqual(expect.arrayContaining(['media_assets_conversation_status_idx', 'media_assets_unclaimed_idx']))
     expect(inspection.prepare('PRAGMA foreign_key_check').all()).toEqual([])

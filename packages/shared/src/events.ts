@@ -99,7 +99,11 @@ export const mediaBlockSchema = z.object({
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),
   durationMs: z.number().int().nonnegative().optional(),
-}).strict()
+}).strict().superRefine(({ kind, purpose }, context) => {
+  if (kind === 'file' && purpose === 'output') {
+    context.addIssue({ code: 'custom', path: ['purpose'], message: 'File attachments can only be input media' })
+  }
+})
 
 export const mediaGenerationBlockSchema = z.object({
   type: z.literal('media_generation'),

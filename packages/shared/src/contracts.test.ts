@@ -985,6 +985,19 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('rejects generic file attachments as output media blocks', () => {
+    expect(() => mediaBlockSchema.parse({
+      type: 'media',
+      blockId: 'block_file_output_1',
+      assetId: 'asset_file_output_1',
+      kind: 'file',
+      purpose: 'output',
+      name: 'report.pdf',
+      mimeType: 'application/pdf',
+      byteSize: 12,
+    })).toThrow()
+  })
+
   it.each([
     ['deepseek', 'notes.anything', 'text/plain', { mode: 'text' }],
     ['openrouter', 'report.pdf', 'application/octet-stream', { mode: 'provider-file', mimeType: 'application/pdf' }],

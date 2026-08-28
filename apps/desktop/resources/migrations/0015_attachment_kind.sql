@@ -10,7 +10,9 @@ CREATE TABLE media_assets (
   conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
   message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
   source TEXT NOT NULL CHECK (source IN ('upload', 'generated')),
-  kind TEXT NOT NULL CHECK (kind IN ('image', 'audio', 'video', 'file')),
+  kind TEXT NOT NULL CHECK (
+    kind IN ('image', 'audio', 'video') OR (kind = 'file' AND source = 'upload')
+  ),
   mime_type TEXT,
   original_name TEXT NOT NULL,
   relative_path TEXT,

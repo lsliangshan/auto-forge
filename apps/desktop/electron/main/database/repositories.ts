@@ -482,6 +482,9 @@ const mediaAssetRecordShape = {
 }
 
 const mediaAssetRecordSchema = z.object(mediaAssetRecordShape).strict().superRefine((asset, context) => {
+  if (asset.source === 'generated' && asset.kind === 'file') {
+    context.addIssue({ code: 'custom', path: ['kind'], message: 'Generated media assets cannot be files' })
+  }
   if (asset.status !== 'ready') return
   for (const field of ['relativePath', 'mimeType', 'byteSize', 'sha256'] as const) {
     if (asset[field] === undefined) context.addIssue({ code: 'custom', path: [field], message: 'Ready media assets require complete file metadata' })
