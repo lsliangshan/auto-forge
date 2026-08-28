@@ -55,10 +55,32 @@ async function withParserChild<T>(source: string, run: (path: string) => Promise
   }
 }
 
-type ProcessRow = { pid: number; parentPid: number; groupId: number; command: string }
+async function withAsyncEaccesExecutable<T>(run: (path: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), 'autoforge-spawn-eacces-'))
+  const path = join(directory, 'node')
+  await writeFile(path, '', { encoding: 'utf8', mode: 0o600 })
+  try {
+    const child = spawn(path, [], { stdio: 'ignore', windowsHide: true })
+    const error = new Promise<NodeJS.ErrnoException>((resolvePromise, rejectPromise) => {
+      child.once('error', resolvePromise)
+      child.once('spawn', () => rejectPromise(new Error('Denied executable unexpectedly spawned')))
+    })
+    const closed = new Promise<void>(resolvePromise => child.once('close', () => resolvePromise()))
+    expect(child.pid).toBeUndefined()
+    await expect(error).resolves.toMatchObject({ code: 'EACCES' })
+    await closed
+    return await run(path)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+}
+
+type ProcessRow = {
+  pid: number; parentPid: number; groupId: number; state: string; command: string
+}
 
 async function processRows(): Promise<ProcessRow[]> {
-  const child = spawn('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,command=', '-ww'], {
+  const child = spawn('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,state=,command=', '-ww'], {
     stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
   })
   let stdout = ''
@@ -73,11 +95,11 @@ async function processRows(): Promise<ProcessRow[]> {
   })
   if (code !== 0 || stderr !== '') throw new Error(`ps failed: ${stderr}`)
   return stdout.split('\n').flatMap((line) => {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/u.exec(line)
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/u.exec(line)
     if (!match) return []
     return [{
       pid: Number(match[1]), parentPid: Number(match[2]), groupId: Number(match[3]),
-      command: match[4] ?? '',
+      state: match[4] ?? '', command: match[5] ?? '',
     }]
   })
 }
@@ -110,6 +132,17 @@ async function waitForDescendant(
   throw new Error('Expected descendant process did not start')
 }
 
+async function waitForStoppedProcess(pid: number, timeoutMs = 2_000): Promise<ProcessRow> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const row = (await processRows()).find(candidate => candidate.pid === pid)
+    if (!row) throw new Error('Expected process disappeared before stopping')
+    if (row.state.includes('T')) return row
+    await delay(10)
+  }
+  throw new Error('Expected process did not enter the stopped state')
+}
+
 function processIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
@@ -119,11 +152,27 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-function startProductionScheduler(baseUrl: string, certificateUrl: URL) {
+function startProductionScheduler(
+  baseUrl: string,
+  certificateUrl: URL,
+  deniedSpawn?: { executablePath: string; moduleName: string },
+) {
   const entry = fileURLToPath(new URL(
     '../../cloudbase/knowledge/index.js', import.meta.url,
   ))
-  const runner = `const { main } = require(${JSON.stringify(entry)}); main().then(`
+  const denySpawn = deniedSpawn ? `
+    const realExecPath = process.execPath
+    let matchingExecPathReads = 0
+    Object.defineProperty(process, 'execPath', { configurable: true, get() {
+      const stack = new Error().stack ?? ''
+      if (stack.includes(${JSON.stringify(deniedSpawn.moduleName)})) {
+        matchingExecPathReads += 1
+        if (matchingExecPathReads === 2) return ${JSON.stringify(deniedSpawn.executablePath)}
+      }
+      return realExecPath
+    } })
+  ` : ''
+  const runner = `${denySpawn}const { main } = require(${JSON.stringify(entry)}); main().then(`
     + `result => process.stdout.write(JSON.stringify({ ok: true, pid: process.pid, result }) + '\\n'), `
     + `error => process.stdout.write(JSON.stringify({ ok: false, pid: process.pid, code: error?.code }) + '\\n'))`
   const child = spawn(process.execPath, ['--no-addons', '-e', runner], {
@@ -135,7 +184,7 @@ function startProductionScheduler(baseUrl: string, certificateUrl: URL) {
       AUTOFORGE_KNOWLEDGE_WORKER_ID: 'worker_1',
       NODE_EXTRA_CA_CERTS: fileURLToPath(certificateUrl),
     },
-    stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'], detached: deniedSpawn !== undefined, windowsHide: true,
   })
   let stdout = ''
   let stderr = ''
@@ -160,7 +209,13 @@ function startProductionScheduler(baseUrl: string, certificateUrl: URL) {
       }
     })
   })
-  return { child, output, stderr: () => stderr }
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolvePromise, rejectPromise) => {
+      child.once('error', rejectPromise)
+      child.once('close', (code, signal) => resolvePromise({ code, signal }))
+    },
+  )
+  return { child, output, closed, stderr: () => stderr }
 }
 
 function docxDirectoryFixture(compressedBytes: number, expandedBytes: number): Buffer {
@@ -874,6 +929,246 @@ describe('CloudBase knowledge scheduled worker', () => {
   }, 10_000)
 
   it.runIf(process.platform === 'darwin')(
+    'settles the exact job after the default job spawn emits asynchronous EACCES',
+    async () => {
+      const certificateUrl = new URL(
+        '../../apps/desktop/electron/main/media/test-fixtures/pinned-media-test-cert.pem',
+        import.meta.url,
+      )
+      const keyUrl = new URL(
+        '../../apps/desktop/electron/main/media/test-fixtures/pinned-media-test-key.pem',
+        import.meta.url,
+      )
+      const [certificate, key] = await Promise.all([
+        readFile(certificateUrl), readFile(keyUrl),
+      ])
+      const database = new DatabaseSync(':memory:')
+      database.exec(`
+          CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, state TEXT NOT NULL, attempt INTEGER NOT NULL,
+            worker_id TEXT, lease_token TEXT, mutation_permit TEXT, error_code TEXT,
+            settlement_kind TEXT, settlement_worker_id TEXT,
+            settlement_lease_token TEXT, settlement_mutation_permit TEXT,
+            settlement_state TEXT, settlement_error_code TEXT
+          );
+          INSERT INTO jobs(id, state, attempt) VALUES ('job_upload', 'queued', 0);
+      `)
+      const server = createHttpsServer({ cert: certificate, key }, (request, response) => {
+        const chunks: Buffer[] = []
+        request.on('data', raw => chunks.push(Buffer.isBuffer(raw) ? raw : Buffer.from(raw)))
+        request.on('end', () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, string>
+          const json = (value: unknown) => {
+            response.writeHead(200, { 'content-type': 'application/json' })
+            response.end(JSON.stringify(value))
+          }
+          if (request.url === '/rpc/autoforge_knowledge_claim_job') {
+            const changed = database.prepare(`
+                UPDATE jobs SET state = 'running', attempt = attempt + 1,
+                  worker_id = ?, lease_token = ?, mutation_permit = 'permit_job_upload'
+                WHERE id = 'job_upload' AND state = 'queued'
+            `).run(body.p_worker_id, body.p_lease_token)
+            expect(changed.changes).toBe(1)
+            json({ job: {
+              id: 'job_upload', kind: 'upload', entityId: 'upload_entity',
+              leaseToken: body.p_lease_token, attempt: 1,
+              mutationPermit: 'permit_job_upload', mutationBudgetMs: 6_000,
+            } })
+            return
+          }
+          if (request.url === '/rpc/autoforge_knowledge_complete_job') {
+            const changed = database.prepare(`
+                UPDATE jobs SET state = 'queued', error_code = ?,
+                  worker_id = NULL, lease_token = NULL, mutation_permit = NULL,
+                  settlement_kind = 'complete', settlement_worker_id = ?,
+                  settlement_lease_token = ?, settlement_mutation_permit = ?,
+                  settlement_state = ?, settlement_error_code = ?
+                WHERE id = ? AND state = 'running' AND attempt = 1
+                  AND worker_id = ? AND lease_token = ? AND mutation_permit = ?
+            `).run(
+              body.p_error_code, body.p_worker_id, body.p_lease_token,
+              body.p_mutation_permit, body.p_state, body.p_error_code,
+              body.p_job_id, body.p_worker_id, body.p_lease_token, body.p_mutation_permit,
+            )
+            expect(changed.changes).toBe(1)
+            json({ completed: true })
+            return
+          }
+          if (request.url === '/rpc/autoforge_knowledge_cleanup_retention') {
+            json({
+              prunedChanges: 0, prunedTombstones: 0, prunedSnapshots: 0,
+              prunedGenerations: 0, prunedDispatchPermits: 0,
+            })
+            return
+          }
+          response.writeHead(500)
+          response.end()
+        })
+      })
+      await new Promise<void>((resolvePromise, rejectPromise) => {
+        server.once('error', rejectPromise)
+        server.listen(0, '127.0.0.1', resolvePromise)
+      })
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('HTTPS fixture did not bind')
+
+      try {
+        await withAsyncEaccesExecutable(async (executablePath) => {
+          const scheduler = startProductionScheduler(
+            `https://127.0.0.1:${address.port}`, certificateUrl,
+            { executablePath, moduleName: 'job-process.js' },
+          )
+          try {
+            await expect(scheduler.output).resolves.toEqual({
+              ok: true, pid: scheduler.child.pid,
+              result: { claimed: 1, completed: 0, failed: 1 },
+            })
+            await expect(scheduler.closed).resolves.toEqual({ code: 0, signal: null })
+            expect(scheduler.stderr()).toBe('')
+            expect(database.prepare(`
+                SELECT state, attempt, worker_id, lease_token, mutation_permit, error_code,
+                  settlement_kind, settlement_worker_id, settlement_lease_token,
+                  settlement_mutation_permit, settlement_state, settlement_error_code
+                FROM jobs WHERE id = 'job_upload'
+            `).get()).toEqual({
+              state: 'queued', attempt: 1, worker_id: null, lease_token: null,
+              mutation_permit: null, error_code: 'TRANSIENT_FAILURE',
+              settlement_kind: 'complete', settlement_worker_id: 'worker_1',
+              settlement_lease_token: expect.any(String),
+              settlement_mutation_permit: 'permit_job_upload',
+              settlement_state: 'failed', settlement_error_code: 'TRANSIENT_FAILURE',
+            })
+          } finally {
+            if (scheduler.child.exitCode === null && scheduler.child.signalCode === null) {
+              scheduler.child.kill('SIGKILL')
+            }
+            await scheduler.output.catch(() => undefined)
+            await scheduler.closed.catch(() => undefined)
+          }
+        })
+      } finally {
+        database.close()
+        server.closeAllConnections()
+        await new Promise<void>(resolvePromise => server.close(() => resolvePromise()))
+      }
+    },
+    10_000,
+  )
+
+  it.runIf(process.platform === 'darwin')(
+    'replays the exact abandon after the default settlement spawn emits asynchronous EACCES',
+    async () => {
+      const certificateUrl = new URL(
+        '../../apps/desktop/electron/main/media/test-fixtures/pinned-media-test-cert.pem',
+        import.meta.url,
+      )
+      const keyUrl = new URL(
+        '../../apps/desktop/electron/main/media/test-fixtures/pinned-media-test-key.pem',
+        import.meta.url,
+      )
+      const [certificate, key] = await Promise.all([
+        readFile(certificateUrl), readFile(keyUrl),
+      ])
+      const database = new DatabaseSync(':memory:')
+      database.exec(`
+          CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, state TEXT NOT NULL, attempt INTEGER NOT NULL,
+            worker_id TEXT, lease_token TEXT, mutation_permit TEXT,
+            settlement_kind TEXT, settlement_worker_id TEXT,
+            settlement_lease_token TEXT, settlement_mutation_permit TEXT
+          );
+          INSERT INTO jobs(id, state, attempt) VALUES ('job_upload', 'queued', 0);
+      `)
+      const server = createHttpsServer({ cert: certificate, key }, (request, response) => {
+        const chunks: Buffer[] = []
+        request.on('data', raw => chunks.push(Buffer.isBuffer(raw) ? raw : Buffer.from(raw)))
+        request.on('end', () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, string>
+          const json = (value: unknown) => {
+            response.writeHead(200, { 'content-type': 'application/json' })
+            response.end(JSON.stringify(value))
+          }
+          if (request.url === '/rpc/autoforge_knowledge_claim_job') {
+            const changed = database.prepare(`
+                UPDATE jobs SET state = 'running', attempt = attempt + 1,
+                  worker_id = ?, lease_token = ?, mutation_permit = 'permit_job_upload'
+                WHERE id = 'job_upload' AND state = 'queued'
+            `).run(body.p_worker_id, body.p_lease_token)
+            expect(changed.changes).toBe(1)
+            json({ job: {
+              id: 'job_upload', kind: 'upload', entityId: 'upload_entity',
+              leaseToken: body.p_lease_token, attempt: 1,
+              mutationPermit: 'permit_job_upload', mutationBudgetMs: 100,
+            } })
+            return
+          }
+          if (request.url === '/rpc/autoforge_knowledge_abandon_claimed_job') {
+            const changed = database.prepare(`
+                UPDATE jobs SET state = 'queued', attempt = attempt - 1,
+                  worker_id = NULL, lease_token = NULL, mutation_permit = NULL,
+                  settlement_kind = 'abandon', settlement_worker_id = ?,
+                  settlement_lease_token = ?, settlement_mutation_permit = ?
+                WHERE id = ? AND state = 'running' AND attempt = 1
+                  AND worker_id = ? AND lease_token = ? AND mutation_permit = ?
+            `).run(
+              body.p_worker_id, body.p_lease_token, body.p_mutation_permit,
+              body.p_job_id, body.p_worker_id, body.p_lease_token, body.p_mutation_permit,
+            )
+            expect(changed.changes).toBe(1)
+            json({ abandoned: true })
+            return
+          }
+          response.writeHead(500)
+          response.end()
+        })
+      })
+      await new Promise<void>((resolvePromise, rejectPromise) => {
+        server.once('error', rejectPromise)
+        server.listen(0, '127.0.0.1', resolvePromise)
+      })
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('HTTPS fixture did not bind')
+
+      try {
+        await withAsyncEaccesExecutable(async (executablePath) => {
+          const scheduler = startProductionScheduler(
+            `https://127.0.0.1:${address.port}`, certificateUrl,
+            { executablePath, moduleName: 'settlement-process.js' },
+          )
+          try {
+            await expect(scheduler.output).resolves.toEqual({
+              ok: false, pid: scheduler.child.pid, code: 'TRANSIENT_FAILURE',
+            })
+            await expect(scheduler.closed).resolves.toEqual({ code: 0, signal: null })
+            expect(scheduler.stderr()).toBe('')
+            expect(database.prepare(`
+                SELECT state, attempt, worker_id, lease_token, mutation_permit,
+                  settlement_kind, settlement_worker_id, settlement_lease_token,
+                  settlement_mutation_permit FROM jobs WHERE id = 'job_upload'
+            `).get()).toEqual({
+              state: 'queued', attempt: 0, worker_id: null, lease_token: null,
+              mutation_permit: null, settlement_kind: 'abandon',
+              settlement_worker_id: 'worker_1', settlement_lease_token: expect.any(String),
+              settlement_mutation_permit: 'permit_job_upload',
+            })
+          } finally {
+            if (scheduler.child.exitCode === null && scheduler.child.signalCode === null) {
+              scheduler.child.kill('SIGKILL')
+            }
+            await scheduler.output.catch(() => undefined)
+            await scheduler.closed.catch(() => undefined)
+          }
+        })
+      } finally {
+        database.close()
+        server.closeAllConnections()
+        await new Promise<void>(resolvePromise => server.close(() => resolvePromise()))
+      }
+    },
+    10_000,
+  )
+
+  it.runIf(process.platform === 'darwin')(
     'kills a real stalled nested parser before the default scheduler settles its job',
     async () => {
       const certificateUrl = new URL(
@@ -893,10 +1188,14 @@ describe('CloudBase knowledge scheduled worker', () => {
       database.exec(`
           CREATE TABLE jobs (
             id TEXT PRIMARY KEY, state TEXT NOT NULL, attempt INTEGER NOT NULL,
-            worker_id TEXT, lease_token TEXT, mutation_permit TEXT
+            worker_id TEXT, lease_token TEXT, mutation_permit TEXT, error_code TEXT,
+            settlement_kind TEXT, settlement_worker_id TEXT,
+            settlement_lease_token TEXT, settlement_mutation_permit TEXT,
+            settlement_state TEXT, settlement_error_code TEXT
           );
           INSERT INTO jobs(id, state, attempt) VALUES ('job_upload', 'queued', 0);
       `)
+      let claimedLeaseToken: string | undefined
       let parserPid: number | undefined
       let parserAliveAtSettlement: boolean | undefined
       const server = createHttpsServer({ cert: certificate, key }, (request, response) => {
@@ -909,6 +1208,7 @@ describe('CloudBase knowledge scheduled worker', () => {
             response.end(JSON.stringify(value))
           }
           if (request.url === '/rpc/autoforge_knowledge_claim_job') {
+            claimedLeaseToken = body.p_lease_token
             const changed = database.prepare(`
                 UPDATE jobs SET state = 'running', attempt = attempt + 1,
                   worker_id = ?, lease_token = ?, mutation_permit = 'permit_job_upload'
@@ -939,12 +1239,24 @@ describe('CloudBase knowledge scheduled worker', () => {
           if (request.url === '/rpc/autoforge_knowledge_complete_job') {
             parserAliveAtSettlement = parserPid === undefined
               ? undefined : processIsAlive(parserPid)
+            const current = database.prepare(`
+                SELECT attempt FROM jobs WHERE id = ? AND state = 'running'
+            `).get(body.p_job_id) as { attempt: number } | undefined
+            const nextState = body.p_state === 'failed'
+              && body.p_error_code === 'TRANSIENT_FAILURE'
+              ? (current && current.attempt >= 3 ? 'failed' : 'queued')
+              : body.p_state
             const changed = database.prepare(`
-                UPDATE jobs SET state = 'queued', worker_id = NULL,
-                  lease_token = NULL, mutation_permit = NULL
-                WHERE id = ? AND state = 'running' AND worker_id = ?
+                UPDATE jobs SET state = ?, error_code = ?, worker_id = NULL,
+                  lease_token = NULL, mutation_permit = NULL,
+                  settlement_kind = 'complete', settlement_worker_id = ?,
+                  settlement_lease_token = ?, settlement_mutation_permit = ?,
+                  settlement_state = ?, settlement_error_code = ?
+                WHERE id = ? AND state = 'running' AND attempt = 1 AND worker_id = ?
                   AND lease_token = ? AND mutation_permit = ?
             `).run(
+              nextState, body.p_error_code, body.p_worker_id, body.p_lease_token,
+              body.p_mutation_permit, body.p_state, body.p_error_code,
               body.p_job_id, body.p_worker_id, body.p_lease_token, body.p_mutation_permit,
             )
             expect(changed.changes).toBe(1)
@@ -979,21 +1291,31 @@ describe('CloudBase knowledge scheduled worker', () => {
           scheduler.child.pid, row => row.command.includes('parser-child.js'),
         )
         parserPid = parser.pid
+        expect(processIsAlive(parserPid)).toBe(true)
+        expect(parser.state).not.toContain('T')
+        process.kill(parserPid, 'SIGSTOP')
+        const stoppedParser = await waitForStoppedProcess(parserPid)
         const schedulerRow = (await processRows()).find(row => row.pid === scheduler.child.pid)
         expect(jobChild.groupId).toBe(jobChild.pid)
-        expect(parser.groupId).toBe(jobChild.groupId)
+        expect(stoppedParser.groupId).toBe(jobChild.groupId)
         expect(jobChild.groupId).not.toBe(schedulerRow?.groupId)
-        process.kill(parserPid, 'SIGSTOP')
 
         await expect(scheduler.output).resolves.toEqual({
           ok: true, pid: scheduler.child.pid,
           result: { claimed: 1, completed: 0, failed: 1 },
         })
         expect(database.prepare(`
-            SELECT state, worker_id, lease_token, mutation_permit
+            SELECT state, attempt, worker_id, lease_token, mutation_permit, error_code,
+              settlement_kind, settlement_worker_id, settlement_lease_token,
+              settlement_mutation_permit, settlement_state, settlement_error_code
             FROM jobs WHERE id = 'job_upload'
         `).get()).toEqual({
-          state: 'queued', worker_id: null, lease_token: null, mutation_permit: null,
+          state: 'queued', attempt: 1, worker_id: null, lease_token: null,
+          mutation_permit: null, error_code: 'TRANSIENT_FAILURE',
+          settlement_kind: 'complete', settlement_worker_id: 'worker_1',
+          settlement_lease_token: claimedLeaseToken,
+          settlement_mutation_permit: 'permit_job_upload',
+          settlement_state: 'failed', settlement_error_code: 'TRANSIENT_FAILURE',
         })
         expect(parserAliveAtSettlement).toBe(false)
         expect(processIsAlive(parserPid)).toBe(false)
@@ -1004,6 +1326,7 @@ describe('CloudBase knowledge scheduled worker', () => {
         if (scheduler.child.exitCode === null && scheduler.child.signalCode === null) {
           scheduler.child.kill('SIGKILL')
         }
+        await scheduler.output.catch(() => undefined)
         bytes.fill(0)
         database.close()
         server.closeAllConnections()

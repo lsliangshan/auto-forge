@@ -154,6 +154,7 @@ function createKnowledgeSettlementProcess({
     const frame = encodeFrame(input)
     return await new Promise((resolvePromise, rejectPromise) => {
       let child
+      let onChildError = () => undefined
       try {
         child = spawnImpl(process.execPath, [
           '--no-addons', '--max-old-space-size=64', canonicalChildEntry,
@@ -162,14 +163,25 @@ function createKnowledgeSettlementProcess({
           env: environmentForSettlement(environment),
           stdio: ['pipe', 'pipe', 'pipe'], detached: true, windowsHide: true,
         })
+        child.once('error', error => onChildError(error))
       } catch {
         rejectPromise({ code: 'TRANSIENT_FAILURE' })
         return
       }
       const groupId = child.pid
       if (!Number.isSafeInteger(groupId) || groupId <= 0) {
-        try { child.kill('SIGKILL') } catch { /* spawn failed before PID assignment */ }
-        rejectPromise({ code: 'TRANSIENT_FAILURE' })
+        const closePipes = () => {
+          child.stdin?.destroy()
+          child.stdout?.destroy()
+          child.stderr?.destroy()
+        }
+        child.stdin?.on('error', () => undefined)
+        onChildError = closePipes
+        child.once('close', () => {
+          closePipes()
+          rejectPromise({ code: 'TRANSIENT_FAILURE' })
+        })
+        closePipes()
         return
       }
       let settled = false
@@ -204,7 +216,7 @@ function createKnowledgeSettlementProcess({
       const onAbort = () => stop()
       const timeoutId = setTimeout(stop, timeoutMs)
       boundary?.signal.addEventListener('abort', onAbort, { once: true })
-      child.once('error', stop)
+      onChildError = stop
       child.stdout?.on('data', (chunk) => {
         if (stopping) return
         const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
