@@ -178,6 +178,7 @@ interface KnowledgeCloudLifecycle {
   }): Promise<void>
   enqueue(input: Parameters<KnowledgeSyncService['enqueue']>[0]): void
   synchronize(knowledgeBaseId: string): Promise<unknown>
+  resume(knowledgeBaseId: string): void
   publishGeneration(input: {
     requestId: string
     knowledgeBaseId: string
@@ -306,6 +307,7 @@ export function createLocalKnowledgeService(
     enableSync: async () => fail('SERVICE_UNAVAILABLE'),
     enqueue: () => fail('SERVICE_UNAVAILABLE'),
     synchronize: async () => fail('SERVICE_UNAVAILABLE'),
+    resume: () => fail('SERVICE_UNAVAILABLE'),
     publishGeneration: async () => fail('SERVICE_UNAVAILABLE'),
     beginCloudRetention: (knowledgeBaseId, boundaryAt) => {
       const select = () => database.prepare(`
@@ -814,29 +816,70 @@ export function createLocalKnowledgeService(
     const uploadJobId = pending.uploadJobId
     if (!uploadJobId) return
     if (pending.nextRetryAt > now()) return
+    const currentMode = active.store.database.prepare(`
+      SELECT mode FROM cloud_sync_states WHERE knowledge_base_id = ?
+    `).get(pending.knowledgeBaseId) as { mode: string } | undefined
+    if (currentMode?.mode === 'paused') {
+      active.cloud.resume(pending.knowledgeBaseId)
+      assertCurrentBinding(active)
+      if (!ordinaryCloudAllowed(active)) return
+    }
+    const deferPublication = (errorCode: string): void => {
+      const recoveryAttempt = pending!.recoveryAttempt + 1
+      const retryDelay = Math.min(60_000, 1_000 * (2 ** Math.min(recoveryAttempt - 1, 6)))
+      const observedAt = now()
+      active.store.database.prepare(`
+        UPDATE cloud_pending_publications
+        SET recovery_attempt = ?, next_retry_at = ?, last_error_code = ?, updated_at = ?
+        WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
+      `).run(
+        recoveryAttempt, observedAt + retryDelay, errorCode, observedAt,
+        pending!.knowledgeBaseId, pending!.generationId, uploadJobId,
+      )
+    }
     let completed = false
     for (let poll = 0; poll < 3; poll += 1) {
-      const job = await remote.getJob({ jobId: uploadJobId })
+      let job: Awaited<ReturnType<ProductionCloudKnowledgeRemote['getJob']>>
+      try {
+        job = await remote.getJob({ jobId: uploadJobId })
+      } catch (error) {
+        assertCurrentBinding(active)
+        if (!ordinaryCloudAllowed(active)) return
+        const candidate = typeof error === 'object' && error !== null
+          ? error as { code?: unknown; retryable?: unknown }
+          : {}
+        if (candidate.code === 'TRANSIENT_FAILURE' && candidate.retryable === true) {
+          deferPublication('TRANSIENT_FAILURE')
+        } else {
+          active.store.database.prepare(`
+            UPDATE cloud_pending_publications
+            SET last_error_code = ?, updated_at = ?
+            WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
+          `).run(
+            typeof candidate.code === 'string' ? candidate.code : 'INTERNAL_ERROR', now(),
+            pending.knowledgeBaseId, pending.generationId, uploadJobId,
+          )
+        }
+        return
+      }
       assertCurrentBinding(active)
       if (!ordinaryCloudAllowed(active)) return
       if (job.jobId !== uploadJobId) fail('INTERNAL_ERROR')
       if (job.state === 'completed') { completed = true; break }
       if (job.state === 'failed' || job.state === 'cancelled') {
-        fail('SERVICE_UNAVAILABLE')
+        active.store.database.prepare(`
+          UPDATE cloud_pending_publications
+          SET last_error_code = ?, updated_at = ?
+          WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
+        `).run(
+          job.errorCode ?? (job.state === 'failed' ? 'SERVICE_UNAVAILABLE' : 'CANCELLED'),
+          now(), pending.knowledgeBaseId, pending.generationId, uploadJobId,
+        )
+        return
       }
     }
     if (!completed) {
-      const recoveryAttempt = pending.recoveryAttempt + 1
-      const retryDelay = Math.min(60_000, 1_000 * (2 ** Math.min(recoveryAttempt - 1, 6)))
-      active.store.database.prepare(`
-        UPDATE cloud_pending_publications
-        SET recovery_attempt = ?, next_retry_at = ?,
-          last_error_code = 'GENERATION_NOT_READY', updated_at = ?
-        WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
-      `).run(
-        recoveryAttempt, now() + retryDelay, now(), pending.knowledgeBaseId,
-        pending.generationId, uploadJobId,
-      )
+      deferPublication('GENERATION_NOT_READY')
       return
     }
     await active.cloud.publishGeneration({
@@ -875,6 +918,8 @@ export function createLocalKnowledgeService(
       SELECT knowledge_base_id AS knowledgeBaseId
       FROM cloud_pending_publications
       WHERE next_retry_at <= ?
+        AND (last_error_code IS NULL
+          OR last_error_code IN ('GENERATION_NOT_READY', 'TRANSIENT_FAILURE'))
       ORDER BY next_retry_at, updated_at, knowledge_base_id
       LIMIT 8
     `).all(now()) as Array<{ knowledgeBaseId: string }>

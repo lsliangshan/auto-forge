@@ -459,6 +459,7 @@ describe('local knowledge service', () => {
 
   it('recovers a due queued generation from persisted state on the first search after restart', async () => {
     const memory = memoryKnowledgeStore()
+    let restartNow = 2
     memory.database.exec(`
       INSERT INTO knowledge_bases(
         id, name, created_at, updated_at, lifecycle_status, recycled_at
@@ -481,7 +482,7 @@ describe('local knowledge service', () => {
       UPDATE documents SET active_version_id = 'version_restart' WHERE id = 'document_restart';
       INSERT INTO cloud_sync_states(
         knowledge_base_id, mode, published_generation_id, epoch, updated_at
-      ) VALUES ('base_restart', 'syncing', NULL, 1, 1);
+      ) VALUES ('base_restart', 'paused', NULL, 1, 1);
       INSERT INTO cloud_pending_publications(
         knowledge_base_id, generation_id, document_id, version_id, object_id,
         upload_job_id, publish_request_id, updated_at, recovery_attempt,
@@ -518,7 +519,7 @@ describe('local knowledge service', () => {
         betaEnabled: true, cloudEnabled: true,
       }),
       cloudKillSwitchEnabled: () => false,
-      now: () => 2,
+      now: () => restartNow,
     })
     restarted.configureCloudRemote!(remote)
     await restarted.bind('alice')
@@ -553,6 +554,44 @@ describe('local knowledge service', () => {
     ).get()).toBeUndefined())
     expect(remote.getJob).not.toHaveBeenCalled()
     expect(publishGeneration).not.toHaveBeenCalled()
+
+    memory.database.prepare(`
+      UPDATE cloud_sync_states SET mode = 'syncing', published_generation_id = NULL
+      WHERE knowledge_base_id = 'base_restart'
+    `).run()
+    memory.database.prepare(`
+      INSERT INTO cloud_pending_publications(
+        knowledge_base_id, generation_id, document_id, version_id, object_id,
+        upload_job_id, publish_request_id, updated_at, recovery_attempt,
+        next_retry_at, last_error_code
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'base_restart', 'generation_restart_2', 'document_restart', 'version_restart',
+      'object_restart', 'upload_job_restart_2', 'publish_restart_2', 2, 1, 2,
+      'GENERATION_NOT_READY',
+    )
+    const transient = Object.assign(new Error('lost job response'), {
+      code: 'TRANSIENT_FAILURE', retryable: true,
+    })
+    vi.mocked(remote.getJob).mockReset()
+      .mockRejectedValueOnce(transient)
+      .mockResolvedValue({
+        jobId: 'upload_job_restart_2', state: 'completed', errorCode: null,
+      })
+    await restarted.list({ userId: 'alice' })
+    await vi.waitFor(() => expect(memory.database.prepare(`
+      SELECT recovery_attempt AS recoveryAttempt, next_retry_at AS nextRetryAt,
+        last_error_code AS lastErrorCode
+      FROM cloud_pending_publications WHERE knowledge_base_id = 'base_restart'
+    `).get()).toEqual({
+      recoveryAttempt: 2, nextRetryAt: 2_002, lastErrorCode: 'TRANSIENT_FAILURE',
+    }))
+    await restarted.list({ userId: 'alice' })
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    expect(remote.getJob).toHaveBeenCalledTimes(1)
+    restartNow = 2_002
+    await restarted.list({ userId: 'alice' })
+    await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
   })
 
   it('keeps import and search local when the cloud kill switch is closed', async () => {
