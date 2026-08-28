@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 11
+export const KNOWLEDGE_SCHEMA_VERSION = 12
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -343,6 +343,83 @@ const KNOWLEDGE_SCHEMA_V11 = `
     ADD COLUMN last_error_code TEXT;
 `
 
+const KNOWLEDGE_SCHEMA_V12 = `
+  CREATE TABLE cloud_base_projections (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ready', 'processing', 'paused', 'failed', 'recycled')),
+    published_generation_id TEXT,
+    revision TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE cloud_document_projections (
+    id TEXT PRIMARY KEY,
+    knowledge_base_id TEXT NOT NULL REFERENCES cloud_base_projections(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    active_version_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'ready', 'failed', 'paused', 'deleted')),
+    revision TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (id, knowledge_base_id)
+  ) STRICT;
+
+  CREATE TABLE cloud_generation_projections (
+    id TEXT PRIMARY KEY,
+    knowledge_base_id TEXT NOT NULL REFERENCES cloud_base_projections(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('published', 'retained')),
+    revision TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (id, knowledge_base_id)
+  ) STRICT;
+
+  CREATE TABLE cloud_version_projections (
+    id TEXT PRIMARY KEY,
+    knowledge_base_id TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL CHECK (version_number > 0),
+    status TEXT NOT NULL CHECK (status IN ('staging', 'ready', 'failed', 'retired')),
+    content_hash TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    local_object_available INTEGER NOT NULL DEFAULT 0 CHECK (local_object_available = 0),
+    revision TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (id, document_id),
+    UNIQUE (document_id, version_number),
+    FOREIGN KEY (document_id, knowledge_base_id)
+      REFERENCES cloud_document_projections(id, knowledge_base_id) ON DELETE CASCADE,
+    FOREIGN KEY (generation_id, knowledge_base_id)
+      REFERENCES cloud_generation_projections(id, knowledge_base_id) ON DELETE CASCADE
+  ) STRICT;
+
+  CREATE TABLE cloud_remote_sync_cursors (
+    knowledge_base_id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE cloud_remote_sync_states (
+    knowledge_base_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL CHECK (mode IN ('syncing', 'synced', 'paused', 'failed')),
+    published_generation_id TEXT,
+    epoch INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE cloud_remote_entity_heads (
+    knowledge_base_id TEXT NOT NULL,
+    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('knowledge_base', 'document', 'metadata')),
+    entity_id TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (knowledge_base_id, entity_kind, entity_id)
+  ) STRICT;
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
@@ -355,6 +432,7 @@ const migrations = new Map<number, string>([
   [9, KNOWLEDGE_SCHEMA_V9],
   [10, KNOWLEDGE_SCHEMA_V10],
   [11, KNOWLEDGE_SCHEMA_V11],
+  [12, KNOWLEDGE_SCHEMA_V12],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {

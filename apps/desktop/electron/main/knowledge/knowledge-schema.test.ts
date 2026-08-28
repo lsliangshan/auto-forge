@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v11', () => {
+describe('knowledge schema v12', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(11)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(12)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -55,6 +55,13 @@ describe('knowledge schema v11', () => {
       'cloud_sync_states',
       'cloud_entity_heads',
       'cloud_pending_publications',
+      'cloud_base_projections',
+      'cloud_document_projections',
+      'cloud_version_projections',
+      'cloud_generation_projections',
+      'cloud_remote_sync_cursors',
+      'cloud_remote_sync_states',
+      'cloud_remote_entity_heads',
       'conflicts',
       'sync_cursors',
     ]))
@@ -78,6 +85,53 @@ describe('knowledge schema v11', () => {
       'upload_job_id', 'publish_request_id', 'updated_at', 'recovery_attempt',
       'next_retry_at', 'last_error_code',
     ])
+    expect((database.prepare(
+      'PRAGMA table_info(cloud_version_projections)',
+    ).all() as Array<{ name: string }>).map(column => column.name)).toEqual([
+      'id', 'knowledge_base_id', 'document_id', 'version_number', 'status',
+      'content_hash', 'generation_id', 'created_at', 'local_object_available',
+      'revision', 'updated_at',
+    ])
+    expect(() => database.exec(`
+      INSERT INTO cloud_base_projections(
+        id, name, status, published_generation_id, revision, updated_at
+      ) VALUES ('cloud_base', 'Cloud', 'ready', 'cloud_generation', 'r1', 1);
+      INSERT INTO cloud_document_projections(
+        id, knowledge_base_id, name, mime_type, active_version_id, status, revision, updated_at
+      ) VALUES (
+        'cloud_document', 'cloud_base', 'cloud.txt', 'text/plain',
+        'cloud_version', 'ready', 'r1', 1
+      );
+      INSERT INTO cloud_generation_projections(
+        id, knowledge_base_id, status, revision, updated_at
+      ) VALUES ('cloud_generation', 'cloud_base', 'published', 'r1', 1);
+      INSERT INTO cloud_version_projections(
+        id, knowledge_base_id, document_id, version_number, status, content_hash,
+        generation_id, created_at, local_object_available, revision, updated_at
+      ) VALUES (
+        'cloud_version', 'cloud_base', 'cloud_document', 1, 'ready', 'hash',
+        'cloud_generation', 1, 1, 'r1', 1
+      );
+    `)).toThrow(/check constraint/i)
+    expect((database.prepare(
+      "PRAGMA foreign_key_list('sync_cursors')",
+    ).all() as Array<{ table: string }>).map(foreignKey => foreignKey.table)).toContain(
+      'knowledge_bases',
+    )
+    expect((database.prepare(
+      "PRAGMA foreign_key_list('cloud_sync_states')",
+    ).all() as Array<{ table: string }>).map(foreignKey => foreignKey.table)).toContain(
+      'knowledge_bases',
+    )
+    database.prepare(`
+      INSERT INTO cloud_remote_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES (?, 'syncing', NULL, 1, ?)
+    `).run('remote_only_base', 1)
+    database.prepare(`
+      INSERT INTO cloud_remote_sync_cursors(knowledge_base_id, sequence, updated_at)
+      VALUES (?, ?, ?)
+    `).run('remote_only_base', 7, 1)
   })
 
   it('backfills immutable version metadata when upgrading a v2 database', () => {
@@ -85,6 +139,13 @@ describe('knowledge schema v11', () => {
     initializeKnowledgeSchema(database)
     database.prepare('DELETE FROM knowledge_schema_migrations WHERE version >= 3').run()
     database.exec(`
+      DROP TABLE cloud_version_projections;
+      DROP TABLE cloud_generation_projections;
+      DROP TABLE cloud_document_projections;
+      DROP TABLE cloud_base_projections;
+      DROP TABLE cloud_remote_sync_cursors;
+      DROP TABLE cloud_remote_sync_states;
+      DROP TABLE cloud_remote_entity_heads;
       DROP TABLE knowledge_provider_consents;
       DROP TABLE cloud_pending_publications;
       DROP TABLE cloud_entity_heads;
