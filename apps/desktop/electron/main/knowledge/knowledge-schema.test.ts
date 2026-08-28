@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v12', () => {
+describe('knowledge schema v13', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(12)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(13)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -83,7 +83,9 @@ describe('knowledge schema v12', () => {
     ).all() as Array<{ name: string }>).map(column => column.name)).toEqual([
       'knowledge_base_id', 'generation_id', 'document_id', 'version_id', 'object_id',
       'upload_job_id', 'publish_request_id', 'updated_at', 'recovery_attempt',
-      'next_retry_at', 'last_error_code',
+      'next_retry_at', 'last_error_code', 'upload_attempt', 'upload_request_id',
+      'upload_ticket', 'storage_reference', 'upload_authorization_json',
+      'upload_authorization_expires_at', 'upload_put_completed', 'upload_verified',
     ])
     expect((database.prepare(
       'PRAGMA table_info(cloud_version_projections)',

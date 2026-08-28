@@ -23,7 +23,11 @@ import { ImportJobRunner, type KnowledgeParserPort } from './import-job-runner.j
 import { LocalKnowledgeRetriever } from './local-retriever.js'
 import type { LocalKnowledgeVersionScope } from './local-retriever.js'
 import { CloudKnowledgeRetriever, type CloudCandidate } from './cloud-retriever.js'
-import type { CloudKnowledgeChange } from './cloudbase-knowledge-client.js'
+import type {
+  CloudKnowledgeChange,
+  CloudUploadAuthorization,
+  CloudUploadRecoveryState,
+} from './cloudbase-knowledge-client.js'
 import { sanitizeKnowledgeText } from './knowledge-sanitizer.js'
 import type { KnowledgeOwner, KnowledgeService } from './knowledge-types.js'
 import { PARSER_MEDIA_TYPES, type ParserMediaType } from './parser-protocol.js'
@@ -193,6 +197,8 @@ interface KnowledgeCloudLifecycle {
     knowledgeBaseId: string
     generationId: string
   }): Promise<void>
+  recordOrphan(knowledgeBaseId: string, storageReference: string): void
+  cleanupOrphans(knowledgeBaseId: string): Promise<void>
   beginCloudRetention(knowledgeBaseId: string, boundaryAt: number): CloudRetentionState
   advanceCloudRetention(knowledgeBaseId: string): Promise<CloudRetentionState | undefined>
   purgeCloudImmediately(knowledgeBaseId: string): Promise<void>
@@ -406,6 +412,8 @@ export function createLocalKnowledgeService(
     synchronizeOwnerCatalog: async () => fail('SERVICE_UNAVAILABLE'),
     resume: () => fail('SERVICE_UNAVAILABLE'),
     publishGeneration: async () => fail('SERVICE_UNAVAILABLE'),
+    recordOrphan: () => fail('SERVICE_UNAVAILABLE'),
+    cleanupOrphans: async () => fail('SERVICE_UNAVAILABLE'),
     beginCloudRetention: (knowledgeBaseId, boundaryAt) => {
       const select = () => database.prepare(`
         SELECT knowledge_base_id AS knowledgeBaseId, stage, download_until AS downloadUntil,
@@ -973,6 +981,14 @@ export function createLocalKnowledgeService(
     recoveryAttempt: number
     nextRetryAt: number
     lastErrorCode: string | null
+    uploadAttempt: number
+    uploadRequestId: string | null
+    uploadTicket: string | null
+    storageReference: string | null
+    uploadAuthorizationJson: string | null
+    uploadAuthorizationExpiresAt: number | null
+    uploadPutCompleted: number
+    uploadVerified: number
   }
 
   const pendingCloudPublication = (
@@ -985,6 +1001,14 @@ export function createLocalKnowledgeService(
       pending.upload_job_id AS uploadJobId, pending.publish_request_id AS publishRequestId,
       pending.recovery_attempt AS recoveryAttempt, pending.next_retry_at AS nextRetryAt,
       pending.last_error_code AS lastErrorCode,
+      pending.upload_attempt AS uploadAttempt,
+      pending.upload_request_id AS uploadRequestId,
+      pending.upload_ticket AS uploadTicket,
+      pending.storage_reference AS storageReference,
+      pending.upload_authorization_json AS uploadAuthorizationJson,
+      pending.upload_authorization_expires_at AS uploadAuthorizationExpiresAt,
+      pending.upload_put_completed AS uploadPutCompleted,
+      pending.upload_verified AS uploadVerified,
       base.name AS baseName, document.name AS documentName, version.mime_type AS mimeType,
       version.version_number AS versionNumber, version.content_hash AS contentHash,
       version.created_at AS createdAt
@@ -997,6 +1021,33 @@ export function createLocalKnowledgeService(
     WHERE pending.knowledge_base_id = ?
   `).get(knowledgeBaseId) as PendingCloudPublication | undefined
 
+  const persistedUploadRecovery = (
+    pending: PendingCloudPublication,
+  ): CloudUploadRecoveryState | undefined => {
+    if (!pending.uploadAuthorizationJson) return undefined
+    let candidate: unknown
+    try { candidate = JSON.parse(pending.uploadAuthorizationJson) } catch { fail('INTERNAL_ERROR') }
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      fail('INTERNAL_ERROR')
+    }
+    const authorization = candidate as Partial<CloudUploadAuthorization>
+    const expiresAt = typeof authorization.expiresAt === 'string'
+      ? Date.parse(authorization.expiresAt)
+      : Number.NaN
+    if (!pending.uploadRequestId || !pending.uploadTicket || !pending.storageReference
+      || pending.uploadJobId === null || !Number.isSafeInteger(expiresAt)
+      || authorization.uploadTicket !== pending.uploadTicket
+      || authorization.storageReference !== pending.storageReference
+      || authorization.jobId !== pending.uploadJobId
+      || expiresAt !== pending.uploadAuthorizationExpiresAt) {
+      fail('INTERNAL_ERROR')
+    }
+    return {
+      authorization: authorization as CloudUploadAuthorization,
+      putCompleted: pending.uploadPutCompleted === 1,
+    }
+  }
+
   const processCloudPublication = async (
     active: Binding,
     knowledgeBaseId: string,
@@ -1006,8 +1057,14 @@ export function createLocalKnowledgeService(
     const cloudAllowed = () => ordinaryCloudAllowed(active)
       && isCloudConsentCurrent(active, consentEpoch)
     if (!remote || !cloudAllowed()) return
-    let pending = pendingCloudPublication(active, knowledgeBaseId)
-    if (!pending) return
+    const initialPending = pendingCloudPublication(active, knowledgeBaseId)
+    if (!initialPending) return
+    let pending: PendingCloudPublication = initialPending
+    const reloadPending = (): PendingCloudPublication => {
+      const reloaded = pendingCloudPublication(active, knowledgeBaseId)
+      if (!reloaded) fail('CONFLICT')
+      return reloaded
+    }
     if (pending.nextRetryAt > now()) return
     const deferPublication = (errorCode: string): void => {
       const recoveryAttempt = pending!.recoveryAttempt + 1
@@ -1092,7 +1149,7 @@ export function createLocalKnowledgeService(
       `).run(pending.knowledgeBaseId, pending.generationId)
       return
     }
-    if (!pending.uploadJobId) {
+    if (pending.uploadAttempt === 0 && pending.uploadVerified === 0) {
       const revision = stableCloudId(
         'revision', pending.documentId, pending.versionId, pending.contentHash,
       )
@@ -1148,6 +1205,48 @@ export function createLocalKnowledgeService(
         terminalPublication('SYNC_FAILED')
         return
       }
+    }
+    while (pending.uploadVerified === 0) {
+      let recovery = persistedUploadRecovery(pending)
+      const retireAuthorization = async (): Promise<void> => {
+        if (!recovery) return
+        active.cloud.recordOrphan(
+          pending!.knowledgeBaseId, recovery.authorization.storageReference,
+        )
+        const retired = active.store.database.prepare(`
+          UPDATE cloud_pending_publications
+          SET upload_request_id = NULL, upload_ticket = NULL, upload_job_id = NULL,
+            storage_reference = NULL, upload_authorization_json = NULL,
+            upload_authorization_expires_at = NULL, upload_put_completed = 0,
+            updated_at = ?
+          WHERE knowledge_base_id = ? AND generation_id = ?
+            AND upload_verified = 0 AND upload_ticket = ?
+        `).run(
+          now(), pending!.knowledgeBaseId, pending!.generationId,
+          recovery.authorization.uploadTicket,
+        )
+        if (retired.changes !== 1) fail('CONFLICT')
+        await active.cloud.cleanupOrphans(pending!.knowledgeBaseId)
+        assertCurrentBinding(active)
+        if (!cloudAllowed()) return
+        pending = reloadPending()
+        recovery = undefined
+      }
+      if (recovery && !recovery.putCompleted
+        && pending.uploadAuthorizationExpiresAt! <= now()) {
+        try {
+          await retireAuthorization()
+          if (!cloudAllowed()) return
+        } catch (error) {
+          assertCurrentBinding(active)
+          if (cloudAllowed()) recordPublicationFailure(error)
+          return
+        }
+      }
+      if (!recovery && pending.uploadAttempt >= 3) {
+        terminalPublication('UPLOAD_AUTHORIZATION_EXPIRED')
+        return
+      }
       let bytes: Buffer
       try {
         bytes = await active.store.objects.read(pending.objectId)
@@ -1158,8 +1257,15 @@ export function createLocalKnowledgeService(
       }
       assertCurrentBinding(active)
       try {
+        const uploadAttempt = recovery ? pending.uploadAttempt : pending.uploadAttempt + 1
+        const uploadRequestId = recovery
+          ? pending.uploadRequestId!
+          : stableCloudId(
+              'upload', pending.documentId, pending.versionId, String(uploadAttempt),
+            )
+        let observedAuthorization = recovery !== undefined
         const uploaded = await remote.uploadDocument({
-          requestId: stableCloudId('upload', pending.documentId, pending.versionId),
+          requestId: uploadRequestId,
           knowledgeBaseId: pending.knowledgeBaseId,
           documentId: pending.documentId,
           versionId: pending.versionId,
@@ -1167,21 +1273,86 @@ export function createLocalKnowledgeService(
           sha256: pending.contentHash,
           mimeType: pending.mimeType,
           bytes,
+        }, {
+          ...(recovery ? { resume: recovery } : {}),
+          onRecoveryState: async state => {
+            assertCurrentBinding(active)
+            if (!observedAuthorization && state.putCompleted) fail('INTERNAL_ERROR')
+            const authorization = state.authorization
+            const expiresAt = Date.parse(authorization.expiresAt)
+            const encoded = JSON.stringify(authorization)
+            if (!Number.isSafeInteger(expiresAt) || Buffer.byteLength(encoded, 'utf8') > 8_192
+              || authorization.mimeType !== pending!.mimeType
+              || authorization.uploadAuthorization.expiresAt !== authorization.expiresAt
+              || authorization.uploadAuthorization.headers['content-length'] !== String(bytes.byteLength)
+              || authorization.uploadAuthorization.headers['content-type'] !== pending!.mimeType
+              || authorization.uploadAuthorization.headers['x-content-sha256'] !== pending!.contentHash
+              || authorization.uploadAuthorization.headers['x-upload-ticket']
+                !== authorization.uploadTicket) {
+              fail('INTERNAL_ERROR')
+            }
+            const updated = active.store.database.prepare(`
+              UPDATE cloud_pending_publications
+              SET upload_attempt = ?, upload_request_id = ?, upload_ticket = ?,
+                upload_job_id = ?, storage_reference = ?, upload_authorization_json = ?,
+                upload_authorization_expires_at = ?, upload_put_completed = ?,
+                recovery_attempt = 0, next_retry_at = 0, last_error_code = NULL,
+                updated_at = ?
+              WHERE knowledge_base_id = ? AND generation_id = ? AND upload_verified = 0
+                AND (upload_ticket IS NULL OR upload_ticket = ?)
+            `).run(
+              uploadAttempt, uploadRequestId, authorization.uploadTicket,
+              authorization.jobId, authorization.storageReference, encoded, expiresAt,
+              Number(state.putCompleted), now(), pending!.knowledgeBaseId,
+              pending!.generationId, authorization.uploadTicket,
+            )
+            if (updated.changes !== 1) fail('CONFLICT')
+            observedAuthorization = true
+            pending = reloadPending()
+            recovery = state
+            if (!cloudAllowed()) fail('CONFLICT')
+          },
         })
         assertCurrentBinding(active)
-        if (!cloudAllowed()) return
+        if (!cloudAllowed()) {
+          await retireAuthorization()
+          return
+        }
+        if (!observedAuthorization || pending.uploadPutCompleted !== 1
+          || pending.uploadJobId !== uploaded.jobId
+          || pending.storageReference !== uploaded.storageReference) {
+          fail('INTERNAL_ERROR')
+        }
         const updated = active.store.database.prepare(`
-          UPDATE cloud_pending_publications SET upload_job_id = ?, recovery_attempt = 0,
+          UPDATE cloud_pending_publications SET upload_verified = 1, recovery_attempt = 0,
             next_retry_at = 0, last_error_code = NULL, updated_at = ?
-          WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id IS NULL
+          WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
+            AND storage_reference = ? AND upload_put_completed = 1 AND upload_verified = 0
         `).run(
-          uploaded.jobId, now(), pending.knowledgeBaseId, pending.generationId,
+          now(), pending.knowledgeBaseId, pending.generationId,
+          uploaded.jobId, uploaded.storageReference,
         )
         if (updated.changes !== 1) fail('CONFLICT')
-        pending = { ...pending, uploadJobId: uploaded.jobId }
+        pending = reloadPending()
       } catch (error) {
         assertCurrentBinding(active)
-        if (cloudAllowed()) recordPublicationFailure(error)
+        if (!cloudAllowed()) {
+          try { await retireAuthorization() } catch { /* durable orphan retry remains */ }
+          return
+        }
+        const failure = classifyPublicationFailure(error)
+        if (recovery && (failure.code === 'CONFLICT' || failure.code === 'FORBIDDEN')) {
+          try {
+            await retireAuthorization()
+            if (!cloudAllowed()) return
+          } catch (retirementError) {
+            assertCurrentBinding(active)
+            if (cloudAllowed()) recordPublicationFailure(retirementError)
+            return
+          }
+          continue
+        }
+        recordPublicationFailure(error)
         return
       } finally {
         bytes.fill(0)
@@ -1275,6 +1446,17 @@ export function createLocalKnowledgeService(
   }
 
   const recoverDueCloudPublications = (active: Binding): void => {
+    const orphaned = active.store.database.prepare(`
+      SELECT DISTINCT knowledge_base_id AS knowledgeBaseId
+      FROM cloud_sync_orphans ORDER BY knowledge_base_id LIMIT 8
+    `).all() as Array<{ knowledgeBaseId: string }>
+    for (const row of orphaned) {
+      const cleanup = serialCloudTask(active, row.knowledgeBaseId, async () => {
+        await active.cloud.cleanupOrphans(row.knowledgeBaseId)
+        assertCurrentBinding(active)
+      })
+      void cleanup.catch(() => undefined)
+    }
     if (!ordinaryCloudAllowed(active)) return
     const consentEpoch = active.cloudConsentEpoch
     const rows = active.store.database.prepare(`

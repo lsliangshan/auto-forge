@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { generateKeyPairSync, sign } from 'node:crypto'
+import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import type { KnowledgeEntitlementState } from '@autoforge/shared'
 import { KnowledgeStoreFactory } from './encrypted-database.js'
@@ -10,6 +10,10 @@ import { canonicalizeEntitlementPayload, KnowledgeEntitlementVerifier } from './
 import type { KnowledgeParserPort } from './import-job-runner.js'
 import { memoryKnowledgeStore, parsedText } from './knowledge-test-support.js'
 import type { CloudKnowledgeRemote } from './sync-service.js'
+import type {
+  CloudUploadDocumentOptions,
+  CloudUploadRecoveryState,
+} from './cloudbase-knowledge-client.js'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -48,8 +52,25 @@ function cloudRemote(overrides: Partial<CloudKnowledgeRemote> = {}): CloudKnowle
       generationId: input.generationId,
       status: 'staging' as const,
     })),
-    uploadDocument: vi.fn().mockResolvedValue({
-      jobId: 'unused', storageReference: 'knowledge/unused',
+    uploadDocument: vi.fn(async (input, options) => {
+      const expiresAt = '2026-09-30T00:00:00.000Z'
+      const authorization: CloudUploadRecoveryState['authorization'] = {
+        uploadTicket: `ticket_${input.requestId}`,
+        storageReference: `knowledge/unused/${input.requestId}`,
+        objectId: `object_${input.requestId}`, jobId: `job_${input.requestId}`,
+        mimeType: input.mimeType, expiresAt, uploadAuthorization: {
+          url: `https://storage.invalid/${input.requestId}`, method: 'PUT', headers: {
+            'content-length': String(input.byteSize), 'content-type': input.mimeType,
+            'x-content-sha256': input.sha256, 'x-upload-ticket': `ticket_${input.requestId}`,
+          }, expiresAt,
+        },
+      }
+      if (!options.resume) {
+        await options.onRecoveryState({ authorization, putCompleted: false })
+        await options.onRecoveryState({ authorization, putCompleted: true })
+      }
+      const active = options.resume?.authorization ?? authorization
+      return { jobId: active.jobId, storageReference: active.storageReference }
     }),
     search: vi.fn().mockResolvedValue({
       generationState: 'published', generations: [], strategy: 'keyword_only_consent',
@@ -90,9 +111,22 @@ async function failingPublication(
       hasMore: false, changes: [],
     }
   })
-  const uploadDocument = vi.fn(async () => {
+  const uploadDocument = vi.fn(async (input, options) => {
     if (phase === 'upload') throw failure
-    return { jobId: 'phase_upload_job', storageReference: 'knowledge/phase/object' }
+    const expiresAt = '2026-09-30T00:00:00.000Z'
+    const authorization: CloudUploadRecoveryState['authorization'] = {
+      uploadTicket: 'phase_upload_ticket', storageReference: 'knowledge/phase/object',
+      objectId: 'phase_object', jobId: 'phase_upload_job', mimeType: input.mimeType,
+      expiresAt, uploadAuthorization: {
+        url: 'https://storage.invalid/phase', method: 'PUT', headers: {
+          'content-length': String(input.byteSize), 'content-type': input.mimeType,
+          'x-content-sha256': input.sha256, 'x-upload-ticket': 'phase_upload_ticket',
+        }, expiresAt,
+      },
+    }
+    await options.onRecoveryState({ authorization, putCompleted: false })
+    await options.onRecoveryState({ authorization, putCompleted: true })
+    return { jobId: authorization.jobId, storageReference: authorization.storageReference }
   })
   const publishGeneration = vi.fn(async (input: { generationId: string }) => {
     if (phase === 'publish') throw failure
@@ -150,6 +184,87 @@ async function failingPublication(
   return {
     memory, service, owner, baseId: base.id, phaseCall,
     setNow: (value: number) => { observedAt = value },
+  }
+}
+
+async function recoverablePublication(
+  uploadDocument: NonNullable<CloudKnowledgeRemote['uploadDocument']>,
+  cleanupOrphans = vi.fn().mockResolvedValue({ removed: 1 }),
+) {
+  const memory = memoryKnowledgeStore()
+  let observedAt = 1_000
+  const bytes = Buffer.from('recoverable publication')
+  const contentHash = createHash('sha256').update(bytes).digest('hex')
+  memory.objects.values.set('object_recovery', bytes)
+  memory.database.exec(`
+    INSERT INTO knowledge_bases(id, name, created_at, updated_at)
+    VALUES ('base_recovery', 'Recovery', 1, 1);
+    INSERT INTO documents(
+      id, knowledge_base_id, name, mime_type, active_version_id, created_at, updated_at,
+      lifecycle_status, publication_generation
+    ) VALUES (
+      'document_recovery', 'base_recovery', 'recovery.txt', 'text/plain', NULL,
+      1, 1, 'ready', 1
+    );
+    INSERT INTO document_versions(
+      id, document_id, version_number, status, content_hash, object_id, created_at,
+      publication_generation, name, mime_type
+    ) VALUES (
+      'version_recovery', 'document_recovery', 1, 'ready', '${contentHash}',
+      'object_recovery', 1, 1, 'recovery.txt', 'text/plain'
+    );
+    UPDATE documents SET active_version_id = 'version_recovery'
+    WHERE id = 'document_recovery';
+    INSERT INTO cloud_sync_states(
+      knowledge_base_id, mode, published_generation_id, epoch, updated_at
+    ) VALUES ('base_recovery', 'syncing', NULL, 1, 1);
+    INSERT INTO cloud_pending_publications(
+      knowledge_base_id, generation_id, document_id, version_id, object_id,
+      upload_job_id, publish_request_id, updated_at
+    ) VALUES (
+      'base_recovery', 'generation_recovery', 'document_recovery', 'version_recovery',
+      'object_recovery', NULL, 'publish_recovery', 1
+    );
+    INSERT INTO knowledge_entitlement_projection(
+      singleton, tier, status, beta_enabled, cloud_enabled, epoch, updated_at,
+      accepted_key_generation, verified, explicit_free, max_observed_at
+    ) VALUES (1, 'member', 'active', 1, 1, 1, 1, 1, 1, 0, 1);
+  `)
+  const remote = cloudRemote({
+    uploadDocument,
+    cleanupOrphans,
+    publishGeneration: vi.fn(async input => ({
+      generationId: input.generationId, previousGenerationId: null, sequence: 3,
+    })),
+    getJob: vi.fn(async input => ({
+      jobId: input.jobId, state: 'completed' as const, errorCode: null,
+    })),
+  })
+  const service = createLocalKnowledgeService({
+    openStore: async () => memory.store,
+    selectImportFiles: async () => [],
+    createParser: () => ({
+      parse: async () => parsedText('unused'), terminateAll: async () => undefined,
+    }),
+    saveExport: async () => undefined,
+    isMember: () => true,
+    entitlement: () => ({
+      tier: 'member', status: 'active', localEnabled: true,
+      betaEnabled: true, cloudEnabled: true,
+    }),
+    cloudKillSwitchEnabled: () => false,
+    now: () => observedAt,
+  })
+  service.configureCloudRemote!(remote)
+  await service.bind('alice', true)
+  memory.database.prepare(`
+    UPDATE cloud_sync_states SET mode = 'syncing'
+    WHERE knowledge_base_id = 'base_recovery'
+  `).run()
+  return {
+    memory, remote, service, cleanupOrphans,
+    setNow: (value: number) => { observedAt = value },
+    trigger: () => service.list({ userId: 'alice' }),
   }
 }
 
@@ -366,8 +481,21 @@ describe('local knowledge service', () => {
     const beginGeneration = vi.fn(async (input: {
       knowledgeBaseId: string; generationId: string
     }) => ({ ...input, status: 'staging' as const }))
-    const uploadDocument = vi.fn().mockResolvedValue({
-      jobId: 'upload_job_1', storageReference: 'knowledge/1/base/object_1',
+    const uploadDocument = vi.fn(async (input, options) => {
+      const expiresAt = '2026-09-30T00:00:00.000Z'
+      const authorization: CloudUploadRecoveryState['authorization'] = {
+        uploadTicket: 'upload_ticket_1', storageReference: 'knowledge/1/base/object_1',
+        objectId: 'upload_object_1', jobId: 'upload_job_1', mimeType: input.mimeType,
+        expiresAt, uploadAuthorization: {
+          url: 'https://storage.invalid/upload_1', method: 'PUT', headers: {
+            'content-length': String(input.byteSize), 'content-type': input.mimeType,
+            'x-content-sha256': input.sha256, 'x-upload-ticket': 'upload_ticket_1',
+          }, expiresAt,
+        },
+      }
+      await options.onRecoveryState({ authorization, putCompleted: false })
+      await options.onRecoveryState({ authorization, putCompleted: true })
+      return { jobId: authorization.jobId, storageReference: authorization.storageReference }
     })
     const search = vi.fn(async ({ knowledgeBaseIds }: { knowledgeBaseIds: string[] }) => ({
       generationState: 'published',
@@ -454,7 +582,7 @@ describe('local knowledge service', () => {
     expect(beginGeneration).toHaveBeenCalledOnce()
     expect(uploadDocument).toHaveBeenCalledWith(expect.objectContaining({
       knowledgeBaseId: base.id, documentId: document.id, bytes: expect.any(Buffer),
-    }))
+    }), expect.objectContaining({ onRecoveryState: expect.any(Function) }))
     expect(remote.pushMutation).toHaveBeenCalled()
     expect(remote.pushMutation).toHaveBeenCalledWith(expect.objectContaining({
       knowledgeBaseId: base.id,
@@ -781,8 +909,21 @@ describe('local knowledge service', () => {
       mutationId: input.mutationId, status: 'applied' as const,
       sequence: 1, revision: input.mutationId,
     }))
-    const uploadDocument = vi.fn().mockResolvedValue({
-      jobId: 'upload_job_late', storageReference: 'knowledge/1/base/object_late',
+    const uploadDocument = vi.fn(async (input, options) => {
+      const expiresAt = '2026-09-30T00:00:00.000Z'
+      const authorization: CloudUploadRecoveryState['authorization'] = {
+        uploadTicket: 'upload_ticket_late', storageReference: 'knowledge/1/base/object_late',
+        objectId: 'upload_object_late', jobId: 'upload_job_late', mimeType: input.mimeType,
+        expiresAt, uploadAuthorization: {
+          url: 'https://storage.invalid/upload_late', method: 'PUT', headers: {
+            'content-length': String(input.byteSize), 'content-type': input.mimeType,
+            'x-content-sha256': input.sha256, 'x-upload-ticket': 'upload_ticket_late',
+          }, expiresAt,
+        },
+      }
+      await options.onRecoveryState({ authorization, putCompleted: false })
+      await options.onRecoveryState({ authorization, putCompleted: true })
+      return { jobId: authorization.jobId, storageReference: authorization.storageReference }
     })
     const getJob = vi.fn()
       .mockResolvedValueOnce({ jobId: 'upload_job_late', state: 'running' as const, errorCode: null })
@@ -926,11 +1067,11 @@ describe('local knowledge service', () => {
       ) VALUES ('base_restart', 'paused', NULL, 1, 1);
       INSERT INTO cloud_pending_publications(
         knowledge_base_id, generation_id, document_id, version_id, object_id,
-        upload_job_id, publish_request_id, updated_at, recovery_attempt,
+        upload_job_id, upload_verified, publish_request_id, updated_at, recovery_attempt,
         next_retry_at, last_error_code
       ) VALUES (
         'base_restart', 'generation_restart', 'document_restart', 'version_restart',
-        'object_restart', 'upload_job_restart', 'publish_restart', 1, 1, 1,
+        'object_restart', 'upload_job_restart', 1, 'publish_restart', 1, 1, 1,
         'GENERATION_NOT_READY'
       );
       INSERT INTO knowledge_entitlement_projection(
@@ -979,12 +1120,12 @@ describe('local knowledge service', () => {
     memory.database.prepare(`
       INSERT INTO cloud_pending_publications(
         knowledge_base_id, generation_id, document_id, version_id, object_id,
-        upload_job_id, publish_request_id, updated_at, recovery_attempt,
+        upload_job_id, upload_verified, publish_request_id, updated_at, recovery_attempt,
         next_retry_at, last_error_code
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       'base_restart', 'generation_restart', 'document_restart', 'version_restart',
-      'object_restart', 'upload_job_restart', 'publish_restart', 2, 1, 2,
+      'object_restart', 'upload_job_restart', 1, 'publish_restart', 2, 1, 2,
       'GENERATION_NOT_READY',
     )
     vi.mocked(remote.getJob).mockClear()
@@ -1003,12 +1144,12 @@ describe('local knowledge service', () => {
     memory.database.prepare(`
       INSERT INTO cloud_pending_publications(
         knowledge_base_id, generation_id, document_id, version_id, object_id,
-        upload_job_id, publish_request_id, updated_at, recovery_attempt,
+        upload_job_id, upload_verified, publish_request_id, updated_at, recovery_attempt,
         next_retry_at, last_error_code
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       'base_restart', 'generation_restart_2', 'document_restart', 'version_restart',
-      'object_restart', 'upload_job_restart_2', 'publish_restart_2', 2, 1, 2,
+      'object_restart', 'upload_job_restart_2', 1, 'publish_restart_2', 2, 1, 2,
       'GENERATION_NOT_READY',
     )
     const transient = Object.assign(new Error('lost job response'), {
@@ -1033,6 +1174,180 @@ describe('local knowledge service', () => {
     restartNow = 2_002
     await restarted.list({ userId: 'alice' })
     await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
+  })
+
+  it('persists upload authorization before PUT and resumes after a lost verify response', async () => {
+    const observedOptions: CloudUploadDocumentOptions[] = []
+    const authorization = {
+      uploadTicket: 'ticket_lost_verify',
+      storageReference: 'knowledge/1/base_recovery/object_lost_verify',
+      objectId: 'object_lost_verify', jobId: 'job_lost_verify', mimeType: 'text/plain',
+      expiresAt: '2026-09-01T00:00:00.000Z', uploadAuthorization: {
+        url: 'https://storage.invalid/ticket_lost_verify', method: 'PUT' as const,
+        headers: {
+          'content-length': '23', 'content-type': 'text/plain',
+          'x-content-sha256': createHash('sha256')
+            .update(Buffer.from('recoverable publication')).digest('hex'),
+          'x-upload-ticket': 'ticket_lost_verify',
+        }, expiresAt: '2026-09-01T00:00:00.000Z',
+      },
+    }
+    const uploadDocument = vi.fn(async (
+      _input: Parameters<NonNullable<CloudKnowledgeRemote['uploadDocument']>>[0],
+      options: CloudUploadDocumentOptions,
+    ) => {
+      observedOptions.push(options)
+      if (uploadDocument.mock.calls.length === 1) {
+        await options.onRecoveryState({ authorization, putCompleted: false })
+        expect(fixture.memory.database.prepare(`
+          SELECT upload_ticket AS uploadTicket, upload_job_id AS uploadJobId,
+            storage_reference AS storageReference, upload_put_completed AS putCompleted
+          FROM cloud_pending_publications WHERE knowledge_base_id = 'base_recovery'
+        `).get()).toEqual({
+          uploadTicket: authorization.uploadTicket, uploadJobId: authorization.jobId,
+          storageReference: authorization.storageReference, putCompleted: 0,
+        })
+        await options.onRecoveryState({ authorization, putCompleted: true })
+        throw Object.assign(new Error('verify response lost'), {
+          code: 'TRANSIENT_FAILURE', retryable: true,
+        })
+      }
+      expect(options.resume).toEqual({ authorization, putCompleted: true })
+      return { jobId: authorization.jobId, storageReference: authorization.storageReference }
+    })
+    const fixture = await recoverablePublication(uploadDocument)
+
+    await fixture.trigger()
+    await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(fixture.memory.database.prepare(`
+      SELECT upload_ticket AS uploadTicket, upload_put_completed AS putCompleted,
+        upload_verified AS uploadVerified, last_error_code AS lastErrorCode
+      FROM cloud_pending_publications WHERE knowledge_base_id = 'base_recovery'
+    `).get()).toEqual({
+      uploadTicket: authorization.uploadTicket, putCompleted: 1,
+      uploadVerified: 0, lastErrorCode: 'TRANSIENT_FAILURE',
+    }))
+
+    fixture.setNow(2_000)
+    await fixture.trigger()
+    await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledTimes(2))
+    expect(observedOptions[1]!.resume).toEqual({ authorization, putCompleted: true })
+  })
+
+  it('retires an expired unused authorization before issuing a bounded new attempt', async () => {
+    const calls: Array<{ requestId: string; resume?: CloudUploadRecoveryState }> = []
+    let persistedSecondAttempt: unknown
+    const authorization = (suffix: string, expiresAt: string): CloudUploadRecoveryState['authorization'] => ({
+      uploadTicket: `ticket_${suffix}`,
+      storageReference: `knowledge/1/base_recovery/object_${suffix}`,
+      objectId: `object_${suffix}`, jobId: `job_${suffix}`, mimeType: 'text/plain',
+      expiresAt, uploadAuthorization: {
+        url: `https://storage.invalid/ticket_${suffix}`, method: 'PUT', headers: {
+          'content-length': '23', 'content-type': 'text/plain',
+          'x-content-sha256': createHash('sha256')
+            .update(Buffer.from('recoverable publication')).digest('hex'),
+          'x-upload-ticket': `ticket_${suffix}`,
+        }, expiresAt,
+      },
+    })
+    const expired = authorization('expired', '1970-01-01T00:00:01.500Z')
+    const current = authorization('current', '1970-01-01T00:01:00.000Z')
+    const uploadDocument = vi.fn(async (
+      input: Parameters<NonNullable<CloudKnowledgeRemote['uploadDocument']>>[0],
+      options: CloudUploadDocumentOptions,
+    ) => {
+      calls.push({ requestId: input.requestId, ...(options.resume ? { resume: options.resume } : {}) })
+      if (uploadDocument.mock.calls.length === 1) {
+        await options.onRecoveryState({ authorization: expired, putCompleted: false })
+        throw Object.assign(new Error('offline before PUT'), {
+          code: 'TRANSIENT_FAILURE', retryable: true,
+        })
+      }
+      expect(options.resume).toBeUndefined()
+      await options.onRecoveryState({ authorization: current, putCompleted: false })
+      await options.onRecoveryState({ authorization: current, putCompleted: true })
+      persistedSecondAttempt = fixture.memory.database.prepare(`
+        SELECT upload_attempt AS uploadAttempt, upload_ticket AS uploadTicket,
+          storage_reference AS storageReference, upload_put_completed AS putCompleted
+        FROM cloud_pending_publications WHERE knowledge_base_id = 'base_recovery'
+      `).get()
+      return { jobId: current.jobId, storageReference: current.storageReference }
+    })
+    const fixture = await recoverablePublication(uploadDocument)
+
+    await fixture.trigger()
+    await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledOnce())
+    fixture.setNow(3_000)
+    await fixture.trigger()
+    await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledTimes(2))
+
+    expect(calls[0]!.requestId).not.toBe(calls[1]!.requestId)
+    expect(calls[1]!.resume).toBeUndefined()
+    expect(fixture.cleanupOrphans).toHaveBeenCalledWith(expect.objectContaining({
+      knowledgeBaseId: 'base_recovery',
+      storageReferences: [expired.storageReference],
+    }))
+    expect(persistedSecondAttempt).toMatchObject({
+      uploadAttempt: 2, uploadTicket: current.uploadTicket,
+      storageReference: current.storageReference, putCompleted: 1,
+    })
+  })
+
+  it('orphan-cleans a late PUT after consent is revoked without requiring reacceptance', async () => {
+    const latePut = deferred<void>()
+    const cleanupOrphans = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('cleanup response lost'), {
+        code: 'TRANSIENT_FAILURE', retryable: true,
+      }))
+      .mockResolvedValue({ removed: 1 })
+    const authorization: CloudUploadRecoveryState['authorization'] = {
+      uploadTicket: 'ticket_late_put',
+      storageReference: 'knowledge/1/base_recovery/object_late_put',
+      objectId: 'object_late_put', jobId: 'job_late_put', mimeType: 'text/plain',
+      expiresAt: '2026-09-01T00:00:00.000Z', uploadAuthorization: {
+        url: 'https://storage.invalid/ticket_late_put', method: 'PUT', headers: {
+          'content-length': '23', 'content-type': 'text/plain',
+          'x-content-sha256': createHash('sha256')
+            .update(Buffer.from('recoverable publication')).digest('hex'),
+          'x-upload-ticket': 'ticket_late_put',
+        }, expiresAt: '2026-09-01T00:00:00.000Z',
+      },
+    }
+    const uploadDocument = vi.fn(async (
+      _input: Parameters<NonNullable<CloudKnowledgeRemote['uploadDocument']>>[0],
+      options: CloudUploadDocumentOptions,
+    ) => {
+      await options.onRecoveryState({ authorization, putCompleted: false })
+      await latePut.promise
+      await options.onRecoveryState({ authorization, putCompleted: true })
+      return { jobId: authorization.jobId, storageReference: authorization.storageReference }
+    })
+    const fixture = await recoverablePublication(uploadDocument, cleanupOrphans)
+
+    await fixture.trigger()
+    await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledOnce())
+    fixture.service.setCloudSyncConsent!('alice', false)
+    latePut.resolve()
+
+    await vi.waitFor(() => expect(fixture.cleanupOrphans).toHaveBeenCalledWith({
+      requestId: expect.any(String), knowledgeBaseId: 'base_recovery',
+      storageReferences: [authorization.storageReference],
+    }))
+    expect(fixture.memory.database.prepare(`
+      SELECT upload_attempt AS uploadAttempt, upload_ticket AS uploadTicket,
+        upload_job_id AS uploadJobId, storage_reference AS storageReference,
+        upload_verified AS uploadVerified
+      FROM cloud_pending_publications WHERE knowledge_base_id = 'base_recovery'
+    `).get()).toEqual({
+      uploadAttempt: 1, uploadTicket: null, uploadJobId: null,
+      storageReference: null, uploadVerified: 0,
+    })
+    await fixture.service.list({ userId: 'alice' })
+    await vi.waitFor(() => expect(cleanupOrphans).toHaveBeenCalledTimes(2))
+    expect(fixture.memory.database.prepare(
+      'SELECT count(*) AS count FROM cloud_sync_orphans',
+    ).get()).toEqual({ count: 0 })
+    expect(uploadDocument).toHaveBeenCalledOnce()
   })
 
   it('keeps import and search local when the cloud kill switch is closed', async () => {
@@ -1203,9 +1518,48 @@ describe('local knowledge service', () => {
     const secondPublish = deferred<{
       generationId: string; previousGenerationId: string | null; sequence: number
     }>()
-    const uploadDocument = vi.fn()
-      .mockImplementationOnce(async () => firstUpload.promise)
-      .mockImplementationOnce(async () => secondUpload.promise)
+    let oldAuthorization: CloudUploadRecoveryState['authorization'] | undefined
+    const authorization = (
+      suffix: string,
+      input: Parameters<NonNullable<CloudKnowledgeRemote['uploadDocument']>>[0],
+    ): CloudUploadRecoveryState['authorization'] => {
+      const expiresAt = '2026-09-30T00:00:00.000Z'
+      const uploadTicket = `ticket_${suffix}`
+      return {
+        uploadTicket, storageReference: `knowledge/epoch/${suffix}`,
+        objectId: `object_${suffix}`, jobId: `upload_${suffix}`,
+        mimeType: input.mimeType, expiresAt, uploadAuthorization: {
+          url: `https://storage.invalid/${suffix}`, method: 'PUT', headers: {
+            'content-length': String(input.byteSize), 'content-type': input.mimeType,
+            'x-content-sha256': input.sha256, 'x-upload-ticket': uploadTicket,
+          }, expiresAt,
+        },
+      }
+    }
+    const uploadDocument = vi.fn(async (
+      input: Parameters<NonNullable<CloudKnowledgeRemote['uploadDocument']>>[0],
+      options: CloudUploadDocumentOptions,
+    ) => {
+      if (uploadDocument.mock.calls.length === 1) {
+        oldAuthorization = authorization('old_epoch', input)
+        await options.onRecoveryState({ authorization: oldAuthorization, putCompleted: false })
+        await options.onRecoveryState({ authorization: oldAuthorization, putCompleted: true })
+        await firstUpload.promise
+        return {
+          jobId: oldAuthorization.jobId,
+          storageReference: oldAuthorization.storageReference,
+        }
+      }
+      const currentAuthorization = authorization('new_epoch', input)
+      expect(options.resume).toBeUndefined()
+      await options.onRecoveryState({ authorization: currentAuthorization, putCompleted: false })
+      await options.onRecoveryState({ authorization: currentAuthorization, putCompleted: true })
+      await secondUpload.promise
+      return {
+        jobId: currentAuthorization.jobId,
+        storageReference: currentAuthorization.storageReference,
+      }
+    })
     const pushMutation = vi.fn(async (input: Parameters<CloudKnowledgeRemote['pushMutation']>[0]) => ({
       mutationId: input.mutationId, status: 'applied' as const,
       sequence: 1, revision: input.mutationId,
@@ -1233,8 +1587,9 @@ describe('local knowledge service', () => {
       }),
       cloudKillSwitchEnabled: () => false,
     })
+    const cleanupOrphans = vi.fn().mockResolvedValue({ removed: 1 })
     service.configureCloudRemote!(cloudRemote({
-      uploadDocument, getJob, publishGeneration, pushMutation,
+      uploadDocument, getJob, publishGeneration, pushMutation, cleanupOrphans,
     }))
     const owner = { userId: 'alice' }
     await service.bind(owner.userId, true)
@@ -1256,6 +1611,10 @@ describe('local knowledge service', () => {
     await vi.waitFor(() => expect(uploadDocument).toHaveBeenCalledTimes(2))
     expect(getJob).not.toHaveBeenCalled()
     expect(publishGeneration).not.toHaveBeenCalled()
+    expect(cleanupOrphans).toHaveBeenCalledWith(expect.objectContaining({
+      knowledgeBaseId: base.id,
+      storageReferences: [oldAuthorization!.storageReference],
+    }))
     secondUpload.resolve({ jobId: 'upload_new_epoch', storageReference: 'knowledge/new' })
     await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
 

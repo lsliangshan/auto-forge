@@ -6,6 +6,7 @@ import type {
   PublishGenerationInput,
   PushMutationInput,
   CloudUploadDocumentInput,
+  CloudUploadDocumentOptions,
 } from './cloudbase-knowledge-client.js'
 import type { CloudSearchGateway } from './cloud-retriever.js'
 
@@ -57,7 +58,10 @@ export interface CloudKnowledgeRemote {
     revision: string
     generationId: string
   }): Promise<{ knowledgeBaseId: string; generationId: string; status: 'staging' }>
-  uploadDocument?(input: CloudUploadDocumentInput): Promise<{
+  uploadDocument?(
+    input: CloudUploadDocumentInput,
+    options: CloudUploadDocumentOptions,
+  ): Promise<{
     jobId: string
     storageReference: string
   }>
@@ -372,7 +376,15 @@ export class KnowledgeSyncService {
       }
     }
 
-    await this.pull(knowledgeBaseId, epoch, entitlementEpoch, remoteProjection)
+    try {
+      await this.pull(knowledgeBaseId, epoch, entitlementEpoch, remoteProjection)
+    } catch (error) {
+      if (this.isCloudAccessCurrent(entitlementEpoch)
+        && this.isProjectionActive(knowledgeBaseId, epoch, remoteProjection)) {
+        this.compareAndSetProjectionMode(knowledgeBaseId, epoch, 'failed', remoteProjection)
+      }
+      throw error
+    }
     if (!this.isProjectionActive(knowledgeBaseId, epoch, remoteProjection)) {
       return { status: 'paused', processed, conflicts }
     }
@@ -985,7 +997,6 @@ export class KnowledgeSyncService {
   }
 
   async cleanupOrphans(knowledgeBaseId: string): Promise<void> {
-    const entitlementEpoch = this.captureCloudAccess()
     const rows = this.database.prepare(`
       SELECT storage_reference AS storageReference, request_id AS requestId
       FROM cloud_sync_orphans WHERE knowledge_base_id = ?
@@ -999,7 +1010,6 @@ export class KnowledgeSyncService {
       knowledgeBaseId,
       storageReferences: references,
     })
-    this.assertCloudAccess(entitlementEpoch)
     if (!this.isEpochCurrent(knowledgeBaseId, epoch)) throw syncError('CONFLICT')
     const placeholders = references.map(() => '?').join(', ')
     this.database.prepare(`

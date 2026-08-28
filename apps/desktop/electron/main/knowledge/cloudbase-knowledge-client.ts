@@ -201,6 +201,18 @@ export interface CloudUploadDocumentInput {
   bytes: Buffer
 }
 
+export type CloudUploadAuthorization = z.infer<typeof uploadAuthorizationSchema>
+
+export interface CloudUploadRecoveryState {
+  authorization: CloudUploadAuthorization
+  putCompleted: boolean
+}
+
+export interface CloudUploadDocumentOptions {
+  resume?: CloudUploadRecoveryState
+  onRecoveryState(state: CloudUploadRecoveryState): void | Promise<void>
+}
+
 export class CloudBaseKnowledgeClient {
   constructor(
     private readonly functions: CloudBaseFunctionPort,
@@ -289,7 +301,10 @@ export class CloudBaseKnowledgeClient {
     return result
   }
 
-  async uploadDocument(input: CloudUploadDocumentInput): Promise<{
+  async uploadDocument(
+    input: CloudUploadDocumentInput,
+    options: CloudUploadDocumentOptions,
+  ): Promise<{
     jobId: string
     storageReference: string
   }> {
@@ -309,18 +324,44 @@ export class CloudBaseKnowledgeClient {
       throw new CloudKnowledgeError('INVALID_INPUT')
     }
     const { bytes, ...authorizationInput } = parsed.data
-    const authorization = await this.authorizeUpload(authorizationInput)
-    const fetchImpl = this.options.fetchImpl ?? fetch
-    const response = await this.transport(signal => fetchImpl(
-      authorization.uploadAuthorization.url,
-      {
-        method: authorization.uploadAuthorization.method,
-        headers: authorization.uploadAuthorization.headers,
-        body: bytes as unknown as BodyInit,
-        signal,
-      },
-    ))
-    if (!response.ok) throw new CloudKnowledgeError('TRANSIENT_FAILURE')
+    let recovered: CloudUploadRecoveryState | undefined
+    if (options.resume) {
+      const parsedRecovery = z.object({
+        authorization: uploadAuthorizationSchema,
+        putCompleted: z.boolean(),
+      }).strict().safeParse(options.resume)
+      if (!parsedRecovery.success) throw new CloudKnowledgeError('INVALID_INPUT')
+      recovered = parsedRecovery.data
+    }
+    const authorization = recovered?.authorization ?? await this.authorizeUpload(authorizationInput)
+    if (authorization.mimeType !== parsed.data.mimeType
+      || authorization.uploadAuthorization.expiresAt !== authorization.expiresAt
+      || authorization.uploadAuthorization.headers['content-type'] !== parsed.data.mimeType
+      || authorization.uploadAuthorization.headers['content-length'] !== String(parsed.data.byteSize)
+      || authorization.uploadAuthorization.headers['x-content-sha256'] !== parsed.data.sha256
+      || authorization.uploadAuthorization.headers['x-upload-ticket']
+        !== authorization.uploadTicket) {
+      throw new CloudKnowledgeError('INVALID_INPUT')
+    }
+    let putCompleted = recovered?.putCompleted ?? false
+    if (!recovered) {
+      await options.onRecoveryState({ authorization, putCompleted: false })
+    }
+    if (!putCompleted) {
+      const fetchImpl = this.options.fetchImpl ?? fetch
+      const response = await this.transport(signal => fetchImpl(
+        authorization.uploadAuthorization.url,
+        {
+          method: authorization.uploadAuthorization.method,
+          headers: authorization.uploadAuthorization.headers,
+          body: bytes as unknown as BodyInit,
+          signal,
+        },
+      ))
+      if (!response.ok) throw new CloudKnowledgeError('TRANSIENT_FAILURE')
+      putCompleted = true
+      await options.onRecoveryState({ authorization, putCompleted })
+    }
     const completed = await this.completeUpload({ uploadTicket: authorization.uploadTicket })
     if (completed.objectId !== authorization.objectId
       || completed.storageReference !== authorization.storageReference) {

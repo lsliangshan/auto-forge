@@ -396,6 +396,29 @@ describe('KnowledgeSyncService', () => {
     ).get('kb_1')).toEqual({ sequence: 42 })
   })
 
+  it('persists failed mode when a current-epoch pull fails before rethrowing', async () => {
+    const failure = Object.assign(new Error('pull failed'), { code: 'TRANSIENT_FAILURE' })
+    const { service } = fixture({ fullResync: vi.fn().mockRejectedValue(failure) })
+
+    await expect(service.synchronize('kb_1')).rejects.toBe(failure)
+    expect(service.getState('kb_1').mode).toBe('failed')
+  })
+
+  it('does not let a stale pull failure overwrite a newer paused epoch', async () => {
+    let rejectPull!: (error: Error) => void
+    const fullResync = vi.fn(() => new Promise<never>((_resolve, reject) => {
+      rejectPull = reject
+    }))
+    const { service } = fixture({ fullResync })
+    const synchronizing = service.synchronize('kb_1')
+    await vi.waitFor(() => expect(fullResync).toHaveBeenCalledOnce())
+    service.pause('kb_1')
+    rejectPull(new Error('late pull failure'))
+
+    await expect(synchronizing).rejects.toThrow('late pull failure')
+    expect(service.getState('kb_1').mode).toBe('paused')
+  })
+
   it('uses independent durable state for a remote-only snapshot and commits its cursor atomically', async () => {
     const replaceRemoteSnapshot = async (...args: unknown[]) => {
       const changes = args[0] as Array<{ payload: Record<string, unknown> }>
@@ -929,6 +952,21 @@ describe('KnowledgeSyncService', () => {
     await service.cleanupOrphans('kb_1')
     expect(cleanupOrphans).toHaveBeenCalledWith({
       requestId: expect.any(String), knowledgeBaseId: 'kb_1', storageReferences: ['storage/object_1'],
+    })
+    expect(database.prepare('SELECT count(*) AS count FROM cloud_sync_orphans').get())
+      .toEqual({ count: 0 })
+  })
+
+  it('keeps orphan cleanup executable after ordinary cloud access closes', async () => {
+    const cleanupOrphans = vi.fn().mockResolvedValue({ removed: 1 })
+    const { database, service } = fixture({ cleanupOrphans })
+    service.recordOrphan('kb_1', 'knowledge/1/kb_1/late_upload')
+    service.setCloudAccess(false)
+
+    await expect(service.cleanupOrphans('kb_1')).resolves.toBeUndefined()
+    expect(cleanupOrphans).toHaveBeenCalledWith({
+      requestId: expect.any(String), knowledgeBaseId: 'kb_1',
+      storageReferences: ['knowledge/1/kb_1/late_upload'],
     })
     expect(database.prepare('SELECT count(*) AS count FROM cloud_sync_orphans').get())
       .toEqual({ count: 0 })

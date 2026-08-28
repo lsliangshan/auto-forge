@@ -418,7 +418,13 @@ describe('CloudBaseKnowledgeClient', () => {
           configurationVersion: 'autoforge-knowledge-embedding-v1', region: 'guangzhou',
         }, keywordCandidates: [], vectorCandidates: [], driftProbeRequired: false,
       } } })
-    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+    const recoveryStates: Array<{ putCompleted: boolean; authorization: unknown }> = []
+    const fetchImpl = vi.fn().mockImplementation(async () => {
+      expect(recoveryStates).toEqual([
+        expect.objectContaining({ putCompleted: false, authorization: expect.any(Object) }),
+      ])
+      return { ok: true, status: 200 }
+    })
     const client = new CloudBaseKnowledgeClient(
       { callFunction }, 'autoforge-knowledge', { fetchImpl, id: () => 'search_1' },
     )
@@ -429,6 +435,8 @@ describe('CloudBaseKnowledgeClient', () => {
     await expect(client.uploadDocument({
       requestId: 'upload_1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
       versionId: 'version_1', byteSize: 4, sha256, mimeType: 'text/plain', bytes,
+    }, {
+      onRecoveryState: async state => { recoveryStates.push(state) },
     })).resolves.toEqual({ jobId: 'job_1', storageReference: 'knowledge/1/kb_1/object_1' })
     await expect(client.search({ query: '合同条款', knowledgeBaseIds: ['kb_1'], limit: 24 }))
       .resolves.toMatchObject({ generationState: 'published' })
@@ -442,6 +450,47 @@ describe('CloudBaseKnowledgeClient', () => {
     expect(callFunction.mock.calls.map(([input]) => input.data.action)).toEqual([
       'beginGeneration', 'authorizeUpload', 'completeUpload', 'searchKnowledge',
     ])
+    expect(recoveryStates).toEqual([
+      expect.objectContaining({ putCompleted: false, authorization: expect.any(Object) }),
+      expect.objectContaining({ putCompleted: true, authorization: expect.any(Object) }),
+    ])
+  })
+
+  it('resumes a persisted post-PUT authorization without reauthorizing or repeating PUT', async () => {
+    const bytes = Buffer.from('body')
+    const sha256 = createHash('sha256').update(bytes).digest('hex')
+    const authorization = {
+      uploadTicket: 'ticket_resume', storageReference: 'knowledge/1/kb_1/object_resume',
+      objectId: 'object_resume', jobId: 'job_resume', mimeType: 'text/plain',
+      expiresAt: '2026-09-26T12:15:00.000Z', uploadAuthorization: {
+        url: 'https://pg-storage.example/upload/ticket_resume', method: 'PUT' as const,
+        headers: {
+          'content-length': '4', 'content-type': 'text/plain',
+          'x-content-sha256': sha256, 'x-upload-ticket': 'ticket_resume',
+        }, expiresAt: '2026-09-26T12:15:00.000Z',
+      },
+    }
+    const callFunction = vi.fn().mockResolvedValue({ result: { ok: true, data: {
+      objectId: authorization.objectId, storageReference: authorization.storageReference,
+      verified: true,
+    } } })
+    const fetchImpl = vi.fn()
+    const client = new CloudBaseKnowledgeClient(
+      { callFunction }, 'autoforge-knowledge', { fetchImpl },
+    )
+
+    await expect(client.uploadDocument({
+      requestId: 'upload_attempt_1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+      versionId: 'version_1', byteSize: bytes.byteLength, sha256,
+      mimeType: 'text/plain', bytes,
+    }, {
+      resume: { authorization, putCompleted: true },
+      onRecoveryState: async () => undefined,
+    })).resolves.toEqual({
+      jobId: authorization.jobId, storageReference: authorization.storageReference,
+    })
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(callFunction.mock.calls.map(([input]) => input.data.action)).toEqual(['completeUpload'])
   })
 
   it('aborts a never-settling mediated upload at the same bounded deadline', async () => {
@@ -471,6 +520,8 @@ describe('CloudBaseKnowledgeClient', () => {
         requestId: 'upload_1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
         versionId: 'version_1', byteSize: bytes.byteLength, sha256,
         mimeType: 'text/plain', bytes,
+      }, {
+        onRecoveryState: async () => undefined,
       })
       const rejected = expect(upload).rejects.toMatchObject({
         code: 'TRANSIENT_FAILURE', retryable: true,

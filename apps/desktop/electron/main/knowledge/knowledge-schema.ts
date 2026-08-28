@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 12
+export const KNOWLEDGE_SCHEMA_VERSION = 13
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -420,6 +420,26 @@ const KNOWLEDGE_SCHEMA_V12 = `
   ) STRICT;
 `
 
+const KNOWLEDGE_SCHEMA_V13 = `
+  ALTER TABLE cloud_pending_publications
+    ADD COLUMN upload_attempt INTEGER NOT NULL DEFAULT 0
+      CHECK (upload_attempt BETWEEN 0 AND 3);
+  ALTER TABLE cloud_pending_publications ADD COLUMN upload_request_id TEXT;
+  ALTER TABLE cloud_pending_publications ADD COLUMN upload_ticket TEXT;
+  ALTER TABLE cloud_pending_publications ADD COLUMN storage_reference TEXT;
+  ALTER TABLE cloud_pending_publications ADD COLUMN upload_authorization_json TEXT;
+  ALTER TABLE cloud_pending_publications ADD COLUMN upload_authorization_expires_at INTEGER;
+  ALTER TABLE cloud_pending_publications
+    ADD COLUMN upload_put_completed INTEGER NOT NULL DEFAULT 0
+      CHECK (upload_put_completed IN (0, 1));
+  ALTER TABLE cloud_pending_publications
+    ADD COLUMN upload_verified INTEGER NOT NULL DEFAULT 0
+      CHECK (upload_verified IN (0, 1));
+  UPDATE cloud_pending_publications
+  SET upload_verified = 1
+  WHERE upload_job_id IS NOT NULL;
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
@@ -433,6 +453,7 @@ const migrations = new Map<number, string>([
   [10, KNOWLEDGE_SCHEMA_V10],
   [11, KNOWLEDGE_SCHEMA_V11],
   [12, KNOWLEDGE_SCHEMA_V12],
+  [13, KNOWLEDGE_SCHEMA_V13],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {
