@@ -493,13 +493,14 @@ export class KnowledgeSyncService {
     `).run(this.dependencies.now(), knowledgeBaseId, row.epoch)
     if (claimed.changes !== 1) throw syncError('CONFLICT')
     row = { ...row, epoch: row.epoch + 1 }
+    const purgeEpoch = row.epoch
     const assertPurgeCurrent = (deletionJobId: string | null): void => {
       if (ownerEpoch !== this.entitlementEpoch) throw syncError('CONFLICT')
       const current = this.database.prepare(`
         SELECT epoch, deletion_job_id AS deletionJobId
         FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
       `).get(knowledgeBaseId) as { epoch: number; deletionJobId: string | null } | undefined
-      if (!current || current.epoch !== row.epoch || current.deletionJobId !== deletionJobId) {
+      if (!current || current.epoch !== purgeEpoch || current.deletionJobId !== deletionJobId) {
         throw syncError('CONFLICT')
       }
     }

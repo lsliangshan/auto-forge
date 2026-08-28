@@ -481,7 +481,7 @@ describe('sandbox parser supervisor', () => {
   })
 
   it('preserves the primary parser error when cleanup also crosses the deadline', async () => {
-    const h = harness((request) => ({
+    const h = harness((request: { jobId: string; mediaType: string }) => ({
       version: 1, type: 'error', jobId: request.jobId, code: 'PARSER_UNSUPPORTED_FORMAT',
     }))
     let releaseCleanup!: () => void
