@@ -74,6 +74,8 @@ export const useSettingsStore = defineStore('settings', {
     tokenUsageError: '',
     remoteUsageError: '',
     cloudDataError: '',
+    _cloudDataOwnerId: undefined as string | undefined,
+    _cloudDataVersion: 0,
     _loadVersion: 0,
     _tokenUsageVersion: 0,
     _credentialVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
@@ -107,6 +109,21 @@ export const useSettingsStore = defineStore('settings', {
     },
   },
   actions: {
+    bindAccountOwner(ownerId: string | undefined) {
+      if (ownerId === this._cloudDataOwnerId) return
+      this._cloudDataOwnerId = ownerId
+      this._cloudDataVersion += 1
+      this._tokenUsageVersion += 1
+      this.tokenUsage = undefined
+      this.remoteUsage = undefined
+      this.accountDataPreferences = undefined
+      this.legacyImportPreview = undefined
+      this.cloudSyncConsentState = undefined
+      this.saving = false
+      this.tokenUsageError = ''
+      this.remoteUsageError = ''
+      this.cloudDataError = ''
+    },
     async refreshGrants() {
       this.error = ''
       try {
@@ -131,6 +148,9 @@ export const useSettingsStore = defineStore('settings', {
       }
     },
     async loadCloudData() {
+      const ownerId = this._cloudDataOwnerId
+      if (!ownerId) return
+      const version = ++this._cloudDataVersion
       this.cloudDataError = ''
       this.remoteUsageError = ''
       const [remoteUsage, accountDataPreferences, legacyImportPreview, cloudSyncConsentState]
@@ -140,6 +160,7 @@ export const useSettingsStore = defineStore('settings', {
         Promise.resolve().then(() => getDesktopApi().settings.previewLegacyImport()),
         Promise.resolve().then(() => getDesktopApi().settings.getCloudSyncConsentState()),
       ])
+      if (ownerId !== this._cloudDataOwnerId || version !== this._cloudDataVersion) return
       if (remoteUsage.status === 'fulfilled') {
         this.remoteUsage = remoteUsage.value
       } else {
@@ -162,26 +183,42 @@ export const useSettingsStore = defineStore('settings', {
       }
     },
     async updateAccountDataPreferences(input: AccountDataPreferences) {
+      const ownerId = this._cloudDataOwnerId
+      if (!ownerId) return
       this.cloudDataError = ''
       try {
-        this.accountDataPreferences = await getDesktopApi().settings
+        const updated = await getDesktopApi().settings
           .updateAccountDataPreferences(input)
+        if (ownerId !== this._cloudDataOwnerId) return
+        this.accountDataPreferences = updated
         await this.loadCloudData()
       } catch (error) {
-        this.cloudDataError = displayError(error, '账户数据偏好保存失败')
+        if (ownerId === this._cloudDataOwnerId) {
+          this.cloudDataError = displayError(error, '账户数据偏好保存失败')
+        }
       }
     },
     async revokeCloudSyncConsent() {
+      const ownerId = this._cloudDataOwnerId
+      if (!ownerId || this.cloudSyncConsentState?.state !== 'accepted') return
+      const version = ++this._cloudDataVersion
       this.saving = true
       this.cloudDataError = ''
       try {
-        this.cloudSyncConsentState = await getDesktopApi().settings
+        const revoked = await getDesktopApi().settings
           .revokeCloudSyncConsent({ confirmed: true })
+        if (ownerId === this._cloudDataOwnerId && version === this._cloudDataVersion) {
+          this.cloudSyncConsentState = revoked
+        }
       } catch (error) {
-        this.cloudDataError = displayError(error, '云同步授权撤回失败')
+        if (ownerId === this._cloudDataOwnerId && version === this._cloudDataVersion) {
+          this.cloudDataError = displayError(error, '云同步授权撤回失败')
+        }
         throw error
       } finally {
-        this.saving = false
+        if (ownerId === this._cloudDataOwnerId && version === this._cloudDataVersion) {
+          this.saving = false
+        }
       }
     },
     async load() {

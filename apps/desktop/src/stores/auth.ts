@@ -4,6 +4,7 @@ import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
 import { useExecutionStore } from './execution'
 import { useKnowledgeStore } from './knowledge'
+import { useSettingsStore } from './settings'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
@@ -58,10 +59,13 @@ function finishRestoring(store: { restoring: boolean }): void {
 function replaceSession(store: { session: AuthSession | null }, session: AuthSession | null): void {
   const previousUserId = store.session?.user.id
   const nextUserId = session?.user.id
-  if (previousUserId !== undefined && previousUserId !== nextUserId) {
-    useChatStore().resetLocalData()
-    useExecutionStore().resetLocalData()
-    useKnowledgeStore().resetLocalData()
+  if (previousUserId !== nextUserId) {
+    useSettingsStore().bindAccountOwner(nextUserId)
+    if (previousUserId !== undefined) {
+      useChatStore().resetLocalData()
+      useExecutionStore().resetLocalData()
+      useKnowledgeStore().resetLocalData()
+    }
   }
   store.session = session
 }

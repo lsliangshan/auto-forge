@@ -3,13 +3,19 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ElementPlus, { ElMessageBox } from 'element-plus'
-import { toSafeAppError, type AuthSession, type DesktopAPI } from '@autoforge/shared'
+import {
+  toSafeAppError,
+  type AuthSession,
+  type DesktopAPI,
+  type PrivacyConsentState,
+} from '@autoforge/shared'
 import App from '../../src/App.vue'
 import AppRail from '../../src/components/AppRail.vue'
 import { createAuthGuard, routes, safeRedirect } from '../../src/router'
 import { useAuthStore } from '../../src/stores/auth'
 import { useChatStore } from '../../src/stores/chat'
 import { useExecutionStore } from '../../src/stores/execution'
+import { useSettingsStore } from '../../src/stores/settings'
 
 const authSession: AuthSession = {
   user: { id: 'user_1', account: 'Alice' },
@@ -27,6 +33,17 @@ const adminSession: AuthSession = {
 const bobSession: AuthSession = {
   user: { id: 'user_2', account: 'Bob' },
   authenticatedAt: '2026-08-07T00:02:00.000Z',
+}
+
+const acceptedCloudConsent: PrivacyConsentState = {
+  purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+  consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+  state: 'accepted', revision: 1,
+}
+
+const revokedCloudConsent: PrivacyConsentState = {
+  purpose: 'cloud_sync', revokedAt: '2026-08-28T01:00:00.000Z',
+  clientVersion: '0.1.0', state: 'revoked', revision: 2,
 }
 
 function deferred<T>() {
@@ -87,6 +104,11 @@ function createApi(): DesktopAPI {
       validateProviderCredential: vi.fn().mockResolvedValue({
         provider: 'deepseek', configured: false, validation: 'unchecked',
       }),
+      getRemoteUsage: vi.fn().mockResolvedValue(undefined),
+      getAccountDataPreferences: vi.fn().mockResolvedValue(undefined),
+      previewLegacyImport: vi.fn().mockResolvedValue(undefined),
+      getCloudSyncConsentState: vi.fn().mockResolvedValue(null),
+      revokeCloudSyncConsent: vi.fn().mockResolvedValue(revokedCloudConsent),
     },
     system: { getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopAPI
@@ -112,6 +134,52 @@ afterEach(() => {
 })
 
 describe('authentication store', () => {
+  it('does not retain or repopulate Alice cloud consent after switching to Bob', async () => {
+    const api = createApi()
+    const aliceLoad = deferred<PrivacyConsentState | null>()
+    vi.mocked(api.auth.loginWithPassword)
+      .mockResolvedValueOnce(authSession)
+      .mockResolvedValueOnce(bobSession)
+    vi.mocked(api.settings.getCloudSyncConsentState).mockReturnValueOnce(aliceLoad.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const settings = useSettingsStore()
+
+    await auth.loginWithPassword({ account: 'Alice', password: 'password' })
+    const loadingAlice = settings.loadCloudData()
+    settings.saving = true
+    await auth.loginWithPassword({ account: 'Bob', password: 'password' })
+
+    expect(settings.cloudSyncConsentState).toBeUndefined()
+    expect(settings.saving).toBe(false)
+    await settings.revokeCloudSyncConsent()
+    expect(api.settings.revokeCloudSyncConsent).not.toHaveBeenCalled()
+
+    aliceLoad.resolve(acceptedCloudConsent)
+    await loadingAlice
+    expect(settings.cloudSyncConsentState).toBeUndefined()
+  })
+
+  it('keeps an authoritative revoke when an earlier consent load resolves later', async () => {
+    const api = createApi()
+    const staleLoad = deferred<PrivacyConsentState | null>()
+    vi.mocked(api.auth.loginWithPassword).mockResolvedValue(authSession)
+    vi.mocked(api.settings.getCloudSyncConsentState).mockReturnValueOnce(staleLoad.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const settings = useSettingsStore()
+
+    await auth.loginWithPassword({ account: 'Alice', password: 'password' })
+    settings.cloudSyncConsentState = acceptedCloudConsent
+    const loading = settings.loadCloudData()
+    await settings.revokeCloudSyncConsent()
+    expect(settings.cloudSyncConsentState).toEqual(revokedCloudConsent)
+
+    staleLoad.resolve(acceptedCloudConsent)
+    await loading
+    expect(settings.cloudSyncConsentState).toEqual(revokedCloudConsent)
+  })
+
   it.each(['restore', 'password', 'otp'] as const)(
     'resets old-user chat before a direct UID replacement through %s',
     async (flow) => {
