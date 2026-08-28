@@ -696,7 +696,7 @@ describe('CloudBase knowledge scheduled worker', () => {
     }
   })
 
-  it('settles a never-resolving parser before its lease expires and returns from runOnce', async () => {
+  it('waits for the original parser abort acknowledgement before settling its lease', async () => {
     vi.useFakeTimers()
     try {
       const bytes = Buffer.from('bounded parser source')
@@ -721,25 +721,37 @@ describe('CloudBase knowledge scheduled worker', () => {
         throw new Error(`unexpected rpc ${name}`)
       })
       let parserSignal: AbortSignal | undefined
+      let parserDrained = false
       const worker = createKnowledgeWorker({
         rpc,
         storage: { readObject: vi.fn().mockResolvedValue(bytes), deleteObjects: vi.fn() },
         parser: { parse: vi.fn(({ signal }: { signal?: AbortSignal }) => {
           parserSignal = signal
-          return new Promise<never>(() => undefined)
+          return new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => {
+              setTimeout(() => {
+                parserDrained = true
+                reject({ code: 'TRANSIENT_FAILURE' })
+              }, 5)
+            }, { once: true })
+          })
         }) },
         parserTimeoutMs: 50,
         workerId: 'worker_1', id: () => 'lease_job_upload',
       })
 
       const run = worker.runOnce()
-      const bounded = Promise.race([
-        run,
-        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 60)),
+      const beforeAck = Promise.race([
+        run.then(() => 'settled' as const),
+        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 51)),
       ])
-      await vi.advanceTimersByTimeAsync(60)
+      await vi.advanceTimersByTimeAsync(51)
+      await expect(beforeAck).resolves.toBe('unsettled')
+      expect(parserDrained).toBe(false)
+      await vi.advanceTimersByTimeAsync(4)
 
-      await expect(bounded).resolves.toEqual({ claimed: 1, completed: 0, failed: 1 })
+      await expect(run).resolves.toEqual({ claimed: 1, completed: 0, failed: 1 })
+      expect(parserDrained).toBe(true)
       expect(parserSignal?.aborted).toBe(true)
       expect(bytes.every(byte => byte === 0)).toBe(true)
       expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_complete_job', {

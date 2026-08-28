@@ -167,7 +167,9 @@ function createJobBoundary(timeoutMs, settlementReserveMs) {
     clearTimeout(timeoutId)
   }
 
-  async function race({ deadlineAt, drainDeadline, controller, pending, context }, operation) {
+  async function race(
+    { deadlineAt, drainDeadline, controller, pending, context }, operation, requireDrain = false,
+  ) {
     const remaining = deadlineAt - Date.now()
     if (remaining <= 0) {
       controller.abort()
@@ -187,7 +189,10 @@ function createJobBoundary(timeoutMs, settlementReserveMs) {
     try {
       return await Promise.race([running, expired])
     } catch (error) {
-      if (timedOut || controller.signal.aborted) await drain(pending, drainDeadline)
+      if (timedOut || controller.signal.aborted) {
+        if (requireDrain) await Promise.allSettled([running])
+        else await drain(pending, drainDeadline)
+      }
       throw error
     } finally {
       clearTimeout(timeoutId)
@@ -201,6 +206,10 @@ function createJobBoundary(timeoutMs, settlementReserveMs) {
       deadlineAt: workDeadline, drainDeadline: workDrainDeadline,
       controller: workController, pending: pendingWork, context: workContext,
     }, operation),
+    workAndDrain: operation => race({
+      deadlineAt: workDeadline, drainDeadline: workDrainDeadline,
+      controller: workController, pending: pendingWork, context: workContext,
+    }, operation, true),
     settle: operation => race({
       deadlineAt: settlementDeadline, drainDeadline: finalDeadline,
       controller: settlementController, pending: pendingSettlement, context: settlementContext,
@@ -236,7 +245,7 @@ function createKnowledgeWorker({
   }
 
   async function parseUpload(input, boundary) {
-    return await boundary.work(async (requestBoundary) => {
+    return await boundary.workAndDrain(async (requestBoundary) => {
       const remaining = requestBoundary.deadlineAt - Date.now()
       if (remaining <= 0) throw { code: 'TRANSIENT_FAILURE' }
       let timeoutId
@@ -246,13 +255,14 @@ function createKnowledgeWorker({
           reject({ code: 'TRANSIENT_FAILURE' })
         }, Math.min(parserTimeoutMs, remaining))
       })
+      const parsing = Promise.resolve().then(() => parser.parse({
+        ...input, signal: requestBoundary.signal,
+      }))
       try {
-        return await Promise.race([
-          Promise.resolve().then(() => parser.parse({
-            ...input, signal: requestBoundary.signal,
-          })),
-          timedOut,
-        ])
+        return await Promise.race([parsing, timedOut])
+      } catch (error) {
+        if (requestBoundary.signal.aborted) await Promise.allSettled([parsing])
+        throw error
       } finally {
         clearTimeout(timeoutId)
       }
