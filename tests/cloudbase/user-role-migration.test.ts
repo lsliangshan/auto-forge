@@ -88,11 +88,18 @@ describe('CloudBase PostgreSQL user role migration', () => {
     )
     const verificationIndex = readme.indexOf('验证顺序')
     const rollbackIndex = readme.indexOf('0002_knowledge_entitlement.rollback.sql')
+    const reapplyIndex = readme.indexOf(
+      '../../migrations/20260828200000_user_role_knowledge_entitlement.sql',
+      rollbackIndex,
+    )
+    const baseRollbackIndex = readme.indexOf('0001_user_roles.rollback.sql', rollbackIndex)
 
     expect(baseIndex).toBeGreaterThanOrEqual(0)
     expect(additiveIndex).toBeGreaterThan(baseIndex)
     expect(verificationIndex).toBeGreaterThan(additiveIndex)
     expect(rollbackIndex).toBeGreaterThan(verificationIndex)
+    expect(reapplyIndex).toBeGreaterThan(rollbackIndex)
+    expect(baseRollbackIndex).toBeGreaterThan(reapplyIndex)
     expect(readme).toContain('保留 `knowledge_entitlement` 列、约束和已有值')
     expect(readme).not.toMatch(/(?:执行|运行)\s+(?:DROP|TRUNCATE|DELETE)\b/i)
     const executableBlocks = [...readme.matchAll(/```[^\n]*\n([\s\S]*?)```/g)]

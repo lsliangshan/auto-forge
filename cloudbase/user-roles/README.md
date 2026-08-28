@@ -50,4 +50,12 @@
 
 ## 回滚
 
-保持桌面 Cloud kill switch 关闭并先撤回依赖 entitlement 投影的桌面功能，再执行 `migrations/0002_knowledge_entitlement.rollback.sql`。该脚本只把 `autoforge_ensure_my_role` 恢复为上一版投影并重申最小权限；它保留 `knowledge_entitlement` 列、约束和已有值，以便安全重新应用 forward migration。验证 RPC 不再返回 entitlement、数据库中的测试值仍存在后，才可视需要执行 `migrations/0001_user_roles.rollback.sql` 撤销基础 RPC。基础回滚同样保留角色表、审计表和已接收数据，供审计、对账与恢复；禁止把删列、删表、截断或删除已接收数据当作回滚。
+按以下顺序演练 entitlement 回滚和恢复：
+
+1. 保持桌面 Cloud kill switch 关闭，并先撤回依赖 entitlement 投影的桌面功能。
+2. 执行 `migrations/0002_knowledge_entitlement.rollback.sql`。该脚本只把 `autoforge_ensure_my_role` 恢复为上一版投影并重申最小权限；它保留 `knowledge_entitlement` 列、约束和已有值。
+3. 验证 RPC 不再返回 entitlement，同时数据库中的测试 entitlement 值仍存在。
+4. 重新应用 `../../migrations/20260828200000_user_role_knowledge_entitlement.sql`，验证同一 entitlement 值重新出现在 RPC 投影中，再恢复依赖该投影的功能。
+5. 只有在确定撤销整个用户角色 RPC 面、而非演练 entitlement 回滚时，才可另行执行 `migrations/0001_user_roles.rollback.sql`。基础回滚同样保留角色表、审计表和已接收数据，供审计、对账与恢复。
+
+禁止把删列、删表、截断或删除已接收数据当作回滚。
