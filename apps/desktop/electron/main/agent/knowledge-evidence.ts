@@ -65,7 +65,7 @@ export class CurrentTurnKnowledgeEvidence {
   add(values: readonly KnowledgeEvidence[]): readonly KnowledgeEvidence[] {
     const parsed = knowledgeEvidenceSchema.array().max(MAX_CURRENT_TURN_EVIDENCE).parse(values)
     if (parsed.some(item => [item.id, item.documentId, item.versionId].some(identity => (
-      identity.length > 512 || /[\]\r\n]/u.test(identity)
+      !validKnowledgeMarkerIdentity(identity)
     )))) {
       throw new Error('Knowledge evidence identity is invalid')
     }
@@ -120,7 +120,11 @@ export type KnowledgeAnswerValidation =
   | { kind: 'repair'; invalidEvidenceIds: string[] }
   | { kind: 'insufficient'; reason: 'no-evidence' | 'uncited' | 'invalid-citation' | 'unsupported-claim' }
 
-const KNOWLEDGE_MARKER = /\[\[kb:([^\u005b\u005d\r\n]{1,512})\]\]/gu
+function validKnowledgeMarkerIdentity(identity: string): boolean {
+  return identity.length >= 1 && identity.length <= 512 && !/[\]\r\n]/u.test(identity)
+}
+
+const KNOWLEDGE_MARKER = /\[\[kb:([^\]\r\n]{1,512})\]\]/gu
 const SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX = /\[\[[\s\u200b-\u200d\u2060\ufeff]*kb[\s\u200b-\u200d\u2060\ufeff]*[:：]/gimu
 const KNOWLEDGE_MARKER_PLACEHOLDER_START = '\u{e200}'
 const KNOWLEDGE_MARKER_PLACEHOLDER_END = '\u{e201}'
@@ -222,11 +226,12 @@ function stripSuspiciousKnowledgeMarkers(answer: string): string {
   return sanitized
 }
 
-function sanitizeMixedKnowledgeAnswer(answer: string, preserveCanonicalMarkers: boolean): string {
+function sanitizeMixedKnowledgeAnswer(answer: string, admittedEvidenceIds: ReadonlySet<string>): string {
   const canonicalMarkers: string[] = []
   const boundedAnswer = answer.slice(0, KNOWLEDGE_ANSWER_MAX_LENGTH)
-  const protectedAnswer = preserveCanonicalMarkers
-    ? boundedAnswer.replace(KNOWLEDGE_MARKER, (marker) => {
+  const protectedAnswer = admittedEvidenceIds.size > 0
+    ? boundedAnswer.replace(KNOWLEDGE_MARKER, (marker, identity: string) => {
+        if (identity.includes('[[') && !admittedEvidenceIds.has(identity)) return marker
         canonicalMarkers.push(marker)
         return `${KNOWLEDGE_MARKER_PLACEHOLDER_START}${canonicalMarkers.length - 1}${KNOWLEDGE_MARKER_PLACEHOLDER_END}`
       })
@@ -696,13 +701,13 @@ export function validateKnowledgeAnswer(
   mode: KnowledgeSelection['mode'],
   repairAttempts: number,
 ): KnowledgeAnswerValidation {
+  const admitted = new Set(evidence.map(item => item.id))
   const validatedAnswer = mode === 'mixed'
-    ? sanitizeMixedKnowledgeAnswer(answer, evidence.length > 0)
+    ? sanitizeMixedKnowledgeAnswer(answer, admitted)
     : answer
   if (mode === 'mixed' && !hasMixedAnswerContent(validatedAnswer)) {
     return { kind: 'insufficient', reason: 'no-evidence' }
   }
-  const admitted = new Set(evidence.map(item => item.id))
   const citedEvidenceIds = [...validatedAnswer.matchAll(KNOWLEDGE_MARKER)]
     .map(match => match[1]!)
     .filter((id, index, values) => values.indexOf(id) === index)
