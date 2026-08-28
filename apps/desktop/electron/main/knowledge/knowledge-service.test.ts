@@ -22,12 +22,16 @@ function cloudRemote(overrides: Partial<CloudKnowledgeRemote> = {}): CloudKnowle
     beginSync: vi.fn().mockResolvedValue({
       knowledgeBaseId: 'unused', generationId: 'unused', status: 'staging',
     }),
-    pushMutation: vi.fn().mockResolvedValue({
-      mutationId: 'unused', status: 'applied', sequence: 1, revision: 'unused',
-    }),
-    pullChanges: vi.fn().mockResolvedValue({
-      kind: 'incremental', nextSequence: 0, hasMore: false, changes: [],
-    }),
+    pushMutation: vi.fn(async input => ({
+      mutationId: input.mutationId, status: 'applied' as const,
+      sequence: 1, revision: input.mutationId,
+    })),
+    pullChanges: vi.fn(async input => ({
+      kind: 'incremental' as const,
+      nextSequence: input.afterSequence,
+      hasMore: false,
+      changes: [],
+    })),
     fullResync: vi.fn().mockResolvedValue({ kind: 'snapshot', nextSequence: 0, changes: [] }),
     publishGeneration: vi.fn().mockResolvedValue({
       generationId: 'unused', previousGenerationId: null, sequence: 1,
@@ -361,6 +365,13 @@ describe('local knowledge service', () => {
       knowledgeBaseId: base.id, documentId: document.id, bytes: expect.any(Buffer),
     }))
     expect(remote.pushMutation).toHaveBeenCalled()
+    expect(remote.pushMutation).toHaveBeenCalledWith(expect.objectContaining({
+      knowledgeBaseId: base.id,
+      entityKind: 'knowledge_base',
+      entityId: base.id,
+      operation: 'upsert',
+      payload: { name: 'Cloud', publishedGenerationId: publishedGeneration },
+    }))
     expect(remote.pullChanges).toHaveBeenCalled()
     expect(search).toHaveBeenCalledWith({ query: '云端合同', knowledgeBaseIds: [base.id], limit: 24 })
     expect(result).toMatchObject({
@@ -613,7 +624,7 @@ describe('local knowledge service', () => {
     await vi.waitFor(() => expect(publishGeneration).toHaveBeenCalledOnce())
 
     expect(beginGeneration).toHaveBeenCalledOnce()
-    expect(pushMutation).toHaveBeenCalledOnce()
+    expect(pushMutation).toHaveBeenCalledTimes(2)
     expect(uploadDocument).toHaveBeenCalledOnce()
     expect(getJob).toHaveBeenCalledTimes(4)
     expect(memory.database.prepare(

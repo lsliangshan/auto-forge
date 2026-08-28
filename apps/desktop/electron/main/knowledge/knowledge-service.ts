@@ -939,6 +939,7 @@ export function createLocalKnowledgeService(
     mimeType: string
     versionNumber: number
     contentHash: string
+    createdAt: number
     recoveryAttempt: number
     nextRetryAt: number
     lastErrorCode: string | null
@@ -955,7 +956,8 @@ export function createLocalKnowledgeService(
       pending.recovery_attempt AS recoveryAttempt, pending.next_retry_at AS nextRetryAt,
       pending.last_error_code AS lastErrorCode,
       base.name AS baseName, document.name AS documentName, version.mime_type AS mimeType,
-      version.version_number AS versionNumber, version.content_hash AS contentHash
+      version.version_number AS versionNumber, version.content_hash AS contentHash,
+      version.created_at AS createdAt
     FROM cloud_pending_publications AS pending
     JOIN knowledge_bases AS base ON base.id = pending.knowledge_base_id
     JOIN documents AS document ON document.id = pending.document_id
@@ -973,11 +975,63 @@ export function createLocalKnowledgeService(
     if (!remote || !ordinaryCloudAllowed(active)) return
     let pending = pendingCloudPublication(active, knowledgeBaseId)
     if (!pending) return
+    if (pending.nextRetryAt > now()) return
+    const deferPublication = (errorCode: string): void => {
+      const recoveryAttempt = pending!.recoveryAttempt + 1
+      const retryDelay = Math.min(60_000, 1_000 * (2 ** Math.min(recoveryAttempt - 1, 6)))
+      const observedAt = now()
+      active.store.database.prepare(`
+        UPDATE cloud_pending_publications
+        SET recovery_attempt = ?, next_retry_at = ?, last_error_code = ?, updated_at = ?
+        WHERE knowledge_base_id = ? AND generation_id = ?
+      `).run(
+        recoveryAttempt, observedAt + retryDelay, errorCode, observedAt,
+        pending!.knowledgeBaseId, pending!.generationId,
+      )
+    }
+    const finalizePublishedHead = async (): Promise<boolean> => {
+      const currentMode = active.store.database.prepare(`
+        SELECT mode FROM cloud_sync_states WHERE knowledge_base_id = ?
+      `).get(pending!.knowledgeBaseId) as { mode: string } | undefined
+      if (currentMode?.mode === 'paused') active.cloud.resume(pending!.knowledgeBaseId)
+      const head = active.store.database.prepare(`
+        SELECT revision FROM cloud_entity_heads
+        WHERE knowledge_base_id = ? AND entity_kind = 'knowledge_base' AND entity_id = ?
+      `).get(
+        pending!.knowledgeBaseId, pending!.knowledgeBaseId,
+      ) as { revision: string } | undefined
+      active.cloud.enqueue({
+        mutationId: stableCloudId(
+          'base-mutation', pending!.knowledgeBaseId, pending!.generationId,
+        ),
+        knowledgeBaseId: pending!.knowledgeBaseId,
+        entityKind: 'knowledge_base',
+        entityId: pending!.knowledgeBaseId,
+        operation: 'upsert',
+        baseRevision: head?.revision ?? null,
+        payload: {
+          name: pending!.baseName,
+          publishedGenerationId: pending!.generationId,
+        },
+      })
+      const synchronization = await active.cloud.synchronize(
+        pending!.knowledgeBaseId,
+      ) as { status?: string }
+      assertCurrentBinding(active)
+      return synchronization.status === 'synced' && ordinaryCloudAllowed(active)
+    }
     const published = active.store.database.prepare(`
       SELECT published_generation_id AS publishedGenerationId
       FROM cloud_sync_states WHERE knowledge_base_id = ?
     `).get(pending.knowledgeBaseId) as { publishedGenerationId: string | null } | undefined
     if (published?.publishedGenerationId === pending.generationId) {
+      try {
+        if (!await finalizePublishedHead()) return
+      } catch {
+        assertCurrentBinding(active)
+        if (ordinaryCloudAllowed(active)) deferPublication('TRANSIENT_FAILURE')
+        return
+      }
       active.store.database.prepare(`
         DELETE FROM cloud_pending_publications
         WHERE knowledge_base_id = ? AND generation_id = ?
@@ -1015,6 +1069,7 @@ export function createLocalKnowledgeService(
           versionNumber: pending.versionNumber,
           contentHash: pending.contentHash,
           generationId: pending.generationId,
+          createdAt: pending.createdAt,
         },
       })
       const synchronization = await active.cloud.synchronize(pending.knowledgeBaseId) as {
@@ -1052,7 +1107,6 @@ export function createLocalKnowledgeService(
     }
     const uploadJobId = pending.uploadJobId
     if (!uploadJobId) return
-    if (pending.nextRetryAt > now()) return
     const currentMode = active.store.database.prepare(`
       SELECT mode FROM cloud_sync_states WHERE knowledge_base_id = ?
     `).get(pending.knowledgeBaseId) as { mode: string } | undefined
@@ -1060,19 +1114,6 @@ export function createLocalKnowledgeService(
       active.cloud.resume(pending.knowledgeBaseId)
       assertCurrentBinding(active)
       if (!ordinaryCloudAllowed(active)) return
-    }
-    const deferPublication = (errorCode: string): void => {
-      const recoveryAttempt = pending!.recoveryAttempt + 1
-      const retryDelay = Math.min(60_000, 1_000 * (2 ** Math.min(recoveryAttempt - 1, 6)))
-      const observedAt = now()
-      active.store.database.prepare(`
-        UPDATE cloud_pending_publications
-        SET recovery_attempt = ?, next_retry_at = ?, last_error_code = ?, updated_at = ?
-        WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
-      `).run(
-        recoveryAttempt, observedAt + retryDelay, errorCode, observedAt,
-        pending!.knowledgeBaseId, pending!.generationId, uploadJobId,
-      )
     }
     let completed = false
     for (let poll = 0; poll < 3; poll += 1) {
@@ -1125,6 +1166,13 @@ export function createLocalKnowledgeService(
       generationId: pending.generationId,
     })
     assertCurrentBinding(active)
+    try {
+      if (!await finalizePublishedHead()) return
+    } catch {
+      assertCurrentBinding(active)
+      if (ordinaryCloudAllowed(active)) deferPublication('TRANSIENT_FAILURE')
+      return
+    }
     active.store.database.prepare(`
       DELETE FROM cloud_pending_publications
       WHERE knowledge_base_id = ? AND generation_id = ? AND upload_job_id = ?
