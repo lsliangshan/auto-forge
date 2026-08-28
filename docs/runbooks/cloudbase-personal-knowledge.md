@@ -75,7 +75,7 @@ Stop if the two forward migrations are not byte-identical.
    verify that job child launches a fresh parser child whose environment contains
    no RPC, Storage, TokenHub, proxy, service-role,
    or provider credential and whose network APIs are denied. Exercise the exact
-   parser ceilings before or during accumulation: 64 MiB input, 32 MiB expanded
+    parser ceilings before or during accumulation: 64 MiB input, 16 MiB expanded
    DOCX and 100x compression ratio, 1000 PDF pages, 16 MiB text, 10000 blocks or
    chunks, 768 KiB result, 832 KiB response frame, and 128 MiB V8 old-space.
    Treat the parent's 192 MiB RSS sampler only as a post-allocation kill guard,

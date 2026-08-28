@@ -2637,6 +2637,18 @@ describe('CloudBase knowledge scheduled worker', () => {
     expect(extractRawText).not.toHaveBeenCalled()
   })
 
+  it('keeps the DOCX expanded-byte ceiling at 16 MiB in code and operator docs', async () => {
+    const [worker, readme, runbook] = await Promise.all([
+      readFile(new URL('../../cloudbase/knowledge/worker/knowledge-worker.js', import.meta.url), 'utf8'),
+      readFile(new URL('../../cloudbase/knowledge/README.md', import.meta.url), 'utf8'),
+      readFile(new URL('../../docs/runbooks/cloudbase-personal-knowledge.md', import.meta.url), 'utf8'),
+    ])
+    expect(worker).toContain('MAX_DOCX_EXPANDED_BYTES = 16 * 1024 * 1024')
+    expect(readme).toContain('DOCX 展开总量最多 16 MiB')
+    expect(runbook).toMatch(/16 MiB expanded\s+DOCX/)
+    expect(runbook).not.toMatch(/32 MiB expanded\s+DOCX/)
+  })
+
   it('checks actual DOCX expansion before invoking Mammoth', async () => {
     const extractRawText = vi.fn()
     const parser = createKnowledgeParser({ loadMammoth: () => ({ extractRawText }) })
