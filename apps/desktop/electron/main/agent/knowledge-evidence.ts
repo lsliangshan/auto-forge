@@ -120,11 +120,12 @@ export type KnowledgeAnswerValidation =
   | { kind: 'repair'; invalidEvidenceIds: string[] }
   | { kind: 'insufficient'; reason: 'no-evidence' | 'uncited' | 'invalid-citation' | 'unsupported-claim' }
 
-const KNOWLEDGE_MARKER = /\[\[kb:([^\]\r\n]{1,512})\]\]/gu
+const KNOWLEDGE_MARKER = /\[\[kb:([^\u005b\u005d\r\n]{1,512})\]\]/gu
 const SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX = /\[\[[\s\u200b-\u200d\u2060\ufeff]*kb[\s\u200b-\u200d\u2060\ufeff]*[:：]/gimu
 const KNOWLEDGE_MARKER_PLACEHOLDER_START = '\u{e200}'
 const KNOWLEDGE_MARKER_PLACEHOLDER_END = '\u{e201}'
 const KNOWLEDGE_MARKER_PLACEHOLDER = /\u{e200}(\d+)\u{e201}/gu
+const KNOWLEDGE_ANSWER_MAX_LENGTH = 4_000
 const NUMERIC_DOT = '\u{e100}'
 const NUMERIC_COLON = '\u{e101}'
 const NUMERIC_COMMA = '\u{e102}'
@@ -203,21 +204,33 @@ function stripSuspiciousKnowledgeMarkers(answer: string): string {
     const prefix = SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX.exec(answer)
     if (!prefix) return `${sanitized}${answer.slice(cursor)}`
     sanitized += answer.slice(cursor, prefix.index)
-    const close = answer.indexOf(']]', SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX.lastIndex)
-    if (close === -1) return sanitized
-    cursor = close + 2
+    let depth = 1
+    let markerEnd = SUSPICIOUS_KNOWLEDGE_MARKER_PREFIX.lastIndex
+    while (markerEnd + 1 < answer.length) {
+      if (answer.startsWith('[[', markerEnd)) {
+        depth += 1
+        markerEnd += 2
+      } else if (answer.startsWith(']]', markerEnd)) {
+        depth -= 1
+        markerEnd += 2
+        if (depth === 0) break
+      } else markerEnd += 1
+    }
+    if (depth !== 0) return sanitized
+    cursor = markerEnd
   }
   return sanitized
 }
 
 function sanitizeMixedKnowledgeAnswer(answer: string, preserveCanonicalMarkers: boolean): string {
   const canonicalMarkers: string[] = []
+  const boundedAnswer = answer.slice(0, KNOWLEDGE_ANSWER_MAX_LENGTH)
   const protectedAnswer = preserveCanonicalMarkers
-    ? answer.replace(KNOWLEDGE_MARKER, (marker) => {
+    ? boundedAnswer.replace(KNOWLEDGE_MARKER, (marker) => {
         canonicalMarkers.push(marker)
         return `${KNOWLEDGE_MARKER_PLACEHOLDER_START}${canonicalMarkers.length - 1}${KNOWLEDGE_MARKER_PLACEHOLDER_END}`
       })
-    : answer
+    : boundedAnswer
   return stripSuspiciousKnowledgeMarkers(protectedAnswer)
     .replace(
       KNOWLEDGE_MARKER_PLACEHOLDER,

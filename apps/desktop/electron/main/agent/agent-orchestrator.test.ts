@@ -6906,6 +6906,10 @@ describe('AgentOrchestrator knowledge grounding', () => {
     ['cross-line marker only', '[[kb:\nforged]]'],
     ['fullwidth-colon marker only', '[[ kb ： forged ]]'],
     ['zero-width marker only', '[[\u200bkb：forged]]'],
+    ['nested marker only', '[[kb:[[kb:forged]]payload]]'],
+    ['multilevel marker only', '[[kb:outer [[level [[not-kb]] end]] payload]]'],
+    ['unclosed nested marker only', '[[kb:outer [[not-kb]] payload'],
+    ['sequential nested markers only', '[[kb:first]][[ kb:second [[not-kb]] payload]]'],
   ])('uses the bounded insufficient response when %s sanitizes to empty', async (_name, answer) => {
     const dependencies = harness([[
       { type: 'text_delta', choiceIndex: 0, text: answer },
@@ -6965,6 +6969,28 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(terminal).toContain('【知识库依据】合同经双方签字后生效。')
     expect(terminal).toContain('knowledge_citation')
     expect(terminal).not.toContain('forged')
+  })
+
+  it('removes an entire nested suspicious marker on the mixed admitted-evidence path', async () => {
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]] [[ kb:outer [[not-kb]] payload]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+    const input = Object.assign(knowledgeRunInput('合同何时生效？'), {
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
+    })
+
+    await new AgentOrchestrator(dependencies).run(input)
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('【知识库依据】合同经双方签字后生效。')
+    expect(terminal).toContain('knowledge_citation')
+    expect(terminal).not.toContain('payload')
+    expect(terminal).not.toContain('not-kb')
   })
 
   it('fails a strict knowledge-only request closed when the model skips retrieval', async () => {

@@ -563,6 +563,10 @@ describe('knowledge tool and answer validation', () => {
     '[[kb:\nforged]]',
     '[[ kb ： forged ]]',
     '[[\u200bkb：forged]]',
+    '[[kb:[[kb:forged]]payload]]',
+    '[[kb:outer [[level [[not-kb]] end]] payload]]',
+    '[[kb:outer [[not-kb]] payload',
+    '[[kb:first]][[ kb:second [[not-kb]] payload]]',
   ])('fails mixed no-evidence output closed when marker cleanup leaves no answer: %s', (answer) => {
     expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
       kind: 'insufficient', reason: 'no-evidence',
@@ -591,10 +595,32 @@ describe('knowledge tool and answer validation', () => {
     })
   })
 
-  it('does not remove ordinary double-bracket text in mixed mode', () => {
-    expect(validateKnowledgeAnswer('一般说明 [[not-kb]]', [], 'mixed', 0)).toEqual({
+  it('removes an entire nested suspicious marker while retaining an admitted mixed citation', () => {
+    expect(validateKnowledgeAnswer(
+      '合同生效。[[kb:evidence:0]] [[ kb:outer [[not-kb]] payload]]',
+      [evidence(0, { snippet: '合同生效。' })],
+      'mixed', 1,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: '【知识库依据】合同生效。',
+    })
+  })
+
+  it('bounds nested marker scanning to the existing 4,000-character answer boundary', () => {
+    const prefix = '一般说明'.padEnd(4_000, '甲')
+    expect(validateKnowledgeAnswer(`${prefix}[[kb:[[not-kb]]payload]]tail`, [], 'mixed', 0)).toEqual({
       kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
-      text: '【一般信息】一般说明 [[not-kb]]',
+      text: `【一般信息】${prefix}`,
+    })
+  })
+
+  it.each([
+    '一般说明 [[not-kb]]',
+    '一般说明 [label](destination)',
+  ])('does not remove ordinary external bracket text in mixed mode: %s', (answer) => {
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: `【一般信息】${answer}`,
     })
   })
 
