@@ -225,6 +225,15 @@ function storedConsent(
   database: SqliteDatabase,
   purpose: PrivacyConsentPurpose,
 ): PrivacyConsent | undefined {
+  const unacknowledgedAcceptance = database.prepare(`
+    SELECT 1
+    FROM outbox_mutations
+    WHERE kind = 'privacy.consent'
+      AND json_extract(payload_json, '$.purpose') = @purpose
+      AND state IN ('pending', 'syncing', 'failed')
+    LIMIT 1
+  `).get({ purpose })
+  if (unacknowledgedAcceptance !== undefined) return undefined
   const state = storedConsentState(database, purpose)
   if (state?.state !== 'accepted') return undefined
   return privacyConsentSchema.parse({
@@ -313,7 +322,10 @@ function optimisticallyProjectConsent(
 ): void {
   const currentRevision = storedConsentState(database, mutation.payload.purpose)?.revision ?? 0
   if (currentRevision !== mutation.baseRevision) throw new UserDataConsistencyError()
-  if (mutation.kind === 'privacy.consent') projectConsent(database, mutation.payload)
+  if (mutation.kind === 'privacy.consent') {
+    projectConsent(database, mutation.payload)
+    return
+  }
   writeConsentState(database, consentStateFromMutation(mutation, mutation.baseRevision + 1))
 }
 
@@ -1403,6 +1415,10 @@ function acknowledgePushResults(
       if (local?.state !== 'syncing') throw new UserDataConsistencyError()
       if (result.status === 'applied') {
         requireValidRemoteResult(receipt)
+        if (local.kind === 'privacy.consent' || local.kind === 'privacy.consent.revoke') {
+          preserveReceiptEvidence(database, local)
+          acknowledgeLocalMutation(database, ownerUserId, local, receipt)
+        }
       } else if (result.status === 'duplicate') {
         requireValidRemoteResult(receipt)
         preserveReceiptEvidence(database, local)

@@ -2142,8 +2142,13 @@ describe('UserDataStoreManager', () => {
       },
     }
     alice.outbox.recordWithConsent(consent)
+    expect(alice.account.getConsent('cloud_sync')).toBeUndefined()
+    alice.outbox.markSyncing([consent.id])
+    alice.outbox.acknowledgePushResults(
+      [consent], [{ id: consent.id, status: 'applied', revision: 1 }],
+    )
     expect(alice.account.getConsent('cloud_sync')).toEqual(consent.payload)
-    expect(alice.outbox.find(consent.id)).toBeDefined()
+    expect(alice.outbox.find(consent.id)).toBeUndefined()
 
     const preferences: Extract<SyncMutation, { kind: 'preferences.update' }> = {
       id: 'preferences_mutation_1', kind: 'preferences.update', entityId: 'account-preferences',
@@ -2192,6 +2197,11 @@ describe('UserDataStoreManager', () => {
       },
     }
     store.outbox.recordWithConsent(accepted)
+    expect(store.account.getConsentState('cloud_sync')).toBeUndefined()
+    store.outbox.markSyncing([accepted.id])
+    store.outbox.acknowledgePushResults(
+      [accepted], [{ id: accepted.id, status: 'applied', revision: 1 }],
+    )
     expect(store.account.getConsentState('cloud_sync')).toEqual({
       ...accepted.payload, state: 'accepted', revision: 1,
     })
@@ -2224,6 +2234,14 @@ describe('UserDataStoreManager', () => {
       },
     }
     store.outbox.recordWithConsent(reaccepted)
+    expect(store.account.getConsent('cloud_sync')).toBeUndefined()
+    expect(store.account.getConsentState('cloud_sync')).toMatchObject({
+      state: 'revoked', revision: 2,
+    })
+    store.outbox.markSyncing([reaccepted.id])
+    store.outbox.acknowledgePushResults(
+      [reaccepted], [{ id: reaccepted.id, status: 'applied', revision: 3 }],
+    )
     expect(store.account.getConsentState('cloud_sync')).toEqual({
       ...reaccepted.payload, state: 'accepted', revision: 3,
     })
@@ -2234,6 +2252,34 @@ describe('UserDataStoreManager', () => {
       FROM privacy_consents WHERE purpose = 'cloud_sync'
     `).all()).toEqual([{ purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08' }])
     inspection.close()
+    manager.close()
+  })
+
+  it('does not authorize an optimistic acceptance before applied or duplicate acknowledgement', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const accepted: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      id: 'consent_pending_authority', kind: 'privacy.consent',
+      entityId: 'cloud-sync-2026-08', baseRevision: 0,
+      occurredAt: '2026-08-28T00:00:00.000Z', payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+
+    store.outbox.recordWithConsent(accepted)
+    expect(store.account.getConsent('cloud_sync')).toBeUndefined()
+    expect(store.account.getConsentState('cloud_sync')).toBeUndefined()
+
+    store.outbox.markSyncing([accepted.id])
+    store.outbox.acknowledgePushResults(
+      [accepted], [{ id: accepted.id, status: 'applied', revision: 1 }],
+    )
+    expect(store.account.getConsent('cloud_sync')).toEqual(accepted.payload)
+    expect(store.account.getConsentState('cloud_sync')).toEqual({
+      ...accepted.payload, state: 'accepted', revision: 1,
+    })
+    expect(store.outbox.find(accepted.id)).toBeUndefined()
     manager.close()
   })
 

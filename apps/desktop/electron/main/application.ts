@@ -2438,7 +2438,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           occurredAt: consent.data.consentedAt, payload: consent.data,
         })
         applyCurrentCloudSyncConsent(session.user.id)
-        queueUserDataFlush()
+        await userDataSync.flush()
+        applyCurrentCloudSyncConsent(session.user.id)
       },
       getCloudSyncConsentState: async () => {
         await requireAuthenticatedSession()

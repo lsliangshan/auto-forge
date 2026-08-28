@@ -192,6 +192,10 @@ describe('UserDataSyncEngine', () => {
       },
     }
     alice.outbox.recordWithConsent(accepted)
+    alice.outbox.markSyncing([accepted.id])
+    alice.outbox.acknowledgePushResults(
+      [accepted], [{ id: accepted.id, status: 'applied', revision: 1 }],
+    )
     const revoke: Extract<SyncMutation, { kind: 'privacy.consent.revoke' }> = {
       id: 'consent_revoke_engine', kind: 'privacy.consent.revoke', entityId: 'cloud_sync',
       baseRevision: 1, occurredAt: '2026-08-28T01:00:00.000Z', payload: {
@@ -231,6 +235,77 @@ describe('UserDataSyncEngine', () => {
     await Promise.all([latePull, handoff])
     expect(consentEvents).toHaveLength(1)
     expect(manager.current()?.account.getConsentState('cloud_sync')).toBeUndefined()
+    manager.close()
+  })
+
+  it('forces authoritative pull after a stale accept conflicts with later server revocation', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const acceptedR1: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      id: 'server_accept_r1', kind: 'privacy.consent', entityId: 'cloud-sync-2026-08',
+      baseRevision: 0, occurredAt: '2026-08-28T00:00:00.000Z', payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    const revokedR2: Extract<SyncMutation, { kind: 'privacy.consent.revoke' }> = {
+      id: 'device_a_revoke_r2', kind: 'privacy.consent.revoke', entityId: 'cloud_sync',
+      baseRevision: 1, occurredAt: '2026-08-28T01:00:00.000Z', payload: {
+        purpose: 'cloud_sync', revokedAt: '2026-08-28T01:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_authoritative_r2', mutations: [
+        remoteReceipt(acceptedR1, 1), remoteReceipt(revokedR2, 2),
+      ],
+    }, 1)
+    const staleAccepted: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      ...acceptedR1, id: 'device_b_stale_accept_r3', baseRevision: 2,
+      occurredAt: '2026-08-28T02:00:00.000Z', payload: {
+        ...acceptedR1.payload, consentedAt: '2026-08-28T02:00:00.000Z',
+      },
+    }
+    store.outbox.recordWithConsent(staleAccepted)
+    expect(store.account.getConsent('cloud_sync')).toBeUndefined()
+
+    const serverAcceptedR3: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      ...staleAccepted, id: 'server_accept_r3',
+    }
+    const serverRevokedR4: Extract<SyncMutation, { kind: 'privacy.consent.revoke' }> = {
+      ...revokedR2, id: 'server_revoke_r4', baseRevision: 3,
+      occurredAt: '2026-08-28T03:00:00.000Z', payload: {
+        ...revokedR2.payload, revokedAt: '2026-08-28T03:00:00.000Z',
+      },
+    }
+    const calls: string[] = []
+    const consentEvents: Array<PrivacyConsentState | undefined> = []
+    const { engine } = createEngine(manager, async (input) => {
+      calls.push(input.action)
+      if (input.action === 'syncPush') return success({
+        results: [{
+          id: staleAccepted.id, status: 'conflict', errorCode: 'SYNC_CONFLICT',
+        }],
+        cursor: 'cursor_conflict_authoritative_r4',
+      })
+      return success({
+        mutations: [remoteReceipt(serverAcceptedR3, 3), remoteReceipt(serverRevokedR4, 4)],
+        cursor: 'cursor_authoritative_r4',
+      })
+    }, new FakeClock(), undefined, undefined, (_binding, state) => {
+      consentEvents.push(state)
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(calls).toEqual(['syncPush', 'syncPull'])
+    expect(store.account.getConsent('cloud_sync')).toBeUndefined()
+    expect(store.account.getConsentState('cloud_sync')).toEqual({
+      ...serverRevokedR4.payload, state: 'revoked', revision: 4,
+    })
+    expect(consentEvents.at(-1)).toEqual({
+      ...serverRevokedR4.payload, state: 'revoked', revision: 4,
+    })
     manager.close()
   })
 

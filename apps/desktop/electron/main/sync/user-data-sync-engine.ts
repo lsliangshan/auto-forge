@@ -347,6 +347,7 @@ export class UserDataSyncEngine {
     this.#clearTimer()
     this.#status = { state: 'running' }
     let quarantineCode: AppErrorCode | undefined
+    let authoritativePullCompleted = false
 
     while (this.#isCurrent(binding)) {
       const ready = binding.store.outbox.listReady(this.#dependencies.now(), BATCH_LIMIT)
@@ -452,18 +453,43 @@ export class UserDataSyncEngine {
       }
 
       let terminalResultCode: AppErrorCode | undefined
+      const consentConflicts: Array<Extract<
+        SyncMutation,
+        { kind: 'privacy.consent' | 'privacy.consent.revoke' }
+      >> = []
       for (const result of data.results) {
         if (result.status === 'conflict') {
           const code = result.errorCode === 'SYNC_CONFLICT' ? result.errorCode : 'SYNC_CONFLICT'
           binding.store.outbox.markFailed(result.id, code)
           this.#untrackSyncing(binding, [result.id])
-          terminalResultCode ??= code
+          const mutation = mutations.find(({ id }) => id === result.id)
+          if (mutation?.kind === 'privacy.consent'
+            || mutation?.kind === 'privacy.consent.revoke') {
+            consentConflicts.push(mutation)
+          } else {
+            terminalResultCode ??= code
+          }
         } else if (result.status === 'rejected') {
           const code = result.errorCode ?? 'INVALID_INPUT'
           binding.store.outbox.markFailed(result.id, code)
           this.#untrackSyncing(binding, [result.id])
           terminalResultCode ??= code
         }
+      }
+      if (consentConflicts.length > 0) {
+        const pullOutcome = await this.#pull(binding)
+        if (!this.#isCurrent(binding)) return
+        const converged = pullOutcome === 'success' && consentConflicts.every((mutation) => (
+          (binding.store.account.getConsentState(mutation.payload.purpose)?.revision ?? 0)
+            > mutation.baseRevision
+        ))
+        if (!converged) {
+          this.#quarantine('SYNC_CONFLICT')
+          return
+        }
+        for (const mutation of consentConflicts) binding.store.outbox.delete(mutation.id)
+        this.#notifyConsent(binding, consentConflicts)
+        authoritativePullCompleted = true
       }
       if (terminalResultCode) {
         this.#notify(binding, conversationIds)
@@ -474,7 +500,7 @@ export class UserDataSyncEngine {
 
     if (!this.#isCurrent(binding)) return
     this.#pullRequested = false
-    const pullOutcome = await this.#pull(binding)
+    const pullOutcome = authoritativePullCompleted ? 'success' : await this.#pull(binding)
     if (!this.#isCurrent(binding)) return
     if (quarantineCode) {
       this.#quarantine(quarantineCode)

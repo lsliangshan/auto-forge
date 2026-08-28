@@ -26,7 +26,7 @@ import {
 } from '@autoforge/shared'
 import {
   createApplicationFailureRecorder,
-  createApplicationRuntime,
+  createApplicationRuntime as createApplicationRuntimeImpl,
   createWorkflowExecutionSourceResolver,
   MaintenanceGate,
   observeAuthService,
@@ -238,7 +238,47 @@ function serializedProxyHarness() {
 }
 
 let networkProxy = createNetworkProxy()
-type RuntimeOptions = Parameters<typeof createApplicationRuntime>[0]
+type RuntimeOptions = Parameters<typeof createApplicationRuntimeImpl>[0]
+
+function consentAcknowledgingUserDataSyncPort(
+  delegate?: RuntimeOptions['userDataSyncPort'],
+): NonNullable<RuntimeOptions['userDataSyncPort']> {
+  let consentEstablished = false
+  return {
+    call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+      const includesConsent = input.action === 'syncPush'
+        && input.mutations.some((mutation) => mutation.kind === 'privacy.consent'
+          || mutation.kind === 'privacy.consent.revoke')
+      if (input.action === 'syncPush' && (includesConsent || !consentEstablished)) {
+        consentEstablished ||= includesConsent
+        return { ok: true, data: {
+          results: input.mutations.map((mutation) => ({
+            id: mutation.id, status: 'applied' as const,
+            revision: mutation.baseRevision + 1,
+          })),
+          cursor: 'cursor_test_consent_push',
+        } }
+      }
+      if (input.action === 'syncPull' && !consentEstablished) {
+        return { ok: true, data: { mutations: [], cursor: null } }
+      }
+      if (delegate) return delegate.call(input)
+      if (input.action === 'syncPull') {
+        return { ok: true, data: { mutations: [], cursor: null } }
+      }
+      throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' })
+    }),
+  }
+}
+
+function createApplicationRuntime(input: RuntimeOptions) {
+  return createApplicationRuntimeImpl({
+    ...input,
+    ...('userDataSyncPort' in input ? {} : {
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort(),
+    }),
+  })
+}
 
 function createTestAuthService(): AuthService {
   const users = new Map<string, { session: AuthSession; password: string; target: string }>()
@@ -376,6 +416,7 @@ function options(
   overrides: Partial<RuntimeOptions> = {},
 ): RuntimeOptions {
   const authService = createTestAuthService()
+  const userDataSyncPort = consentAcknowledgingUserDataSyncPort()
   return {
     paths: {
       database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
@@ -398,6 +439,7 @@ function options(
     networkProxy,
     browserWorkspace: createBrowserWorkspace(),
     authService,
+    userDataSyncPort,
     ...overrides,
   }
 }
@@ -444,6 +486,13 @@ async function authenticate(
       purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
       consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
     })
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const state = await runtime.services.settings.getCloudSyncConsentState()
+      if (state?.state === 'accepted') break
+      await Promise.resolve()
+    }
+    const state = await runtime.services.settings.getCloudSyncConsentState()
+    if (state?.state !== 'accepted') throw new Error('Test consent was not acknowledged')
   }
   return session
 }
@@ -827,7 +876,20 @@ describe('createApplicationRuntime', () => {
   it('requires persisted cloud-sync consent before the first conversation without mutating cache or outbox', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-cloud-consent-'))
     directories.push(root)
-    const runtime = createApplicationRuntime(options(root))
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => (
+        input.action === 'syncPush'
+          ? { ok: true, data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const,
+              revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'cursor_cloud_consent_push',
+          } }
+          : { ok: true, data: { mutations: [], cursor: null } }
+      )),
+    }
+    const runtime = createApplicationRuntime(options(root, { userDataSyncPort }))
     const session = await authenticate(runtime, 'ConsentAlice', false)
 
     await expect(runtime.services.chat.createConversation())
@@ -844,8 +906,11 @@ describe('createApplicationRuntime', () => {
       purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
       consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
     })
+    await vi.waitFor(() => expect(withUserData(
+      root, session.user.id, (store) => store.account.getConsent('cloud_sync'),
+    )).toMatchObject({ documentVersion: 'cloud-sync-2026-08' }))
     await expect(runtime.services.chat.createConversation())
-      .resolves.toMatchObject({ title: '新会话', syncState: 'pending' })
+      .resolves.toMatchObject({ title: '新会话' })
     expect(withUserData(root, session.user.id, (store) => store.account.getConsent('cloud_sync')))
       .toMatchObject({ documentVersion: 'cloud-sync-2026-08' })
     await runtime.close()
@@ -1158,10 +1223,14 @@ describe('createApplicationRuntime', () => {
       VALUES ('legacy_quarantine', 'Legacy quarantine', 'user_named', NULL, 1, 1)
     `).run()
     seeded.close()
+    let pullCount = 0
     const userDataSyncPort = {
       call: vi.fn(async (input: CloudBaseUserDataCall) => {
         if (input.action === 'syncPull') {
-          return { ok: false as const, error: { code: 'INVALID_INPUT' as const } }
+          pullCount += 1
+          return pullCount === 1
+            ? { ok: true as const, data: { mutations: [], cursor: 'cursor_quarantine_initial' } }
+            : { ok: false as const, error: { code: 'INVALID_INPUT' as const } }
         }
         if (input.action === 'importLegacyBatch') {
           return {
@@ -1172,7 +1241,13 @@ describe('createApplicationRuntime', () => {
           }
         }
         if (input.action === 'syncPush') {
-          return { ok: true as const, data: { results: [], cursor: 'quarantine_push' } }
+          return { ok: true as const, data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const,
+              revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'cursor_quarantine_push',
+          } }
         }
         throw toSafeAppError({ code: 'INTERNAL_ERROR' })
       }),
@@ -1496,13 +1571,31 @@ describe('createApplicationRuntime', () => {
       })),
       sourceAvailable: vi.fn(async () => false),
     })
+    const pushedConsents: SyncMutation[] = []
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+        if (input.action === 'syncPush') {
+          pushedConsents.push(...input.mutations.filter((mutation) => (
+            mutation.kind === 'privacy.consent' || mutation.kind === 'privacy.consent.revoke'
+          )))
+          return { ok: true, data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const,
+              revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'cursor_authoritative_consent_push',
+          } }
+        }
+        return { ok: true, data: { mutations: [], cursor: null } }
+      }),
+    }
     const runtime = createApplicationRuntime(options(root, {
-      userDataStores, knowledgeService,
+      userDataStores, knowledgeService, userDataSyncPort,
     }))
     const session = await authenticate(runtime, 'KnowledgeConsentAlice', false)
 
     expect(knowledgeService.bind).toHaveBeenLastCalledWith(session.user.id, false)
-    userDataStores.current()!.outbox.recordWithConsent({
+    const oldConsent: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
       id: 'old-cloud-consent', kind: 'privacy.consent',
       entityId: 'cloud-sync-2025-01', baseRevision: 0,
       occurredAt: '2026-08-25T00:00:00.000Z',
@@ -1510,7 +1603,12 @@ describe('createApplicationRuntime', () => {
         purpose: 'cloud_sync', documentVersion: 'cloud-sync-2025-01',
         consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
       },
-    })
+    }
+    userDataStores.current()!.outbox.recordWithConsent(oldConsent)
+    userDataStores.current()!.outbox.markSyncing([oldConsent.id])
+    userDataStores.current()!.outbox.acknowledgePushResults(
+      [oldConsent], [{ id: oldConsent.id, status: 'applied', revision: 1 }],
+    )
     await runtime.services.auth.loginWithPassword({
       account: 'KnowledgeConsentAlice', password: 'password',
     })
@@ -1520,13 +1618,15 @@ describe('createApplicationRuntime', () => {
       purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
       consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
     })
-    await expect(runtime.services.settings.getCloudSyncConsentState()).resolves.toEqual({
-      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
-      consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
-      state: 'accepted', revision: 2,
+    await vi.waitFor(async () => {
+      await expect(runtime.services.settings.getCloudSyncConsentState()).resolves.toEqual({
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+        state: 'accepted', revision: 2,
+      })
+      expect(knowledgeService.setCloudSyncConsent)
+        .toHaveBeenLastCalledWith(session.user.id, true)
     })
-    expect(knowledgeService.setCloudSyncConsent)
-      .toHaveBeenLastCalledWith(session.user.id, true)
 
     await expect(runtime.services.settings.revokeCloudSyncConsent({ confirmed: true }))
       .resolves.toMatchObject({
@@ -1545,14 +1645,14 @@ describe('createApplicationRuntime', () => {
       purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
       consentedAt: '2026-08-28T02:00:00.000Z', clientVersion: '0.1.0',
     })
-    await expect(runtime.services.settings.getCloudSyncConsentState())
-      .resolves.toMatchObject({ state: 'accepted', revision: 4 })
-    expect(knowledgeService.setCloudSyncConsent)
-      .toHaveBeenLastCalledWith(session.user.id, true)
-    expect(userDataStores.current()!.outbox.list(100)
-      .filter(({ kind }) => kind === 'privacy.consent' || kind === 'privacy.consent.revoke')
+    await vi.waitFor(async () => {
+      await expect(runtime.services.settings.getCloudSyncConsentState())
+        .resolves.toMatchObject({ state: 'accepted', revision: 4 })
+      expect(knowledgeService.setCloudSyncConsent)
+        .toHaveBeenLastCalledWith(session.user.id, true)
+    })
+    expect(pushedConsents
       .map(({ kind, baseRevision }) => ({ kind, baseRevision }))).toEqual([
-      { kind: 'privacy.consent', baseRevision: 0 },
       { kind: 'privacy.consent', baseRevision: 1 },
       { kind: 'privacy.consent.revoke', baseRevision: 2 },
       { kind: 'privacy.consent', baseRevision: 3 },
@@ -1591,7 +1691,7 @@ describe('createApplicationRuntime', () => {
         }
         if (input.action === 'syncPull') {
           pullCount += 1
-          if (pullCount === 2) {
+          if (pullCount === 3) {
             return {
               ok: true,
               data: {
@@ -2992,6 +3092,8 @@ describe('createApplicationRuntime', () => {
         await new Promise<void>((resolve) => { setImmediate(resolve) })
       }
     }
+    await settleEvents()
+    emitChat.mockClear()
 
     await runtime.services.auth.logout({ discardPending: true })
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'anonymous')))
@@ -7129,7 +7231,10 @@ describe('createApplicationRuntime', () => {
       },
     })
     const conversation = await runtime.services.chat.createConversation()
-    expect(await listConversations(runtime)).toEqual([conversation])
+    expect(await listConversations(runtime)).toEqual([{
+      ...conversation,
+      syncState: expect.stringMatching(/^(pending|syncing)$/),
+    }])
     expect(await listMessages(runtime, conversation.id)).toEqual([])
     expect(await runtime.services.chat.renameConversation(conversation.id, 'Renamed')).toMatchObject({ title: 'Renamed' })
     await runtime.services.chat.send(chatInput(conversation.id, 'persist me'))
@@ -8342,7 +8447,7 @@ describe('createApplicationRuntime', () => {
     }
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
-      userDataSyncPort,
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort(userDataSyncPort),
     }))
 
     const alice = await authenticate(runtime, 'CacheAlice')
@@ -8355,7 +8460,7 @@ describe('createApplicationRuntime', () => {
     expect(userDataStores.current()?.conversations.get(aliceConversation.id)?.userId)
       .toBe(alice.user.id)
 
-    await authenticate(runtime, 'CacheBob')
+    await authenticate(runtime, 'CacheBob', false)
     expect(await runtime.services.chat.listConversations({ limit: 50 })).toEqual({ items: [] })
 
     await runtime.services.auth.loginWithPassword({ account: 'CacheAlice', password: 'password' })
@@ -8393,9 +8498,9 @@ describe('createApplicationRuntime', () => {
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
       knowledgeService,
-      userDataSyncPort: {
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort({
         call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
-      },
+      }),
       chooseMediaFiles: async () => [source],
     }))
     const session = await authenticate(runtime, 'LogoutPendingAlice')
@@ -8408,7 +8513,7 @@ describe('createApplicationRuntime', () => {
     await expect(access(mediaPath)).resolves.toBeUndefined()
 
     await expect(runtime.services.auth.logout()).resolves.toEqual({
-      status: 'pending_sync', pendingCount: 2,
+      status: 'pending_sync', pendingCount: 1,
     })
     expect(knowledgeLifecycle.slice(-2)).toEqual(['invalidate', 'bind'])
     await expect(runtime.services.auth.requireSession()).resolves.toMatchObject({
@@ -8568,9 +8673,9 @@ describe('createApplicationRuntime', () => {
     const userDataStores = new UserDataStoreManager(userDataRoot)
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
-      userDataSyncPort: {
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort({
         call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
-      },
+      }),
       chooseMediaFiles: async () => [source],
     }))
     const session = await authenticate(runtime, 'PreservePendingAlice')
@@ -8580,7 +8685,7 @@ describe('createApplicationRuntime', () => {
     })
     const mediaRoot = join(root, 'user-media', userMediaScope(session.user.id))
     const mediaPath = join(mediaRoot, conversation.id, `${asset!.id}.png`)
-    expect(userDataStores.current()?.outbox.countPending()).toBe(2)
+    expect(userDataStores.current()?.outbox.countPending()).toBe(1)
 
     await expect(runtime.services.auth.logout({ preservePending: true }))
       .resolves.toEqual({ status: 'logged_out' })
@@ -8591,7 +8696,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.auth.loginWithPassword({
       account: 'PreservePendingAlice', password: 'password',
     })
-    expect(userDataStores.current()?.outbox.countPending()).toBe(2)
+    expect(userDataStores.current()?.outbox.countPending()).toBe(1)
     await runtime.close()
   })
 
@@ -8912,9 +9017,9 @@ describe('createApplicationRuntime', () => {
     })
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
-      userDataSyncPort: {
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort({
         call: userDataSyncCall,
-      },
+      }),
       modelProviders: snapshotProviders({ deepseek: {
         listModels: async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')],
         validateCredential: async () => ({ valid: true }),
