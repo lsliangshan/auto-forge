@@ -4,6 +4,8 @@ const { createHash, randomUUID } = require('node:crypto')
 
 const MAX_JOBS_PER_RUN = 8
 const LEASE_SECONDS = 600
+const DEFAULT_PARSER_TIMEOUT_MS = 120_000
+const MAX_PARSER_TIMEOUT_MS = (LEASE_SECONDS * 1000) - 1_000
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024
 const MAX_INDEX_BYTES = 786_432
 const MAX_ITEMS = 10_000
@@ -101,13 +103,35 @@ function validParseResult(value) {
 
 function createKnowledgeWorker({
   rpc, storage, parser, embeddingWorker, workerId, id = randomUUID,
-  maxJobs = MAX_JOBS_PER_RUN,
+  maxJobs = MAX_JOBS_PER_RUN, parserTimeoutMs = DEFAULT_PARSER_TIMEOUT_MS,
 }) {
   if (typeof rpc !== 'function' || !storage || typeof storage.readObject !== 'function'
     || typeof storage.deleteObjects !== 'function' || !parser || typeof parser.parse !== 'function'
     || !nonEmptyString(workerId) || !Number.isSafeInteger(maxJobs)
-    || maxJobs < 1 || maxJobs > MAX_JOBS_PER_RUN) {
+    || maxJobs < 1 || maxJobs > MAX_JOBS_PER_RUN
+    || !Number.isSafeInteger(parserTimeoutMs)
+    || parserTimeoutMs < 1 || parserTimeoutMs > MAX_PARSER_TIMEOUT_MS) {
     throw new Error('Knowledge worker is not configured')
+  }
+
+  async function parseUpload(input) {
+    const controller = new AbortController()
+    let timeoutId
+    const timedOut = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort()
+        reject({ code: 'TRANSIENT_FAILURE' })
+      }, parserTimeoutMs)
+    })
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => parser.parse({ ...input, signal: controller.signal })),
+        timedOut,
+      ])
+    } finally {
+      clearTimeout(timeoutId)
+      controller.abort()
+    }
   }
 
   async function processUpload(job) {
@@ -126,7 +150,7 @@ function createKnowledgeWorker({
     }
     let parsed
     try {
-      parsed = await parser.parse({
+      parsed = await parseUpload({
         bytes, mimeType: work.mimeType, versionId: work.versionId,
       })
     } finally {
