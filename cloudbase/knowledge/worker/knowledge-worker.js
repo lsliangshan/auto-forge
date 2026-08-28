@@ -269,6 +269,10 @@ function createKnowledgeWorker({
     })
   }
 
+  function mutationParameters(parameters, requestBoundary) {
+    return { ...parameters, p_request_deadline_ms: requestBoundary.deadlineAt }
+  }
+
   async function processUpload(job, boundary) {
     const work = await boundary.work(requestBoundary => rpc('autoforge_knowledge_get_upload_work', {
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
@@ -304,7 +308,7 @@ function createKnowledgeWorker({
       bytes.fill(0)
     }
     if (!validParseResult(parsed)) throw { code: 'PARSER_LIMIT_EXCEEDED' }
-    const completed = await boundary.work(requestBoundary => rpc('autoforge_knowledge_complete_upload_index', {
+    const completed = await boundary.work(requestBoundary => rpc('autoforge_knowledge_complete_upload_index', mutationParameters({
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
       p_owner_id: work.ownerId, p_knowledge_base_id: work.knowledgeBaseId,
       p_document_id: work.documentId, p_version_id: work.versionId,
@@ -313,7 +317,7 @@ function createKnowledgeWorker({
       p_version_number: work.versionNumber, p_content_hash: work.sha256,
       p_parser_version: parsed.parserVersion,
       p_blocks: parsed.blocks, p_chunks: parsed.chunks,
-    }, requestBoundary))
+    }, requestBoundary), requestBoundary))
     if (!exactKeys(completed, ['completed', 'generationId', 'embeddingJobId'])
       || completed.completed !== true || completed.generationId !== work.generationId
       || !(completed.embeddingJobId === null || nonEmptyString(completed.embeddingJobId))) {
@@ -331,13 +335,13 @@ function createKnowledgeWorker({
       || prepared.storageReferences.some(reference => !validStorageReference(reference))) {
       throw { code: 'INTERNAL_ERROR' }
     }
-    await boundary.work(requestBoundary => storage.deleteObjects(
+    await boundary.workAndDrain(requestBoundary => storage.deleteObjects(
       prepared.storageReferences, requestBoundary,
     ))
-    const completed = await boundary.work(requestBoundary => rpc('autoforge_knowledge_complete_base_purge', {
+    const completed = await boundary.work(requestBoundary => rpc('autoforge_knowledge_complete_base_purge', mutationParameters({
       p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
       p_deleted_storage_references: prepared.storageReferences,
-    }, requestBoundary))
+    }, requestBoundary), requestBoundary))
     if (!exactKeys(completed, ['jobId', 'completed'])
       || completed.jobId !== job.id || completed.completed !== true) {
       throw { code: 'INTERNAL_ERROR' }
@@ -348,7 +352,7 @@ function createKnowledgeWorker({
     if (!embeddingWorker || typeof embeddingWorker.run !== 'function') {
       throw { code: 'TRANSIENT_FAILURE' }
     }
-    const result = await boundary.work(requestBoundary => embeddingWorker.run({
+    const result = await boundary.workAndDrain(requestBoundary => embeddingWorker.run({
       workerId, jobId: job.id, leaseToken: job.leaseToken,
     }, requestBoundary))
     if (!exactKeys(result, ['state', 'embedded'])
@@ -358,9 +362,9 @@ function createKnowledgeWorker({
     }
     if (result.state === 'revoked') throw { code: 'FORBIDDEN' }
     if (result.state === 'partial') {
-      const yielded = await boundary.work(requestBoundary => rpc('autoforge_knowledge_yield_job', {
+      const yielded = await boundary.work(requestBoundary => rpc('autoforge_knowledge_yield_job', mutationParameters({
         p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
-      }, requestBoundary))
+      }, requestBoundary), requestBoundary))
       if (!exactKeys(yielded, ['yielded']) || yielded.yielded !== true) {
         throw { code: 'INTERNAL_ERROR' }
       }
@@ -395,10 +399,10 @@ function createKnowledgeWorker({
         } catch (error) {
           const code = safeCode(error)
           try {
-            await boundary.settle(requestBoundary => rpc('autoforge_knowledge_complete_job', {
+            await boundary.settle(requestBoundary => rpc('autoforge_knowledge_complete_job', mutationParameters({
               p_worker_id: workerId, p_job_id: job.id, p_lease_token: job.leaseToken,
               p_state: 'failed', p_error_code: code,
-            }, requestBoundary))
+            }, requestBoundary), requestBoundary))
           } catch {
             // A lost/expired lease must never be settled under a different identity.
           }
@@ -926,15 +930,18 @@ function createWorkerStorageClient({
   async function request(path, body, allowBytes, requestBoundary) {
     const requestLimit = effectiveRequestTimeout(timeoutMs, requestBoundary)
     const boundary = deadline(requestLimit.timeoutMs, requestLimit.signal)
+    let transport
     try {
       let response
       try {
-        response = await boundary.race(fetchImpl(`${normalizedBaseUrl}${path}`, {
+        transport = Promise.resolve().then(() => fetchImpl(`${normalizedBaseUrl}${path}`, {
           method: 'POST', headers: {
             authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json',
           }, body: JSON.stringify(body), signal: boundary.signal,
         }))
+        response = await boundary.race(transport)
       } catch {
+        if (boundary.signal.aborted && transport) await Promise.allSettled([transport])
         throw { code: 'TRANSIENT_FAILURE' }
       }
       if (!response?.ok) throw { code: response?.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }

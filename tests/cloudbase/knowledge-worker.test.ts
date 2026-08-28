@@ -562,6 +562,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       expect.objectContaining({
         p_worker_id: 'worker_1', p_job_id: 'job_upload',
         p_lease_token: 'lease_job_upload', p_generation_id: 'generation_1',
+        p_request_deadline_ms: expect.any(Number),
         p_blocks: expect.any(Array), p_chunks: expect.any(Array),
       }), requestBoundary())
     expect(bytes.every(byte => byte === 0)).toBe(true)
@@ -654,6 +655,7 @@ describe('CloudBase knowledge scheduled worker', () => {
     expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_yield_job', {
       p_worker_id: 'worker_1', p_job_id: 'job_embedding',
       p_lease_token: 'lease_job_embedding',
+      p_request_deadline_ms: expect.any(Number),
     }, requestBoundary())
     expect(rpc.mock.calls.some(([name]) => name === 'autoforge_knowledge_complete_job')).toBe(false)
     expect(rpc.mock.calls.filter(([name]) => name === 'autoforge_knowledge_claim_job')).toHaveLength(1)
@@ -687,6 +689,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_complete_job', {
         p_worker_id: 'worker_1', p_job_id: 'job_upload',
         p_lease_token: 'lease_job_upload', p_state: 'failed', p_error_code: expectedCode,
+        p_request_deadline_ms: expect.any(Number),
       }, requestBoundary())
       if (expectedCode === 'TRANSIENT_FAILURE') {
         expect(rpc.mock.calls.filter(([name]) => (
@@ -758,7 +761,118 @@ describe('CloudBase knowledge scheduled worker', () => {
         p_worker_id: 'worker_1', p_job_id: 'job_upload',
         p_lease_token: 'lease_job_upload', p_state: 'failed',
         p_error_code: 'TRANSIENT_FAILURE',
+        p_request_deadline_ms: expect.any(Number),
       }, requestBoundary())
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('waits for the embedding transport abort acknowledgement before returning', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    try {
+      type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
+      let claims = 0
+      let embeddingDrained = false
+      const rpc = vi.fn().mockImplementation(async (name: string) => {
+        if (name === 'autoforge_knowledge_claim_job') {
+          claims += 1
+          return claims === 1 ? claim('job_embedding', 'embedding') : { job: null }
+        }
+        if (name === 'autoforge_knowledge_complete_job') return { completed: true }
+        if (name === 'autoforge_knowledge_cleanup_retention') return {
+          prunedChanges: 0, prunedTombstones: 0, prunedSnapshots: 0,
+          prunedGenerations: 0, prunedDispatchPermits: 0,
+        }
+        throw new Error(`unexpected rpc ${name}`)
+      })
+      const worker = createKnowledgeWorker({
+        rpc, storage: { readObject: vi.fn(), deleteObjects: vi.fn() },
+        parser: { parse: vi.fn() }, workerId: 'worker_1', id: () => 'lease_job_embedding',
+        jobTimeoutMs: 100, settlementReserveMs: 30,
+        embeddingWorker: { run: vi.fn((_input: unknown, boundary?: Boundary) => (
+          new Promise<never>((_resolve, reject) => {
+            boundary?.signal.addEventListener('abort', () => {
+              setTimeout(() => {
+                embeddingDrained = true
+                reject({ code: 'TRANSIENT_FAILURE' })
+              }, 35)
+            }, { once: true })
+          })
+        )) },
+      })
+
+      const run = worker.runOnce()
+      const beforeAck = Promise.race([
+        run.then(() => 'settled' as const),
+        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 101)),
+      ])
+      await vi.advanceTimersByTimeAsync(101)
+      await expect(beforeAck).resolves.toBe('unsettled')
+      expect(embeddingDrained).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(4)
+      await expect(run).resolves.toEqual({ claimed: 1, completed: 0, failed: 1 })
+      expect(embeddingDrained).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('waits for the Storage delete abort acknowledgement before returning', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    try {
+      type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
+      let claims = 0
+      let storageDrained = false
+      const rpc = vi.fn().mockImplementation(async (name: string) => {
+        if (name === 'autoforge_knowledge_claim_job') {
+          claims += 1
+          return claims === 1 ? claim('job_purge', 'purge') : { job: null }
+        }
+        if (name === 'autoforge_knowledge_prepare_base_purge') return {
+          jobId: 'job_purge', storageReferences: ['knowledge/1/kb_1/object_1'],
+        }
+        if (name === 'autoforge_knowledge_complete_job') return { completed: true }
+        if (name === 'autoforge_knowledge_cleanup_retention') return {
+          prunedChanges: 0, prunedTombstones: 0, prunedSnapshots: 0,
+          prunedGenerations: 0, prunedDispatchPermits: 0,
+        }
+        throw new Error(`unexpected rpc ${name}`)
+      })
+      const worker = createKnowledgeWorker({
+        rpc,
+        storage: {
+          readObject: vi.fn(),
+          deleteObjects: vi.fn((_references: unknown, boundary?: Boundary) => (
+            new Promise<never>((_resolve, reject) => {
+              boundary?.signal.addEventListener('abort', () => {
+                setTimeout(() => {
+                  storageDrained = true
+                  reject({ code: 'TRANSIENT_FAILURE' })
+                }, 35)
+              }, { once: true })
+            })
+          )),
+        },
+        parser: { parse: vi.fn() }, workerId: 'worker_1', id: () => 'lease_job_purge',
+        jobTimeoutMs: 100, settlementReserveMs: 30,
+      })
+
+      const run = worker.runOnce()
+      const beforeAck = Promise.race([
+        run.then(() => 'settled' as const),
+        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 101)),
+      ])
+      await vi.advanceTimersByTimeAsync(101)
+      await expect(beforeAck).resolves.toBe('unsettled')
+      expect(storageDrained).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(4)
+      await expect(run).resolves.toEqual({ claimed: 1, completed: 0, failed: 1 })
+      expect(storageDrained).toBe(true)
     } finally {
       vi.useRealTimers()
     }
@@ -832,13 +946,14 @@ describe('CloudBase knowledge scheduled worker', () => {
         p_worker_id: 'worker_1', p_job_id: 'job_upload',
         p_lease_token: 'lease_job_upload', p_state: 'failed',
         p_error_code: 'TRANSIENT_FAILURE',
+        p_request_deadline_ms: expect.any(Number),
       }, requestBoundary())
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it('aborts and drains late upload completion before settling the captured lease', async () => {
+  it('prevents an ignored-abort upload completion from mutating after runOnce returns', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(0)
     try {
@@ -848,10 +963,11 @@ describe('CloudBase knowledge scheduled worker', () => {
       const workBoundaries: Array<Boundary | undefined> = []
       const storageBoundaries: Array<Boundary | undefined> = []
       let settlementBoundary: Boundary | undefined
+      let completionDeadline: number | undefined
       let parserSignal: AbortSignal | undefined
       let lateCompletionSideEffects = 0
       let claims = 0
-      const rpc = vi.fn((name: string, _parameters: unknown, boundary?: Boundary) => {
+      const rpc = vi.fn((name: string, parameters: unknown, boundary?: Boundary) => {
         if (name === 'autoforge_knowledge_claim_job') {
           claims += 1
           return Promise.resolve(claims === 1 ? claim('job_upload', 'upload') : { job: null })
@@ -867,15 +983,17 @@ describe('CloudBase knowledge scheduled worker', () => {
         }
         if (name === 'autoforge_knowledge_complete_upload_index') {
           workBoundaries.push(boundary)
+          completionDeadline = (parameters as { p_request_deadline_ms?: number })
+            .p_request_deadline_ms
           return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-              lateCompletionSideEffects += 1
-              resolve({ completed: true, generationId: 'generation_1', embeddingJobId: null })
+            setTimeout(() => {
+              if (!Number.isSafeInteger(completionDeadline) || Date.now() <= completionDeadline!) {
+                lateCompletionSideEffects += 1
+                resolve({ completed: true, generationId: 'generation_1', embeddingJobId: null })
+              } else {
+                reject({ code: 'CONFLICT' })
+              }
             }, 200)
-            boundary?.signal.addEventListener('abort', () => {
-              clearTimeout(timer)
-              reject({ code: 'TRANSIENT_FAILURE' })
-            }, { once: true })
           })
         }
         if (name === 'autoforge_knowledge_complete_job') {
@@ -924,6 +1042,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       expect(storageBoundaries[0]?.signal).toBe(workBoundaries[0]?.signal)
       expect(parserSignal).toBe(workBoundaries[0]?.signal)
       expect(workBoundaries[1]?.signal.aborted).toBe(true)
+      expect(completionDeadline).toBe(70)
       expect(settlementBoundary?.deadlineAt).toBeGreaterThan(70)
       expect(settlementBoundary?.signal.aborted).toBe(false)
 
@@ -934,15 +1053,16 @@ describe('CloudBase knowledge scheduled worker', () => {
     }
   })
 
-  it('aborts and drains a late authoritative lease settlement before runOnce returns', async () => {
+  it('prevents an ignored-abort failed settlement from mutating after runOnce returns', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(0)
     try {
       type Boundary = { signal: AbortSignal; deadlineAt: number; timeoutMs: number }
       let claims = 0
       let settlementBoundary: Boundary | undefined
+      let settlementDeadline: number | undefined
       let lateSettlementSideEffects = 0
-      const rpc = vi.fn((name: string, _parameters: unknown, boundary?: Boundary) => {
+      const rpc = vi.fn((name: string, parameters: unknown, boundary?: Boundary) => {
         if (name === 'autoforge_knowledge_claim_job') {
           claims += 1
           return Promise.resolve(claims === 1 ? claim('job_upload', 'upload') : { job: null })
@@ -952,15 +1072,17 @@ describe('CloudBase knowledge scheduled worker', () => {
         }
         if (name === 'autoforge_knowledge_complete_job') {
           settlementBoundary = boundary
+          settlementDeadline = (parameters as { p_request_deadline_ms?: number })
+            .p_request_deadline_ms
           return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-              lateSettlementSideEffects += 1
-              resolve({ completed: true })
+            setTimeout(() => {
+              if (!Number.isSafeInteger(settlementDeadline) || Date.now() <= settlementDeadline!) {
+                lateSettlementSideEffects += 1
+                resolve({ completed: true })
+              } else {
+                reject({ code: 'CONFLICT' })
+              }
             }, 200)
-            boundary?.signal.addEventListener('abort', () => {
-              clearTimeout(timer)
-              reject({ code: 'TRANSIENT_FAILURE' })
-            }, { once: true })
           })
         }
         if (name === 'autoforge_knowledge_cleanup_retention') return Promise.resolve({
@@ -980,6 +1102,7 @@ describe('CloudBase knowledge scheduled worker', () => {
       await vi.advanceTimersByTimeAsync(100)
       await expect(run).resolves.toEqual({ claimed: 1, completed: 0, failed: 1 })
       expect(settlementBoundary?.deadlineAt).toBe(90)
+      expect(settlementDeadline).toBe(90)
       expect(settlementBoundary?.signal.aborted).toBe(true)
 
       await vi.advanceTimersByTimeAsync(500)
@@ -1368,7 +1491,9 @@ describe('CloudBase knowledge scheduled worker', () => {
         timeoutMs: 500,
         fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => {
           signal = init.signal
-          return new Promise<never>(() => undefined)
+          return new Promise<never>((_resolve, reject) => {
+            init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+          })
         }),
       })
       const read = storage.readObject({

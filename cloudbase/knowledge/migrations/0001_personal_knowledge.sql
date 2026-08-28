@@ -1581,7 +1581,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_base_purge(
   p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
-  p_deleted_storage_references jsonb
+  p_deleted_storage_references jsonb, p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1596,7 +1596,8 @@ DECLARE
 BEGIN
   IF p_worker_id IS NULL OR length(p_worker_id) NOT BETWEEN 1 AND 128
     OR btrim(p_worker_id) = '' OR p_job_id IS NULL OR p_lease_token IS NULL
-    OR btrim(p_lease_token) = '' THEN
+    OR btrim(p_lease_token) = '' OR p_request_deadline_ms IS NULL
+    OR p_request_deadline_ms <= 0 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   IF jsonb_typeof(p_deleted_storage_references) IS DISTINCT FROM 'array' THEN
@@ -1612,6 +1613,7 @@ BEGIN
     WHERE id = p_job_id AND kind = 'purge' AND state = 'running'
       AND worker_id = p_worker_id AND lease_token = p_lease_token
       AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0)
     FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   SELECT count(*) INTO expected_count FROM public.knowledge_objects object
@@ -1686,7 +1688,10 @@ BEGIN
     worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
     updated_at = clock_timestamp()
     WHERE owner_id = job.owner_id AND id = job.id
-      AND worker_id = p_worker_id AND lease_token = p_lease_token;
+      AND worker_id = p_worker_id AND lease_token = p_lease_token
+      AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0);
+  IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   RETURN jsonb_build_object('jobId', job.id, 'completed', true);
 END;
 $$;
@@ -1754,7 +1759,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_job(
   p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
-  p_state varchar, p_error_code varchar
+  p_state varchar, p_error_code varchar, p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1768,7 +1773,8 @@ BEGIN
   IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
     OR p_job_id IS NULL OR btrim(p_job_id) = ''
     OR p_lease_token IS NULL OR btrim(p_lease_token) = ''
-    OR p_state IS NULL OR p_state NOT IN ('completed', 'failed') THEN
+    OR p_state IS NULL OR p_state NOT IN ('completed', 'failed')
+    OR p_request_deadline_ms IS NULL OR p_request_deadline_ms <= 0 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   next_state := CASE
@@ -1782,7 +1788,8 @@ BEGIN
     updated_at = clock_timestamp()
     WHERE id = p_job_id AND state = 'running' AND worker_id = p_worker_id
       AND lease_token = p_lease_token
-      AND lease_expires_at > clock_timestamp();
+      AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0);
   GET DIAGNOSTICS changed = ROW_COUNT;
   IF changed <> 1 THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   RETURN jsonb_build_object('completed', true);
@@ -1912,7 +1919,7 @@ $$;
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_embedding_generation(
   p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
   p_owner_id bigint, p_knowledge_base_id varchar, p_generation_id varchar,
-  p_consent_epoch bigint
+  p_consent_epoch bigint, p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1924,12 +1931,16 @@ DECLARE
   consent public.knowledge_embedding_consents%ROWTYPE;
   generation public.knowledge_index_generations%ROWTYPE;
 BEGIN
+  IF p_request_deadline_ms IS NULL OR p_request_deadline_ms <= 0 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
   SELECT * INTO job FROM public.knowledge_jobs
     WHERE owner_id = p_owner_id AND id = p_job_id
       AND knowledge_base_id = p_knowledge_base_id
       AND kind = 'embedding' AND entity_id = p_generation_id
       AND state = 'running' AND worker_id = p_worker_id
       AND lease_token = p_lease_token AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0)
     FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   SELECT * INTO consent FROM public.knowledge_embedding_consents
@@ -1964,7 +1975,11 @@ BEGIN
   UPDATE public.knowledge_jobs SET state = 'completed', worker_id = NULL,
     lease_token = NULL, lease_expires_at = NULL, error_code = NULL,
     updated_at = clock_timestamp()
-    WHERE owner_id = job.owner_id AND id = job.id;
+    WHERE owner_id = job.owner_id AND id = job.id AND state = 'running'
+      AND worker_id = p_worker_id AND lease_token = p_lease_token
+      AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0);
+  IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   RETURN jsonb_build_object('ready', true);
 END;
 $$;
@@ -2080,11 +2095,71 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_assert_worker_mutation_window(
+  p_owner_id bigint, p_purpose varchar, p_consent_epoch bigint,
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
+  p_knowledge_base_id varchar, p_generation_id varchar,
+  p_request_deadline_ms bigint, p_allow_revocation_recovery boolean
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE consent public.knowledge_embedding_consents%ROWTYPE;
+BEGIN
+  IF p_owner_id IS NULL OR p_purpose NOT IN ('query', 'chunk')
+    OR p_consent_epoch IS NULL OR p_consent_epoch < 0
+    OR p_request_deadline_ms IS NULL OR p_request_deadline_ms <= 0
+    OR p_allow_revocation_recovery IS NULL THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  IF clock_timestamp() >= to_timestamp(p_request_deadline_ms / 1000.0) THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  IF p_purpose = 'query' THEN
+    IF p_worker_id IS NOT NULL OR p_job_id IS NOT NULL OR p_lease_token IS NOT NULL THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN;
+  END IF;
+  IF p_worker_id IS NOT NULL AND btrim(p_worker_id) <> ''
+    AND p_job_id IS NOT NULL AND btrim(p_job_id) <> ''
+    AND p_lease_token IS NOT NULL AND btrim(p_lease_token) <> '' THEN
+    PERFORM 1 FROM public.knowledge_jobs AS lease_job
+      WHERE lease_job.owner_id = p_owner_id AND lease_job.id = p_job_id
+        AND lease_job.kind = 'embedding' AND lease_job.state = 'running'
+        AND lease_job.knowledge_base_id = p_knowledge_base_id
+        AND lease_job.entity_id = p_generation_id
+        AND lease_job.worker_id = p_worker_id
+        AND lease_job.lease_token = p_lease_token
+        AND lease_job.lease_expires_at > clock_timestamp()
+      FOR SHARE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN;
+  END IF;
+  IF NOT p_allow_revocation_recovery OR p_worker_id IS NOT NULL
+    OR p_job_id IS NOT NULL OR p_lease_token IS NOT NULL THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = p_owner_id FOR SHARE;
+  IF NOT FOUND OR consent.state <> 'revoking'
+    OR consent.consent_epoch <= p_consent_epoch THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(
   p_owner_id varchar, p_purpose varchar, p_request_id varchar,
   p_attempt_id integer, p_consent_epoch bigint, p_knowledge_base_id varchar,
   p_generation_id varchar, p_chunk_id varchar,
-  p_model varchar, p_dimensions integer, p_configuration_version varchar
+  p_model varchar, p_dimensions integer, p_configuration_version varchar,
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
+  p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -2112,6 +2187,10 @@ BEGIN
       OR p_generation_id IS NULL OR p_chunk_id IS NULL)) THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+  );
   PERFORM pg_advisory_xact_lock(hashtextextended(
     owner::text || ':' || p_purpose || ':' || p_request_id, 0
   ));
@@ -2184,6 +2263,10 @@ BEGIN
       IF permit.state = 'issued' THEN
         UPDATE public.knowledge_embedding_dispatch_permits SET state = 'expired'
           WHERE owner_id = owner AND permit_id = permit.permit_id;
+        PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+          owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+          p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+        );
       END IF;
       RETURN jsonb_build_object('issued', false);
     END IF;
@@ -2228,6 +2311,10 @@ BEGIN
       p_model, p_dimensions, p_configuration_version, new_expiry
     ) RETURNING * INTO permit;
   END IF;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+  );
   RETURN jsonb_build_object(
     'issued', true, 'permitId', permit.permit_id,
     'purpose', permit.purpose, 'requestId', permit.request_id,
@@ -2247,7 +2334,8 @@ CREATE OR REPLACE FUNCTION public.autoforge_knowledge_reserve_embedding_dispatch
   p_attempt_id integer, p_consent_epoch bigint, p_knowledge_base_id varchar,
   p_generation_id varchar, p_chunk_id varchar,
   p_model varchar, p_dimensions integer, p_configuration_version varchar,
-  p_permit_id varchar
+  p_permit_id varchar, p_worker_id varchar, p_job_id varchar,
+  p_lease_token varchar, p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -2269,6 +2357,10 @@ BEGIN
     OR p_configuration_version <> 'autoforge-knowledge-embedding-v1' THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+  );
   SELECT * INTO consent FROM public.knowledge_embedding_consents
     WHERE owner_id = owner FOR UPDATE;
   SELECT * INTO permit FROM public.knowledge_embedding_dispatch_permits
@@ -2295,6 +2387,10 @@ BEGIN
         settled_at = CASE WHEN permit.state = 'dispatching'
           THEN clock_timestamp() ELSE settled_at END
         WHERE owner_id = owner AND permit_id = permit.permit_id;
+      PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+        owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+        p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+      );
     END IF;
     RETURN jsonb_build_object('reserved', false);
   END IF;
@@ -2303,6 +2399,10 @@ BEGIN
       dispatching_at = clock_timestamp()
       WHERE owner_id = owner AND permit_id = permit.permit_id;
   END IF;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+  );
   RETURN jsonb_build_object('reserved', true);
 END;
 $$;
@@ -2312,7 +2412,8 @@ CREATE OR REPLACE FUNCTION public.autoforge_knowledge_mark_embedding_dispatch_st
   p_attempt_id integer, p_consent_epoch bigint, p_knowledge_base_id varchar,
   p_generation_id varchar, p_chunk_id varchar,
   p_model varchar, p_dimensions integer, p_configuration_version varchar,
-  p_permit_id varchar
+  p_permit_id varchar, p_worker_id varchar, p_job_id varchar,
+  p_lease_token varchar, p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -2325,6 +2426,10 @@ DECLARE
   permit public.knowledge_embedding_dispatch_permits%ROWTYPE;
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+  );
   SELECT * INTO consent FROM public.knowledge_embedding_consents
     WHERE owner_id = owner FOR UPDATE;
   SELECT * INTO permit FROM public.knowledge_embedding_dispatch_permits
@@ -2348,12 +2453,20 @@ BEGIN
       UPDATE public.knowledge_embedding_dispatch_permits SET state = 'failed',
         settled_at = clock_timestamp()
         WHERE owner_id = owner AND permit_id = permit.permit_id;
+      PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+        owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+        p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+      );
     END IF;
     RETURN jsonb_build_object('started', false);
   END IF;
   UPDATE public.knowledge_embedding_dispatch_permits SET state = 'started',
     started_at = clock_timestamp(), expires_at = clock_timestamp() + interval '2 minutes'
     WHERE owner_id = owner AND permit_id = permit.permit_id;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+  );
   RETURN jsonb_build_object('started', true);
 END;
 $$;
@@ -2364,7 +2477,8 @@ CREATE OR REPLACE FUNCTION public.autoforge_knowledge_record_embedding_dispatch_
   p_generation_id varchar, p_chunk_id varchar,
   p_model varchar, p_dimensions integer, p_configuration_version varchar,
   p_permit_id varchar, p_outcome varchar, p_provider_response_hash varchar,
-  p_retryable boolean
+  p_retryable boolean, p_worker_id varchar, p_job_id varchar,
+  p_lease_token varchar, p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -2381,6 +2495,10 @@ BEGIN
     OR p_retryable IS NULL OR (p_outcome = 'completed' AND p_retryable) THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, true
+  );
   SELECT * INTO permit FROM public.knowledge_embedding_dispatch_permits
     WHERE owner_id = owner AND permit_id = p_permit_id FOR UPDATE;
   IF NOT FOUND
@@ -2411,6 +2529,10 @@ BEGIN
     provider_retryable = p_retryable,
     settlement_intent_at = clock_timestamp()
     WHERE owner_id = owner AND permit_id = permit.permit_id;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, true
+  );
   RETURN jsonb_build_object('recorded', true);
 END;
 $$;
@@ -2420,7 +2542,8 @@ CREATE OR REPLACE FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_
   p_attempt_id integer, p_consent_epoch bigint, p_knowledge_base_id varchar,
   p_generation_id varchar, p_chunk_id varchar,
   p_model varchar, p_dimensions integer, p_configuration_version varchar,
-  p_permit_id varchar, p_outcome varchar
+  p_permit_id varchar, p_outcome varchar, p_worker_id varchar,
+  p_job_id varchar, p_lease_token varchar, p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -2434,6 +2557,10 @@ BEGIN
   IF p_outcome NOT IN ('completed', 'failed') THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, true
+  );
   SELECT * INTO permit FROM public.knowledge_embedding_dispatch_permits
     WHERE owner_id = owner AND permit_id = p_permit_id FOR UPDATE;
   IF NOT FOUND
@@ -2461,6 +2588,10 @@ BEGIN
   UPDATE public.knowledge_embedding_dispatch_permits SET state = p_outcome,
     settled_at = clock_timestamp()
     WHERE owner_id = owner AND permit_id = permit.permit_id;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    owner, p_purpose, p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, true
+  );
   RETURN jsonb_build_object('settled', true);
 END;
 $$;
@@ -2684,7 +2815,9 @@ $$;
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_store_embedding(
   p_owner_id bigint, p_knowledge_base_id varchar, p_generation_id varchar,
   p_chunk_id varchar, p_version_id varchar, p_consent_epoch bigint, p_model varchar,
-  p_dimensions integer, p_configuration_version varchar, p_vector real[]
+  p_dimensions integer, p_configuration_version varchar, p_vector real[],
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
+  p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -2702,6 +2835,10 @@ BEGIN
       WHERE value::text IN ('NaN', 'Infinity', '-Infinity')) THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    p_owner_id, 'chunk', p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+  );
   SELECT * INTO consent FROM public.knowledge_embedding_consents
     WHERE owner_id = p_owner_id FOR SHARE;
   IF NOT FOUND OR consent.state <> 'granted'
@@ -2735,6 +2872,10 @@ BEGIN
     p_model, p_dimensions, p_configuration_version, p_vector
   ) ON CONFLICT(owner_id, knowledge_base_id, generation_id, chunk_id)
     DO NOTHING;
+  PERFORM public.autoforge_knowledge_assert_worker_mutation_window(
+    p_owner_id, 'chunk', p_consent_epoch, p_worker_id, p_job_id, p_lease_token,
+    p_knowledge_base_id, p_generation_id, p_request_deadline_ms, false
+  );
   RETURN jsonb_build_object('stored', true);
 END;
 $$;
@@ -3103,25 +3244,26 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_prepare_orphan_cleanup(varchar
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_orphan_cleanup(varchar, varchar, varchar, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_prepare_base_purge(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_base_purge(varchar, varchar, varchar, jsonb) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_base_purge(varchar, varchar, varchar, jsonb, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, boolean) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_reserve_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_mark_embedding_dispatch_started(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_record_embedding_dispatch_settlement_intent(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, boolean) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_assert_worker_mutation_window(bigint, varchar, bigint, varchar, varchar, varchar, varchar, varchar, bigint, boolean) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_reserve_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_mark_embedding_dispatch_started(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_record_embedding_dispatch_settlement_intent(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, boolean, varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_revocation_attempt(varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_finalize_embedding_revocation(varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_assert_embedding_consent(bigint, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[], varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_query_terms(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_search_keywords(varchar, varchar[], varchar, integer) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_search_vectors(varchar, varchar[], real[], varchar, integer, varchar, integer) FROM PUBLIC, anon, authenticated;
@@ -3164,25 +3306,25 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_prepare_orphan_cleanup(varc
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_orphan_cleanup(varchar, varchar, varchar, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_prepare_base_purge(varchar, varchar, varchar) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_base_purge(varchar, varchar, varchar, jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_base_purge(varchar, varchar, varchar, jsonb, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(varchar, varchar, varchar, varchar, varchar) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, boolean) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_reserve_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_mark_embedding_dispatch_started(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_record_embedding_dispatch_settlement_intent(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, boolean) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, bigint) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_reserve_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, varchar, bigint) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_mark_embedding_dispatch_started(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, varchar, bigint) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_record_embedding_dispatch_settlement_intent(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, boolean, varchar, varchar, varchar, bigint) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, varchar, varchar, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_embedding_revocation_attempt(varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_finalize_embedding_revocation(varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_assert_embedding_consent(bigint, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[]) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[], varchar, varchar, varchar, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_query_terms(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_search_keywords(varchar, varchar[], varchar, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_search_vectors(varchar, varchar[], real[], varchar, integer, varchar, integer) TO service_role;

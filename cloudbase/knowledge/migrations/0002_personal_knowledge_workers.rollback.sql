@@ -8,18 +8,18 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_upload_work(
 ) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_upload_index(
   varchar, varchar, varchar, bigint, varchar, varchar, varchar, varchar,
-  varchar, varchar, varchar, integer, varchar, varchar, jsonb, jsonb
+  varchar, varchar, varchar, integer, varchar, varchar, jsonb, jsonb, bigint
 ) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_yield_job(
-  varchar, varchar, varchar
+  varchar, varchar, varchar, bigint
 ) FROM PUBLIC, anon, authenticated, service_role;
 
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_yield_job(
-  varchar, varchar, varchar
+  varchar, varchar, varchar, bigint
 );
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_upload_index(
   varchar, varchar, varchar, bigint, varchar, varchar, varchar, varchar,
-  varchar, varchar, varchar, integer, varchar, varchar, jsonb, jsonb
+  varchar, varchar, varchar, integer, varchar, varchar, jsonb, jsonb, bigint
 );
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_upload_work(
   varchar, varchar, varchar

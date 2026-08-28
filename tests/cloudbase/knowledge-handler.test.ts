@@ -443,7 +443,9 @@ describe('CloudBase knowledge function', () => {
       const signals: AbortSignal[] = []
       const fetchImpl = vi.fn((_url: string, init: { signal: AbortSignal }) => {
         signals.push(init.signal)
-        return new Promise<never>(() => undefined)
+        return new Promise<never>((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
       })
       const rpc = createPostgresRpcClient({
         baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-only',
@@ -465,6 +467,41 @@ describe('CloudBase knowledge function', () => {
       expect(signals).toHaveLength(2)
       expect(signals.every(signal => signal.aborted)).toBe(true)
       expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drains the underlying fetch abort acknowledgement before returning', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    try {
+      let drained = false
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-only',
+        timeoutMs: 50,
+        fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => (
+          new Promise<never>((_resolve, reject) => {
+            init.signal.addEventListener('abort', () => {
+              setTimeout(() => {
+                drained = true
+                reject(new Error('transport closed'))
+              }, 5)
+            }, { once: true })
+          })
+        )),
+      })
+      const request = rpc('autoforge_knowledge_get_entitlement', { p_caller_user_id: '1' })
+      const beforeAck = Promise.race([
+        request.then(() => 'settled' as const, () => 'settled' as const),
+        new Promise<'unsettled'>(resolve => setTimeout(() => resolve('unsettled'), 51)),
+      ])
+      await vi.advanceTimersByTimeAsync(51)
+      await expect(beforeAck).resolves.toBe('unsettled')
+      expect(drained).toBe(false)
+      await vi.advanceTimersByTimeAsync(4)
+      await expect(request).rejects.toEqual({ code: 'TRANSIENT_FAILURE' })
+      expect(drained).toBe(true)
     } finally {
       vi.useRealTimers()
     }
@@ -871,7 +908,9 @@ describe('CloudBase embedding consent and retrieval', () => {
         timeoutMs: 50,
         fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => {
           requestSignal = init.signal
-          return new Promise<never>(() => undefined)
+          return new Promise<never>((_resolve, reject) => {
+            init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+          })
         }),
       })
       const request = tokenHub.embed({
@@ -897,7 +936,9 @@ describe('CloudBase embedding consent and retrieval', () => {
       const signals: AbortSignal[] = []
       const fetchImpl = vi.fn((_url: string, init: { signal: AbortSignal }) => {
         signals.push(init.signal)
-        return new Promise<never>(() => undefined)
+        return new Promise<never>((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
       })
       const rpc = createPostgresRpcClient({
         baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-only',
@@ -1052,7 +1093,9 @@ describe('CloudBase embedding consent and retrieval', () => {
       input: '合同条款', model: embedding.model, dimensions: 1024,
       configurationVersion: embedding.configurationVersion, region: 'guangzhou',
       dispatchPermit: 'permit_search_outage', idempotencyKey: 'embed_search_outage_1',
-    })
+    }, expect.objectContaining({
+      signal: expect.any(AbortSignal), deadlineAt: expect.any(Number), timeoutMs: 10_000,
+    }))
   })
 
   it('uses a new bounded attempt identity for one transient provider retry', async () => {
@@ -1762,7 +1805,9 @@ describe('CloudBase embedding consent and retrieval', () => {
   it('drains bounded batches and marks the shadow ready only after vectors are stored', async () => {
     let claims = 0
     const vector = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0)
-    const rpc = vi.fn().mockImplementation(async (name: string) => {
+    const rpc = vi.fn().mockImplementation(async (name: string, parameters: {
+      p_request_deadline_ms?: number
+    }) => {
       if (name === 'autoforge_knowledge_claim_embedding_batch') {
         claims += 1
         return {
@@ -1797,12 +1842,38 @@ describe('CloudBase embedding consent and retrieval', () => {
     const worker = createEmbeddingGenerationWorker({
       rpc, tokenHub: { embed: vi.fn().mockResolvedValue(vector) },
     })
-    await expect(worker.run({ workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1' }))
+    const requestBoundary = {
+      signal: new AbortController().signal,
+      deadlineAt: Date.now() + 5_000,
+      timeoutMs: 5_000,
+    }
+    await expect(worker.run({
+      workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1',
+    }, requestBoundary))
       .resolves.toEqual({ state: 'completed', embedded: 1 })
     expect(claims).toBe(2)
     expect(rpc.mock.calls.map(([name]) => name)).toContain(
       'autoforge_knowledge_complete_embedding_generation',
     )
+    const mutationNames = new Set([
+      'autoforge_knowledge_issue_embedding_dispatch_permit',
+      'autoforge_knowledge_reserve_embedding_dispatch_attempt',
+      'autoforge_knowledge_mark_embedding_dispatch_started',
+      'autoforge_knowledge_record_embedding_dispatch_settlement_intent',
+      'autoforge_knowledge_settle_embedding_dispatch_attempt',
+      'autoforge_knowledge_store_embedding',
+      'autoforge_knowledge_complete_embedding_generation',
+    ])
+    const mutationCalls = rpc.mock.calls.filter(([name]) => mutationNames.has(name))
+    expect(new Set(mutationCalls.map(([name]) => name))).toEqual(mutationNames)
+    expect(mutationCalls.every(([, parameters]) => (
+      parameters.p_request_deadline_ms === requestBoundary.deadlineAt
+    ))).toBe(true)
+    expect(mutationCalls.every(([, parameters]) => (
+      parameters.p_worker_id === 'worker_1'
+        && parameters.p_job_id === 'job_1'
+        && parameters.p_lease_token === 'lease_1'
+    ))).toBe(true)
   })
 
   it('returns a resumable partial result after one configured embedding slice', async () => {

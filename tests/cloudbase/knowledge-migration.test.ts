@@ -649,6 +649,63 @@ describe('CloudBase personal knowledge migration', () => {
     expect(lease.state).toBe('completed')
   })
 
+  it('rejects late lease mutations with the caller deadline inside the transaction', async () => {
+    const [sql, workerSql] = await Promise.all([
+      readFile(canonicalUrl, 'utf8'), readFile(workerCanonicalUrl, 'utf8'),
+    ])
+    for (const [source, name] of [
+      [sql, 'autoforge_knowledge_complete_job'],
+      [sql, 'autoforge_knowledge_complete_base_purge'],
+      [sql, 'autoforge_knowledge_complete_embedding_generation'],
+      [workerSql, 'autoforge_knowledge_complete_upload_index'],
+      [workerSql, 'autoforge_knowledge_yield_job'],
+    ] as const) {
+      const definition = functionDefinition(source, name)
+      const body = staticFunctionBodyFragment(source, name)
+      expect(definition).toContain('p_request_deadline_ms bigint')
+      expect(body).toContain('to_timestamp(p_request_deadline_ms / 1000.0)')
+    }
+    for (const name of [
+      'autoforge_knowledge_complete_job',
+      'autoforge_knowledge_complete_base_purge',
+      'autoforge_knowledge_complete_embedding_generation',
+    ]) {
+      const body = staticFunctionBodyFragment(sql, name)
+      expect(body).toContain('worker_id = p_worker_id')
+      expect(body).toContain('lease_token = p_lease_token')
+      expect(body).toContain('lease_expires_at > clock_timestamp()')
+    }
+    for (const name of [
+      'autoforge_knowledge_complete_upload_index',
+      'autoforge_knowledge_yield_job',
+    ]) {
+      const body = staticFunctionBodyFragment(workerSql, name)
+      expect(body).toContain('worker_id = p_worker_id')
+      expect(body).toContain('lease_token = p_lease_token')
+      expect(body).toContain('lease_expires_at > clock_timestamp()')
+    }
+    const leaseWindow = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_assert_worker_mutation_window',
+    )
+    expect(leaseWindow).toContain('worker_id = p_worker_id')
+    expect(leaseWindow).toContain('lease_token = p_lease_token')
+    expect(leaseWindow).toContain('lease_expires_at > clock_timestamp()')
+    expect(leaseWindow).toContain('to_timestamp(p_request_deadline_ms / 1000.0)')
+    for (const name of [
+      'autoforge_knowledge_issue_embedding_dispatch_permit',
+      'autoforge_knowledge_reserve_embedding_dispatch_attempt',
+      'autoforge_knowledge_mark_embedding_dispatch_started',
+      'autoforge_knowledge_record_embedding_dispatch_settlement_intent',
+      'autoforge_knowledge_settle_embedding_dispatch_attempt',
+      'autoforge_knowledge_store_embedding',
+    ]) {
+      expect(functionDefinition(sql, name)).toContain('p_request_deadline_ms bigint')
+      const body = staticFunctionBodyFragment(sql, name)
+      const windowChecks = body.match(/autoforge_knowledge_assert_worker_mutation_window/g)
+      expect(windowChecks?.length).toBeGreaterThanOrEqual(2)
+    }
+  })
+
   it('statically requires payload purge after exact Storage deletion and models payload removal separately', async () => {
     const sql = await readFile(canonicalUrl, 'utf8')
     expect(sql).toContain('autoforge_knowledge_prepare_base_purge')

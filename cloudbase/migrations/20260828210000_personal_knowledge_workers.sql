@@ -171,7 +171,8 @@ CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_upload_index(
   p_owner_id bigint, p_knowledge_base_id varchar, p_document_id varchar,
   p_version_id varchar, p_generation_id varchar, p_object_id varchar,
   p_name varchar, p_mime_type varchar, p_version_number integer,
-  p_content_hash varchar, p_parser_version varchar, p_blocks jsonb, p_chunks jsonb
+  p_content_hash varchar, p_parser_version varchar, p_blocks jsonb, p_chunks jsonb,
+  p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -213,7 +214,8 @@ BEGIN
     OR jsonb_typeof(p_chunks) IS DISTINCT FROM 'array'
     OR jsonb_array_length(p_blocks) NOT BETWEEN 1 AND 10000
     OR jsonb_array_length(p_chunks) NOT BETWEEN 1 AND 10000
-    OR pg_column_size(p_blocks) + pg_column_size(p_chunks) > 786432 THEN
+    OR pg_column_size(p_blocks) + pg_column_size(p_chunks) > 786432
+    OR p_request_deadline_ms IS NULL OR p_request_deadline_ms <= 0 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   FOR block_item IN SELECT value FROM jsonb_array_elements(p_blocks) LOOP
@@ -275,6 +277,7 @@ BEGIN
       AND kind = 'upload' AND entity_id = p_version_id AND state = 'running'
       AND worker_id = p_worker_id AND lease_token = p_lease_token
       AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0)
     FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   SELECT * INTO object FROM public.knowledge_objects
@@ -401,7 +404,8 @@ BEGIN
     updated_at = clock_timestamp()
     WHERE owner_id = p_owner_id AND id = p_job_id AND kind = 'upload'
       AND worker_id = p_worker_id AND lease_token = p_lease_token
-      AND lease_expires_at > clock_timestamp();
+      AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0);
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   RETURN jsonb_build_object(
     'completed', true, 'generationId', p_generation_id,
@@ -411,7 +415,8 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_yield_job(
-  p_worker_id varchar, p_job_id varchar, p_lease_token varchar
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
+  p_request_deadline_ms bigint
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -424,13 +429,15 @@ BEGIN
   IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
     OR p_job_id IS NULL OR btrim(p_job_id) = '' OR length(p_job_id) > 128
     OR p_lease_token IS NULL OR btrim(p_lease_token) = ''
-    OR length(p_lease_token) > 128 THEN
+    OR length(p_lease_token) > 128 OR p_request_deadline_ms IS NULL
+    OR p_request_deadline_ms <= 0 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   SELECT * INTO job FROM public.knowledge_jobs
     WHERE id = p_job_id AND kind = 'embedding' AND state = 'running'
       AND worker_id = p_worker_id AND lease_token = p_lease_token
       AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0)
     FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   UPDATE public.knowledge_jobs SET state = 'queued',
@@ -439,7 +446,8 @@ BEGIN
     updated_at = clock_timestamp()
     WHERE owner_id = job.owner_id AND id = job.id
       AND worker_id = p_worker_id AND lease_token = p_lease_token
-      AND lease_expires_at > clock_timestamp();
+      AND lease_expires_at > clock_timestamp()
+      AND clock_timestamp() < to_timestamp(p_request_deadline_ms / 1000.0);
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   RETURN jsonb_build_object('yielded', true);
 END;
@@ -453,10 +461,10 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_upload_work(
 ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_upload_index(
   varchar, varchar, varchar, bigint, varchar, varchar, varchar, varchar,
-  varchar, varchar, varchar, integer, varchar, varchar, jsonb, jsonb
+  varchar, varchar, varchar, integer, varchar, varchar, jsonb, jsonb, bigint
 ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_yield_job(
-  varchar, varchar, varchar
+  varchar, varchar, varchar, bigint
 ) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_begin_generation(
@@ -467,10 +475,10 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_upload_work(
 ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_upload_index(
   varchar, varchar, varchar, bigint, varchar, varchar, varchar, varchar,
-  varchar, varchar, varchar, integer, varchar, varchar, jsonb, jsonb
+  varchar, varchar, varchar, integer, varchar, varchar, jsonb, jsonb, bigint
 ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_yield_job(
-  varchar, varchar, varchar
+  varchar, varchar, varchar, bigint
 ) TO service_role;
 
 COMMIT;
