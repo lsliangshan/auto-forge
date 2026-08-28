@@ -187,7 +187,11 @@ export class KnowledgeSyncService {
   }
 
   private assertCloudAccess(epoch: number): void {
-    if (!this.cloudAllowed || epoch !== this.entitlementEpoch) throw syncError('CONFLICT')
+    if (!this.isCloudAccessCurrent(epoch)) throw syncError('CONFLICT')
+  }
+
+  private isCloudAccessCurrent(epoch: number): boolean {
+    return this.cloudAllowed && epoch === this.entitlementEpoch
   }
 
   enqueue(input: PushMutationInput): void {
@@ -296,14 +300,15 @@ export class KnowledgeSyncService {
           if (this.completeMutation(mutation)) processed += 1
         }
       } catch (error) {
-        if (!this.isActive(knowledgeBaseId, epoch)) {
+        if (!this.isCloudAccessCurrent(entitlementEpoch)
+          || !this.isActive(knowledgeBaseId, epoch)) {
           return { status: 'paused', processed, conflicts }
         }
         this.failMutation(mutation, error)
       }
     }
 
-    await this.pull(knowledgeBaseId, epoch)
+    await this.pull(knowledgeBaseId, epoch, entitlementEpoch)
     if (!this.isActive(knowledgeBaseId, epoch)) {
       return { status: 'paused', processed, conflicts }
     }
@@ -627,6 +632,8 @@ export class KnowledgeSyncService {
       actualDigest: string
     }>,
   ): Promise<void> {
+    const ownerEpoch = this.entitlementEpoch
+    const isOwnerCurrent = () => ownerEpoch === this.entitlementEpoch
     let conversion = this.database.prepare(`
       SELECT operation_id AS operationId, request_id AS requestId, state,
         expected_published_generation_id AS expectedPublishedGenerationId,
@@ -672,10 +679,13 @@ export class KnowledgeSyncService {
     }
     const epoch = this.getControl(knowledgeBaseId).epoch
     const assertConverting = () => {
+      if (!isOwnerCurrent()) throw syncError('CONFLICT')
       const control = this.getControl(knowledgeBaseId)
       if (control.epoch !== epoch || control.mode !== 'converting') throw syncError('CONFLICT')
     }
-    const conversionGuard = this.createCommitGuard(knowledgeBaseId, epoch, 'converting')
+    const conversionGuard = this.createCommitGuard(
+      knowledgeBaseId, epoch, 'converting', isOwnerCurrent,
+    )
     if (conversion.state === 'downloading') {
       const verification = await downloadAndVerify(conversionGuard)
       assertConverting()
@@ -767,10 +777,12 @@ export class KnowledgeSyncService {
     knowledgeBaseId: string,
     epoch: number,
     mode: Extract<CloudSyncMode, 'syncing' | 'converting'>,
+    isOwnerCurrent: () => boolean,
   ): KnowledgeSyncCommitGuard {
     const isCurrent = () => {
       const current = this.getControl(knowledgeBaseId)
-      return current.epoch === epoch && current.mode === mode
+      return isOwnerCurrent()
+        && current.epoch === epoch && current.mode === mode
     }
     return Object.freeze({
       knowledgeBaseId,
@@ -949,38 +961,46 @@ export class KnowledgeSyncService {
     })()
   }
 
-  private async pull(knowledgeBaseId: string, epoch: number): Promise<void> {
+  private async pull(
+    knowledgeBaseId: string,
+    epoch: number,
+    entitlementEpoch: number,
+  ): Promise<void> {
     const cursor = this.database.prepare(`
       SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?
     `).get(knowledgeBaseId) as { sequence: number } | undefined
     let afterSequence = cursor?.sequence ?? 0
-    const commitGuard = this.createCommitGuard(knowledgeBaseId, epoch, 'syncing')
+    const isCurrent = () => this.isCloudAccessCurrent(entitlementEpoch)
+      && this.isActive(knowledgeBaseId, epoch)
+    const commitGuard = this.createCommitGuard(
+      knowledgeBaseId, epoch, 'syncing', () => this.isCloudAccessCurrent(entitlementEpoch),
+    )
     if (afterSequence === 0) {
       const snapshot = await this.remote.fullResync({ knowledgeBaseId })
-      if (!this.isActive(knowledgeBaseId, epoch)) return
+      if (!isCurrent()) return
       try {
         await this.dependencies.replaceRemoteSnapshot(snapshot.changes, commitGuard)
       } catch (error) {
-        if (!this.isActive(knowledgeBaseId, epoch)) return
+        if (!isCurrent()) return
         throw error
       }
-      if (!this.isActive(knowledgeBaseId, epoch)) return
+      if (!isCurrent()) return
       this.replaceCursor(knowledgeBaseId, snapshot.nextSequence, this.dependencies.now())
       return
     }
     while (true) {
       const result = await this.remote.pullChanges({ knowledgeBaseId, afterSequence })
-      if (!this.isActive(knowledgeBaseId, epoch)) return
+      if (!isCurrent()) return
       if (result.kind === 'cursor_stale') {
         const snapshot = await this.remote.fullResync({ knowledgeBaseId })
-        if (!this.isActive(knowledgeBaseId, epoch)) return
+        if (!isCurrent()) return
         try {
           await this.dependencies.replaceRemoteSnapshot(snapshot.changes, commitGuard)
         } catch (error) {
-          if (!this.isActive(knowledgeBaseId, epoch)) return
+          if (!isCurrent()) return
           throw error
         }
-        if (!this.isActive(knowledgeBaseId, epoch)) return
+        if (!isCurrent()) return
         this.replaceCursor(knowledgeBaseId, snapshot.nextSequence, this.dependencies.now())
         return
       }
@@ -993,18 +1013,18 @@ export class KnowledgeSyncService {
         if (change.sequence <= afterSequence || change.sequence > result.nextSequence) {
           throw syncError('INTERNAL_ERROR')
         }
-        if (!this.isActive(knowledgeBaseId, epoch)) return
+        if (!isCurrent()) return
         try {
           await this.dependencies.applyRemoteChange(change, commitGuard)
         } catch (error) {
-          if (!this.isActive(knowledgeBaseId, epoch)) return
+          if (!isCurrent()) return
           throw error
         }
-        if (!this.isActive(knowledgeBaseId, epoch)) return
+        if (!isCurrent()) return
         afterSequence = change.sequence
       }
       if (result.nextSequence !== afterSequence) throw syncError('INTERNAL_ERROR')
-      if (!this.isActive(knowledgeBaseId, epoch)) return
+      if (!isCurrent()) return
       this.upsertCursor(knowledgeBaseId, result.nextSequence, this.dependencies.now())
       if (!result.hasMore) return
     }

@@ -130,6 +130,20 @@ describe('KnowledgeSyncService', () => {
     expect(() => service.resume('kb_1')).toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }))
   })
 
+  it('allows verified conversion during the download window after cloud access closes', async () => {
+    const { remote, service } = fixture()
+    service.beginCloudRetention('kb_1', 500)
+    service.setCloudAccess(false)
+
+    await expect(service.convertToLocalOnly('kb_1', async () => ({
+      complete: true, expectedDigest: 'verified', actualDigest: 'verified',
+    }))).resolves.toBeUndefined()
+    expect(remote.deleteKnowledgeBase).toHaveBeenCalledOnce()
+    expect(service.getState('kb_1')).toEqual({
+      mode: 'local_only', publishedGenerationId: null,
+    })
+  })
+
   it('durably advances the 30+30 day lifecycle and permits immediate purge while cloud is off', async () => {
     const { database, remote, service } = fixture()
     expect(service.beginCloudRetention('kb_1')).toMatchObject({
@@ -371,6 +385,58 @@ describe('KnowledgeSyncService', () => {
     expect(database.prepare(
       'SELECT count(*) AS count FROM sync_cursors WHERE knowledge_base_id = ?',
     ).get('kb_1')).toEqual({ count: 0 })
+  })
+
+  it('rejects a late full snapshot when durable owner invalidation rolls back', async () => {
+    let resolveSnapshot!: (value: {
+      kind: 'snapshot'
+      nextSequence: number
+      changes: Array<{
+        sequence: number
+        entityKind: 'document'
+        entityId: string
+        operation: 'upsert'
+        revision: string
+        payload: Record<string, unknown>
+      }>
+    }) => void
+    const fullResync = vi.fn().mockReturnValue(new Promise(resolve => { resolveSnapshot = resolve }))
+    let localWrites = 0
+    const replaceRemoteSnapshot = async (...args: unknown[]) => {
+      commitFromCallback(args, () => { localWrites += 1 })
+    }
+    const { database, service } = fixture(
+      { fullResync }, true, { replaceRemoteSnapshot },
+    )
+    database.exec(`
+      CREATE TRIGGER fail_owner_pause
+      BEFORE UPDATE OF mode ON cloud_sync_states
+      WHEN NEW.mode = 'paused'
+      BEGIN
+        SELECT RAISE(ABORT, 'owner fence failed');
+      END
+    `)
+
+    const running = service.synchronize('kb_1')
+    await vi.waitFor(() => expect(fullResync).toHaveBeenCalledOnce())
+    expect(() => service.invalidateOwner()).toThrow('owner fence failed')
+    resolveSnapshot({
+      kind: 'snapshot', nextSequence: 7,
+      changes: [{
+        sequence: 7, entityKind: 'document', entityId: 'document_remote',
+        operation: 'upsert', revision: 'r7', payload: { late: true },
+      }],
+    })
+
+    await expect(running).rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(service.drain()).resolves.toBeUndefined()
+    expect(localWrites).toBe(0)
+    expect(database.prepare(
+      'SELECT count(*) AS count FROM sync_cursors WHERE knowledge_base_id = ?',
+    ).get('kb_1')).toEqual({ count: 0 })
+    expect(database.prepare(
+      'SELECT mode, epoch FROM cloud_sync_states WHERE knowledge_base_id = ?',
+    ).get('kb_1')).toEqual({ mode: 'syncing', epoch: 1 })
   })
 
   it('replaces an expired incremental cursor with a complete snapshot', async () => {

@@ -87,6 +87,8 @@ interface Binding {
   handles: Map<string, ImportHandleRecord>
   cloud: KnowledgeCloudLifecycle
   cloudOwnerInvalidated: boolean
+  cloudOwnerInvalidationFailed: boolean
+  cloudOwnerInvalidationFailure?: unknown
   cloudTasks: Set<Promise<unknown>>
   cloudPublications: Map<string, Promise<void>>
 }
@@ -1059,17 +1061,27 @@ export function createLocalKnowledgeService(
   }
 
   const invalidateBinding = (current: Binding): void => {
-    if (!current.cloudOwnerInvalidated) {
-      current.cloud.invalidateOwner()
-      current.cloudOwnerInvalidated = true
+    try {
+      if (!current.cloudOwnerInvalidated) {
+        current.cloud.invalidateOwner()
+        current.cloudOwnerInvalidated = true
+      }
+    } catch (error) {
+      if (!current.cloudOwnerInvalidationFailed) {
+        current.cloudOwnerInvalidationFailed = true
+        current.cloudOwnerInvalidationFailure = error
+      }
+    } finally {
+      current.runner.invalidate()
     }
-    current.runner.invalidate()
   }
 
   const retire = (current: Binding): void => {
     invalidateBinding(current)
     const closing = (async () => {
-      const failures: PromiseSettledResult<unknown>[] = []
+      const failures: PromiseSettledResult<unknown>[] = current.cloudOwnerInvalidationFailed
+        ? [{ status: 'rejected', reason: current.cloudOwnerInvalidationFailure }]
+        : []
       failures.push(...await settle([
         () => current.runner.drain(),
         () => current.cloud.drain(),
@@ -1106,8 +1118,8 @@ export function createLocalKnowledgeService(
 
   const beginRetirements = (): void => {
     for (const pending of pendingRetirements) {
-      pendingRetirements.delete(pending)
       retire(pending)
+      pendingRetirements.delete(pending)
     }
   }
 
@@ -1222,6 +1234,7 @@ export function createLocalKnowledgeService(
       Object.assign(active, {
         ownerId, epoch: bindEpoch, store, parser, runner, handles: new Map(),
         cloud: createCloudLifecycle(store), cloudOwnerInvalidated: false,
+        cloudOwnerInvalidationFailed: false,
         cloudTasks: new Set(), cloudPublications: new Map(),
       })
       if (bindEpoch !== epoch) {

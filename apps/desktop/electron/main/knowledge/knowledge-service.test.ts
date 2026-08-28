@@ -710,6 +710,92 @@ describe('local knowledge service', () => {
     expect(memory.closes()).toBe(1)
   })
 
+  it('surfaces a synchronous owner-fence failure while still draining and closing retirement', async () => {
+    const memory = memoryKnowledgeStore()
+    const invalidationOrder: string[] = []
+    let terminations = 0
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({
+        parse: async () => parsedText('unused'),
+        terminateAll: async () => {
+          invalidationOrder.push('runner')
+          terminations += 1
+        },
+      }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+    })
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    const base = await service.create(owner, '云端故障库')
+    memory.database.prepare(`
+      INSERT INTO cloud_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES (?, 'synced', 'generation_1', 1, 1)
+    `).run(base.id)
+    memory.database.function('observe_cloud_owner_fence', () => {
+      invalidationOrder.push('cloud-fence')
+    })
+    memory.database.exec(`
+      CREATE TRIGGER fail_cloud_owner_fence
+      BEFORE UPDATE OF mode ON cloud_sync_states
+      WHEN NEW.mode = 'paused'
+      BEGIN
+        SELECT observe_cloud_owner_fence();
+        SELECT RAISE(ABORT, 'cloud owner fence failed');
+      END
+    `)
+
+    let invalidationFailure: unknown
+    try {
+      service.invalidate()
+    } catch (error) {
+      invalidationFailure = error
+    }
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+
+    let firstDrainFailure: unknown
+    try {
+      await service.drain()
+    } catch (error) {
+      firstDrainFailure = error
+    }
+    memory.database.exec('DROP TRIGGER fail_cloud_owner_fence')
+
+    let secondDrainFailure: unknown
+    try {
+      await service.drain()
+    } catch (error) {
+      secondDrainFailure = error
+    }
+
+    expect({
+      invalidationFailure: invalidationFailure instanceof Error
+        ? invalidationFailure.message
+        : invalidationFailure,
+      invalidationOrder,
+      terminations,
+      firstDrainFailure: firstDrainFailure instanceof Error
+        ? firstDrainFailure.message
+        : firstDrainFailure,
+      secondDrainFailure,
+      closes: memory.closes(),
+      sync: memory.database.prepare(`
+        SELECT mode, epoch FROM cloud_sync_states WHERE knowledge_base_id = ?
+      `).get(base.id),
+    }).toEqual({
+      invalidationFailure: undefined,
+      invalidationOrder: ['cloud-fence', 'runner', 'cloud-fence'],
+      terminations: 1,
+      firstDrainFailure: 'cloud owner fence failed',
+      secondDrainFailure: undefined,
+      closes: 1,
+      sync: { mode: 'synced', epoch: 1 },
+    })
+  })
+
   it('purges a local-only recycled base without a remote deletion operation', async () => {
     const memory = memoryKnowledgeStore()
     const remote = cloudRemote()

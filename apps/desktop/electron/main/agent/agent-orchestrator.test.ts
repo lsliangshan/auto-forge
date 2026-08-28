@@ -6729,6 +6729,84 @@ describe('AgentOrchestrator knowledge grounding', () => {
     },
   )
 
+  it.each(['approval update', 'finalization'] as const)(
+    'releases a pending approval scope and active indexes when cancellation %s fails',
+    async (failurePoint) => {
+      const dependencies = harness([toolTurn])
+      requireChatApproval(dependencies)
+      attachKnowledge(dependencies, { keepWorkflows: true })
+      const releaseSearchScope = vi.fn()
+      Object.assign(dependencies.knowledge!, { releaseSearchScope })
+      const admittedScope = Object.freeze({
+        scopeId: 'scope_finalize_failure', ownerId: 'user_1', ownerEpoch: 7,
+        baseIds: Object.freeze(['base_selected']), entries: Object.freeze([]), cloudAllowed: false,
+      })
+      const orchestrator = new AgentOrchestrator(dependencies)
+      const pending = await orchestrator.run({
+        ...knowledgeRunInput('使用百度搜索'),
+        requestId: 'scope_finalize_failure',
+        knowledgeSearchScope: admittedScope,
+      })
+      const persistenceFailure = new Error(`agent ${failurePoint} failed`)
+      if (failurePoint === 'approval update') {
+        dependencies.persistence.replaceAssistantBlock = vi.fn(() => { throw persistenceFailure })
+      } else {
+        dependencies.persistence.finalize = vi.fn(() => { throw persistenceFailure })
+      }
+
+      await expect(orchestrator.cancel(pending.requestId)).rejects.toBe(persistenceFailure)
+
+      expect(releaseSearchScope).toHaveBeenCalledOnce()
+      expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
+      expect(orchestrator.hasActiveRuns()).toBe(false)
+      await orchestrator.cancel(pending.requestId)
+      expect(releaseSearchScope).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('keeps a failed consent mutation closed and lets a later successful retry reopen admission', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'failed_change_search',
+        name: 'knowledge_search', arguments: { query: '失败授权期间' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '未使用知识库依据。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'successful_retry_search',
+        name: 'knowledge_search', arguments: { query: '重新授权之后' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const knowledge = attachKnowledge(dependencies)
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    const failed = orchestrator.beginKnowledgeProviderConsentChange('user_1', 'openrouter')
+    await failed.cancellations
+    await orchestrator.run({
+      ...knowledgeRunInput('失败授权期间'),
+      conversationId: 'failed_consent_change', requestId: 'failed_consent_change',
+    })
+    expect(knowledge.search).not.toHaveBeenCalled()
+
+    const retry = orchestrator.beginKnowledgeProviderConsentChange('user_1', 'openrouter')
+    await retry.cancellations
+    orchestrator.completeKnowledgeProviderConsentChange('user_1', 'openrouter', retry.generation)
+    await orchestrator.run({
+      ...knowledgeRunInput('重新授权之后'),
+      conversationId: 'successful_consent_retry', requestId: 'successful_consent_retry',
+    })
+
+    expect(knowledge.search).toHaveBeenCalledOnce()
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('knowledge_citation')
+  })
+
   it('rejects model-controlled scope and sends no snippets when Provider consent is denied', async () => {
     const dependencies = harness([[
       {

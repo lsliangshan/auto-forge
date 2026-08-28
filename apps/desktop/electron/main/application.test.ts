@@ -1573,13 +1573,14 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
-  it('records a knowledge resource drain failure at the Application shutdown boundary', async () => {
+  it('continues knowledge shutdown after synchronous invalidation fails and reports the earliest error', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-drain-failure-'))
     directories.push(root)
+    const invalidationFailure = new Error('knowledge owner fence failed')
     const drainFailure = new Error('knowledge parser termination failed')
     const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
       bind: vi.fn(async () => undefined),
-      invalidate: vi.fn(),
+      invalidate: vi.fn(() => { throw invalidationFailure }),
       drain: vi.fn(async () => { throw drainFailure }),
       captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
       releaseSearchScope: vi.fn(),
@@ -1588,7 +1589,7 @@ describe('createApplicationRuntime', () => {
     })
     const runtime = createApplicationRuntime(options(root, { knowledgeService }))
 
-    await expect(runtime.close()).rejects.toBe(drainFailure)
+    await expect(runtime.close()).rejects.toBe(invalidationFailure)
     expect(knowledgeService.invalidate).toHaveBeenCalledOnce()
     expect(knowledgeService.drain).toHaveBeenCalledOnce()
   })
@@ -1687,72 +1688,183 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
-  it('keeps a Main-captured knowledge scope pinned while approval waits and releases it during shutdown', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-approval-scope-'))
-    directories.push(root)
-    const emitted: ChatEvent[] = []
-    const admittedScope = Object.freeze({
-      scopeId: 'scope_shutdown', ownerId: 'test_user_testuser', ownerEpoch: 1,
-      cloudAllowed: false, baseIds: Object.freeze(['base_selected']), entries: Object.freeze([]),
-    })
-    const releaseSearchScope = vi.fn()
-    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
-      bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
-      captureSearchScope: vi.fn(async () => admittedScope),
-      releaseSearchScope,
-      searchSelected: vi.fn(async () => ({
-        kind: 'results' as const, strategy: 'trigram' as const, evidence: [],
-      })),
-      sourceAvailable: vi.fn(async () => false),
-      getConsent: vi.fn(async () => ({
-        provider: 'openrouter' as const, status: 'granted' as const,
-        updatedAt: '2026-08-28T00:00:00.000Z',
-      })),
-    })
-    const provider = snapshotProvider('openrouter', {
-      listModels: vi.fn(async () => [{
-        ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true,
-      }]),
-      validateCredential: vi.fn(async () => ({ valid: true })),
-      stream: vi.fn(async function* (request: ModelStreamRequest) {
-        const workflowTool = request.tools?.find(tool => tool.function.name !== 'knowledge_search')
-        if (!workflowTool) throw new Error('Expected workflow tool')
-        yield {
-          type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'call_scope_shutdown',
-          name: workflowTool.function.name, arguments: { input: {} },
+  it.each(['shutdown', 'conversation deletion', 'owner logout'] as const)(
+    'keeps a Main-captured knowledge scope pinned while approval waits and releases it once during %s',
+    async (terminalBoundary) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-approval-scope-'))
+      directories.push(root)
+      const emitted: ChatEvent[] = []
+      const admittedScope = Object.freeze({
+        scopeId: 'scope_shutdown', ownerId: 'test_user_testuser', ownerEpoch: 1,
+        cloudAllowed: false, baseIds: Object.freeze(['base_selected']), entries: Object.freeze([]),
+      })
+      const releaseSearchScope = vi.fn()
+      const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+        bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
+        captureSearchScope: vi.fn(async () => admittedScope),
+        releaseSearchScope,
+        searchSelected: vi.fn(async () => ({
+          kind: 'results' as const, strategy: 'trigram' as const, evidence: [],
+        })),
+        sourceAvailable: vi.fn(async () => false),
+        getConsent: vi.fn(async () => ({
+          provider: 'openrouter' as const, status: 'granted' as const,
+          updatedAt: '2026-08-28T00:00:00.000Z',
+        })),
+      })
+      const provider = snapshotProvider('openrouter', {
+        listModels: vi.fn(async () => [{
+          ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true,
+        }]),
+        validateCredential: vi.fn(async () => ({ valid: true })),
+        stream: vi.fn(async function* (request: ModelStreamRequest) {
+          const workflowTool = request.tools?.find(tool => tool.function.name !== 'knowledge_search')
+          if (!workflowTool) throw new Error('Expected workflow tool')
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'call_scope_shutdown',
+            name: workflowTool.function.name, arguments: { input: {} },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+        }),
+      })
+      const runtime = createApplicationRuntime(options(root, {
+        knowledgeService, modelProviders: { openrouter: provider },
+        emitChat: event => { emitted.push(event) },
+      }))
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' }, openrouter: { text: 'openrouter/tools' },
+        },
+      })
+      await installApprovalWorkflow(runtime)
+      const conversation = await runtime.services.chat.createConversation()
+      const currentPreferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
+      await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+        ...currentPreferences, knowledgeBaseIds: ['base_selected'], knowledgeMode: 'strict',
+      })
+
+      await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+      await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+        type: 'block', block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+      })))
+
+      expect(releaseSearchScope).not.toHaveBeenCalled()
+      if (terminalBoundary === 'conversation deletion') {
+        const foreignConversation = await runtime.services.chat.createConversation()
+        const foreign = await runtime.services.chat.send(chatInput(
+          foreignConversation.id, 'foreign approval workflow',
+        ))
+        await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+          type: 'block', conversationId: foreignConversation.id,
+          block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+        })))
+        await expect(runtime.services.chat.deleteConversation(conversation.id))
+          .rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(releaseSearchScope).not.toHaveBeenCalled()
+        await runtime.services.chat.cancel(foreign.requestId)
+        await runtime.services.chat.deleteConversation(conversation.id)
+        await expect(runtime.services.chat.listConversations({ limit: 50 }))
+          .resolves.toEqual({ items: [expect.objectContaining({ id: foreignConversation.id })] })
+      } else if (terminalBoundary === 'owner logout') {
+        await expect(runtime.services.auth.logout({ discardPending: true }))
+          .resolves.toEqual({ status: 'logged_out' })
+      }
+      if (terminalBoundary !== 'shutdown') expect(releaseSearchScope).toHaveBeenCalledOnce()
+      await runtime.close()
+      expect(releaseSearchScope).toHaveBeenCalledOnce()
+      expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
+    },
+  )
+
+  it.each(['chat cancellation', 'approval decision'] as const)(
+    'surfaces an approval persistence failure and clears stale request tracking after %s',
+    async (failureBoundary) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-approval-failure-'))
+      directories.push(root)
+      const emitted: ChatEvent[] = []
+      let inspectedAgent!: AgentOrchestrator
+      const provider = snapshotProvider('openrouter', {
+        listModels: vi.fn(async () => [{
+          ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true,
+        }]),
+        validateCredential: vi.fn(async () => ({ valid: true })),
+        stream: vi.fn(async function* (request: ModelStreamRequest) {
+          if (request.messages.some(message => message.role === 'tool')) {
+            yield { type: 'text_delta' as const, choiceIndex: 0, text: '已停止工作流。' }
+            yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+            return
+          }
+          const workflowTool = request.tools?.find(tool => tool.function.name !== 'knowledge_search')
+          if (!workflowTool) throw new Error('Expected workflow tool')
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0,
+            id: 'call_approval_failure', name: workflowTool.function.name, arguments: { input: {} },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+        }),
+      })
+      const runtime = createApplicationRuntime(options(root, {
+        modelProviders: { openrouter: provider },
+        emitChat: event => { emitted.push(event) },
+        inspectAgent: agent => { inspectedAgent = agent as AgentOrchestrator },
+      }))
+      const persistenceFailure = new Error(`approval ${failureBoundary} persistence failed`)
+      try {
+        await authenticate(runtime)
+        await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+        await runtime.services.settings.update({
+          activeProvider: 'openrouter',
+          defaultModels: {
+            deepseek: { text: 'deepseek-v4-flash' }, openrouter: { text: 'openrouter/tools' },
+          },
+        })
+        await installApprovalWorkflow(runtime)
+        const conversation = await runtime.services.chat.createConversation()
+        const sent = await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+        await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+          type: 'block', block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+        })))
+        const approval = emitted.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+          event.type === 'block' && event.block.type === 'approval'
+        ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+        const agentInternals = inspectedAgent as unknown as {
+          dependencies: {
+            persistence: {
+              replaceAssistantBlock: (...args: unknown[]) => unknown
+              finalize: (...args: unknown[]) => unknown
+            }
+          }
         }
-        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
-      }),
-    })
-    const runtime = createApplicationRuntime(options(root, {
-      knowledgeService, modelProviders: { openrouter: provider },
-      emitChat: event => { emitted.push(event) },
-    }))
-    await authenticate(runtime)
-    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
-    await runtime.services.settings.update({
-      activeProvider: 'openrouter',
-      defaultModels: {
-        deepseek: { text: 'deepseek-v4-flash' }, openrouter: { text: 'openrouter/tools' },
-      },
-    })
-    await installApprovalWorkflow(runtime)
-    const conversation = await runtime.services.chat.createConversation()
-    const currentPreferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
-    await runtime.services.chat.updateGenerationPreferences(conversation.id, {
-      ...currentPreferences, knowledgeBaseIds: ['base_selected'], knowledgeMode: 'strict',
-    })
+        if (failureBoundary === 'chat cancellation') {
+          agentInternals.dependencies.persistence.replaceAssistantBlock = vi.fn(() => {
+            throw persistenceFailure
+          })
+        } else {
+          agentInternals.dependencies.persistence.finalize = vi.fn(() => {
+            throw persistenceFailure
+          })
+        }
 
-    await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
-    await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
-      type: 'block', block: expect.objectContaining({ type: 'approval', state: 'pending' }),
-    })))
-
-    expect(releaseSearchScope).not.toHaveBeenCalled()
-    await runtime.close()
-    expect(releaseSearchScope).toHaveBeenCalledOnce()
-    expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
-  })
+        const failingOperation = failureBoundary === 'chat cancellation'
+          ? runtime.services.chat.cancel(sent.requestId)
+          : runtime.services.executions.decide({
+              executionId: approval.executionId,
+              permissionIndex: approval.permissionIndex,
+              scopeHash: approval.scopeHash,
+              decision: 'deny',
+            })
+        await expect(failingOperation).rejects.toBe(persistenceFailure)
+        expect(inspectedAgent.hasActiveRuns()).toBe(false)
+        await expect(runtime.services.settings.clearLocalData('conversations')).resolves.toBeUndefined()
+        await expect(runtime.close()).rejects.toBe(persistenceFailure)
+      } finally {
+        await runtime.close().catch(() => undefined)
+      }
+    },
+  )
 
   it('fences knowledge disclosure across concurrent revoke and re-grant before any consent await', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-consent-fence-'))
@@ -1884,13 +1996,15 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.send(chatInput(duringRevoke.id, 'during revoke'))
     await waitForTerminal(duringRevoke.id)
 
+    const granting = runtime.services.knowledge.setConsent(owner, 'openrouter', 'granted')
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    expect(setConsent).not.toHaveBeenCalled()
     releaseRevoke.resolve()
     await revoking
+    await grantStarted.promise
     firstSearch.resolve({ kind: 'results', strategy: 'trigram', evidence: [evidence] })
     await waitForTerminal(oldConversation.id)
 
-    const granting = runtime.services.knowledge.setConsent(owner, 'openrouter', 'granted')
-    await grantStarted.promise
     waitForGrantCommit = true
     const duringGrant = await createSelectedConversation()
     await runtime.services.chat.send(chatInput(duringGrant.id, 'during grant'))

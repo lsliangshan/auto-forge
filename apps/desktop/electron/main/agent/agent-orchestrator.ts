@@ -569,6 +569,7 @@ interface ActiveAgentRun {
   knowledgeSelection: Readonly<KnowledgeSelection>
   knowledgeSearchScope?: KnowledgeSearchScope
   knowledgeSearchScopeReleased: boolean
+  terminalCleaned: boolean
   knowledgeProviderConsentGeneration: number
   knowledgeEvidence: CurrentTurnKnowledgeEvidence
   knowledgeSearches: number
@@ -971,6 +972,7 @@ export class AgentOrchestrator {
         ...(input.knowledgeSearchScope === undefined
           ? {} : { knowledgeSearchScope: input.knowledgeSearchScope }),
         knowledgeSearchScopeReleased: false,
+        terminalCleaned: false,
         knowledgeProviderConsentGeneration: this.knowledgeProviderConsentFence(
           input.userId, input.provider,
         ).generation,
@@ -1114,35 +1116,44 @@ export class AgentOrchestrator {
     const active = this.activeByExecution.get(parsed.data.executionId)
     if (!active || !active.pending || active.terminal) return this.failedResult(active?.requestId ?? '', 'CONFLICT')
     if (active.busy) return this.failedResult(active.requestId, 'CONFLICT')
-    const pending = active.pending
-    if (active.loop.approvalExpired()) {
-      this.clearApprovalTimer(active)
-      await this.workflowTools.cancel(pending.tool)
-      this.updateApprovalState(active, pending, 'expired')
-      this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
-      this.clearPending(active)
-      return this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
-    }
-    const result = parsed.data.decision === 'deny'
-      ? await this.workflowTools.deny(pending.tool, parsed.data)
-      : await this.workflowTools.approve(pending.tool, parsed.data)
-    if (result.kind === 'tool_error') {
-      if (result.code === 'CONFLICT' || result.code === 'INVALID_INPUT') {
-        return this.failedResult(active.requestId, result.code)
+    try {
+      const pending = active.pending
+      if (active.loop.approvalExpired()) {
+        this.clearApprovalTimer(active)
+        await this.workflowTools.cancel(pending.tool)
+        this.updateApprovalState(active, pending, 'expired')
+        this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
+        this.clearPending(active)
+        return this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
       }
-      this.clearApprovalTimer(active)
-      active.loop.resumeApproval()
-      this.updateApprovalState(active, pending, parsed.data.decision === 'deny' ? 'denied' : 'invalidated')
-      this.updateWorkflowStatus(active, pending, result.code === 'PERMISSION_DENIED' ? 'cancelled' : 'failed', result)
-      this.appendToolExchange(active, pending, result)
-      this.clearPending(active)
-      this.enableKnowledgeAfterWorkflow(active)
-    } else {
-      this.clearApprovalTimer(active)
-      active.loop.resumeApproval()
-      this.updateApprovalState(active, pending, 'approved')
+      const result = parsed.data.decision === 'deny'
+        ? await this.workflowTools.deny(pending.tool, parsed.data)
+        : await this.workflowTools.approve(pending.tool, parsed.data)
+      if (result.kind === 'tool_error') {
+        if (result.code === 'CONFLICT' || result.code === 'INVALID_INPUT') {
+          return this.failedResult(active.requestId, result.code)
+        }
+        this.clearApprovalTimer(active)
+        active.loop.resumeApproval()
+        this.updateApprovalState(active, pending, parsed.data.decision === 'deny' ? 'denied' : 'invalidated')
+        this.updateWorkflowStatus(active, pending, result.code === 'PERMISSION_DENIED' ? 'cancelled' : 'failed', result)
+        this.appendToolExchange(active, pending, result)
+        this.clearPending(active)
+        this.enableKnowledgeAfterWorkflow(active)
+      } else {
+        this.clearApprovalTimer(active)
+        active.loop.resumeApproval()
+        this.updateApprovalState(active, pending, 'approved')
+      }
+      return this.driveExclusive(active)
+    } catch (error) {
+      active.controller.abort()
+      try {
+        if (!active.terminal) await this.terminalize(active, 'failed', asAppError(error))
+      } catch { /* preserve the approval failure */ }
+      this.cleanupTerminalRun(active)
+      throw error
     }
-    return this.driveExclusive(active)
   }
 
   async cancel(requestId: string): Promise<void> {
@@ -1150,32 +1161,43 @@ export class AgentOrchestrator {
     if (!active || active.terminal) return
     active.cancelled = true
     active.controller.abort()
-    if (active.pending) {
-      await this.workflowTools.cancel(active.pending.tool)
-      this.updateApprovalState(active, active.pending, 'cancelled')
-      this.updateWorkflowStatus(active, active.pending, 'cancelled', appFailure('CANCELLED'))
+    try {
+      if (active.pending) {
+        await this.workflowTools.cancel(active.pending.tool)
+        this.updateApprovalState(active, active.pending, 'cancelled')
+        this.updateWorkflowStatus(active, active.pending, 'cancelled', appFailure('CANCELLED'))
+      }
+      if (!active.terminal) await this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
+    } finally {
+      this.cleanupTerminalRun(active)
     }
-    if (!active.terminal) await this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
   }
 
   beginKnowledgeProviderConsentChange(
     userId: string,
     provider: ModelProviderId,
-  ): Promise<void> {
-    this.advanceKnowledgeProviderConsentFence(userId, provider, true)
+  ): { generation: number; cancellations: Promise<void> } {
+    const generation = this.advanceKnowledgeProviderConsentFence(userId, provider, true)
     const affected = [...this.activeByRequest.values()].filter(active => (
       active.userId === userId
       && active.providerSnapshot.providerId === provider
       && active.knowledgeSelection.baseIds.length > 0
       && !active.terminal
     ))
-    return Promise.all(affected.map(active => this.cancel(active.requestId))).then(() => undefined)
+    return {
+      generation,
+      cancellations: Promise.all(affected.map(active => this.cancel(active.requestId)))
+        .then(() => undefined),
+    }
   }
 
   completeKnowledgeProviderConsentChange(
     userId: string,
     provider: ModelProviderId,
+    generation: number,
   ): void {
+    const current = this.knowledgeProviderConsentFence(userId, provider)
+    if (!current.changing || current.generation !== generation) return
     this.advanceKnowledgeProviderConsentFence(userId, provider, false)
   }
 
@@ -1218,6 +1240,34 @@ export class AgentOrchestrator {
 
   hasActiveRuns(): boolean {
     return this.activeByRequest.size > 0
+  }
+
+  hasActiveRequest(requestId: string): boolean {
+    const active = this.activeByRequest.get(requestId)
+    return active !== undefined && !active.terminal
+  }
+
+  hasActiveConversation(conversationId: string): boolean {
+    return this.activeByConversation.has(conversationId)
+  }
+
+  hasActiveConversationOtherThan(conversationId: string): boolean {
+    for (const activeConversationId of this.activeByConversation.keys()) {
+      if (activeConversationId !== conversationId) return true
+    }
+    return false
+  }
+
+  ownsExecutionForConversation(executionId: string, conversationId: string): boolean {
+    const active = this.activeByExecution.get(executionId)
+    return active?.conversationId === conversationId && !active.terminal
+  }
+
+  async cancelConversation(conversationId: string): Promise<boolean> {
+    const requestId = this.activeByConversation.get(conversationId)
+    if (!requestId) return false
+    await this.cancel(requestId)
+    return true
   }
 
   ownsBrowserRun(runId: string): boolean {
@@ -2847,12 +2897,16 @@ export class AgentOrchestrator {
     }
     active.cancelled = true
     active.controller.abort()
-    const pending = active.pending
-    await this.workflowTools.cancel(pending.tool)
-    this.updateApprovalState(active, pending, 'expired')
-    this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
-    this.clearPending(active)
-    await this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
+    try {
+      const pending = active.pending
+      await this.workflowTools.cancel(pending.tool)
+      this.updateApprovalState(active, pending, 'expired')
+      this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
+      this.clearPending(active)
+      await this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
+    } finally {
+      this.cleanupTerminalRun(active)
+    }
   }
 
   private clearPending(active: ActiveAgentRun): void {
@@ -2897,44 +2951,48 @@ export class AgentOrchestrator {
     cleanup: 'endRun' | 'cancel' | 'takeOver' = 'endRun',
   ): Promise<AgentRunResult> {
     if (active.terminal) return active.terminal
-    const candidate = active.browserBindingId === undefined
-      ? undefined
-      : active.browserCandidate?.bindingId === active.browserBindingId
-        ? active.browserCandidate
-        : active.browserCatalog.bindings.get(active.browserBindingId)
-    if (active.browserStarted && !active.browserCleaned && this.dependencies.browserContinuation) {
-      active.browserTerminal = true
-      try {
-        await this.cleanupBrowser(active, cleanup)
-      } catch {
-        status = 'failed'
-        error = appFailure('INTERNAL_ERROR')
-        if (candidate) this.updateBrowserStatus(active, candidate, 'failed', '网页操作清理失败', error.code)
+    try {
+      const candidate = active.browserBindingId === undefined
+        ? undefined
+        : active.browserCandidate?.bindingId === active.browserBindingId
+          ? active.browserCandidate
+          : active.browserCatalog.bindings.get(active.browserBindingId)
+      if (active.browserStarted && !active.browserCleaned && this.dependencies.browserContinuation) {
+        active.browserTerminal = true
+        try {
+          await this.cleanupBrowser(active, cleanup)
+        } catch {
+          status = 'failed'
+          error = appFailure('INTERNAL_ERROR')
+          if (candidate) this.updateBrowserStatus(active, candidate, 'failed', '网页操作清理失败', error.code)
+        }
       }
-    }
-    const currentBrowserState = active.browserStatusBlockId === undefined
-      ? undefined
-      : active.blocks.find((block): block is BrowserStatusBlock => (
-        block.type === 'browser_status' && block.blockId === active.browserStatusBlockId
-      ))?.state
-    if (candidate
-      && !['failed', 'cancelled'].includes(currentBrowserState ?? '')
-      && !(currentBrowserState === 'awaiting_user' && status === 'completed')) {
-      if (status === 'completed') {
-        this.updateBrowserStatus(active, candidate, 'completed', '浏览器自动操作已完成')
-      } else if (status === 'failed') {
-        this.updateBrowserStatus(active, candidate, 'failed', '网页操作已安全停止', error?.code)
-      } else {
-        this.updateBrowserStatus(
-          active,
-          candidate,
-          'cancelled',
-          cleanup === 'takeOver' ? '用户已接管浏览器页面' : '网页操作已取消',
-          error?.code,
-        )
+      const currentBrowserState = active.browserStatusBlockId === undefined
+        ? undefined
+        : active.blocks.find((block): block is BrowserStatusBlock => (
+          block.type === 'browser_status' && block.blockId === active.browserStatusBlockId
+        ))?.state
+      if (candidate
+        && !['failed', 'cancelled'].includes(currentBrowserState ?? '')
+        && !(currentBrowserState === 'awaiting_user' && status === 'completed')) {
+        if (status === 'completed') {
+          this.updateBrowserStatus(active, candidate, 'completed', '浏览器自动操作已完成')
+        } else if (status === 'failed') {
+          this.updateBrowserStatus(active, candidate, 'failed', '网页操作已安全停止', error?.code)
+        } else {
+          this.updateBrowserStatus(
+            active,
+            candidate,
+            'cancelled',
+            cleanup === 'takeOver' ? '用户已接管浏览器页面' : '网页操作已取消',
+            error?.code,
+          )
+        }
       }
+      return this.finish(active, status, error)
+    } finally {
+      this.cleanupTerminalRun(active)
     }
-    return this.finish(active, status, error)
   }
 
   private finish(
@@ -2959,26 +3017,45 @@ export class AgentOrchestrator {
     const costs = [active.costUsd, routingUsage?.costUsd]
       .filter((cost): cost is string => cost !== undefined)
     const costUsd = costs.length === 0 ? undefined : addUsd(costs)
-    this.dependencies.persistence.finalize({
-      runId: active.runId,
-      requestId: active.requestId,
-      messageId: active.messageId,
-      blocks,
-      status,
-      endedAt: this.now(),
-      ...(active.generationId ? { generationId: active.generationId } : {}),
-      ...(inputTokens === undefined ? {} : { inputTokens }),
-      ...(outputTokens === undefined ? {} : { outputTokens }),
-      ...(costUsd === undefined ? {} : { costUsd }),
-      ...(error ? { errorCode: error.code } : {}),
-    })
-    active.blocks = blocks
-    const result: AgentRunResult = {
-      requestId: active.requestId,
-      status,
-      ...(error ? { error } : {}),
+    try {
+      this.dependencies.persistence.finalize({
+        runId: active.runId,
+        requestId: active.requestId,
+        messageId: active.messageId,
+        blocks,
+        status,
+        endedAt: this.now(),
+        ...(active.generationId ? { generationId: active.generationId } : {}),
+        ...(inputTokens === undefined ? {} : { inputTokens }),
+        ...(outputTokens === undefined ? {} : { outputTokens }),
+        ...(costUsd === undefined ? {} : { costUsd }),
+        ...(error ? { errorCode: error.code } : {}),
+      })
+      active.blocks = blocks
+      const result: AgentRunResult = {
+        requestId: active.requestId,
+        status,
+        ...(error ? { error } : {}),
+      }
+      active.terminal = result
+      if (errorBlock) {
+        this.safeEmit({
+          type: 'block', conversationId: active.conversationId, messageId: active.messageId, block: errorBlock,
+        })
+      }
+      this.safeEmit({
+        type: 'status', conversationId: active.conversationId, requestId: active.requestId, status,
+        ...(error ? { error } : {}),
+      })
+      return result
+    } finally {
+      this.cleanupTerminalRun(active)
     }
-    active.terminal = result
+  }
+
+  private cleanupTerminalRun(active: ActiveAgentRun): void {
+    if (active.terminalCleaned) return
+    active.terminalCleaned = true
     this.releaseActiveKnowledgeSearchScope(active)
     this.activeByRequest.delete(active.requestId)
     this.activeByRun.delete(active.runId)
@@ -2989,16 +3066,6 @@ export class AgentOrchestrator {
       this.activeByExecution.delete(active.pending.tool.executionId)
       void this.workflowTools.cancel(active.pending.tool)
     }
-    if (errorBlock) {
-      this.safeEmit({
-        type: 'block', conversationId: active.conversationId, messageId: active.messageId, block: errorBlock,
-      })
-    }
-    this.safeEmit({
-      type: 'status', conversationId: active.conversationId, requestId: active.requestId, status,
-      ...(error ? { error } : {}),
-    })
-    return result
   }
 
   private releaseKnowledgeSearchScope(scope: KnowledgeSearchScope | undefined): void {
@@ -3029,13 +3096,15 @@ export class AgentOrchestrator {
     userId: string,
     provider: ModelProviderId,
     changing: boolean,
-  ): void {
+  ): number {
     const key = this.knowledgeProviderConsentKey(userId, provider)
     const current = this.knowledgeProviderConsentFences.get(key)
+    const generation = (current?.generation ?? 0) + 1
     this.knowledgeProviderConsentFences.set(key, {
-      generation: (current?.generation ?? 0) + 1,
+      generation,
       changing,
     })
+    return generation
   }
 
   private isKnowledgeProviderConsentCurrent(active: ActiveAgentRun): boolean {

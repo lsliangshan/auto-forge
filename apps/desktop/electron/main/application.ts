@@ -1447,6 +1447,29 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   isBrowserRunActive = (runId) => agent.ownsBrowserRun(runId)
   options.inspectAgent?.(agent)
+  const pruneInactiveAgentRequests = () => {
+    for (const requestId of activeRequests) {
+      if (!activeChatWork.has(requestId) && !agent.hasActiveRequest(requestId)) {
+        activeRequests.delete(requestId)
+      }
+    }
+  }
+  const knowledgeConsentMutationTails = new Map<string, Promise<void>>()
+  const runKnowledgeConsentMutation = <Result>(
+    ownerId: string,
+    provider: ModelProviderId,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const key = `${ownerId}\0${provider}`
+    const previous = knowledgeConsentMutationTails.get(key) ?? Promise.resolve()
+    const result = previous.then(operation)
+    const tail = result.then(() => undefined, () => undefined)
+    knowledgeConsentMutationTails.set(key, tail)
+    void tail.then(() => {
+      if (knowledgeConsentMutationTails.get(key) === tail) knowledgeConsentMutationTails.delete(key)
+    })
+    return result
+  }
   const persistence = createAgentPersistence(chatDatabase)
   const mediaGeneration = new MediaGenerationOrchestrator({
     providers: providerRegistry,
@@ -1592,6 +1615,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       chatDatabase.chatRuns.getByRequestId(requestId)?.userId === userId
     ))
     const results = await Promise.allSettled(requestIds.map((requestId) => agent.cancel(requestId)))
+    pruneInactiveAgentRequests()
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
     if (failed) throw failed.reason
   }
@@ -1794,16 +1818,24 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const session = await requireAuthenticatedSession()
         requireOwnedConversation(conversationId, session.user.id)
         return maintenance.runExclusive(
-          () => [...activeChatWork.values()].some((work) => work.conversationId !== conversationId)
-            || [...activeConversationTitleWork.values()].some(
-              (work) => work.conversationId !== conversationId,
+          () => {
+            const targetAgentActive = agent.hasActiveConversation(conversationId)
+            const foreignExecution = [...activeExecutions].some(
+              executionId => !agent.ownsExecutionForConversation(executionId, conversationId),
             )
-            || mediaGeneration.hasActiveRuns()
-            || chatDatabase.mediaGenerationJobs.listActive().length > 0
-            || activeExecutions.size > 0
-            || executions.hasActiveExecutions()
-            || browser.hasActiveContexts(),
+            return [...activeChatWork.values()].some((work) => work.conversationId !== conversationId)
+              || agent.hasActiveConversationOtherThan(conversationId)
+              || [...activeConversationTitleWork.values()].some(
+                (work) => work.conversationId !== conversationId,
+              )
+              || mediaGeneration.hasActiveRuns()
+              || chatDatabase.mediaGenerationJobs.listActive().length > 0
+              || foreignExecution
+              || (executions.hasActiveExecutions() && !targetAgentActive)
+              || browser.hasActiveContexts()
+          },
           async () => {
+            await agent.cancelConversation(conversationId)
             const requests = [...activeChatWork.entries()]
               .filter(([, work]) => work.conversationId === conversationId)
             await Promise.all(requests.map(([requestId]) => agent.cancel(requestId)))
@@ -1974,10 +2006,21 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           ?? chatDatabase.chatRuns.getByRequestId(requestId)?.conversationId
         if (!conversationId) throw failure('NOT_FOUND')
         requireOwnedConversation(conversationId, session.user.id)
-        await Promise.allSettled([
-          agent.cancel(requestId),
-          mediaGeneration.cancel(requestId),
-        ])
+        const cancellations = [
+          { source: 'agent-cancel' as const, operation: agent.cancel(requestId) },
+          { source: 'media-cancel' as const, operation: mediaGeneration.cancel(requestId) },
+        ]
+        const results = await Promise.allSettled(cancellations.map(({ operation }) => operation))
+        pruneInactiveAgentRequests()
+        results.forEach((result, index) => {
+          if (result.status === 'rejected') {
+            recordFailure(result.reason, cancellations[index]!.source)
+          }
+        })
+        const failed = results.find(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        )
+        if (failed) throw failed.reason
       },
       takeOverBrowser: async (input) => {
         const session = await auth.requireSession()
@@ -2247,6 +2290,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         try {
           result = await agent.resumeApproval(decision)
         } catch (error) {
+          pruneInactiveAgentRequests()
           recordFailure(error, 'background-chat')
           throw error
         }
@@ -2565,18 +2609,24 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     knowledge: knowledge ? {
       ...knowledge,
       setConsent: async (owner, provider, status) => {
-        const cancellations = agent.beginKnowledgeProviderConsentChange(owner.userId, provider)
-        await cancellations
-        const result = await knowledge.setConsent(owner, provider, status)
-        agent.completeKnowledgeProviderConsentChange(owner.userId, provider)
-        return result
+        const change = agent.beginKnowledgeProviderConsentChange(owner.userId, provider)
+        void change.cancellations.catch(() => undefined)
+        return runKnowledgeConsentMutation(owner.userId, provider, async () => {
+          await change.cancellations
+          const result = await knowledge.setConsent(owner, provider, status)
+          agent.completeKnowledgeProviderConsentChange(owner.userId, provider, change.generation)
+          return result
+        })
       },
       revokeConsent: async (owner, provider) => {
-        const cancellations = agent.beginKnowledgeProviderConsentChange(owner.userId, provider)
-        await cancellations
-        const result = await knowledge.revokeConsent(owner, provider)
-        agent.completeKnowledgeProviderConsentChange(owner.userId, provider)
-        return result
+        const change = agent.beginKnowledgeProviderConsentChange(owner.userId, provider)
+        void change.cancellations.catch(() => undefined)
+        return runKnowledgeConsentMutation(owner.userId, provider, async () => {
+          await change.cancellations
+          const result = await knowledge.revokeConsent(owner, provider)
+          agent.completeKnowledgeProviderConsentChange(owner.userId, provider, change.generation)
+          return result
+        })
       },
     } : createUnavailableKnowledgeService(),
     system: {
@@ -2667,13 +2717,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       if (closePromise) return closePromise
       closePromise = (async () => {
         acceptingWork = false
-        knowledge?.invalidate()
         const capture = async (
           source: ApplicationFailureSource,
           operation: () => void | Promise<void>,
         ): Promise<void> => {
           try { await Promise.resolve().then(operation) } catch (error) { recordFailure(error, source) }
         }
+        try { knowledge?.invalidate() } catch (error) { recordFailure(error, 'knowledge-drain') }
         await capture('admission-drain', () => userDataAdmission.stopAndDrain())
         await capture('knowledge-drain', () => knowledge?.drain())
         await capture('admission-drain', () => maintenance.stopAndDrain())
