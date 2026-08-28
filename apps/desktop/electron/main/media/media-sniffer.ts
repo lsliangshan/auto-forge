@@ -70,12 +70,12 @@ function detectIsoMedia(bytes: Uint8Array): DetectedMedia | undefined {
   return genericMp4 ? detected('video', 'video/mp4', 'mp4') : undefined
 }
 
-function detectSvg(bytes: Uint8Array): DetectedMedia | undefined {
+export function isSafeSvg(bytes: Uint8Array): boolean {
   let text: string
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   } catch {
-    return undefined
+    return false
   }
   text = text.replace(/^\uFEFF/, '')
   let previous: string
@@ -86,9 +86,22 @@ function detectSvg(bytes: Uint8Array): DetectedMedia | undefined {
       .replace(/^<\?xml(?:\s[^?]*)?\?>/i, '')
       .replace(/^<!--[\s\S]*?-->/, '')
   } while (text !== previous)
-  return /^<svg(?:\s|>)/i.test(text)
-    ? detected('image', 'image/svg+xml', 'svg', false)
-    : undefined
+  if (!/^<svg(?:\s|>)/i.test(text)) return false
+  const hasExternalAttribute = [...text.matchAll(/\b(?:href|src)\s*=\s*["']([^"']*)["']/gi)]
+    .some((match) => !/^(?:#|data:)/i.test(match[1]!.trim()))
+  const hasExternalCssUrl = [...text.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)]
+    .some((match) => !/^(?:#|data:)/i.test(match[1]!.trim()))
+  return !(
+    /<!DOCTYPE\b|<!ENTITY\b|<script\b|<foreignObject\b/i.test(text)
+    || /\son[a-z]+\s*=/i.test(text)
+    || /@import\b/i.test(text)
+    || hasExternalAttribute
+    || hasExternalCssUrl
+  )
+}
+
+function detectSvg(bytes: Uint8Array): DetectedMedia | undefined {
+  return isSafeSvg(bytes) ? detected('image', 'image/svg+xml', 'svg', false) : undefined
 }
 
 function isMp3Frame(bytes: Uint8Array): boolean {
@@ -205,6 +218,19 @@ export function detectMediaType(prefix: Uint8Array): DetectedMedia | undefined {
   if (ascii(bytes, 0, 6) === 'GIF87a' || ascii(bytes, 0, 6) === 'GIF89a') {
     return detected('image', 'image/gif', 'gif')
   }
+  if (
+    startsWith(bytes, [0x49, 0x49, 0x2a, 0x00])
+    || startsWith(bytes, [0x4d, 0x4d, 0x00, 0x2a])
+  ) return detected('image', 'image/tiff', 'tiff', false)
+  if (ascii(bytes, 0, 2) === 'BM') return detected('image', 'image/bmp', 'bmp', false)
+  if (
+    bytes.byteLength >= 6
+    && bytes[0] === 0
+    && bytes[1] === 0
+    && (bytes[2] === 1 || bytes[2] === 2)
+    && bytes[3] === 0
+  ) return detected('image', 'image/vnd.microsoft.icon', 'ico', false)
+  if (ascii(bytes, 0, 4) === 'icns') return detected('image', 'image/icns', 'icns', false)
 
   const isoMedia = detectIsoMedia(bytes)
   if (isoMedia) return isoMedia
