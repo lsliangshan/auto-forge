@@ -2338,6 +2338,101 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
+  it.each([
+    ['revoke/revoke', 'accepted', 'revoke', 'revoke'],
+    ['revoke/regrant', 'accepted', 'revoke', 'accept'],
+    ['regrant/revoke', 'revoked', 'accept', 'revoke'],
+    ['regrant/regrant', 'revoked', 'accept', 'accept'],
+  ] as const)(
+    'replaces only the exact failed optimistic consent loser for %s',
+    (_name, initial, localKind, remoteKind) => {
+      const manager = new UserDataStoreManager(temporaryRoot())
+      const store = manager.open('cloud-alice')
+      const accept = (
+        id: string, baseRevision: number, consentedAt: string,
+      ): Extract<SyncMutation, { kind: 'privacy.consent' }> => ({
+        id, kind: 'privacy.consent', entityId: 'cloud-sync-2026-08', baseRevision,
+        occurredAt: consentedAt, payload: {
+          purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+          consentedAt, clientVersion: '0.1.0',
+        },
+      })
+      const revoke = (
+        id: string, baseRevision: number, revokedAt: string,
+      ): Extract<SyncMutation, { kind: 'privacy.consent.revoke' }> => ({
+        id, kind: 'privacy.consent.revoke', entityId: 'cloud_sync', baseRevision,
+        occurredAt: revokedAt, payload: {
+          purpose: 'cloud_sync', revokedAt, clientVersion: '0.1.0',
+        },
+      })
+      const initialAccept = accept('initial_accept', 0, '2026-08-28T00:00:00.000Z')
+      const seed = initial === 'accepted'
+        ? [pulledMutation(initialAccept, 1)]
+        : [
+            pulledMutation(initialAccept, 1),
+            pulledMutation(revoke('initial_revoke', 1, '2026-08-28T01:00:00.000Z'), 2),
+          ]
+      store.sync.applyRemotePage({
+        protocolVersion: 1, cursor: 'cursor_consent_seed', mutations: seed,
+      }, 1)
+      const baseRevision = initial === 'accepted' ? 1 : 2
+      const local = localKind === 'revoke'
+        ? revoke('local_loser', baseRevision, '2026-08-28T02:00:00.000Z')
+        : accept('local_loser', baseRevision, '2026-08-28T02:00:00.000Z')
+      const authoritative = remoteKind === 'revoke'
+        ? revoke('remote_winner', baseRevision, '2026-08-28T03:00:00.000Z')
+        : accept('remote_winner', baseRevision, '2026-08-28T03:00:00.000Z')
+      store.outbox.recordWithConsent(local)
+      store.outbox.markSyncing([local.id])
+      store.outbox.markFailed(local.id, 'SYNC_CONFLICT')
+
+      store.sync.applyRemotePage({
+        protocolVersion: 1, cursor: `cursor-winner-${_name}`,
+        mutations: [pulledMutation(authoritative, baseRevision + 1)],
+      }, 2)
+
+      expect(store.account.getConsentState('cloud_sync')).toEqual(remoteKind === 'revoke'
+        ? { ...authoritative.payload, state: 'revoked', revision: baseRevision + 1 }
+        : { ...authoritative.payload, state: 'accepted', revision: baseRevision + 1 })
+      expect(store.outbox.find(local.id)).toMatchObject({
+        state: 'failed', lastErrorCode: 'SYNC_CONFLICT', baseRevision,
+      })
+      manager.close()
+    },
+  )
+
+  it('keeps equal-revision consent divergence fatal without that exact failed conflict', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const accepted: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      id: 'accepted', kind: 'privacy.consent', entityId: 'cloud-sync-2026-08',
+      baseRevision: 0, occurredAt: '2026-08-28T00:00:00.000Z', payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    const localRevoke: Extract<SyncMutation, { kind: 'privacy.consent.revoke' }> = {
+      id: 'local_not_conflicted', kind: 'privacy.consent.revoke', entityId: 'cloud_sync',
+      baseRevision: 1, occurredAt: '2026-08-28T01:00:00.000Z', payload: {
+        purpose: 'cloud_sync', revokedAt: '2026-08-28T01:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    const remoteRevoke = {
+      ...localRevoke, id: 'remote_divergent',
+      occurredAt: '2026-08-28T02:00:00.000Z',
+      payload: { ...localRevoke.payload, revokedAt: '2026-08-28T02:00:00.000Z' },
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor-accepted-state', mutations: [pulledMutation(accepted, 1)],
+    }, 1)
+    store.outbox.recordWithConsent(localRevoke)
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor-divergent-state', mutations: [pulledMutation(remoteRevoke, 2)],
+    }, 2)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    manager.close()
+  })
+
   it('assigns consecutive optimistic preference revisions and preserves the newest value across receipts', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open('cloud-alice')

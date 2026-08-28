@@ -346,7 +346,34 @@ function applyRemoteConsent(
   const next = consentStateFromMutation(mutation, resultRevision)
   if (current !== undefined && current.revision > resultRevision) return
   if (current !== undefined && current.revision === resultRevision) {
-    if (!isDeepStrictEqual(current, next)) throw new UserDataConsistencyError()
+    if (!isDeepStrictEqual(current, next)) {
+      const failed = (database.prepare(`
+        SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
+          payload_json AS payloadJson, state, attempts,
+          next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
+          occurred_at AS occurredAt, created_at AS createdAt
+        FROM outbox_mutations
+        WHERE state = 'failed' AND last_error_code = 'SYNC_CONFLICT'
+          AND kind IN ('privacy.consent', 'privacy.consent.revoke')
+          AND base_revision = @baseRevision
+          AND json_extract(payload_json, '$.purpose') = @purpose
+      `).all({
+        baseRevision: resultRevision - 1,
+        purpose: mutation.payload.purpose,
+      }) as Query[]).map(outboxFromRow).filter((candidate): candidate is OutboxMutationRecord & {
+        kind: ConsentMutation['kind']
+        payload: ConsentMutation['payload']
+      } => (
+        (candidate.kind === 'privacy.consent' || candidate.kind === 'privacy.consent.revoke')
+        && candidate.payload.purpose === mutation.payload.purpose
+        && isDeepStrictEqual(
+          current,
+          consentStateFromMutation(candidate as ConsentMutation, resultRevision),
+        )
+      ))
+      if (failed.length !== 1) throw new UserDataConsistencyError()
+      writeConsentState(database, next)
+    }
     return
   }
   if ((current?.revision ?? 0) !== mutation.baseRevision) {
