@@ -127,14 +127,18 @@ describe('preload desktop bridge', () => {
     const importRequest = { includeUnowned: false, cloudSyncConsent }
 
     await app.api.settings.recordPrivacyConsent(cloudSyncConsent)
+    await app.api.settings.getCloudSyncConsentState()
+    await app.api.settings.revokeCloudSyncConsent({ confirmed: true })
     await app.api.settings.previewLegacyImport()
     await app.api.settings.importLegacyData(importRequest)
     await app.api.settings.getAccountDataPreferences()
     await app.api.settings.updateAccountDataPreferences({ timezone: 'UTC', displayCurrency: 'USD' })
     await app.api.settings.getRemoteUsage()
 
-    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-6)).toEqual([
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-8)).toEqual([
       [ipcChannels.settingsRecordPrivacyConsent, cloudSyncConsent],
+      [ipcChannels.settingsGetCloudSyncConsentState, undefined],
+      [ipcChannels.settingsRevokeCloudSyncConsent, { confirmed: true }],
       [ipcChannels.settingsPreviewLegacyImport, undefined],
       [ipcChannels.settingsImportLegacyData, importRequest],
       [ipcChannels.settingsGetAccountDataPreferences, undefined],

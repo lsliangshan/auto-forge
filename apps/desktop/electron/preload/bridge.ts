@@ -149,6 +149,12 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       ),
       getTokenUsage: () => invoke(ipcRenderer, ipcChannels.settingsGetTokenUsage),
       recordPrivacyConsent: (input) => invoke(ipcRenderer, ipcChannels.settingsRecordPrivacyConsent, input),
+      getCloudSyncConsentState: () => invoke(
+        ipcRenderer, ipcChannels.settingsGetCloudSyncConsentState,
+      ),
+      revokeCloudSyncConsent: (input) => invoke(
+        ipcRenderer, ipcChannels.settingsRevokeCloudSyncConsent, input,
+      ),
       previewLegacyImport: () => invoke(ipcRenderer, ipcChannels.settingsPreviewLegacyImport),
       importLegacyData: (input) => invoke(ipcRenderer, ipcChannels.settingsImportLegacyData, input),
       getAccountDataPreferences: () => invoke(ipcRenderer, ipcChannels.settingsGetAccountDataPreferences),
