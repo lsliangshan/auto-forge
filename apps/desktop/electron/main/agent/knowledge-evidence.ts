@@ -121,7 +121,10 @@ export type KnowledgeAnswerValidation =
   | { kind: 'insufficient'; reason: 'no-evidence' | 'uncited' | 'invalid-citation' | 'unsupported-claim' }
 
 function validKnowledgeMarkerIdentity(identity: string): boolean {
-  return identity.length >= 1 && identity.length <= 512 && !/[\]\r\n]/u.test(identity)
+  return identity.length >= 1
+    && identity.length <= 512
+    && !identity.includes('[[')
+    && !/[\]\r\n]/u.test(identity)
 }
 
 const KNOWLEDGE_MARKER = /\[\[kb:([^\]\r\n]{1,512})\]\]/gu
@@ -701,7 +704,7 @@ export function validateKnowledgeAnswer(
   mode: KnowledgeSelection['mode'],
   repairAttempts: number,
 ): KnowledgeAnswerValidation {
-  const admitted = new Set(evidence.map(item => item.id))
+  const admitted = new Set(evidence.map(item => item.id).filter(validKnowledgeMarkerIdentity))
   const validatedAnswer = mode === 'mixed'
     ? sanitizeMixedKnowledgeAnswer(answer, admitted)
     : answer

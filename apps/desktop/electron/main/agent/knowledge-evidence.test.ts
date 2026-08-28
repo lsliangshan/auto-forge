@@ -71,6 +71,41 @@ describe('CurrentTurnKnowledgeEvidence', () => {
     }
   })
 
+  it('rejects consecutive opening brackets in every admitted evidence identity', () => {
+    const identities = [
+      { id: 'evidence:[[0', documentId: 'document_0', versionId: 'version_0' },
+      { id: 'evidence:0', documentId: 'document_[[0', versionId: 'version_0' },
+      { id: 'evidence:0', documentId: 'document_0', versionId: 'version_[[0' },
+    ]
+    for (const identity of identities) {
+      const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+      const current = evidence(0, {
+        ...identity,
+        citation: {
+          evidenceId: identity.id, documentId: identity.documentId, versionId: identity.versionId,
+          coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 1 },
+        },
+      })
+      expect(() => registry.add([current])).toThrow('Knowledge evidence identity is invalid')
+      expect(registry.snapshot()).toEqual([])
+    }
+  })
+
+  it.each([
+    'evidence:\r0',
+    'evidence:\n0',
+    'e'.repeat(513),
+  ])('rejects marker-delimiter and length boundary violation %s', (id) => {
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    expect(() => registry.add([evidence(0, {
+      id,
+      citation: {
+        evidenceId: id, documentId: 'document_0', versionId: 'version_0',
+        coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 1 },
+      },
+    })])).toThrow('Knowledge evidence identity is invalid')
+  })
+
   it('builds a bounded untrusted Provider envelope without owner, path, URL, or generation fields', () => {
     const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
     registry.add([evidence(0, {
@@ -127,10 +162,10 @@ describe('knowledge tool and answer validation', () => {
   })
 
   it.each([
-    'evidence:[0',
-    'evidence:[part[0',
-    'evidence:[[0',
-  ])('accepts canonical strict and mixed citations for admitted evidence id %s', (id) => {
+    { name: 'one opening bracket', id: 'evidence:[0' },
+    { name: 'non-consecutive opening brackets', id: 'evidence:[part[0' },
+    { name: '512-code-unit boundary', id: 'e'.repeat(512) },
+  ])('accepts canonical strict and mixed citations at $name', ({ id }) => {
     const current = evidence(0, {
       id,
       snippet: '合同生效。',
@@ -151,22 +186,29 @@ describe('knowledge tool and answer validation', () => {
     })
   })
 
-  it('keeps an admitted opening-bracket citation while removing a nested marker payload', () => {
+  it('does not admit or preserve an injected nested-marker identity and trailing payload', () => {
     const id = 'evidence:[[0'
     const current = evidence(0, {
       id,
-      snippet: '合同生效。',
+      snippet: '合同生效payload',
       citation: {
         evidenceId: id, documentId: 'document_0', versionId: 'version_0',
         coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 5 },
       },
     })
-
-    expect(validateKnowledgeAnswer(
-      `合同生效。[[kb:${id}]] [[kb:[[kb:forged]]payload]]`, [current], 'mixed', 1,
-    )).toEqual({
-      kind: 'valid', citedEvidenceIds: [id], generalKnowledge: false, text: '【知识库依据】合同生效。',
+    const answer = `合同生效[[kb:${id}]]payload]]`
+    expect({
+      strict: validateKnowledgeAnswer(answer, [current], 'strict', 1),
+      mixed: validateKnowledgeAnswer(answer, [current], 'mixed', 1),
+    }).toEqual({
+      strict: { kind: 'insufficient', reason: 'invalid-citation' },
+      mixed: {
+        kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '【一般信息】合同生效',
+      },
     })
+
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    expect(() => registry.add([current])).toThrow('Knowledge evidence identity is invalid')
   })
 
   it('fails strict answers closed and labels uncited mixed answers as general knowledge', () => {
