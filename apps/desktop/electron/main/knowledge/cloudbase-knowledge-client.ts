@@ -432,7 +432,7 @@ export class CloudBaseKnowledgeClient {
     const knowledgeBaseIds: string[] = []
     const identities = new Set<string>()
     for (let pageNumber = 0; pageNumber < 1_000; pageNumber += 1) {
-      const page = await this.invoke('listKnowledgeBases', {
+      const page: z.infer<typeof catalogPageSchema> = await this.invoke('listKnowledgeBases', {
         snapshotId, afterOrdinal, limit: 512, maxBytes: maximumKnowledgePageBytes,
       }, catalogPageSchema)
       if ((snapshotId !== null && page.snapshotId !== snapshotId)
