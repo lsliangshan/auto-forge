@@ -66,6 +66,10 @@ describe('local conversion intent', () => {
     ['safe\u0000\n附件 9：other.pdf', 5, '文件-6'],
     ['附\u034F件-secret.pdf', 6, '文件-7'],
     ['目\uFE0F标格\u0301式-report.pdf', 7, '文件-8'],
+    ['附\u02D0件-\uA789-\u2236.pdf', 8, '文件-9'],
+    ['目\u02D0标格式-\uA789-\u2236.pdf', 9, '文件-10'],
+    ['voice\u02D0note.pdf', 10, 'voicenote.pdf'],
+    ['report\uA789private\u2236data.pdf', 11, 'report-private-data.pdf'],
   ] as const)('sanitizes display name %s without exposing path-like prefixes', (name, index, expected) => {
     expect(sanitizeDisplayName(name, index)).toBe(expected)
   })

@@ -1,6 +1,6 @@
-import type { ChatEvent } from '@autoforge/shared'
+import { chatBlockSchema, type ChatEvent } from '@autoforge/shared'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
-import type { AppRepositories, Conversation } from '../database/repositories.js'
+import type { AppRepositories, Conversation, Message } from '../database/repositories.js'
 import { serializeHistoricalMessage } from './conversation-context.js'
 import type { ModelProviderSnapshot } from './model-provider.js'
 
@@ -54,6 +54,14 @@ function boundedTitleContext(value: string): string {
   return `${characters.slice(0, MAX_TITLE_CONTEXT_CHARACTERS).join('')}…`
 }
 
+function userTextOnly(message: Message): string | undefined {
+  const content = chatBlockSchema.array().parse(message.blocks)
+    .flatMap((block) => block.type === 'text' && block.text ? [block.text] : [])
+    .join('\n')
+    .trim()
+  return content || undefined
+}
+
 function completedTurn(
   repositories: ConversationTitleRepositories,
   conversationId: string,
@@ -65,8 +73,12 @@ function completedTurn(
   const user = [...messages.slice(0, assistantIndex)].reverse().find((message) => message.role === 'user')
   const assistant = messages[assistantIndex]
   if (!user || !assistant) return undefined
-  const serializedUser = serializeHistoricalMessage(user, omitAttachmentProjections)
-  const serializedAssistant = serializeHistoricalMessage(assistant, omitAttachmentProjections)
+  if (omitAttachmentProjections) {
+    const userText = userTextOnly(user)
+    return userText ? { user: boundedTitleContext(userText) } : undefined
+  }
+  const serializedUser = serializeHistoricalMessage(user)
+  const serializedAssistant = serializeHistoricalMessage(assistant)
   if (!serializedUser || !serializedAssistant) return undefined
   return {
     user: boundedTitleContext(serializedUser.content as string),
@@ -104,7 +116,12 @@ export class ConversationTitleService {
           model: input.model,
           messages: [
             { role: 'system', content: TITLE_SYSTEM_PROMPT },
-            { role: 'user', content: `用户：${turn.user}\nAI：${turn.assistant}` },
+            {
+              role: 'user',
+              content: turn.assistant === undefined
+                ? `用户：${turn.user}`
+                : `用户：${turn.user}\nAI：${turn.assistant}`,
+            },
           ],
           maxOutputTokens: 64,
           endUserId: input.userId,

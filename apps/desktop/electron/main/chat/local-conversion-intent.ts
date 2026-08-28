@@ -25,7 +25,7 @@ export function sanitizeDisplayName(value: string, index = 0): string {
   const trimmed = typeof value === 'string' ? value.trim() : ''
   const normalized = trimmed.normalize('NFKC')
     .replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, '/')
-    .replace(/[\p{M}\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cs}\p{Co}\p{Cn}]/gu, '')
+    .replace(/[\p{M}\p{Lm}\p{Default_Ignorable_Code_Point}\p{Cf}\p{Cs}\p{Co}\p{Cn}]/gu, '')
   if (!normalized || /^(?:data:|https?:\/\/|file:)/iu.test(normalized)) return fallback
   const segments = normalized.split(/[\\/]+/gu)
     .map((segment) => segment.trim())

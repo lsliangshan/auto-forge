@@ -4931,10 +4931,12 @@ describe('createApplicationRuntime', () => {
     directories.push(root)
     const source = join(root, 'private-source.txt')
     const privateContent = 'IMPLICIT_CONVERSION_PRIVATE_CONTENT_MARKER'
+    const assistantEchoMarker = 'ASSISTANT_ECHO_PRIVATE_MARKER'
     await writeFile(source, privateContent)
     const captured: ModelStreamRequest[] = []
     const chatEvents: ChatEvent[] = []
     const modelInput = vi.fn()
+    let attachmentSourceId = ''
     const createMediaAssetService = mediaAssetModule.createMediaAssetService
     vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
       const service = createMediaAssetService(createOptions)
@@ -4949,7 +4951,16 @@ describe('createApplicationRuntime', () => {
         yield {
           type: 'text_delta' as const,
           choiceIndex: 0,
-          text: isConversationTitleRequest(request) ? '附件格式转换' : '我会选择合适的本地转换工作流。',
+          text: isConversationTitleRequest(request)
+            ? '附件格式转换'
+            : [
+                assistantEchoMarker,
+                'private-source.txt',
+                'text/plain',
+                '42 bytes',
+                attachmentSourceId,
+                privateContent,
+              ].join(' '),
         }
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
       },
@@ -4972,6 +4983,7 @@ describe('createApplicationRuntime', () => {
     const [asset] = await runtime.services.media.pickFiles({
       conversationId: conversation.id, existingAssetIds: [],
     })
+    attachmentSourceId = asset!.id
 
     const sent = await runtime.services.chat.send({
       ...chatInput(conversation.id, content), assetIds: [asset!.id], outputType: 'text',
@@ -4987,14 +4999,18 @@ describe('createApplicationRuntime', () => {
     expect(modelInput).not.toHaveBeenCalled()
     const providerPayload = JSON.stringify(captured)
     expect(providerPayload).not.toContain(privateContent)
+    expect(providerPayload).not.toContain(assistantEchoMarker)
     expect(providerPayload).not.toContain(Buffer.from(privateContent).toString('base64'))
     expect(providerPayload).not.toContain(asset!.id)
     expect(providerPayload).not.toContain(source)
     expect(providerPayload).not.toMatch(/dataBase64|mediaAssetId|sourceId|absolutePath|relativePath|file:\/\//i)
     const agentPayload = JSON.stringify(agentRequests(captured)[0])
     expect(agentPayload).toContain('[附件 0: private-source.txt, text/plain, 42 bytes]')
-    const titlePayload = JSON.stringify(captured.find(isConversationTitleRequest))
-    expect(titlePayload).not.toMatch(/历史附件|private-source\.txt|text\/plain|42 bytes|mediaAssetId|sourceId/i)
+    const titleRequest = captured.find(isConversationTitleRequest)
+    expect(titleRequest?.messages).toContainEqual({ role: 'user', content: `用户：${content}` })
+    const titlePayload = JSON.stringify(titleRequest)
+    expect(titlePayload).not.toContain('AI：')
+    expect(titlePayload).not.toMatch(/历史附件|private-source\.txt|text\/plain|42 bytes|mediaAssetId|sourceId|ASSISTANT_ECHO_PRIVATE_MARKER/i)
     await runtime.close()
   })
 
@@ -5047,7 +5063,9 @@ describe('createApplicationRuntime', () => {
 
     expect(captured).toHaveLength(2)
     expect(JSON.stringify(agentRequests(captured)[0])).toContain(content)
-    expect(JSON.stringify(captured.find(isConversationTitleRequest))).toContain(
+    const titlePayload = JSON.stringify(captured.find(isConversationTitleRequest))
+    expect(titlePayload).toContain('这是附件内容的总结。')
+    expect(titlePayload).toContain(
       '[历史附件: file; 名称: ordinary-title.txt; MIME: text/plain; 大小: 33 bytes]',
     )
     await runtime.close()

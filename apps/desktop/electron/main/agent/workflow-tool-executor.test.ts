@@ -144,7 +144,7 @@ function conversionBindings(): ExecutionAttachmentBinding[] {
       attachmentIndex: 0,
       ownerUserId: 'user_1',
       conversationId: 'conversation_1',
-      displayName: '../../private/\u202E附\u034F件\u2066-目\uFE0F标格\u0301式.pdf',
+      displayName: '../../private/\u202E附\u034F\u02D0件\u2066-目\uFE0F\u02D0标格\u0301式-\uA789-\u2236.pdf',
       mimeType: 'application/pdf',
       byteSize: 12,
       source: { kind: 'media', mediaAssetId: 'media_private_0' },
@@ -365,6 +365,7 @@ describe('WorkflowToolExecutor', () => {
     expect(actionSummary.match(/：/gu)).toHaveLength(2)
     expect(actionSummary).not.toMatch(/[\p{Cc}\p{Cf}]/u)
     expect(actionSummary).not.toMatch(/[\p{M}\p{Default_Ignorable_Code_Point}]/u)
+    expect(actionSummary).not.toMatch(/\p{Lm}|[\uA789\u2236]/u)
     expect(actionSummary).not.toMatch(/media_private|b{32}/)
 
     const once = onceDecision(prepared.pending)
@@ -398,7 +399,7 @@ describe('WorkflowToolExecutor', () => {
     }
     expect(startInput.attachmentBindings).toEqual(attachments)
     expect(startInput.attachmentBindings[0]).toMatchObject({
-      displayName: '../../private/\u202E附\u034F件\u2066-目\uFE0F标格\u0301式.pdf',
+      displayName: '../../private/\u202E附\u034F\u02D0件\u2066-目\uFE0F\u02D0标格\u0301式-\uA789-\u2236.pdf',
       sourceFingerprint: 'b'.repeat(64),
     })
     expect(startInput.fileConvertAuthorization).toEqual({
