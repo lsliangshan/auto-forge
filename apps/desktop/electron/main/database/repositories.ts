@@ -308,6 +308,7 @@ export interface ConversionJob {
   preset?: ConversionPreset
   status: ConversionJobStatus
   epoch: number
+  progress: number
   errorCode?: AppErrorCode
   createdAt: number
   updatedAt: number
@@ -318,12 +319,28 @@ export interface ConversionJob {
 export type NewConversionJob = Pick<
   ConversionJob,
   'id' | 'ownerUserId' | 'executionId' | 'sourceKind' | 'sourceId' | 'targetFormat'
-> & Partial<Pick<ConversionJob, 'preset' | 'status' | 'epoch' | 'errorCode' | 'createdAt' | 'updatedAt' | 'startedAt' | 'endedAt'>>
+> & Partial<Pick<ConversionJob, 'preset' | 'status' | 'epoch' | 'progress' | 'errorCode' | 'createdAt' | 'updatedAt' | 'startedAt' | 'endedAt'>>
 
 export type ConversionJobTransition = Partial<Pick<
   ConversionJob,
-  'status' | 'errorCode' | 'startedAt' | 'endedAt'
+  'status' | 'progress' | 'errorCode' | 'startedAt' | 'endedAt'
 >>
+
+const conversionIconRepresentationSizeSchema = z.union([
+  z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64),
+  z.literal(128), z.literal(256), z.literal(512), z.literal(1024),
+])
+
+export const conversionArtifactMetadataSchema = z.object({
+  iconRepresentations: z.array(conversionIconRepresentationSizeSchema).min(1).max(9)
+    .refine((sizes) => new Set(sizes).size === sizes.length, 'Icon representations must be unique')
+    .optional(),
+  pdfPage: z.number().int().min(1).max(100).optional(),
+  frameSelection: z.literal('first').optional(),
+  transparentPadding: z.literal(true).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, 'Conversion metadata must describe an output')
+
+export type ConversionArtifactMetadata = z.infer<typeof conversionArtifactMetadataSchema>
 
 export interface ConversionArtifact {
   id: string
@@ -337,7 +354,7 @@ export interface ConversionArtifact {
   byteSize: number
   sha256: string
   relativePath: string
-  metadata?: unknown
+  metadata?: ConversionArtifactMetadata
   status: 'ready' | 'deleted'
   createdAt: number
   updatedAt: number
@@ -838,6 +855,12 @@ export interface AppRepositories {
       expectedStatuses: ConversionJobStatus[]
       patch: ConversionJobTransition
     }): boolean
+    retry(input: {
+      jobId: string
+      ownerUserId: string
+      expectedEpoch: number
+      expectedStatuses: ConversionJobStatus[]
+    }): boolean
     interruptInFlight(ownerUserId: string): number
   }
   conversionArtifacts: {
@@ -877,7 +900,7 @@ const providerUsageColumns = 'id, operation_key AS operationKey, user_id AS user
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
 const executionColumns = 'id, owner_user_id AS ownerUserId, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
-const conversionJobColumns = 'id, owner_user_id AS ownerUserId, execution_id AS executionId, source_kind AS sourceKind, source_id AS sourceId, target_format AS targetFormat, preset, status, epoch, error_code AS errorCode, created_at AS createdAt, updated_at AS updatedAt, started_at AS startedAt, ended_at AS endedAt'
+const conversionJobColumns = 'id, owner_user_id AS ownerUserId, execution_id AS executionId, source_kind AS sourceKind, source_id AS sourceId, target_format AS targetFormat, preset, status, epoch, progress, error_code AS errorCode, created_at AS createdAt, updated_at AS updatedAt, started_at AS startedAt, ended_at AS endedAt'
 const conversionArtifactColumns = 'id, owner_user_id AS ownerUserId, execution_id AS executionId, conversion_job_id AS conversionJobId, role, display_name AS displayName, detected_format AS detectedFormat, mime_type AS mimeType, byte_size AS byteSize, sha256, relative_path AS relativePath, metadata_json AS metadataJson, status, created_at AS createdAt, updated_at AS updatedAt, deleted_at AS deletedAt'
 const browserTabBindingColumns = 'id, tab_id AS tabId, user_id AS userId, conversation_id AS conversationId, chat_run_id AS chatRunId, execution_id AS executionId, workflow_id AS workflowId, workflow_version AS workflowVersion, source, build_hash AS buildHash, security_fingerprint AS securityFingerprint, permission_matrix_json AS permissionMatrixJson, status, terminal_reason AS terminalReason, created_at AS createdAt, ended_at AS endedAt'
 const browserActionAuditColumns = 'id, binding_id AS bindingId, chat_run_id AS chatRunId, sequence, origin, action, target_summary AS targetSummary, risk, outcome, error_code AS errorCode, created_at AS createdAt'
@@ -1601,6 +1624,7 @@ function conversionJobFromRow(row: Query): ConversionJob {
     preset: optional<ConversionPreset>(row.preset),
     status: row.status as ConversionJobStatus,
     epoch: row.epoch as number,
+    progress: row.progress as number,
     errorCode: optional<AppErrorCode>(row.errorCode),
     createdAt: row.createdAt as number,
     updatedAt: row.updatedAt as number,
@@ -1622,12 +1646,31 @@ function conversionArtifactFromRow(row: Query): ConversionArtifact {
     byteSize: row.byteSize as number,
     sha256: row.sha256 as string,
     relativePath: row.relativePath as string,
-    metadata: parse(row.metadataJson as string | null),
+    metadata: row.metadataJson === null ? undefined : conversionArtifactMetadataSchema.parse(parse(row.metadataJson as string)),
     status: row.status as ConversionArtifact['status'],
     createdAt: row.createdAt as number,
     updatedAt: row.updatedAt as number,
     deletedAt: optional<number>(row.deletedAt),
   }
+}
+
+function conversionArtifactMetadata(value: unknown): ConversionArtifactMetadata | undefined {
+  if (value === undefined) return undefined
+  const parsed = conversionArtifactMetadataSchema.safeParse(value)
+  if (!parsed.success) throw new Error('Invalid conversion artifact metadata')
+  return parsed.data
+}
+
+function relativeConversionArtifactPath(value: unknown): string {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.startsWith('/')
+    || value.startsWith('\\')
+    || /^[A-Za-z]:/.test(value)
+    || value.includes('\0')
+  ) throw new Error('Invalid conversion artifact path')
+  return value
 }
 
 function permissionFromRow(row: Query): PermissionGrant {
@@ -2792,14 +2835,15 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         const updatedAt = input.updatedAt ?? createdAt
         const status = input.status ?? 'queued'
         const epoch = input.epoch ?? 0
+        const progress = input.progress ?? 0
         const inserted = transaction(database, () => database.prepare(`
           INSERT INTO conversion_jobs (
             id, owner_user_id, execution_id, source_kind, source_id, target_format, preset,
-            status, epoch, error_code, created_at, updated_at, started_at, ended_at
+            status, epoch, progress, error_code, created_at, updated_at, started_at, ended_at
           )
           SELECT
             @id, @ownerUserId, @executionId, @sourceKind, @sourceId, @targetFormat, @preset,
-            @status, @epoch, @errorCode, @createdAt, @updatedAt, @startedAt, @endedAt
+            @status, @epoch, @progress, @errorCode, @createdAt, @updatedAt, @startedAt, @endedAt
           WHERE EXISTS (
             SELECT 1 FROM executions WHERE id = @executionId AND owner_user_id = @ownerUserId
           )
@@ -2808,6 +2852,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           preset: input.preset ?? null,
           status,
           epoch,
+          progress,
           errorCode: input.errorCode ?? null,
           createdAt,
           updatedAt,
@@ -2865,6 +2910,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return transaction(database, () => database.prepare(`
           UPDATE conversion_jobs
           SET status = COALESCE(@status, status),
+              progress = COALESCE(@progress, progress),
               error_code = COALESCE(@errorCode, error_code),
               started_at = COALESCE(@startedAt, started_at),
               ended_at = COALESCE(@endedAt, ended_at),
@@ -2879,10 +2925,37 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           ownerUserId: input.ownerUserId,
           expectedEpoch: input.expectedEpoch,
           status: input.patch.status ?? null,
+          progress: input.patch.progress ?? null,
           errorCode: input.patch.errorCode ?? null,
           startedAt: input.patch.startedAt ?? null,
           endedAt: input.patch.endedAt ?? null,
           updatedAt,
+          ...expectedParameters,
+        }).changes === 1)
+      },
+      retry(input) {
+        if (input.expectedStatuses.length === 0) return false
+        const expectedParameters = Object.fromEntries(input.expectedStatuses.map((status, index) => [`status${index}`, status]))
+        const statuses = input.expectedStatuses.map((_, index) => `@status${index}`).join(', ')
+        return transaction(database, () => database.prepare(`
+          UPDATE conversion_jobs
+          SET epoch = epoch + 1,
+              status = 'queued',
+              progress = 0,
+              error_code = NULL,
+              started_at = NULL,
+              ended_at = NULL,
+              updated_at = @updatedAt
+          WHERE id = @jobId
+            AND owner_user_id = @ownerUserId
+            AND epoch = @expectedEpoch
+            AND status IN (${statuses})
+            AND status IN ('failed', 'cancelled', 'interrupted')
+        `).run({
+          jobId: input.jobId,
+          ownerUserId: input.ownerUserId,
+          expectedEpoch: input.expectedEpoch,
+          updatedAt: now(),
           ...expectedParameters,
         }).changes === 1)
       },
@@ -2906,6 +2979,8 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         const createdAt = input.createdAt ?? now()
         const updatedAt = input.updatedAt ?? createdAt
         const status = input.status ?? 'ready'
+        const metadata = conversionArtifactMetadata(input.metadata)
+        const relativePath = relativeConversionArtifactPath(input.relativePath)
         const inserted = transaction(database, () => database.prepare(`
           INSERT INTO conversion_artifacts (
             id, owner_user_id, execution_id, conversion_job_id, role, display_name,
@@ -2927,7 +3002,8 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         `).run({
           ...input,
           conversionJobId: input.conversionJobId ?? null,
-          metadataJson: input.metadata === undefined ? null : JSON.stringify(input.metadata),
+          metadataJson: metadata === undefined ? null : JSON.stringify(metadata),
+          relativePath,
           status,
           createdAt,
           updatedAt,

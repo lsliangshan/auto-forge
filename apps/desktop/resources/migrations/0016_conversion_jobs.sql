@@ -15,6 +15,7 @@ CREATE TABLE conversion_jobs (
     'completed', 'failed', 'cancelled', 'interrupted'
   )),
   epoch INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+  progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
   error_code TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -39,7 +40,11 @@ CREATE TABLE conversion_artifacts (
   relative_path TEXT NOT NULL CHECK (
     length(relative_path) > 0
     AND relative_path NOT LIKE '/%'
-    AND relative_path NOT GLOB '[A-Za-z]:*'
+    AND substr(relative_path, 1, 1) <> char(92)
+    AND NOT (
+      substr(relative_path, 2, 1) = ':'
+      AND substr(relative_path, 3, 1) IN ('/', char(92))
+    )
   ),
   metadata_json TEXT,
   status TEXT NOT NULL CHECK (status IN ('ready', 'deleted')),

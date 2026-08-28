@@ -175,6 +175,7 @@ export const conversionJobs = sqliteTable('conversion_jobs', {
   preset: text('preset'),
   status: text('status').notNull(),
   epoch: integer('epoch').notNull(),
+  progress: integer('progress').notNull(),
   errorCode: text('error_code'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),

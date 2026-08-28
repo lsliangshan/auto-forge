@@ -123,6 +123,42 @@ describe('conversion repositories', () => {
     database.close()
   })
 
+  it('retries an eligible terminal job in a new epoch and rejects stale or invalid retries', () => {
+    const { database } = openTestDatabase()
+    createExecution(database, 'execution_retry')
+    createJob(database, 'job_retry', 'execution_retry', 1)
+    const claimed = database.conversionJobs.claimNext('alice')!
+    expect(database.conversionJobs.transition({
+      jobId: claimed.id, ownerUserId: 'alice', expectedEpoch: 0,
+      expectedStatuses: ['downloading_component'],
+      patch: { status: 'failed', progress: 75, errorCode: 'CONVERSION_TIMEOUT', endedAt: 10 },
+    })).toBe(true)
+
+    expect(database.conversionJobs.retry({
+      jobId: claimed.id, ownerUserId: 'bob', expectedEpoch: 0, expectedStatuses: ['failed'],
+    })).toBe(false)
+    expect(database.conversionJobs.retry({
+      jobId: claimed.id, ownerUserId: 'alice', expectedEpoch: 1, expectedStatuses: ['failed'],
+    })).toBe(false)
+    expect(database.conversionJobs.retry({
+      jobId: claimed.id, ownerUserId: 'alice', expectedEpoch: 0, expectedStatuses: ['completed'],
+    })).toBe(false)
+    expect(database.conversionJobs.retry({
+      jobId: claimed.id, ownerUserId: 'alice', expectedEpoch: 0, expectedStatuses: ['failed'],
+    })).toBe(true)
+    expect(database.conversionJobs.getOwned(claimed.id, 'alice')).toMatchObject({
+      status: 'queued', epoch: 1, progress: 0,
+    })
+    expect(database.conversionJobs.getOwned(claimed.id, 'alice')).not.toMatchObject({
+      errorCode: expect.anything(), startedAt: expect.anything(), endedAt: expect.anything(),
+    })
+    expect(database.conversionJobs.transition({
+      jobId: claimed.id, ownerUserId: 'alice', expectedEpoch: 0,
+      expectedStatuses: ['queued'], patch: { status: 'converting' },
+    })).toBe(false)
+    database.close()
+  })
+
   it('interrupts only in-flight jobs during restart recovery', () => {
     const { database } = openTestDatabase()
     createExecution(database, 'execution_recovery')
@@ -149,6 +185,55 @@ describe('conversion repositories', () => {
     const sqlite = new Database(path, { readonly: true })
     const indexes = sqlite.prepare("PRAGMA index_list('conversion_jobs')").all() as Array<{ name: string }>
     expect(indexes.map(({ name }) => name)).toContain('conversion_jobs_owner_status_created_at_idx')
+    sqlite.close()
+  })
+
+  it('accepts only bounded conversion metadata and non-rooted repository paths', () => {
+    const { database } = openTestDatabase()
+    createExecution(database, 'execution_metadata')
+    const job = createJob(database, 'job_metadata', 'execution_metadata', 1)
+    expect(database.conversionArtifacts.create({
+      id: 'artifact_metadata', ownerUserId: 'alice', executionId: 'execution_metadata',
+      conversionJobId: job.id, role: 'output', displayName: 'result.png', detectedFormat: 'png',
+      mimeType: 'image/png', byteSize: 12, sha256: 'b'.repeat(64), relativePath: 'artifacts/result.png',
+      metadata: {
+        iconRepresentations: [16, 32, 48], pdfPage: 1, frameSelection: 'first', transparentPadding: true,
+      },
+    }).metadata).toEqual({
+      iconRepresentations: [16, 32, 48], pdfPage: 1, frameSelection: 'first', transparentPadding: true,
+    })
+    expect(() => database.conversionArtifacts.create({
+      id: 'artifact_metadata_extra', ownerUserId: 'alice', executionId: 'execution_metadata',
+      conversionJobId: job.id, role: 'output', displayName: 'result.png', detectedFormat: 'png',
+      mimeType: 'image/png', byteSize: 12, sha256: 'c'.repeat(64), relativePath: 'artifacts/extra.png',
+      metadata: { providerEvidence: 'private' } as never,
+    })).toThrow('Invalid conversion artifact metadata')
+    for (const relativePath of ['/tmp/result.png', 'C:\\result.png', '\\rooted\\result.png', '\\\\server\\share\\result.png']) {
+      expect(() => database.conversionArtifacts.create({
+        id: `artifact_${relativePath.length}`, ownerUserId: 'alice', executionId: 'execution_metadata',
+        conversionJobId: job.id, role: 'output', displayName: 'result.png', detectedFormat: 'png',
+        mimeType: 'image/png', byteSize: 12, sha256: 'd'.repeat(64), relativePath,
+      })).toThrow('Invalid conversion artifact path')
+    }
+    database.close()
+  })
+
+  it('enforces non-rooted artifact paths in the migration', () => {
+    const { database, path } = openTestDatabase()
+    createExecution(database, 'execution_path_check')
+    database.close()
+
+    const sqlite = new Database(path)
+    const insert = sqlite.prepare(`
+      INSERT INTO conversion_artifacts (
+        id, owner_user_id, execution_id, role, display_name, detected_format,
+        mime_type, byte_size, sha256, relative_path, status, created_at, updated_at
+      ) VALUES (@id, 'alice', 'execution_path_check', 'output', 'result.png', 'png', 'image/png', 1, @sha256, @relativePath, 'ready', 1, 1)
+    `)
+    for (const [index, relativePath] of ['/tmp/result.png', 'C:\\result.png', '\\rooted\\result.png', '\\\\server\\share\\result.png'].entries()) {
+      expect(() => insert.run({ id: `raw_path_${index}`, sha256: 'e'.repeat(64), relativePath }))
+        .toThrow(/CHECK constraint/)
+    }
     sqlite.close()
   })
 })
