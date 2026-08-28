@@ -185,21 +185,42 @@ function normalizedSupportText(value: string): string {
     .slice(0, 4_000)
 }
 
+function canonicalizeChineseRelation(value: string): string {
+  const effectiveDate = value.match(/^(.{1,160}?)(?:于\s*([0-9][0-9./:-]{3,31})\s*生效|生效(?:为|是)\s*([0-9][0-9./:-]{3,31}))$/u)
+  if (effectiveDate) return `${effectiveDate[1]}生效${effectiveDate[2] ?? effectiveDate[3]}`
+
+  const location = value.match(/^(.{1,160}?)(?:地点(?:为|是)|位于)(.{1,240})$/u)
+  if (location) return `${location[1]}位置${location[2]}`
+
+  const copula = value.match(/^(.{1,160}?)(为|是)(.{1,240})$/u)
+  if (copula && !/[因认作成视所以较极尤甚不若各自无]$/u.test(copula[1]!)) {
+    return `${copula[1]}关系${copula[3]}`
+  }
+  return value
+}
+
 function canonicalSupportText(value: string): string {
-  return normalizedSupportText(value)
+  const normalized = normalizedSupportText(value)
+    .replace(/[。！？.!?]+$/gu, '')
     .replace(/^(?:(?:但是|但|然而|不过|而且|并且|同时|以及|且|所以|因此)|\b(?:and|or|but|however|while|whereas|although|though|yet|also|moreover)\b)\s*/iu, '')
     .replace(/(?:签订|签字)/gu, '签署')
     .replace(/(?:开始起效|开始生效|起效)/gu, '生效')
     .replace(/生效日期/gu, '生效')
     .replace(/(?:协定|契约)/gu, '协议')
-    .replace(/(?:地点(?:为|是)|位于)/gu, '位置')
-    .replace(/[为是]/gu, '')
     .replace(/(?:负责发布|发布了)/gu, '发布')
     .replace(/\b(?:agreement|accord)\b/giu, 'contract')
     .replace(/\b(?:takes? effect|comes? into force|becomes? effective)\b/giu, 'effective')
     .replace(/\b(?:allows?|authori[sz]es?)\b/giu, 'permits')
     .replace(/\b(?:forbids?|does not permit)\b/giu, 'prohibits')
     .replace(/\bcancellation\b/giu, 'termination')
+  return canonicalizeChineseRelation(normalized)
+}
+
+function splitEvidenceClauses(value: string): string[] {
+  return protectNumericPunctuation(value)
+    .split(/[。！？!?；;，,\n]+/gu)
+    .map(part => restoreNumericPunctuation(part.trim()))
+    .filter(Boolean)
 }
 
 interface ClaimPolarity {
@@ -334,10 +355,8 @@ function numericTokens(value: string): string[] {
   return value.match(/\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:[./:-]\d+)*/gu) ?? []
 }
 
-function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
-  const rawClaim = claim.replace(KNOWLEDGE_MARKER, '').slice(0, 4_000)
-  const rawEvidence = sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000)
-  const normalizedClaim = canonicalSupportText(claim)
+function clauseSupportsClaim(rawClaim: string, rawEvidence: string): boolean {
+  const normalizedClaim = canonicalSupportText(rawClaim)
   const normalizedEvidence = canonicalSupportText(rawEvidence)
   if (!polarityCompatible(normalizedClaim, normalizedEvidence)) return false
   if (!entitiesCompatible(normalizedClaim, normalizedEvidence, rawClaim, rawEvidence)) return false
@@ -356,6 +375,12 @@ function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
   }
   if (latinTokens.length > 0 && !hasHighCoverage(latinTokens, normalizedEvidence)) return false
   return true
+}
+
+function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
+  const rawClaim = claim.replace(KNOWLEDGE_MARKER, '').slice(0, 4_000)
+  const rawEvidence = sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000)
+  return splitEvidenceClauses(rawEvidence).some(clause => clauseSupportsClaim(rawClaim, clause))
 }
 
 export function formatValidatedKnowledgeAnswer(

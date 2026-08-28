@@ -496,6 +496,15 @@ export interface ElectronParserSupervisorOptions {
   readonly resolveObject: (objectHandle: string) => Promise<Uint8Array>
 }
 
+export function parserProcessMemoryBytes(
+  metrics: ReadonlyArray<{ pid: number; memory: { peakWorkingSetSize: number } }>,
+  pid: number,
+): number {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return 0
+  const metric = metrics.find(candidate => candidate.pid === pid)
+  return metric ? metric.memory.peakWorkingSetSize * 1024 : 0
+}
+
 export async function createElectronParserSupervisor(
   options: ElectronParserSupervisorOptions,
 ): Promise<ParserSupervisor> {
@@ -512,9 +521,7 @@ export async function createElectronParserSupervisor(
     partitionId: () => `autoforge-parser-${randomUUID()}`,
     processMemoryBytes: (window) => {
       const pid = window.webContents.getOSProcessId()
-      const metric = electron.app.getAppMetrics().find(candidate => candidate.pid === pid)
-      if (!metric) throw new Error('Knowledge parser process metrics are unavailable')
-      return metric.memory.peakWorkingSetSize * 1024
+      return parserProcessMemoryBytes(electron.app.getAppMetrics(), pid)
     },
     createSession: partition => electron.session.fromPartition(partition, { cache: false }) as unknown as ParserSession,
     createWindow: settings => new electron.BrowserWindow(settings) as unknown as ParserWindow,

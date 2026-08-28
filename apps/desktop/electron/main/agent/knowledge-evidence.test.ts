@@ -235,6 +235,43 @@ describe('knowledge tool and answer validation', () => {
 
   it.each([
     {
+      name: '不能把乙方的蓝色拼到甲方关系上',
+      snippet: '甲方设备颜色为红色。乙方设备颜色为蓝色。',
+      answer: '甲方设备颜色为蓝色。[[kb:evidence:0]]',
+    },
+    {
+      name: '不能跨项目拼接实施地点',
+      snippet: '晨光项目位于杭州市西湖区。星河项目位于上海市浦东新区。',
+      answer: '晨光项目地点是上海市浦东新区。[[kb:evidence:0]]',
+    },
+    {
+      name: '不能跨产品拼接交付版本',
+      snippet: '甲产品为基础版本。乙产品为企业版本。',
+      answer: '甲产品是企业版本。[[kb:evidence:0]]',
+    },
+    {
+      name: '不能跨主体拼接发布机构',
+      snippet: '甲报告由华南创新研究院发布。乙报告由华北创新研究院发布。',
+      answer: '甲报告由华北创新研究院发布。[[kb:evidence:0]]',
+    },
+  ])('requires one anchored evidence clause: $name', ({ snippet, answer }) => {
+    expect(validateKnowledgeAnswer(answer, [evidence(0, { snippet })], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it.each([
+    ['该项目为国家级示范项目。', '该项目是国家级示范项目。'],
+    ['数据中心位于北京市海淀区。', '数据中心地点是北京市海淀区。'],
+    ['设备外壳颜色为深蓝色。', '设备外壳颜色是深蓝色。'],
+  ])('accepts bounded same-clause copula/location paraphrase: %s', (snippet, claim) => {
+    expect(validateKnowledgeAnswer(
+      `${claim}[[kb:evidence:0]]`, [evidence(0, { snippet })], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
+    {
       name: '中文普通逗号后的无关月球断言',
       snippet: '合同经双方签字后生效。',
       answer: '合同经双方签字后生效，月球由奶酪构成。[[kb:evidence:0]]',

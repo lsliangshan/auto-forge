@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_PARSER_LIMITS, PARSER_RESPONSE_CHUNK_BYTES } from './parser-protocol.js'
 import {
   createElectronParserSupervisor,
+  parserProcessMemoryBytes,
   ParserSupervisor,
   type ParserRendererDependencies,
 } from './parser-supervisor.js'
@@ -137,6 +138,14 @@ function success(request: { jobId: string; mediaType: string }) {
 }
 
 describe('sandbox parser supervisor', () => {
+  it('skips the renderer startup window before Electron process metrics become observable', () => {
+    expect(parserProcessMemoryBytes([], 0)).toBe(0)
+    expect(parserProcessMemoryBytes([], 4321)).toBe(0)
+    expect(parserProcessMemoryBytes([
+      { pid: 4321, memory: { peakWorkingSetSize: 27 } },
+    ], 4321)).toBe(27 * 1024)
+  })
+
   it('resolves only an opaque object handle and transfers no path, plaintext, master key, or credentials', async () => {
     const h = harness(success)
     const oneTimeKey = Buffer.alloc(32, 7)

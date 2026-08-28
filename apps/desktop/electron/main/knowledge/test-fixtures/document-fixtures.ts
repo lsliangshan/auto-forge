@@ -71,6 +71,20 @@ export function minimalDocx(
   extraEntryName?: string,
   useDataDescriptor = false,
 ): Buffer {
+  return minimalDocxWithText(
+    'DOCX heading',
+    `DOCX paragraph${'x'.repeat(extraCharacters)}`,
+    extraEntryName,
+    useDataDescriptor,
+  )
+}
+
+export function minimalDocxWithText(
+  heading: string,
+  paragraph: string,
+  extraEntryName?: string,
+  useDataDescriptor = false,
+): Buffer {
   return storedZip([
     {
       name: '[Content_Types].xml',
@@ -82,7 +96,7 @@ export function minimalDocx(
     },
     {
       name: 'word/document.xml',
-      contents: `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>DOCX heading</w:t></w:r></w:p><w:p><w:r><w:t>DOCX paragraph${'x'.repeat(extraCharacters)}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`,
+      contents: `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>${heading}</w:t></w:r></w:p><w:p><w:r><w:t>${paragraph}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`,
     },
     ...(extraEntryName ? [{ name: extraEntryName, contents: 'ignored extra entry' }] : []),
   ], useDataDescriptor)

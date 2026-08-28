@@ -12,7 +12,7 @@ import { KnowledgeStoreFactory } from '../encrypted-database.js'
 import { LocalKnowledgeRetriever } from '../local-retriever.js'
 import { memoryKnowledgeStore } from '../knowledge-test-support.js'
 import { DEFAULT_PARSER_LIMITS } from '../parser-protocol.js'
-import { minimalDocx, minimalPdf } from '../test-fixtures/document-fixtures.js'
+import { minimalDocxWithText, minimalPdf } from '../test-fixtures/document-fixtures.js'
 import { parseDocx } from '../../../knowledge-parser/parsers/docx.js'
 import { parseHtml } from '../../../knowledge-parser/parsers/html.js'
 import { parseMarkdown } from '../../../knowledge-parser/parsers/markdown.js'
@@ -41,7 +41,7 @@ function percent(passed: number, total: number): number {
 }
 
 function reportGate(gate: string, metrics: Record<string, number | boolean>): void {
-  process.stdout.write(`${JSON.stringify({ schema: 'autoforge.knowledge-gate.v1', gate, metrics })}\n`)
+  process.stdout.write(`${JSON.stringify({ schema: 'autoforge.knowledge-gate.v2', gate, metrics })}\n`)
 }
 
 function artifactFiles(root: string): string[] {
@@ -68,67 +68,72 @@ function seedRetrievalCorpus(): ReturnType<typeof memoryKnowledgeStore> {
   const db = memory.database
   db.prepare('INSERT INTO knowledge_bases(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)')
     .run('evaluation-base', '评估库', 1, 1)
-  db.prepare(`INSERT INTO documents(
+  const insertDocument = db.prepare(`INSERT INTO documents(
     id, knowledge_base_id, name, mime_type, active_version_id, created_at, updated_at,
     lifecycle_status, publication_generation, recycled_at
-  ) VALUES ('evaluation-document', 'evaluation-base', '评估.txt', 'text/plain', NULL, 1, 1, 'ready', 1, NULL)`).run()
-  db.prepare(`INSERT INTO document_versions(
+  ) VALUES (?, 'evaluation-base', ?, 'text/plain', NULL, 1, 1, 'ready', 1, NULL)`)
+  const insertVersion = db.prepare(`INSERT INTO document_versions(
     id, document_id, version_number, status, content_hash, object_id, created_at, publication_generation
-  ) VALUES ('evaluation-version', 'evaluation-document', 1, 'ready', 'hash', '00000000000000000000000000009999', 1, 1)`).run()
-  db.prepare("UPDATE documents SET active_version_id = 'evaluation-version' WHERE id = 'evaluation-document'").run()
+  ) VALUES (?, ?, 1, 'ready', ?, ?, 1, 1)`)
   const insertBlock = db.prepare(`INSERT INTO knowledge_blocks(
     id, version_id, ordinal, kind, text, coordinates_json
-  ) VALUES (?, 'evaluation-version', ?, 'txt', ?, ?)`)
+  ) VALUES (?, ?, 0, 'txt', ?, ?)`)
   const insertChunk = db.prepare(`INSERT INTO kb_chunks(
     id, knowledge_base_id, document_id, version_id, block_id, ordinal, body, coordinates_json
-  ) VALUES (?, 'evaluation-base', 'evaluation-document', 'evaluation-version', ?, ?, ?, ?)`)
+  ) VALUES (?, 'evaluation-base', ?, ?, ?, 0, ?, ?)`)
   db.transaction(() => {
-    corpus.retrievalCases.forEach((item, index) => {
+    corpus.retrievalDocuments.forEach((item, index) => {
+      const versionId = `version-${item.id}`
+      const blockId = `block-${item.id}`
       const coordinates = JSON.stringify({
         kind: 'txt', lineStart: index + 1, lineEnd: index + 1, charStart: 0, charEnd: item.body.length,
       })
-      insertBlock.run(`block-${item.id}`, index, item.body, coordinates)
-      insertChunk.run(`chunk-${item.id}`, `block-${item.id}`, index, item.body, coordinates)
+      insertDocument.run(item.id, `${item.id}.txt`)
+      insertVersion.run(versionId, item.id, `hash-${item.id}`, index.toString(16).padStart(32, '0'))
+      db.prepare('UPDATE documents SET active_version_id = ? WHERE id = ?').run(versionId, item.id)
+      insertBlock.run(blockId, versionId, item.body, coordinates)
+      insertChunk.run(`chunk-${item.id}`, item.id, versionId, blockId, item.body, coordinates)
     })
   })()
   return memory
 }
 
 describe('personal knowledge release evaluation corpus', () => {
-  it('meets citation support, grounding, and no-evidence thresholds on independent literal cases', () => {
-    const unsupportedPositiveIds = corpus.supportCases.filter(item => validateKnowledgeAnswer(
+  it('meets citation support, grounding, and no-evidence thresholds on an untouched holdout', () => {
+    const unsupportedPositiveIds = corpus.holdout.support.filter(item => validateKnowledgeAnswer(
       `${item.claim}[[kb:evaluation-evidence]]`, [evidence(item.evidence)], 'strict', 1,
     ).kind !== 'valid').map(item => item.id)
-    const ungroundedAdversarialIds = corpus.groundingCases.filter(item => {
+    const ungroundedAdversarialIds = corpus.holdout.grounding.filter(item => {
       const result = validateKnowledgeAnswer(
         `${item.claim}[[kb:evaluation-evidence]]`, [evidence(item.evidence)], 'strict', 1,
       )
       return result.kind !== 'insufficient' || result.reason !== 'unsupported-claim'
     }).map(item => item.id)
-    const noEvidence = corpus.noEvidenceCases.filter(claim => {
+    const noEvidence = corpus.holdout.noEvidence.filter(claim => {
       const result = validateKnowledgeAnswer(claim, [], 'strict', 1)
       return result.kind === 'insufficient' && result.reason === 'no-evidence'
     }).length
 
     expect(
-      percent(corpus.supportCases.length - unsupportedPositiveIds.length, corpus.supportCases.length),
+      percent(corpus.holdout.support.length - unsupportedPositiveIds.length, corpus.holdout.support.length),
       `citation support misses: ${unsupportedPositiveIds.join(', ')}`,
     ).toBeGreaterThanOrEqual(
       corpus.thresholds.citationSupport,
     )
     expect(
-      percent(corpus.groundingCases.length - ungroundedAdversarialIds.length, corpus.groundingCases.length),
+      percent(corpus.holdout.grounding.length - ungroundedAdversarialIds.length, corpus.holdout.grounding.length),
       `grounding misses: ${ungroundedAdversarialIds.join(', ')}`,
     ).toBeGreaterThanOrEqual(
       corpus.thresholds.grounding,
     )
-    expect(percent(noEvidence, corpus.noEvidenceCases.length), 'no evidence').toBeGreaterThanOrEqual(
+    expect(percent(noEvidence, corpus.holdout.noEvidence.length), 'no evidence').toBeGreaterThanOrEqual(
       corpus.thresholds.noEvidence,
     )
     reportGate('grounding', {
-      citationSupport: percent(corpus.supportCases.length - unsupportedPositiveIds.length, corpus.supportCases.length),
-      grounding: percent(corpus.groundingCases.length - ungroundedAdversarialIds.length, corpus.groundingCases.length),
-      noEvidence: percent(noEvidence, corpus.noEvidenceCases.length),
+      citationSupport: percent(corpus.holdout.support.length - unsupportedPositiveIds.length, corpus.holdout.support.length),
+      grounding: percent(corpus.holdout.grounding.length - ungroundedAdversarialIds.length, corpus.holdout.grounding.length),
+      noEvidence: percent(noEvidence, corpus.holdout.noEvidence.length),
+      holdout: true,
     })
   })
 
@@ -136,44 +141,98 @@ describe('personal knowledge release evaluation corpus', () => {
     const memory = seedRetrievalCorpus()
     const retriever = new LocalKnowledgeRetriever(memory.database)
     const missed: string[] = []
+    let queries = 0
+    expect(corpus.retrievalDocuments.length).toBeGreaterThan(8)
     for (const item of corpus.retrievalCases) {
-      const result = await retriever.search(item.query, ['evaluation-base'])
-      if (result.kind !== 'results' || !result.evidence.some(value => value.snippet === item.body)) missed.push(item.id)
+      expect(item.queries.length).toBeGreaterThan(1)
+      for (const query of item.queries) {
+        queries += 1
+        const literalMatches = corpus.retrievalDocuments.filter(document => document.body.includes(query))
+        expect(literalMatches.length, `query must not be a unique body fingerprint: ${query}`).toBeGreaterThan(1)
+        const result = await retriever.search(query, ['evaluation-base'])
+        if (
+          result.kind !== 'results'
+          || !result.evidence.some(value => item.relevantDocumentIds.includes(value.documentId))
+        ) missed.push(`${item.id}:${query}`)
+      }
     }
     expect(
-      percent(corpus.retrievalCases.length - missed.length, corpus.retrievalCases.length),
+      percent(queries - missed.length, queries),
       `Recall@8 misses: ${missed.join(', ')}`,
     ).toBeGreaterThanOrEqual(corpus.thresholds.recallAt8)
     reportGate('retrieval', {
-      recallAt8: percent(corpus.retrievalCases.length - missed.length, corpus.retrievalCases.length),
+      recallAt8: percent(queries - missed.length, queries),
+      queries,
+      documents: corpus.retrievalDocuments.length,
+      minimumDistractors: corpus.retrievalDocuments.length - 1,
     })
   })
 
-  it('parses at least 99% of a deterministic 100-document supported-format matrix', async () => {
+  it('parses 100 varied deterministic documents with exact text and coordinates', async () => {
     let passed = 0
     let total = 0
-    for (const template of corpus.supportedDocumentTemplates) {
-      for (let index = 0; index < corpus.samplesPerDocumentTemplate; index += 1) {
-        const marker = `supported-${template.label}-${index}`
-        let text: string
-        if (template.mediaType === 'application/pdf') {
-          text = (await parsePdf(new Uint8Array(minimalPdf([marker])), DEFAULT_PARSER_LIMITS)).text
-        } else if (template.mediaType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-          text = (await parseDocx(minimalDocx(index), DEFAULT_PARSER_LIMITS)).text
-        } else if (template.mediaType === 'text/plain') {
-          text = parseText(Buffer.from(marker)).text
-        } else if (template.mediaType === 'text/markdown') {
-          text = parseMarkdown(Buffer.from(`# ${marker}\n\nbody`)).text
+    for (const format of corpus.supportedDocumentMatrix.formats) {
+      for (let index = 0; index < corpus.supportedDocumentMatrix.samplesPerFormat; index += 1) {
+        const serial = index.toString().padStart(2, '0')
+        const heading = `${format.toUpperCase()} section ${serial}`
+        const paragraph = `Deterministic content ${serial} has value ${1000 + index}.`
+        let parsed
+        let expected
+        if (format === 'pdf') {
+          parsed = await parsePdf(new Uint8Array(minimalPdf([paragraph])), DEFAULT_PARSER_LIMITS)
+          expected = {
+            mediaType: 'application/pdf', text: paragraph,
+            blocks: [{ id: 'page-1', text: paragraph, coordinate: { kind: 'pdf', page: 1, itemStart: 0, itemEnd: 1 } }],
+          }
+        } else if (format === 'docx') {
+          parsed = await parseDocx(minimalDocxWithText(heading, paragraph), DEFAULT_PARSER_LIMITS)
+          expected = {
+            mediaType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            text: `${heading}\n${paragraph}`,
+            blocks: [
+              { id: 'p-1', text: heading, coordinate: { kind: 'docx', paragraphId: 'p-1', headingPath: [heading] } },
+              { id: 'p-2', text: paragraph, coordinate: { kind: 'docx', paragraphId: 'p-2', headingPath: [heading] } },
+            ],
+          }
+        } else if (format === 'txt') {
+          parsed = parseText(Buffer.from(`${heading}\n${paragraph}`))
+          expected = {
+            mediaType: 'text/plain', text: `${heading}\n${paragraph}`,
+            blocks: [
+              { id: 'line-1', text: heading, coordinate: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: heading.length } },
+              { id: 'line-2', text: paragraph, coordinate: { kind: 'txt', lineStart: 2, lineEnd: 2, charStart: heading.length + 1, charEnd: heading.length + 1 + paragraph.length } },
+            ],
+          }
+        } else if (format === 'markdown') {
+          parsed = parseMarkdown(Buffer.from(`# ${heading}\n\n${paragraph}`))
+          expected = {
+            mediaType: 'text/markdown', text: `${heading}\n${paragraph}`,
+            blocks: [
+              { id: 'md-1', text: heading, coordinate: { kind: 'markdown', path: [heading], blockIndex: 0 } },
+              { id: 'md-2', text: paragraph, coordinate: { kind: 'markdown', path: [heading], blockIndex: 1 } },
+            ],
+          }
         } else {
-          text = parseHtml(Buffer.from(`<h1>${marker}</h1><p>body</p>`)).text
+          parsed = parseHtml(Buffer.from(`<main><h1>${heading}</h1><p>${paragraph}</p></main>`))
+          expected = {
+            mediaType: 'text/html', text: `${heading}\n${paragraph}`,
+            blocks: [
+              { id: 'html-1', text: heading, coordinate: { kind: 'html', path: [heading], blockIndex: 0 } },
+              { id: 'html-2', text: paragraph, coordinate: { kind: 'html', path: [heading], blockIndex: 1 } },
+            ],
+          }
         }
         total += 1
-        if (text.length > 0) passed += 1
+        expect(parsed, `${format}-${serial}`).toEqual(expected)
+        passed += 1
       }
     }
     expect(total).toBe(100)
     expect(percent(passed, total)).toBeGreaterThanOrEqual(corpus.thresholds.supportedDocumentSuccess)
-    reportGate('supported-documents', { success: percent(passed, total), samples: total })
+    reportGate('supported-documents', {
+      success: percent(passed, total), samples: total, formats: corpus.supportedDocumentMatrix.formats.length,
+      exactTextAndCoordinates: true,
+    })
   }, 30_000)
 
   it('keeps cross-owner rows, objects, and persisted encrypted artifacts at zero plaintext leakage', async () => {

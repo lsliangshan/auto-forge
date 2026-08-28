@@ -25,9 +25,33 @@ git diff --check
 
 - 评估语料版本固定且机器可读；Recall@8 不低于 90%，引用支持、事实落地、无证据拒绝各不低于 95%，100 个受支持文档样本成功率不低于 99%。
 - 10,000 分片本地 FTS p95 不超过 300 ms；持久导入确认 p95 不超过 1 秒；100 页文本层 PDF p95 不超过 2 分钟。
+- 100 页 PDF 必须在真实 Electron 边界采样：加密对象落盘 → `synchronous=FULL`
+  的 SQLite 作业提交 → 生产 `ParserSupervisor` 沙箱 `BrowserWindow` → blocks/FTS
+  发布 → `ready` 后搜索。不得用直接 parser 调用、人工状态或 mock 数字代替。
 - Alice/Bob 交叉矩阵为零泄漏，数据库、WAL、journal、临时、恢复和对象产物中不得出现随机明文 sentinel。
 - 真实 Electron 流程必须经过 Renderer、生产 Preload、IPC、Application 和加密知识服务，覆盖本地创建、导入、ready、选择、授权、检索、引用；同一运行还要证明云关闭、嵌入拒绝退化、会员到期以及 Provider 切换后授权隔离。
 - macOS x64 和 Windows x64 在独立 native/打包证明前继续 fail closed。
+
+## 隐私与数据处理核对
+
+发布评审必须逐项对照
+`docs/privacy/personal-knowledge-base-data-flow.md`，且不得用一个授权替代另一个：
+
+- 用户设备保存按 UID 分离的加密原文件、块和本地索引，用于本地导入与检索；
+  用户回收、永久删除或清理本地数据时删除。
+- 上海 CloudBase（`autoforge-d1gkhyfb419ba8455` / `ap-shanghai`）可选保存私有源对象、
+  版本、分片、索引代次、同步/作业/删除状态及向量，用于多设备同步和云检索；
+  需会员、Beta、云授权和杀开关共同允许。到期后是 30 天导出/转本地窗口加
+  30 天回收期，也可立即永久删除，且必须先删 Storage 字节再确认元数据删除。
+- 广州 TokenHub 可选处理有界文本分片或查询，使用
+  `kinfra-text-embedding-0.6b` 生成 1024 维向量；需独立嵌入授权。撤销后停止新发送、
+  等待在途请求结算、删除向量并退化为关键词检索；TokenHub 临时处理/日志期限以其条款为准。
+- 用户选择的聊天 Provider（例如 OpenRouter 或 DeepSeek）只在按 UID+Provider 分开授权后
+  接收当前问题、最多 8 条清洗证据和最小坐标，用于生成带引用回答；切换 Provider
+  必须重新授权且零片段泄漏。AutoForge 历史仅保存最小引用，Provider 保存期限以用户配置和其条款为准。
+
+用户始终可导出或删除资料。会员失效时仅保留 1 个本地库+1 个有效文件可写/可检索，
+其他内容加密只读、可导出/删除、不可检索；云操作停止，本地功能继续。
 
 当前 v2 基线仍可能复现三个非知识库失败：Renderer `createdAt` 预期、legacy-import 临时目录 `ENOTEMPTY`、context-summary 计费状态。只有在干净 `origin/v2@a2bd28dd4da10aec6aa68113484ba480991fc672` 上复现且知识库改动不重叠时才能标为基线；新增或变化的失败必须阻止发布。
 

@@ -18,6 +18,7 @@ import {
   knowledgeEventSchema,
   toSafeAppError,
   type AuthSession,
+  type ChatEvent,
   type KnowledgeEntitlementState,
 } from '@autoforge/shared'
 import { createApplicationRuntime, type ApplicationModelProviderPort } from '../main/application.js'
@@ -34,8 +35,8 @@ import { createMediaProtocolHandler } from '../main/media/media-protocol.js'
 import type { NetworkProxyPort } from '../main/network/network-proxy-service.js'
 import { createSecureWindow } from '../main/window.js'
 import { KnowledgeStoreFactory } from '../main/knowledge/encrypted-database.js'
-import { createLocalKnowledgeService } from '../main/knowledge/knowledge-service.js'
-import { CloudKnowledgeRetriever, fixedCloudEmbeddingConfiguration } from '../main/knowledge/cloud-retriever.js'
+import { createLocalKnowledgeService, type LocalKnowledgeService } from '../main/knowledge/knowledge-service.js'
+import type { CloudKnowledgeRemote } from '../main/knowledge/sync-service.js'
 import type { ModelStreamRequest } from '../main/chat/model-provider.js'
 
 type FixtureUser = 'alice' | 'bob'
@@ -176,6 +177,33 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspacePort {
 }
 
 let providerRequestCount = 0
+let knowledgeSnippetDisclosureCount = 0
+let knowledgeCloudCallCount = 0
+const recordedChatEvents: ChatEvent[] = []
+
+function countedCloudRemote(): CloudKnowledgeRemote {
+  const count = <T>(result: T): Promise<T> => {
+    knowledgeCloudCallCount += 1
+    return Promise.resolve(result)
+  }
+  return {
+    beginSync: input => count({
+      knowledgeBaseId: input.knowledgeBaseId, generationId: input.generationId, status: 'staging',
+    }),
+    pushMutation: input => count({
+      mutationId: input.mutationId, status: 'applied', sequence: 1, revision: 'e2e-cloud-revision',
+    }),
+    pullChanges: () => count({ kind: 'incremental', nextSequence: 0, hasMore: false, changes: [] }),
+    fullResync: () => count({ kind: 'snapshot', nextSequence: 0, changes: [] }),
+    publishGeneration: input => count({
+      generationId: input.generationId, previousGenerationId: null, sequence: 1,
+    }),
+    deleteKnowledgeBase: () => count({ deletionJobId: 'e2e-delete-job' }),
+    getJob: input => count({ jobId: input.jobId, state: 'completed', errorCode: null }),
+    cancelJob: () => count(undefined),
+    cleanupOrphans: () => count({ removed: 0 }),
+  }
+}
 
 const deterministicProvider: ApplicationModelProviderPort = {
   async listModels() {
@@ -194,6 +222,7 @@ const deterministicProvider: ApplicationModelProviderPort = {
       && message.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
     ))
     if (hasKnowledgeResult) {
+      knowledgeSnippetDisclosureCount += 1
       const rawToolContent = request.messages.find(message => (
         message.role === 'tool'
         && typeof message.content === 'string'
@@ -363,35 +392,166 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     if (!session) throw new Error('Knowledge release smoke session is unavailable')
     return runtime.services.knowledge.getEntitlement({ userId: session.user.id })
   }
-  if (name === 'expireKnowledgeEntitlement') {
-    e2eKnowledgeNow = Date.parse('2026-09-01T00:00:00.001Z')
+  if (name === 'embeddingRefusal') {
     const session = await runtime.services.auth.getSession()
     if (!session) throw new Error('Knowledge release smoke session is unavailable')
-    return runtime.services.knowledge.getEntitlement({ userId: session.user.id })
-  }
-  if (name === 'embeddingRefusal') {
-    return new CloudKnowledgeRetriever({
-      async search() {
-        return {
-          generationState: 'published',
-          generations: [{ knowledgeBaseId: 'e2e-base', generationId: 'generation-1', previousGenerationId: null }],
-          strategy: 'keyword_only_consent',
-          embedding: fixedCloudEmbeddingConfiguration,
-          keywordCandidates: [],
-          vectorCandidates: [],
-          driftProbeRequired: false,
-        }
+    const owner = { userId: session.user.id }
+    const knowledge = runtime.services.knowledge as LocalKnowledgeService
+    const bases = await knowledge.list(owner)
+    const beforeProviderDisclosure = knowledgeSnippetDisclosureCount
+    const beforeCloud = knowledgeCloudCallCount
+    const consent = await knowledge.revokeConsent(owner, 'openrouter')
+    const retrieval = await knowledge.searchSelected(
+      owner,
+      'AutoForge knowledge smoke',
+      bases.map(base => base.id),
+    )
+    return {
+      consent,
+      retrieval: {
+        kind: retrieval.kind,
+        evidenceCount: retrieval.kind === 'results' ? retrieval.evidence.length : 0,
+        route: 'local-keyword',
       },
-    }).search('本机拒绝嵌入', ['e2e-base'])
+      vectorRequests: knowledgeCloudCallCount - beforeCloud,
+      providerSnippetDisclosures: knowledgeSnippetDisclosureCount - beforeProviderDisclosure,
+    }
+  }
+  if (name === 'expireKnowledgeEntitlement') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    const owner = { userId: session.user.id }
+    const knowledge = runtime.services.knowledge as LocalKnowledgeService
+    const retainedBase = (await knowledge.list(owner))
+      .find(base => base.name === '发布门禁资料')
+    if (!retainedBase) throw new Error('Retained knowledge base is unavailable')
+    const retainedDocument = (await knowledge.listDocuments(owner, retainedBase.id))[0]
+    if (!retainedDocument) throw new Error('Retained knowledge document is unavailable')
+
+    const extraBase = await knowledge.create(owner, '到期后只读资料')
+    const extraHandle = (await knowledge.pickImportFiles(owner))[0]
+    if (!extraHandle) throw new Error('Extra knowledge import handle is unavailable')
+    const extraDocument = await knowledge.importDocument(owner, extraBase.id, extraHandle.id)
+    if (!extraDocument) throw new Error('Extra knowledge document was not queued')
+    let extraReady = false
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = (await knowledge.listDocuments(owner, extraBase.id))[0]
+      if (current?.status === 'ready') {
+        extraReady = true
+        break
+      }
+      if (current?.status === 'failed') throw new Error('Extra knowledge document failed to parse')
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    if (!extraReady) throw new Error('Extra knowledge document did not become ready')
+
+    e2eKnowledgeNow = Date.parse('2026-09-01T00:00:00.001Z')
+    await knowledge.getEntitlement(owner)
+    const entitlement = await knowledge.retainFreeAllowance(owner, {
+      baseId: retainedBase.id,
+      documentId: retainedDocument.id,
+    })
+    const retainedSearch = await knowledge.searchSelected(
+      owner, 'AutoForge knowledge smoke', [retainedBase.id],
+    )
+    const extraSearch = await knowledge.searchSelected(
+      owner, 'AutoForge knowledge smoke', [extraBase.id],
+    )
+    const blockedHandle = (await knowledge.pickImportFiles(owner))[0]
+    if (!blockedHandle) throw new Error('Blocked import handle is unavailable')
+    let extraImport: { blocked: boolean; code?: string } = { blocked: false }
+    try {
+      await knowledge.importDocument(owner, extraBase.id, blockedHandle.id)
+    } catch (error) {
+      extraImport = {
+        blocked: true,
+        code: typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code: unknown }).code)
+          : 'UNKNOWN',
+      }
+    }
+    const projected = await knowledge.list(owner)
+    const availability = await knowledge.getAvailability(owner)
+    return {
+      entitlement,
+      retainedSearch: {
+        kind: retainedSearch.kind,
+        evidenceCount: retainedSearch.kind === 'results' ? retainedSearch.evidence.length : 0,
+      },
+      extraSearch: {
+        kind: extraSearch.kind,
+        evidenceCount: extraSearch.kind === 'results' ? extraSearch.evidence.length : 0,
+      },
+      extraImport,
+      cloud: { available: availability.cloud.available, calls: knowledgeCloudCallCount },
+      extrasReadOnly: projected.find(base => base.id === extraBase.id)?.readOnly === true,
+    }
   }
   if (name === 'switchKnowledgeProvider') {
     const settings = await runtime.services.settings.update({ activeProvider: 'deepseek' })
-    return settings.activeProvider
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    const bases = await runtime.services.knowledge.list({ userId: session.user.id })
+    const retainedBase = bases.find(base => base.readOnly !== true)
+    if (!retainedBase) throw new Error('Retained knowledge base is unavailable after Provider switch')
+    const conversation = await runtime.services.chat.createConversation()
+    const preferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
+    await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+      ...preferences,
+      knowledgeBaseIds: [retainedBase.id],
+      knowledgeMode: 'strict',
+    })
+    const beforeEvents = recordedChatEvents.length
+    const beforeDisclosure = knowledgeSnippetDisclosureCount
+    await runtime.services.chat.send({
+      conversationId: conversation.id,
+      content: 'Ask after Provider switch',
+      assetIds: [],
+      outputType: 'auto',
+      generation: {
+        image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+        audio: { format: 'mp3' },
+        video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      },
+    })
+    let terminalStatus: 'completed' | 'cancelled' | 'failed' | undefined
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const terminal = recordedChatEvents.slice(beforeEvents).find(event => (
+        event.type === 'status'
+        && event.conversationId === conversation.id
+        && ['completed', 'cancelled', 'failed'].includes(event.status)
+      ))
+      if (terminal?.type === 'status' && terminal.status !== 'running') {
+        terminalStatus = terminal.status
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    if (terminalStatus !== 'completed') {
+      throw new Error(`Provider-switch knowledge ask did not complete: ${terminalStatus ?? 'timeout'}`)
+    }
+    const runEvents = recordedChatEvents.slice(beforeEvents)
+    const consentRequired = runEvents.some(event => (
+      (event.type === 'block' || event.type === 'block_update')
+      && event.conversationId === conversation.id
+      && event.block.type === 'knowledge_status'
+      && event.block.status === 'consent_required'
+    ))
+    return {
+      provider: settings.activeProvider,
+      providerSnippetDisclosures: knowledgeSnippetDisclosureCount,
+      providerSnippetDisclosureDelta: knowledgeSnippetDisclosureCount - beforeDisclosure,
+      consentRequired,
+      terminalStatus,
+    }
   }
   if (name === 'deepseekKnowledgeConsent') {
     const session = await runtime.services.auth.getSession()
     if (!session) throw new Error('Knowledge release smoke session is unavailable')
-    return runtime.services.knowledge.getConsent({ userId: session.user.id }, 'deepseek')
+    return {
+      ...await runtime.services.knowledge.getConsent({ userId: session.user.id }, 'deepseek'),
+      providerSnippetDisclosures: knowledgeSnippetDisclosureCount,
+    }
   }
   throw new Error(`Unknown cloud user-data E2E command: ${name}`)
 }
@@ -437,6 +597,7 @@ async function initialize(): Promise<void> {
       if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)
     },
   })
+  knowledgeService.configureCloudRemote!(countedCloudRemote())
   userDataStores = new UserDataStoreManager(join(userData, 'user-caches'))
   const cloudPort = new CloudBaseUserDataPort({
     async callFunction(input) {
@@ -482,7 +643,10 @@ async function initialize(): Promise<void> {
     openExternal: async () => undefined,
     emitChat: (event) => {
       const parsed = chatEventSchema.safeParse(event)
-      if (parsed.success) emit(ipcChannels.chatEvent, parsed.data)
+      if (parsed.success) {
+        recordedChatEvents.push(parsed.data)
+        emit(ipcChannels.chatEvent, parsed.data)
+      }
     },
     emitExecution: (event) => {
       const parsed = executionEventSchema.safeParse(event)

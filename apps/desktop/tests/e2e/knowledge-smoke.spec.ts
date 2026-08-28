@@ -60,7 +60,10 @@ test('runs local knowledge, degradation, expiry, and Provider-switch paths throu
       encryption: { available: true }, parser: { available: true }, cloud: { available: false },
     })
     await expect(command(application, 'embeddingRefusal')).resolves.toMatchObject({
-      strategy: 'keyword_only_consent', evidence: [],
+      consent: { provider: 'openrouter', status: 'unknown' },
+      retrieval: { kind: 'results', evidenceCount: 1, route: 'local-keyword' },
+      vectorRequests: 0,
+      providerSnippetDisclosures: 0,
     })
 
     await page.getByRole('link', { name: '聊天' }).click()
@@ -69,7 +72,9 @@ test('runs local knowledge, degradation, expiry, and Provider-switch paths throu
     await page.getByTestId('knowledge-selector').locator('summary').click()
     await page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
     await page.getByTestId('send-message').click()
-    await expect(page.getByTestId('knowledge-status')).toContainText('需要授权后才能发送依据')
+    await expect(page.getByTestId('knowledge-status').filter({
+      hasText: '需要授权后才能发送依据',
+    })).toBeVisible()
     await page.getByTestId('grant-knowledge-consent').click()
     await page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
     await page.getByTestId('send-message').click()
@@ -77,11 +82,33 @@ test('runs local knowledge, degradation, expiry, and Provider-switch paths throu
     await expect(page.getByPlaceholder('描述你想完成的任务…')).toBeEditable()
 
     await expect(command(application, 'expireKnowledgeEntitlement')).resolves.toMatchObject({
-      tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+      entitlement: {
+        tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+        retentionConfirmed: true,
+      },
+      retainedSearch: { kind: 'results', evidenceCount: 1 },
+      extraSearch: { kind: 'results', evidenceCount: 0 },
+      extraImport: { blocked: true, code: 'FORBIDDEN' },
+      cloud: { available: false, calls: 0 },
+      extrasReadOnly: true,
     })
-    await expect(command(application, 'switchKnowledgeProvider')).resolves.toBe('deepseek')
+    const switched = await command<{
+      provider: string
+      providerSnippetDisclosures: number
+      providerSnippetDisclosureDelta: number
+      consentRequired: boolean
+      terminalStatus: string
+    }>(
+      application,
+      'switchKnowledgeProvider',
+    )
+    expect(switched).toMatchObject({
+      provider: 'deepseek', consentRequired: true, providerSnippetDisclosureDelta: 0,
+      terminalStatus: 'completed',
+    })
     await expect(command(application, 'deepseekKnowledgeConsent')).resolves.toMatchObject({
       provider: 'deepseek', status: 'unknown',
+      providerSnippetDisclosures: switched.providerSnippetDisclosures,
     })
   } finally {
     await application.close().catch(() => undefined)
