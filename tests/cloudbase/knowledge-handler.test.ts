@@ -561,6 +561,50 @@ describe('CloudBase knowledge function', () => {
     })
   })
 
+  it('returns an atomically committed upload verification even if consent is revoked afterward', async () => {
+    const sha256 = 'a'.repeat(64)
+    const objectId = expectedUploadObjectId()
+    const storageReference = expectedStorageReference(objectId)
+    let consentChecks = 0
+    let verifiedInDatabase = false
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_assert_cloud_sync_consent') {
+        consentChecks += 1
+        if (consentChecks > 2) throw { code: 'FORBIDDEN' }
+        return currentCloudSyncConsent
+      }
+      if (name === 'autoforge_knowledge_get_upload') return {
+        ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
+        objectId, storageReference, expectedByteSize: 42, expectedSha256: sha256,
+        expectedMimeType: 'text/plain',
+      }
+      if (name === 'autoforge_knowledge_verify_upload') {
+        verifiedInDatabase = true
+        return {
+          ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
+          objectId, storageReference, byteSize: 42, sha256, mimeType: 'text/plain',
+          verified: true,
+        }
+      }
+      throw new Error(`unexpected RPC ${name}`)
+    })
+    const handler = createProductionKnowledgeHandler({
+      rpc,
+      storage: {
+        createUploadAuthorization: vi.fn(),
+        statObject: vi.fn().mockResolvedValue({ byteSize: 42, sha256, mimeType: 'text/plain' }),
+        deleteObjects: vi.fn(),
+      },
+    })
+
+    await expect(handler({ action: 'completeUpload', uploadTicket: 'ticket_1' }, context))
+      .resolves.toEqual({
+        ok: true, data: { objectId, storageReference, verified: true },
+      })
+    expect(verifiedInDatabase).toBe(true)
+    expect(consentChecks).toBe(2)
+  })
+
   it('rejects reviewer-reproduced owner, base, object, or private-path drift before Storage authorization', async () => {
     const objectId = expectedUploadObjectId()
     const valid = {

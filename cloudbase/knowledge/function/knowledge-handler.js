@@ -1045,7 +1045,6 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           || verified.byteSize !== data.expectedByteSize
           || verified.sha256 !== data.expectedSha256
           || verified.mimeType !== data.expectedMimeType) throw { code: 'INTERNAL_ERROR' }
-        await assertCloudSyncConsent(rpc, uid)
         return boundedSuccess({
           objectId: verified.objectId,
           storageReference: verified.storageReference,

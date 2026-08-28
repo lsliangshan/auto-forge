@@ -75,6 +75,29 @@ function staticFunctionBodyFragment(sql: string, name: string): string {
   return sql.slice(bodyStart + 5, end)
 }
 
+function functionDefinition(sql: string, name: string): string {
+  const marker = `CREATE OR REPLACE FUNCTION public.${name}(`
+  const start = sql.indexOf(marker)
+  expect(start, `${name} exists`).toBeGreaterThanOrEqual(0)
+  const bodyStart = sql.indexOf('AS $$', start)
+  const end = sql.indexOf('$$;', bodyStart + 5)
+  expect(bodyStart, `${name} has body`).toBeGreaterThan(start)
+  expect(end, `${name} body closes`).toBeGreaterThan(bodyStart)
+  return sql.slice(start, end + 3)
+}
+
+function applyFunctionReplacements(definition: string, migration: string): string {
+  const replacements = [...migration.matchAll(
+    /\$old\$([\s\S]*?)\$old\$,\s*\$new\$([\s\S]*?)\$new\$/g,
+  )]
+  expect(replacements.length).toBeGreaterThan(0)
+  return replacements.reduce((current, replacement) => {
+    const next = current.replace(replacement[1], replacement[2])
+    expect(next, `replacement anchor was not found: ${replacement[1]}`).not.toBe(current)
+    return next
+  }, definition)
+}
+
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
   if (value && typeof value === 'object') {
@@ -214,6 +237,61 @@ describe('CloudBase personal knowledge migration', () => {
       /GRANT\s+(?:ALL|SELECT|INSERT|UPDATE|DELETE|EXECUTE)[^;]*\bTO\s+(?:PUBLIC|anon|authenticated)\b/i,
     )
     expect(rollbackCatalog).not.toMatch(/DROP TABLE|TRUNCATE|DELETE\s+FROM|REVOKE ALL ON TABLE/i)
+  })
+
+  it('serializes final upload verification with cloud-sync revocation before any business lock', async () => {
+    const [foundation, workers, catalog, rollback, consentMigration] = await Promise.all([
+      readFile(featureUrl, 'utf8'), readFile(workerFeatureUrl, 'utf8'),
+      readFile(catalogFeatureUrl, 'utf8'), readFile(catalogRollbackUrl, 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.sql', import.meta.url,
+      ), 'utf8'),
+    ])
+    const requireCloud = staticFunctionBodyFragment(
+      catalog, 'autoforge_knowledge_require_cloud',
+    )
+    const knowledgeConsentLock = /pg_advisory_xact_lock\(hashtextextended\(\s*p_owner_id::text \|\| ':privacy-consent:' \|\| consent_purpose,\s*0\s*\)\)/
+    const consentMutationLock = /pg_advisory_xact_lock\(hashtextextended\(\s*p_owner_user_id::text \|\| ':privacy-consent:' \|\| consent_purpose,\s*0\s*\)\)/
+    expect(requireCloud).toMatch(knowledgeConsentLock)
+    expect(consentMigration).toMatch(consentMutationLock)
+    expect(requireCloud.search(knowledgeConsentLock)).toBeLessThan(
+      requireCloud.indexOf('FROM public.app_privacy_consent_states'),
+    )
+
+    const originalVerify = functionDefinition(
+      foundation, 'autoforge_knowledge_verify_upload',
+    )
+    const guardedVerify = applyFunctionReplacements(originalVerify, catalog)
+    const guard = 'PERFORM public.autoforge_knowledge_require_cloud(owner)'
+    expect(guardedVerify.indexOf(guard)).toBeGreaterThanOrEqual(0)
+    expect(guardedVerify.indexOf(guard)).toBeLessThan(
+      guardedVerify.indexOf('SELECT * INTO authorization'),
+    )
+    expect(applyFunctionReplacements(guardedVerify, rollback)).toBe(originalVerify)
+
+    const ordinaryMutations = [
+      ['begin_sync', staticFunctionBodyFragment(foundation, 'autoforge_knowledge_begin_sync')],
+      ['begin_generation', staticFunctionBodyFragment(workers, 'autoforge_knowledge_begin_generation')],
+      ['authorize_upload', staticFunctionBodyFragment(foundation, 'autoforge_knowledge_authorize_upload')],
+      ['verify_upload', guardedVerify],
+      ['push_mutation', staticFunctionBodyFragment(foundation, 'autoforge_knowledge_push_mutation')],
+      ['publish_generation', staticFunctionBodyFragment(foundation, 'autoforge_knowledge_publish_generation')],
+      ['set_embedding_consent', staticFunctionBodyFragment(foundation, 'autoforge_knowledge_set_embedding_consent')],
+      ['begin_embedding_drift_probe', staticFunctionBodyFragment(
+        foundation, 'autoforge_knowledge_begin_embedding_drift_probe',
+      )],
+    ] as const
+    for (const [name, body] of ordinaryMutations) {
+      const guardIndex = body.indexOf(guard)
+      const businessLockIndexes = [
+        body.indexOf('pg_advisory_xact_lock'), body.indexOf('FOR UPDATE'),
+      ].filter(index => index >= 0)
+      expect(guardIndex, `${name} has cloud guard`).toBeGreaterThanOrEqual(0)
+      expect(businessLockIndexes.length, `${name} has a business lock`).toBeGreaterThan(0)
+      expect(guardIndex, `${name} guards before business locks`).toBeLessThan(
+        Math.min(...businessLockIndexes),
+      )
+    }
   })
 
   it('uses owner-composite relationships, forced RLS, and default-deny grants', async () => {

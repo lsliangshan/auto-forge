@@ -21,6 +21,9 @@ BEGIN
     OR entitlement.status NOT IN ('active', 'offline_grace') THEN
     RAISE EXCEPTION USING MESSAGE = 'ENTITLEMENT_REQUIRED', ERRCODE = 'P0001';
   END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(
+    p_owner_id::text || ':privacy-consent:' || consent_purpose, 0
+  ));
   IF to_regclass('public.app_privacy_consent_states') IS NULL THEN
     RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
   END IF;
@@ -38,6 +41,34 @@ BEGIN
   END IF;
 END;
 $$;
+
+DO $migration$
+DECLARE
+  definition text;
+  guarded text;
+BEGIN
+  SELECT pg_get_functiondef(
+    'public.autoforge_knowledge_verify_upload(varchar,varchar,varchar,varchar,varchar,bigint,varchar,varchar,bigint,varchar,varchar)'::regprocedure
+  ) INTO definition;
+
+  guarded := replace(
+    definition,
+    $old$BEGIN
+  SELECT * INTO authorization FROM public.knowledge_upload_authorizations
+    WHERE upload_ticket = p_upload_ticket AND owner_id = owner FOR UPDATE;$old$,
+    $new$BEGIN
+  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  SELECT * INTO authorization FROM public.knowledge_upload_authorizations
+    WHERE upload_ticket = p_upload_ticket AND owner_id = owner FOR UPDATE;$new$
+  );
+  IF guarded = definition THEN
+    RAISE EXCEPTION 'autoforge_knowledge_verify_upload consent guard anchor was not found';
+  END IF;
+
+  -- pg_get_functiondef returns CREATE OR REPLACE; the consent lock is held to transaction end.
+  EXECUTE guarded;
+END
+$migration$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_assert_cloud_sync_consent(
   p_caller_user_id varchar

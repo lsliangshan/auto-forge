@@ -1,5 +1,32 @@
 BEGIN;
 
+DO $rollback$
+DECLARE
+  definition text;
+  restored text;
+BEGIN
+  SELECT pg_get_functiondef(
+    'public.autoforge_knowledge_verify_upload(varchar,varchar,varchar,varchar,varchar,bigint,varchar,varchar,bigint,varchar,varchar)'::regprocedure
+  ) INTO definition;
+
+  restored := replace(
+    definition,
+    $old$BEGIN
+  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  SELECT * INTO authorization FROM public.knowledge_upload_authorizations
+    WHERE upload_ticket = p_upload_ticket AND owner_id = owner FOR UPDATE;$old$,
+    $new$BEGIN
+  SELECT * INTO authorization FROM public.knowledge_upload_authorizations
+    WHERE upload_ticket = p_upload_ticket AND owner_id = owner FOR UPDATE;$new$
+  );
+  IF restored = definition THEN
+    RAISE EXCEPTION 'autoforge_knowledge_verify_upload consent rollback anchor was not found';
+  END IF;
+
+  EXECUTE restored;
+END
+$rollback$;
+
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_assert_cloud_sync_consent(varchar)
   FROM PUBLIC, anon, authenticated, service_role;
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_assert_cloud_sync_consent(varchar);
