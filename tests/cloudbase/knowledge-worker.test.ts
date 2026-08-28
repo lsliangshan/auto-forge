@@ -5,7 +5,7 @@ import { createSocket } from 'node:dgram'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { deflateRawSync, deflateSync } from 'node:zlib'
+import { brotliCompressSync, constants, deflateRawSync, deflateSync } from 'node:zlib'
 import { describe, expect, it, vi } from 'vitest'
 import { createKnowledgeParserProcess } from '../../cloudbase/knowledge/worker/parser-process.js'
 import {
@@ -82,20 +82,14 @@ function docxArchiveFixture(
   return Buffer.concat([local, compressed, central, end])
 }
 
-function pdfFixture(text: string, expandedPaddingBytes = 0): Buffer {
-  const content = Buffer.concat([
-    Buffer.alloc(expandedPaddingBytes, 0x20),
-    Buffer.from(`BT /F1 12 Tf 72 720 Td (${text.replace(/[()\\]/gu, '\\$&')}) Tj ET`, 'ascii'),
-  ])
-  const stream = deflateSync(content)
-  content.fill(0)
+function pdfFilteredFixture(filter: string, stream: Buffer): Buffer {
   const objects = [
     Buffer.from('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n', 'ascii'),
     Buffer.from('2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n', 'ascii'),
     Buffer.from('3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n', 'ascii'),
     Buffer.from('4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n', 'ascii'),
     Buffer.concat([
-      Buffer.from(`5 0 obj\n<< /Length ${stream.byteLength} /Filter /FlateDecode >>\nstream\n`, 'ascii'),
+      Buffer.from(`5 0 obj\n<< /Length ${stream.byteLength} /Filter /${filter} >>\nstream\n`, 'ascii'),
       stream,
       Buffer.from('\nendstream\nendobj\n', 'ascii'),
     ]),
@@ -114,6 +108,18 @@ function pdfFixture(text: string, expandedPaddingBytes = 0): Buffer {
     'trailer', '<< /Size 6 /Root 1 0 R >>', 'startxref', String(xrefOffset), '%%EOF', '',
   ].join('\n'), 'ascii')
   return Buffer.concat([header, ...objects, xref])
+}
+
+function pdfFixture(text: string, expandedPaddingBytes = 0): Buffer {
+  const content = Buffer.concat([
+    Buffer.alloc(expandedPaddingBytes, 0x20),
+    Buffer.from(`BT /F1 12 Tf 72 720 Td (${text.replace(/[()\\]/gu, '\\$&')}) Tj ET`, 'ascii'),
+  ])
+  const stream = deflateSync(content)
+  content.fill(0)
+  const fixture = pdfFilteredFixture('FlateDecode', stream)
+  stream.fill(0)
+  return fixture
 }
 
 describe('CloudBase knowledge scheduled worker', () => {
@@ -1037,6 +1043,52 @@ describe('CloudBase knowledge scheduled worker', () => {
     await expect(parser.parse({
       bytes, mimeType: 'application/pdf', versionId: 'version_pdf_bomb',
     })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+  })
+
+  it('rejects a Brotli stream in the child before RSS enforcement has to kill it', async () => {
+    const expanded = Buffer.alloc(160 * 1024 * 1024, 0x20)
+    const compressed = brotliCompressSync(expanded, {
+      params: { [constants.BROTLI_PARAM_QUALITY]: 0 },
+    })
+    expanded.fill(0)
+    const bytes = pdfFilteredFixture('BrotliDecode', compressed)
+    compressed.fill(0)
+    let kill: ReturnType<typeof vi.spyOn> | undefined
+    const parser = createKnowledgeParserProcess({
+      timeoutMs: 10_000,
+      spawnImpl: (command, args, options) => {
+        const childEntry = args.at(-1)
+        const child = spawn(command, [
+          ...args.slice(0, -1),
+          '--eval', `delete globalThis.DecompressionStream; require(${JSON.stringify(childEntry)})`,
+        ], options)
+        kill = vi.spyOn(child, 'kill')
+        return child
+      },
+    })
+
+    await expect(parser.parse({
+      bytes, mimeType: 'application/pdf', versionId: 'version_pdf_brotli_bomb',
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(kill).toBeDefined()
+    expect(kill).not.toHaveBeenCalled()
+    expect(bytes.every(byte => byte === 0)).toBe(true)
+  })
+
+  it.each([
+    ['DCTDecode', Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 0xff, 0xff, 0xff, 0xff, 3])],
+    ['CCITTFaxDecode', Buffer.from([0xff, 0xff, 0xff, 0xff])],
+    ['JBIG2Decode', Buffer.from([0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a])],
+    ['JPXDecode', Buffer.from([0xff, 0x4f, 0xff, 0x51, 0, 0, 0, 0])],
+  ])('rejects direct %s content-stream decoding in a real child', async (filter, stream) => {
+    const bytes = pdfFilteredFixture(filter, stream)
+    stream.fill(0)
+    const parser = createKnowledgeParserProcess({ timeoutMs: 3_000 })
+
+    await expect(parser.parse({
+      bytes, mimeType: 'application/pdf', versionId: `version_pdf_${filter}`,
+    })).rejects.toEqual({ code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(bytes.every(byte => byte === 0)).toBe(true)
   })
 
   it('bounds text blocks and serialized parser response while accumulating', async () => {

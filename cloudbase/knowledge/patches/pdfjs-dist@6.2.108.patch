@@ -19,7 +19,7 @@ index 1529140e3b8a97c852c73a69802b331969447959..04fbabe874503b64a3585cd86a0d7246
      rangeChunkSize,
      docBaseUrl,
 diff --git a/legacy/build/pdf.worker.mjs b/legacy/build/pdf.worker.mjs
-index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..6dcf222c8cdff261b808b46fc29b71675ec8757e 100644
+index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..c16c97f89d60c85cabba032d54ade0134f5bae68 100644
 --- a/legacy/build/pdf.worker.mjs
 +++ b/legacy/build/pdf.worker.mjs
 @@ -9373,4 +9373,16 @@ class ImageResizer {
@@ -48,7 +48,7 @@ index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..6dcf222c8cdff261b808b46fc29b7167
      const buffer2 = new Uint8Array(size);
      buffer2.set(buffer);
      return this.buffer = buffer2;
-@@ -9467,6 +9481,7 @@ class DecodeStream extends BaseStream {
+@@ -9467,9 +9481,11 @@ class DecodeStream extends BaseStream {
        const chunks = [];
        let totalLength = 0;
        for await (const chunk of readable) {
@@ -56,7 +56,12 @@ index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..6dcf222c8cdff261b808b46fc29b7167
          chunks.push(chunk);
          totalLength += chunk.byteLength;
        }
-@@ -9483,6 +9498,9 @@ class DecodeStream extends BaseStream {
++      reserveDecodedStreamBytes(totalLength);
+       const data = new Uint8Array(totalLength);
+       let offset = 0;
+       for (const chunk of chunks) {
+@@ -9480,7 +9496,10 @@ class DecodeStream extends BaseStream {
+         decompressed: data,
          compressed: bytes
        };
 -    } catch {
@@ -67,15 +72,67 @@ index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..6dcf222c8cdff261b808b46fc29b7167
        return {
          decompressed: null,
          compressed: bytes
-@@ -15001,6 +15019,7 @@ class BrotliStream extends DecodeStream {
-   readBlock() {
-     const bytes = this.stream.getBytes();
-     const decodedData = BrotliDecode(new Int8Array(bytes.buffer, bytes.byteOffset, bytes.length));
-+    reserveDecodedStreamBytes(decodedData.length);
-     this.buffer = new Uint8Array(decodedData.buffer, decodedData.byteOffset, decodedData.length);
-     this.bufferLength = this.buffer.length;
-     this.eof = true;
-@@ -70364,6 +70383,7 @@ class WorkerMessageHandler {
+@@ -14952,6 +14971,7 @@ let makeBrotliDecode = () => {
+     let totalOutput = 0;
+     let chunks = [];
+     while (true) {
++      reserveDecodedStreamBytes(16384);
+       let chunk = new Int8Array(16384);
+       chunks.push(chunk);
+       s.output = chunk;
+@@ -14964,6 +14984,7 @@ let makeBrotliDecode = () => {
+     }
+     close(s);
+     closeInput(s);
++    reserveDecodedStreamBytes(totalOutput);
+     let result = new Int8Array(totalOutput);
+     let offset = 0;
+     for (let i = 0; i < chunks.length; ++i) {
+@@ -17513,9 +17534,15 @@ class Parser {
+           return new LZWStream(stream, maybeLength, earlyChange);
+         case "DCT":
+         case "DCTDecode":
++          if (maxDecodedStreamBytes > 0) {
++            throw new FormatError("PDF decoded stream limit exceeded");
++          }
+           return new JpegStream(stream, maybeLength, params);
+         case "JPX":
+         case "JPXDecode":
++          if (maxDecodedStreamBytes > 0) {
++            throw new FormatError("PDF decoded stream limit exceeded");
++          }
+           return new JpxStream(stream, maybeLength);
+         case "A85":
+         case "ASCII85Decode":
+@@ -17525,11 +17552,17 @@ class Parser {
+           return new AsciiHexStream(stream, maybeLength);
+         case "CCF":
+         case "CCITTFaxDecode":
++          if (maxDecodedStreamBytes > 0) {
++            throw new FormatError("PDF decoded stream limit exceeded");
++          }
+           return new CCITTFaxStream(stream, maybeLength, params);
+         case "RL":
+         case "RunLengthDecode":
+           return new RunLengthStream(stream, maybeLength);
+         case "JBIG2Decode":
++          if (maxDecodedStreamBytes > 0) {
++            throw new FormatError("PDF decoded stream limit exceeded");
++          }
+           return new Jbig2Stream(stream, maybeLength, params);
+         case "BrotliDecode":
+           return new BrotliStream(stream, maybeLength);
+@@ -17547,6 +17580,9 @@ class Parser {
+       warn(`Filter "${name}" is not supported.`);
+       return stream;
+     } catch (ex) {
++      if (ex instanceof Error && ex.message === "PDF decoded stream limit exceeded") {
++        throw ex;
++      }
+       if (ex instanceof MissingDataException) {
+         throw ex;
+       }
+@@ -70364,6 +70400,7 @@ class WorkerMessageHandler {
      handler.on("GetDocRequest", data => this.createDocumentHandler(data, port));
    }
    static createDocumentHandler(docParams, port) {

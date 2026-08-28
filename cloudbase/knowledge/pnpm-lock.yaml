@@ -8,7 +8,7 @@ overrides:
   '@xmldom/xmldom': 0.8.13
 
 patchedDependencies:
-  pdfjs-dist@6.2.108: 300a91943f139ae0afe567ccec3c0cc680c7ad18723539876b779ade69537929
+  pdfjs-dist@6.2.108: 209bd347feaf1cc810cd9f54f6d39ba07b88237e38ee41ceed01a13fc1cd5b32
 
 importers:
 
@@ -19,7 +19,7 @@ importers:
         version: 1.12.1
       pdfjs-dist:
         specifier: 6.2.108
-        version: 6.2.108(patch_hash=300a91943f139ae0afe567ccec3c0cc680c7ad18723539876b779ade69537929)
+        version: 6.2.108(patch_hash=209bd347feaf1cc810cd9f54f6d39ba07b88237e38ee41ceed01a13fc1cd5b32)
 
 packages:
 
@@ -296,7 +296,7 @@ snapshots:
 
   path-is-absolute@1.0.1: {}
 
-  pdfjs-dist@6.2.108(patch_hash=300a91943f139ae0afe567ccec3c0cc680c7ad18723539876b779ade69537929):
+  pdfjs-dist@6.2.108(patch_hash=209bd347feaf1cc810cd9f54f6d39ba07b88237e38ee41ceed01a13fc1cd5b32):
     optionalDependencies:
       '@napi-rs/canvas': 1.0.8
 

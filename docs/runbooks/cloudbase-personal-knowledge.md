@@ -60,8 +60,10 @@ Stop if the two forward migrations are not byte-identical.
    or provider credential and whose network APIs are denied. Exercise the exact
    parser ceilings before or during accumulation: 64 MiB input, 32 MiB expanded
    DOCX and 100x compression ratio, 1000 PDF pages, 16 MiB text, 10000 blocks or
-   chunks, 768 KiB result, 832 KiB response frame, 128 MiB V8 old-space, 192 MiB
-   RSS, and 110 seconds child wall-time. Cancellation, timeout, child crash,
+   chunks, 768 KiB result, 832 KiB response frame, and 128 MiB V8 old-space.
+   Treat the parent's 192 MiB RSS sampler only as a post-allocation kill guard,
+   never as a kernel memory limit; require cgroup, rlimit, or an equivalent hard
+   boundary in the release runtime. Cancellation, timeout, child crash,
    malformed/duplicate/late frames, and parser dependency failure must kill and
    close that request's process, zero its source bytes, fail closed, and never
    complete a different lease. Confirm the scheduler's 120-second parser deadline
