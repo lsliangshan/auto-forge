@@ -72,29 +72,62 @@ function sandboxLiteral(value) {
   return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
 }
 
-function sandboxProfile(nodeExecutable) {
+function parserReadPaths(childEntry) {
+  const paths = [childEntry]
+  if (childEntry === childEntryDefault) {
+    paths.push(
+      realpathSync(resolve(__dirname, 'knowledge-worker.js')),
+      realpathSync(resolve(__dirname, 'package.json')),
+      realpathSync(resolve(__dirname, '..', 'package.json')),
+      realpathSync(resolve(__dirname, '..', 'node_modules')),
+    )
+  }
+  return paths
+}
+
+function sandboxReadFilter(path) {
+  return statSync(path).isDirectory()
+    ? `(subpath "${sandboxLiteral(path)}")`
+    : `(literal "${sandboxLiteral(path)}")`
+}
+
+function sandboxProfile(nodeExecutable, childEntry) {
+  const parserReads = parserReadPaths(childEntry).map(sandboxReadFilter).join(' ')
   return [
     '(version 1)',
-    '(allow default)',
+    '(deny default)',
+    '(allow mach-bootstrap)',
+    '(allow process-info* (target self))',
+    '(allow signal (target self))',
+    '(allow sysctl-read)',
+    '(allow file-read-metadata)',
+    `(allow process-exec (literal "${sandboxLiteral(nodeExecutable)}"))`,
+    `(allow file-read* file-test-existence
+      (literal "/")
+      (literal "/dev/null")
+      (literal "/dev/random")
+      (literal "/dev/urandom")
+      (literal "/dev/zero")
+      (subpath "/System")
+      (subpath "/usr/lib")
+      (subpath "/usr/share")
+      (subpath "/private/var/db/timezone")
+      (literal "${sandboxLiteral(nodeExecutable)}")
+      ${parserReads})`,
+    `(allow file-map-executable
+      (literal "${sandboxLiteral(nodeExecutable)}")
+      (subpath "/System/Library/Frameworks")
+      (subpath "/System/Library/PrivateFrameworks")
+      (subpath "/usr/lib"))`,
+    '(allow file-read-data file-test-existence file-write-data (literal "/dev/fd/0") (literal "/dev/fd/1") (literal "/dev/fd/2"))',
+    '(allow file-read-data file-test-existence file-write-data (literal "/dev/null") (literal "/dev/zero"))',
     '(deny network*)',
     '(deny process-fork)',
-    '(deny signal)',
-    `(deny process-exec (require-not (literal "${sandboxLiteral(nodeExecutable)}")))`,
-    '(deny file-write*)',
   ].join(' ')
 }
 
 function permittedReadArguments(childEntry) {
-  const paths = [childEntry]
-  if (childEntry === childEntryDefault) {
-    paths.push(
-      resolve(__dirname, 'knowledge-worker.js'),
-      resolve(__dirname, 'package.json'),
-      resolve(__dirname, '..', 'package.json'),
-      resolve(__dirname, '..', 'node_modules'),
-    )
-  }
-  return paths.map(path => `--allow-fs-read=${path}`)
+  return parserReadPaths(childEntry).map(path => `--allow-fs-read=${path}`)
 }
 
 function residentBytes(pid) {
@@ -206,7 +239,7 @@ function createKnowledgeParserProcess({
           const environment = { AUTOFORGE_PARSER_CHILD: '1' }
           if (process.versions.electron) environment.ELECTRON_RUN_AS_NODE = '1'
           child = spawnImpl(SANDBOX_EXECUTABLE, [
-            '-p', sandboxProfile(nodeExecutable),
+            '-p', sandboxProfile(nodeExecutable, canonicalChildEntry),
             nodeExecutable,
             '--permission',
             '--no-addons',

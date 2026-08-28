@@ -328,6 +328,66 @@ describe('CloudBase knowledge scheduled worker', () => {
     }
   })
 
+  it('denies node:sqlite reads and extension loading outside the parser allowlist', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-parser-sandbox-sqlite-'))
+    const databasePath = join(directory, 'parent-secret.sqlite')
+    const extensionBasePath = join(directory, 'parent-secret')
+    const extensionPath = `${extensionBasePath}.dylib`
+    const { DatabaseSync } = await import('node:sqlite')
+    const database = new DatabaseSync(databasePath)
+    database.exec("CREATE TABLE secrets(value TEXT NOT NULL); INSERT INTO secrets VALUES ('parent credential material')")
+    database.close()
+    await writeFile(extensionPath, 'not an approved SQLite extension', 'utf8')
+    try {
+      await withParserChild(`
+        const { DatabaseSync } = require('node:sqlite')
+        const denied = error => ['ERR_ACCESS_DENIED', 'EPERM', 'EACCES'].includes(error?.code)
+          || /(?:operation not permitted|permission denied|access denied)/iu.test(String(error?.message))
+        const results = { nodePermissionDisabled: process.permission === undefined }
+        try {
+          const database = new DatabaseSync(${JSON.stringify(databasePath)}, { readOnly: true })
+          database.prepare('SELECT value FROM secrets').get()
+          database.close()
+          results.sqliteReadDenied = false
+        } catch (error) {
+          results.sqliteReadDenied = denied(error)
+            || error?.code === 'ERR_SQLITE_ERROR' && error?.message === 'unable to open database file'
+        }
+        try {
+          const database = new DatabaseSync(':memory:', { allowExtension: true })
+          database.enableLoadExtension(true)
+          database.loadExtension(${JSON.stringify(extensionBasePath)})
+          database.close()
+          results.sqliteExtensionDenied = false
+        } catch (error) {
+          results.sqliteExtensionDenied = denied(error)
+            || error?.code === 'ERR_LOAD_SQLITE_EXTENSION'
+              && /(?:file system sandbox blocked open|no such file)/iu.test(error?.message)
+        }
+        const body = Buffer.from(JSON.stringify({ ok: true, result: results }))
+        const prefix = Buffer.alloc(4); prefix.writeUInt32BE(body.length)
+        process.stdout.write(Buffer.concat([prefix, body]))
+      `, async (childEntry) => {
+        const parser = createKnowledgeParserProcess({
+          childEntry, timeoutMs: 2_000,
+          spawnImpl: (command, args, options) => spawn(command, args.filter(argument => (
+            argument !== '--permission' && argument !== '--no-addons'
+              && !argument.startsWith('--allow-fs-read=')
+          )), options),
+        })
+        await expect(parser.parse({
+          bytes: Buffer.from('sqlite probe'), mimeType: 'text/plain', versionId: 'sqlite_probe',
+        })).resolves.toEqual({
+          nodePermissionDisabled: true,
+          sqliteReadDenied: true,
+          sqliteExtensionDenied: true,
+        })
+      })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('kills a child whose external-memory RSS crosses the parent-owned ceiling', async () => {
     await withParserChild(`
       process.stdin.resume()
