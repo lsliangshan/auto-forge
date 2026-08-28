@@ -232,6 +232,20 @@ function normalizedTuplePart(value: string): string {
   return canonicalSupportText(value).replace(/\s+/gu, '')
 }
 
+function commaFieldTuple(value: string): FactTuple | undefined {
+  const field = value.match(/^([^，,]{1,160}?)[，,]\s*(.{1,240})$/u)
+  if (!field) return undefined
+  const subject = field[1]!.trim()
+  const object = field[2]!.trim()
+  const clausePredicate = /(?:签订|签字|签署|生效|起效|发布|负责|构成|采用|保持|持续|运营|提升|支付|执行|提供|承担|要求|应当|必须|需要|位于|包括|支持|允许|禁止|适用|\b(?:is|are|was|were|signed?|effective|publishes?|requires?|supports?|permits?|allows?|prohibits?|forbids?)\b)/iu
+  if (!subject || !object || clausePredicate.test(subject) || clausePredicate.test(object)) return undefined
+  return {
+    subject: normalizedTuplePart(subject),
+    relation: 'attribute',
+    object,
+  }
+}
+
 function factTuple(rawValue: string): FactTuple | undefined {
   const value = normalizedSupportText(rawValue)
     .replace(/^(?:(?:但是|但|然而|不过|而且|并且|同时|以及|且)|\b(?:and|also|moreover)\b)\s*/iu, '')
@@ -257,15 +271,6 @@ function factTuple(rawValue: string): FactTuple | undefined {
     }
   }
 
-  const field = value.match(/^(.{1,160}?)[：:]\s*(.{1,240})$/u)
-  if (field) {
-    return {
-      subject: normalizedTuplePart(field[1]!),
-      relation: 'attribute',
-      object: field[2]!,
-    }
-  }
-
   const chineseAttribute = value.match(/^(.{1,160}?)(?:为|是|包括)(.{1,240})$/u)
   if (chineseAttribute && !/[因认作成视所以较极尤甚不若各自无]$/u.test(chineseAttribute[1]!)) {
     return {
@@ -283,6 +288,18 @@ function factTuple(rawValue: string): FactTuple | undefined {
       object: englishAttribute[2]!,
     }
   }
+
+  const field = value.match(/^(.{1,160}?)[：:]\s*(.{1,240})$/u)
+  if (field) {
+    return {
+      subject: normalizedTuplePart(field[1]!),
+      relation: 'attribute',
+      object: field[2]!,
+    }
+  }
+
+  const commaField = commaFieldTuple(value)
+  if (commaField) return commaField
 
   const chineseRelation = value.match(/^(.{1,160}?)(支持|允许|禁止|适用)(.{1,240})$/u)
   if (chineseRelation) {
@@ -467,7 +484,7 @@ function clauseSupportsClaim(rawClaim: string, rawEvidence: string): boolean {
 
   const cjkTokens = cjkMaterialTokens(normalizedClaim)
   const latinTokens = latinMaterialTokens(normalizedClaim)
-  if (cjkTokens.length === 0 && latinTokens.length === 0) return false
+  if (cjkTokens.length === 0 && latinTokens.length === 0) return claimNumbers.length > 0
   if (cjkTokens.length > 0) {
     const cjkEvidence = cjkMaterialText(normalizedEvidence)
     const matched = cjkTokens.filter(token => cjkEvidence.includes(token)).length

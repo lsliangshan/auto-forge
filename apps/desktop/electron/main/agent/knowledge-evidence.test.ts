@@ -320,6 +320,41 @@ describe('knowledge tool and answer validation', () => {
     )).toEqual({ kind: 'insufficient', reason: 'unsupported-claim' })
   })
 
+  it.each([
+    {
+      name: 'English Device A comma field',
+      snippet: 'Device A color is red and Device B color is blue.',
+      answer: 'Device A color, blue. [[kb:evidence:0]]',
+    },
+    {
+      name: '中文一字母设备逗号字段',
+      snippet: 'A设备颜色为红色且B设备颜色为蓝色。',
+      answer: 'A设备颜色，蓝色。[[kb:evidence:0]]',
+    },
+  ])('anchors $name to one subject, relation, and value tuple', ({ snippet, answer }) => {
+    const splitFacts = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it.each([
+    ['会议时间为 12:30。', '会议时间：12:30。'],
+    ['会议时间是 12:30。', '会议时间：12:30。'],
+    ['Meeting time is 12:30.', 'Meeting time: 12:30.'],
+  ])('accepts a time field paraphrase without treating the value colon as a field separator: %s', (snippet, claim) => {
+    expect(validateKnowledgeAnswer(
+      `${claim}[[kb:evidence:0]]`, [evidence(0, { snippet })], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
   it('keeps one-subject value lists as one supported fact tuple', () => {
     expect(validateKnowledgeAnswer(
       '甲方支持红色、蓝色。[[kb:evidence:0]]',
