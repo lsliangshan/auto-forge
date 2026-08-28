@@ -1,7 +1,8 @@
 import { EventEmitter } from 'node:events'
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ConverterPackLease } from './converter-pack-types.js'
@@ -24,6 +25,49 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
   let resolve!: (value: T) => void
   const promise = new Promise<T>((settle) => { resolve = settle })
   return { promise, resolve }
+}
+
+async function observedWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<
+  | { readonly settled: true; readonly value: T }
+  | { readonly settled: false }
+> {
+  return new Promise((resolve) => {
+    let finished = false
+    const timer = setTimeout(() => {
+      if (finished) return
+      finished = true
+      resolve({ settled: false })
+    }, timeoutMs)
+    void promise.then((value) => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
+      resolve({ settled: true, value })
+    })
+  })
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+async function resolveTestNodeExecutable(): Promise<string> {
+  for (const directory of (process.env.PATH ?? '').split(delimiter)) {
+    if (directory.length === 0) continue
+    try {
+      const candidate = await realpath(join(directory, 'node'))
+      await access(candidate, constants.X_OK)
+      return candidate
+    } catch {
+      continue
+    }
+  }
+  throw new Error('A real Node executable is required for the process-tree regression test.')
 }
 
 class FakeProcess implements ConversionProcessHandle {
@@ -476,11 +520,104 @@ describe('platform process-tree port', () => {
 
     const terminating = port.terminateTree(handle)
     expect(kills).toEqual([[-9876, 'SIGTERM']])
-    child.emit('close', null, 'SIGTERM')
+    child.emit('exit', null, 'SIGTERM')
     await vi.advanceTimersByTimeAsync(10)
     expect(kills).toEqual([[-9876, 'SIGTERM'], [-9876, 'SIGKILL']])
     await expect(terminating).resolves.toBeUndefined()
   })
+
+  it.runIf(process.platform === 'darwin')('observes a real root exit before inherited pipes close and removes its descendant', async () => {
+    const work = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-real-process-tree-')))
+    temporaryRoots.push(work)
+    const descendantPidPath = join(work, 'descendant.pid')
+    const nodeExecutable = await resolveTestNodeExecutable()
+    const nodeRoot = await realpath(dirname(nodeExecutable))
+    const lease: ConverterPackLease = Object.freeze({
+      name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: process.arch === 'arm64' ? 'arm64' : 'x64', root: nodeRoot,
+      executables: Object.freeze({ node: nodeExecutable }), release() {},
+    })
+    const script = [
+      "const { spawn } = require('node:child_process')",
+      "const { writeFileSync } = require('node:fs')",
+      "const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+      'descendant.unref()',
+      'writeFileSync(process.argv[1], String(descendant.pid))',
+    ].join(';')
+    const plan: ConversionProcessPlan = {
+      executable: nodeExecutable,
+      args: ['-e', script, descendantPidPath],
+      cwd: work,
+      env: createConversionEnvironment(nodeExecutable, work),
+      timeoutMs: CONVERSION_TIMEOUTS.image,
+      outputContract: { kind: 'single' },
+      outputPaths: [join(work, 'unused.png')],
+      outputs: [{ path: join(work, 'unused.png'), format: 'png' }],
+    }
+    const realPort = createNodeConversionProcessTreePort({ platform: 'darwin', terminationGraceMs: 10 })
+    let spawned: ConversionProcessHandle | undefined
+    let terminations = 0
+    const processTree: ConversionProcessTreePort = {
+      spawn(executable, args, options) {
+        spawned = realPort.spawn(executable, args, options)
+        return spawned
+      },
+      async terminateTree(handle) {
+        terminations += 1
+        await realPort.terminateTree(handle)
+      },
+    }
+    const abort = new AbortController()
+    const running = createConversionProcessRunner({ processTree }).run(plan, lease, { signal: abort.signal })
+      .catch((error: unknown) => error)
+    let descendantPid: number | undefined
+    let rootExit: Awaited<ReturnType<typeof observedWithin<ConversionProcessExit>>> | undefined
+    let runnerResult: Awaited<ReturnType<typeof observedWithin<unknown>>> | undefined
+    let terminationsBeforeFallback: number | undefined
+    let descendantGoneBeforeFallback = false
+    let cleanupSettled: boolean | undefined
+    try {
+      await vi.waitFor(() => expect(spawned).toBeDefined(), { interval: 5, timeout: 500 })
+      await vi.waitFor(async () => {
+        descendantPid = Number(await readFile(descendantPidPath, 'utf8'))
+        expect(Number.isSafeInteger(descendantPid)).toBe(true)
+      }, { interval: 5, timeout: 500 })
+      ;[rootExit, runnerResult] = await Promise.all([
+        observedWithin(spawned!.waitForExit(), 1_000),
+        observedWithin(running, 2_500),
+      ])
+      terminationsBeforeFallback = terminations
+      if (runnerResult.settled && descendantPid !== undefined) {
+        await vi.waitFor(() => expect(processExists(descendantPid!)).toBe(false), { interval: 10, timeout: 500 })
+        descendantGoneBeforeFallback = true
+      }
+    } finally {
+      abort.abort()
+      if (spawned?.processGroupId !== undefined) {
+        try { process.kill(-spawned.processGroupId, 'SIGKILL') } catch {
+          // The runner may already have removed the process group.
+        }
+      }
+      if (descendantPid !== undefined) {
+        try { process.kill(descendantPid, 'SIGKILL') } catch {
+          // The group signal may already have removed the descendant.
+        }
+      }
+      const cleanup = await observedWithin(running, 1_000)
+      cleanupSettled = cleanup.settled
+      if (descendantPid !== undefined) {
+        await vi.waitFor(() => expect(processExists(descendantPid!)).toBe(false), { interval: 10, timeout: 500 })
+      }
+    }
+
+    expect(rootExit).toEqual({ settled: true, value: { code: 0, signal: null } })
+    expect(runnerResult).toMatchObject({
+      settled: true,
+      value: { code: 'CONVERSION_INTERRUPTED', exitCode: 0 },
+    })
+    expect(terminationsBeforeFallback).toBe(1)
+    expect(descendantGoneBeforeFallback).toBe(true)
+    expect(cleanupSettled).toBe(true)
+  }, 5_000)
 
   it('fails closed on Windows without a Job Object port and delegates only to the branded port', () => {
     expect(() => createNodeConversionProcessTreePort({ platform: 'win32' })).toThrowError(

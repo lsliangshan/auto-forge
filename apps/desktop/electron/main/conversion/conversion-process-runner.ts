@@ -496,7 +496,7 @@ export function createNodeConversionProcessTreePort(options: NodeProcessTreeOpti
         settled = true
         exit.resolve({ code: null, signal: null, error })
       })
-      child.once('close', (code, signal) => {
+      child.once('exit', (code, signal) => {
         if (settled) return
         settled = true
         exit.resolve({ code, signal })
