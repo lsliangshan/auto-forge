@@ -110,6 +110,15 @@ function services(): DesktopIpcServices {
       clearLocalData: vi.fn(),
       clearBrowserData: vi.fn(),
       recordPrivacyConsent: vi.fn().mockResolvedValue(undefined),
+      getCloudSyncConsentState: vi.fn().mockResolvedValue({
+        purpose: 'cloud_sync', state: 'accepted', revision: 1,
+        documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      }),
+      revokeCloudSyncConsent: vi.fn().mockResolvedValue({
+        purpose: 'cloud_sync', state: 'revoked', revision: 2,
+        revokedAt: '2026-08-25T01:00:00.000Z', clientVersion: '0.1.0',
+      }),
       previewLegacyImport: vi.fn().mockResolvedValue({
         ownedCount: 1, unownedCount: 1, requiresUnownedConfirmation: true,
       }),
@@ -259,6 +268,20 @@ describe('registerDesktopIpc', () => {
       consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
     }
     await expect(app.invoke(ipcChannels.settingsRecordPrivacyConsent, consent)).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.settingsGetCloudSyncConsentState)).resolves.toMatchObject({
+      purpose: 'cloud_sync', state: 'accepted', revision: 1,
+    })
+    await expect(app.invoke(
+      ipcChannels.settingsRevokeCloudSyncConsent, { confirmed: true },
+    )).resolves.toMatchObject({ state: 'revoked', revision: 2 })
+    for (const forged of [
+      {}, { confirmed: false }, { confirmed: true, ownerUserId: 'forged' },
+      { confirmed: true, revision: 1 }, { confirmed: true, purpose: 'cloud_sync' },
+    ]) {
+      await expect(app.invoke(ipcChannels.settingsRevokeCloudSyncConsent, forged))
+        .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    expect(app.dependencies.settings.revokeCloudSyncConsent).toHaveBeenCalledOnce()
     await expect(app.invoke(ipcChannels.settingsPreviewLegacyImport)).resolves.toMatchObject({ ownedCount: 1 })
     await expect(app.invoke(ipcChannels.settingsImportLegacyData, {
       includeUnowned: false, cloudSyncConsent: consent,

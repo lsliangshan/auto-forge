@@ -223,6 +223,14 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsListProviderModels, (input) => options.services.settings.listProviderModels(input.provider, input.refresh))
   register(ipcChannels.settingsGetTokenUsage, () => options.services.settings.getTokenUsage())
   register(ipcChannels.settingsRecordPrivacyConsent, (input) => options.services.settings.recordPrivacyConsent(input))
+  register(
+    ipcChannels.settingsGetCloudSyncConsentState,
+    () => options.services.settings.getCloudSyncConsentState(),
+  )
+  register(
+    ipcChannels.settingsRevokeCloudSyncConsent,
+    (input) => options.services.settings.revokeCloudSyncConsent(input),
+  )
   register(ipcChannels.settingsPreviewLegacyImport, () => options.services.settings.previewLegacyImport())
   register(ipcChannels.settingsImportLegacyData, (input) => options.services.settings.importLegacyData(input))
   register(ipcChannels.settingsGetAccountDataPreferences, () => options.services.settings.getAccountDataPreferences())
