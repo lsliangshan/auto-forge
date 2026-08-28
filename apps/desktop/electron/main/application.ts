@@ -1,9 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { constants, createWriteStream } from 'node:fs'
+import { constants } from 'node:fs'
 import {
   appendFile,
   copyFile,
-  link as hardLink,
   lstat,
   mkdir,
   mkdtemp,
@@ -14,8 +13,6 @@ import {
   rm,
 } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { Transform } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
 import {
   accountDataPreferencesDefaults,
   accountDataPreferencesRecordSchema,
@@ -986,6 +983,7 @@ async function recoverOwnerConversionStorage(
     await rm(candidate, { recursive: true, force: true })
   }
   const quarantinedByArtifact = new Map<string, string[]>()
+  const residueArtifactIds = new Set<string>()
   for (const name of await readdir(quarantine)) {
     const match = conversionQuarantinePattern.exec(name)
     if (!match?.groups?.artifactId) continue
@@ -1007,32 +1005,43 @@ async function recoverOwnerConversionStorage(
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
       throw error
     })
-    const destinationMetadata = destinationExists
-      ? await inspectConversionArtifactNode(rootRealPath, destination, artifact)
-      : undefined
-    const validCandidates = (await Promise.all(candidates.map(async (candidate) => ({
-      candidate,
-      metadata: await inspectConversionArtifactNode(rootRealPath, candidate, artifact),
-    })))).filter((entry) => entry.metadata !== undefined)
-    if (destinationMetadata || destinationExists || validCandidates.length !== 1) continue
-    const selected = validCandidates[0]!
-    const destinationDirectory = await ensureManagedDirectory(dirname(destination))
-    if (!insidePath(rootRealPath, destinationDirectory)) {
-      throw failure('CONVERSION_INPUT_INVALID')
+    if (destinationExists) {
+      await inspectConversionArtifactNode(rootRealPath, destination, artifact)
     }
-    const revalidated = await inspectConversionArtifactNode(rootRealPath, selected.candidate, artifact)
-    if (!revalidated || !sameFileIdentity(selected.metadata!, revalidated)) continue
-    await rename(selected.candidate, join(destinationDirectory, basename(destination)))
-    const restored = await inspectConversionArtifactNode(rootRealPath, destination, artifact)
-    if (!restored || !sameFileIdentity(revalidated, restored)) {
-      throw failure('CONVERSION_INPUT_INVALID')
+    await Promise.all(candidates.map(
+      (candidate) => inspectConversionArtifactNode(rootRealPath, candidate, artifact),
+    ))
+    const destinationExistsAfterVerification = await lstat(destination).then(
+      () => true,
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw error
+      },
+    )
+    if (destinationExistsAfterVerification) {
+      await inspectConversionArtifactNode(rootRealPath, destination, artifact)
+    }
+    residueArtifactIds.add(artifact.id)
+    if (!artifact.conversionJobId || artifact.role !== 'output') continue
+    const job = database.conversionJobs.getOwned(artifact.conversionJobId, ownerUserId)
+    if (!job
+      || job.executionId !== artifact.executionId
+      || job.status !== 'completed') continue
+    if (!database.conversionJobs.interruptCompletedForArtifactRecovery({
+      jobId: job.id,
+      ownerUserId,
+      expectedEpoch: job.epoch,
+    })) {
+      throw failure('CONFLICT')
     }
   }
   for (const execution of database.executions.listForUser(ownerUserId)) {
     for (const job of database.conversionJobs.listForExecution(execution.id, ownerUserId)) {
       if (job.status === 'completed') continue
       for (const artifact of database.conversionArtifacts.listForJob(job.id, ownerUserId)) {
-        if (artifact.status === 'ready' && artifact.role === 'output') {
+        if (artifact.status === 'ready'
+          && artifact.role === 'output'
+          && !residueArtifactIds.has(artifact.id)) {
           await quarantineManagedConversionArtifact(
             dataRoot,
             ownerUserId,
@@ -3020,11 +3029,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           session.user.id,
           artifact,
         )
-        let temporaryPath: string | undefined
-        let linkedDestination: {
+        let destinationHandle: Awaited<ReturnType<typeof open>> | undefined
+        let openedDestination: {
           path: string
-          metadata: Awaited<ReturnType<typeof lstat>>
+          metadata: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>
         } | undefined
+        let saved = false
         try {
           const selected = await options.chooseMediaSavePath(artifact.displayName)
           if (!selected) return { saved: false }
@@ -3040,26 +3050,40 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             throw failure('INVALID_INPUT')
           }
           const canonicalDestination = join(destinationDirectory, basename(destination))
-          const destinationExists = await lstat(canonicalDestination).then(() => true, (error: unknown) => {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+          try {
+            destinationHandle = await open(
+              canonicalDestination,
+              constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+              0o600,
+            )
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw failure('CONFLICT')
             throw error
-          })
-          if (destinationExists) throw failure('CONFLICT')
-          temporaryPath = join(
-            destinationDirectory,
-            `.${randomUUID()}.autoforge-conversion.partial`,
-          )
+          }
+          const destinationBefore = await destinationHandle.stat()
+          if (!destinationBefore.isFile()
+            || destinationBefore.nlink !== 1
+            || destinationBefore.size !== 0) throw failure('INVALID_INPUT')
+          openedDestination = { path: canonicalDestination, metadata: destinationBefore }
           const digest = createHash('sha256')
-          await pipeline(
-            verified.handle.createReadStream({ autoClose: false, start: 0 }),
-            new Transform({
-              transform(chunk: Buffer, _encoding, callback) {
-                digest.update(chunk)
-                callback(null, chunk)
-              },
-            }),
-            createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 }),
-          )
+          let destinationOffset = 0
+          for await (const chunk of verified.handle.createReadStream({ autoClose: false, start: 0 })) {
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            digest.update(bytes)
+            let chunkOffset = 0
+            while (chunkOffset < bytes.byteLength) {
+              const { bytesWritten } = await destinationHandle.write(
+                bytes,
+                chunkOffset,
+                bytes.byteLength - chunkOffset,
+                destinationOffset,
+              )
+              if (bytesWritten <= 0) throw failure('INVALID_INPUT')
+              chunkOffset += bytesWritten
+              destinationOffset += bytesWritten
+            }
+          }
+          await destinationHandle.sync()
           const after = await verified.handle.stat()
           const managed = await lstat(verified.path)
           if (!sameFileMetadata(verified.metadata, after)
@@ -3068,7 +3092,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || digest.digest('hex') !== artifact.sha256) {
             throw failure('CONVERSION_INPUT_INVALID')
           }
-          const temporaryMetadata = await lstat(temporaryPath)
+          const destinationAfter = await destinationHandle.stat()
+          if (!destinationAfter.isFile()
+            || destinationAfter.nlink !== 1
+            || destinationAfter.dev !== destinationBefore.dev
+            || destinationAfter.ino !== destinationBefore.ino
+            || destinationAfter.size !== artifact.byteSize
+            || destinationOffset !== artifact.byteSize) {
+            throw failure('INVALID_INPUT')
+          }
           const selectedDirectoryAfter = await lstat(selectedDirectory)
           const destinationDirectoryAfter = await lstat(destinationDirectory)
           if (selectedDirectoryAfter.isSymbolicLink()
@@ -3080,17 +3112,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || await realpath(selectedDirectory) !== destinationDirectory) {
             throw failure('INVALID_INPUT')
           }
-          try {
-            await hardLink(temporaryPath, canonicalDestination)
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw failure('CONFLICT')
-            throw error
-          }
           const copiedMetadata = await lstat(canonicalDestination)
-          if (!sameFileIdentity(temporaryMetadata, copiedMetadata)) {
-            throw failure('CONVERSION_INPUT_INVALID')
+          if (copiedMetadata.isSymbolicLink()
+            || copiedMetadata.nlink !== 1
+            || !sameFileIdentity(destinationAfter, copiedMetadata)
+            || await realpath(canonicalDestination) !== canonicalDestination) {
+            throw failure('INVALID_INPUT')
           }
-          linkedDestination = { path: canonicalDestination, metadata: copiedMetadata }
           const selectedDirectoryFinal = await lstat(selectedDirectory)
           if (selectedDirectoryFinal.isSymbolicLink()
             || selectedDirectoryFinal.dev !== selectedDirectoryMetadata.dev
@@ -3098,19 +3126,27 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || await realpath(selectedDirectory) !== destinationDirectory) {
             throw failure('INVALID_INPUT')
           }
-          await rm(temporaryPath, { force: true })
-          temporaryPath = undefined
-          linkedDestination = undefined
+          saved = true
           return { saved: true }
         } finally {
           await verified.handle.close().catch(() => undefined)
-          if (linkedDestination) {
-            const current = await lstat(linkedDestination.path).catch(() => undefined)
-            if (current && sameFileIdentity(linkedDestination.metadata, current)) {
-              await rm(linkedDestination.path, { force: true }).catch(() => undefined)
+          if (destinationHandle) {
+            if (!saved) await destinationHandle.truncate(0).catch(() => undefined)
+            const finalMetadata = await destinationHandle.stat().catch(() => undefined)
+            await destinationHandle.close().catch(() => undefined)
+            if (!saved
+              && openedDestination
+              && finalMetadata
+              && openedDestination.metadata.dev === finalMetadata.dev
+              && openedDestination.metadata.ino === finalMetadata.ino) {
+              const current = await lstat(openedDestination.path).catch(() => undefined)
+              if (current
+                && current.dev === finalMetadata.dev
+                && current.ino === finalMetadata.ino) {
+                await rm(openedDestination.path, { force: true }).catch(() => undefined)
+              }
             }
           }
-          if (temporaryPath) await rm(temporaryPath, { force: true }).catch(() => undefined)
         }
       },
       reveal: async ({ artifactId }) => {
@@ -3141,6 +3177,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             session.user.id,
             database.conversionArtifacts,
             artifact,
+            false,
           )
           const currentJob = database.conversionJobs.getOwned(job.id, session.user.id)
           if (currentJob) emitConversionJob(lifecycle, currentJob)

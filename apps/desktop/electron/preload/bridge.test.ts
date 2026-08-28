@@ -20,6 +20,12 @@ function harness(ports: Partial<DesktopBridgePorts> = {}) {
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
 describe('preload desktop bridge', () => {
   it('maps the fixed CloudBase authentication methods', async () => {
     const app = harness()
@@ -325,7 +331,8 @@ describe('preload desktop bridge', () => {
     unsubscribe()
     unsubscribe()
     expect(app.ipcRenderer.removeListener).toHaveBeenCalledWith(ipcChannels.conversionEvent, wrapped)
-    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith('conversion:unsubscribe', undefined)
+    await vi.waitFor(() => expect(app.ipcRenderer.invoke)
+      .toHaveBeenCalledWith('conversion:unsubscribe', undefined))
   })
 
   it('installs the local conversion listener before Main can replay a terminal transition', () => {
@@ -351,6 +358,70 @@ describe('preload desktop bridge', () => {
 
     expect(listener).toHaveBeenCalledWith(terminal)
     unsubscribe()
+  })
+
+  it('shares one serialized Main conversion subscription across local listeners', async () => {
+    const app = harness()
+    const first = vi.fn()
+    const second = vi.fn()
+
+    const unsubscribeFirst = app.api.conversion.onEvent(first)
+    const unsubscribeSecond = app.api.conversion.onEvent(second)
+
+    await vi.waitFor(() => expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionSubscribe,
+    )).toHaveLength(1))
+    expect(app.listeners.get(ipcChannels.conversionEvent)).toHaveLength(1)
+
+    unsubscribeFirst()
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionUnsubscribe,
+    )).toHaveLength(0)
+
+    const wrapped = [...app.listeners.get(ipcChannels.conversionEvent)!][0]!
+    wrapped({}, {
+      type: 'job_updated',
+      job: {
+        jobId: 'job_shared', executionId: 'execution_shared', targetFormat: 'png',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    })
+    expect(first).not.toHaveBeenCalled()
+    expect(second).toHaveBeenCalledOnce()
+
+    unsubscribeSecond()
+    await vi.waitFor(() => expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionUnsubscribe,
+    )).toHaveLength(1))
+    expect(app.listeners.get(ipcChannels.conversionEvent)).toHaveLength(0)
+  })
+
+  it('serializes immediate cleanup behind an in-flight conversion subscribe', async () => {
+    const app = harness()
+    const subscribe = deferred<void>()
+    let mainSubscribed = false
+    vi.mocked(app.ipcRenderer.invoke).mockImplementation(async (channel) => {
+      if (channel === ipcChannels.conversionSubscribe) {
+        await subscribe.promise
+        mainSubscribed = true
+      } else if (channel === ipcChannels.conversionUnsubscribe) {
+        mainSubscribed = false
+      }
+      return undefined
+    })
+
+    const unsubscribe = app.api.conversion.onEvent(vi.fn())
+    await vi.waitFor(() => expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionSubscribe,
+    )).toHaveLength(1))
+    unsubscribe()
+    subscribe.resolve()
+
+    await vi.waitFor(() => expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionUnsubscribe,
+    )).toHaveLength(1))
+    expect(mainSubscribed).toBe(false)
+    expect(app.listeners.get(ipcChannels.conversionEvent)).toHaveLength(0)
   })
 
   it('normalizes IPC errors without exposing resolved paths', async () => {

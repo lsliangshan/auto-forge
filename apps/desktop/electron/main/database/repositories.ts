@@ -861,6 +861,11 @@ export interface AppRepositories {
       expectedEpoch: number
       expectedStatuses: ConversionJobStatus[]
     }): boolean
+    interruptCompletedForArtifactRecovery(input: {
+      jobId: string
+      ownerUserId: string
+      expectedEpoch: number
+    }): boolean
     interruptInFlight(ownerUserId: string): number
   }
   conversionArtifacts: {
@@ -2961,6 +2966,25 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           expectedEpoch: input.expectedEpoch,
           updatedAt: now(),
           ...expectedParameters,
+        }).changes === 1)
+      },
+      interruptCompletedForArtifactRecovery(input) {
+        const interruptedAt = now()
+        return transaction(database, () => database.prepare(`
+          UPDATE conversion_jobs
+          SET status = 'interrupted',
+              error_code = 'CONVERSION_INTERRUPTED',
+              updated_at = @interruptedAt,
+              ended_at = @interruptedAt
+          WHERE id = @jobId
+            AND owner_user_id = @ownerUserId
+            AND epoch = @expectedEpoch
+            AND status = 'completed'
+        `).run({
+          jobId: input.jobId,
+          ownerUserId: input.ownerUserId,
+          expectedEpoch: input.expectedEpoch,
+          interruptedAt,
         }).changes === 1)
       },
       interruptInFlight(ownerUserId) {

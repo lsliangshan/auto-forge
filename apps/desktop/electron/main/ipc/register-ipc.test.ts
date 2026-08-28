@@ -301,6 +301,45 @@ describe('registerDesktopIpc', () => {
     expect(app.sent).toContainEqual({ channel: ipcChannels.conversionEvent, payload: event })
   })
 
+  it('restores and replays the prior conversion subscription after failed identity changes', async () => {
+    const replay = {
+      type: 'job_updated', job: {
+        jobId: 'job_restored', executionId: 'execution_restored', targetFormat: 'pdf',
+        status: 'interrupted', epoch: 0, progress: 50,
+        errorCode: 'CONVERSION_INTERRUPTED', artifacts: [],
+      },
+    } satisfies import('@autoforge/shared').ConversionJobEvent
+    const unsubscribes = [vi.fn(), vi.fn(), vi.fn()]
+    let subscription = 0
+    const app = harness(
+      'http://127.0.0.1:5173/chat',
+      { kind: 'development', origin: 'http://127.0.0.1:5173' },
+      (dependencies) => {
+        vi.mocked(dependencies.conversion.onEvent).mockImplementation((listener) => {
+          if (subscription > 0) listener(replay as never)
+          return unsubscribes[subscription++]!
+        })
+        vi.mocked(dependencies.auth.loginWithPassword)
+          .mockRejectedValue(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
+        vi.mocked(dependencies.auth.logout)
+          .mockRejectedValue(toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }))
+      },
+    )
+
+    await app.invoke(ipcChannels.conversionSubscribe)
+    await expect(app.invoke(ipcChannels.authLoginWithPassword, {
+      account: 'Alice_1', password: 'password',
+    })).rejects.toMatchObject({ code: 'AUTH_INVALID_CREDENTIALS' })
+    expect(unsubscribes[0]).toHaveBeenCalledOnce()
+    expect(app.dependencies.conversion.onEvent).toHaveBeenCalledTimes(2)
+    expect(app.sent).toContainEqual({ channel: ipcChannels.conversionEvent, payload: replay })
+
+    await expect(app.invoke(ipcChannels.authLogout))
+      .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+    expect(unsubscribes[1]).toHaveBeenCalledOnce()
+    expect(app.dependencies.conversion.onEvent).toHaveBeenCalledTimes(3)
+  })
+
   it('closes the list-then-subscribe gap by replaying only after authenticated subscribe', async () => {
     const terminal = {
       type: 'job_updated', job: {

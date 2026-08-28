@@ -53,34 +53,88 @@ function subscribe<T>(
   }
 }
 
-function subscribeAfterHandshake<T>(
+function createHandshakeSubscription<T>(
   ipcRenderer: IpcRendererPort,
   channel: string,
   subscribeChannel: string,
   unsubscribeChannel: string,
   parse: (payload: unknown) => { success: boolean; data?: T },
-  listener: (event: T) => void,
-): () => void {
+): (listener: (event: T) => void) => () => void {
+  const listeners = new Set<(event: T) => void>()
   const wrapped: RendererListener = (_event, payload) => {
     const result = parse(payload)
-    if (result.success) listener(result.data as T)
+    if (!result.success) return
+    for (const listener of listeners) listener(result.data as T)
   }
-  let subscribed = true
-  ipcRenderer.on(channel, wrapped)
-  void invoke<void>(ipcRenderer, subscribeChannel).catch(() => {
-    if (!subscribed) return
-    subscribed = false
-    ipcRenderer.removeListener(channel, wrapped)
-  })
-  return () => {
-    if (!subscribed) return
-    subscribed = false
-    ipcRenderer.removeListener(channel, wrapped)
-    void invoke<void>(ipcRenderer, unsubscribeChannel).catch(() => undefined)
+  let mainSubscribed = false
+  let generation = 0
+  let synchronization: Promise<void> | undefined
+  const startSynchronization = () => {
+    if (synchronization) return
+    let completedGeneration = -1
+    synchronization = (async () => {
+      while (true) {
+        const observedGeneration = generation
+        const wantsSubscription = listeners.size > 0
+        if (wantsSubscription !== mainSubscribed) {
+          if (wantsSubscription) {
+            try {
+              await invoke<void>(ipcRenderer, subscribeChannel)
+              mainSubscribed = true
+            } catch {
+              mainSubscribed = false
+            }
+          } else {
+            try {
+              await invoke<void>(ipcRenderer, unsubscribeChannel)
+            } catch {
+              // Main may already have detached during logout or window cleanup.
+            }
+            mainSubscribed = false
+          }
+        }
+        if (observedGeneration === generation) {
+          completedGeneration = observedGeneration
+          return
+        }
+      }
+    })().catch(() => { completedGeneration = generation }).finally(() => {
+      synchronization = undefined
+      if (completedGeneration !== generation) startSynchronization()
+    })
+  }
+  const synchronize = () => {
+    generation += 1
+    startSynchronization()
+  }
+  return (listener) => {
+    const registered = (event: T) => { listener(event) }
+    const installLocalListener = listeners.size === 0
+    listeners.add(registered)
+    if (installLocalListener) {
+      ipcRenderer.on(channel, wrapped)
+      synchronize()
+    }
+    let subscribed = true
+    return () => {
+      if (!subscribed) return
+      subscribed = false
+      listeners.delete(registered)
+      if (listeners.size !== 0) return
+      ipcRenderer.removeListener(channel, wrapped)
+      synchronize()
+    }
   }
 }
 
 export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBridgePorts): DesktopAPI {
+  const subscribeToConversionEvents = createHandshakeSubscription(
+    ipcRenderer,
+    ipcChannels.conversionEvent,
+    ipcChannels.conversionSubscribe,
+    ipcChannels.conversionUnsubscribe,
+    (payload) => conversionJobEventSchema.safeParse(payload),
+  )
   return {
     auth: {
       getSession: () => invoke(ipcRenderer, ipcChannels.authGetSession),
@@ -166,14 +220,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       saveCopy: (input) => invoke(ipcRenderer, ipcChannels.conversionSaveCopy, input),
       reveal: (input) => invoke(ipcRenderer, ipcChannels.conversionReveal, input),
       deleteArtifact: (input) => invoke(ipcRenderer, ipcChannels.conversionDeleteArtifact, input),
-      onEvent: (listener) => subscribeAfterHandshake(
-        ipcRenderer,
-        ipcChannels.conversionEvent,
-        ipcChannels.conversionSubscribe,
-        ipcChannels.conversionUnsubscribe,
-        (payload) => conversionJobEventSchema.safeParse(payload),
-        listener,
-      ),
+      onEvent: subscribeToConversionEvents,
     },
     permissions: {
       listGrants: () => invoke(ipcRenderer, ipcChannels.permissionsListGrants),

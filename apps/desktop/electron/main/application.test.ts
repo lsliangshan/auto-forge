@@ -2,6 +2,7 @@ import {
   access,
   copyFile,
   link,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -13,7 +14,7 @@ import {
 } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -94,18 +95,40 @@ import {
 import { createWorkflowSourceSelectorVault } from './workflows/workflow-source-selector.js'
 
 const directories: string[] = []
-const { recoveryProbe, renameProbe } = vi.hoisted(() => ({
+const { lstatProbe, openProbe, recoveryProbe, renameProbe, rmProbe } = vi.hoisted(() => ({
+  lstatProbe: vi.fn<(path: string) => void | Promise<void>>(),
+  openProbe: vi.fn<(path: string, flags: string | number) => void | Promise<void>>(),
   recoveryProbe: vi.fn(),
   renameProbe: vi.fn<(from: string, to: string) => void | Promise<void>>(),
+  rmProbe: vi.fn<(path: string) => void | Promise<void>>(),
 }))
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>()
   return {
     ...actual,
+    lstat: async (path: string) => {
+      try {
+        const metadata = await actual.lstat(path)
+        await lstatProbe(path)
+        return metadata
+      } catch (error) {
+        await lstatProbe(path)
+        throw error
+      }
+    },
+    open: async (path: string, flags: string | number, mode?: number) => {
+      const handle = await actual.open(path, flags, mode)
+      await openProbe(path, flags)
+      return handle
+    },
     rename: async (from: string, to: string) => {
       await renameProbe(from, to)
       return actual.rename(from, to)
+    },
+    rm: async (path: string, options?: Parameters<typeof actual.rm>[1]) => {
+      await rmProbe(path)
+      return actual.rm(path, options)
     },
   }
 })
@@ -923,7 +946,10 @@ afterEach(async () => {
 beforeEach(() => {
   networkProxy = createNetworkProxy()
   recoveryProbe.mockClear()
+  lstatProbe.mockReset()
+  openProbe.mockReset()
   renameProbe.mockReset()
+  rmProbe.mockReset()
 })
 
 describe('createApplicationRuntime', () => {
@@ -8904,6 +8930,47 @@ describe('createApplicationRuntime', () => {
     }
   })
 
+  it('truncates its retained save-copy inode when the selected directory swaps after final-leaf open', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-save-open-race-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversionsaveopenrace'
+    const bytes = Buffer.from('verified retained-handle conversion output')
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_save_open_race', jobId: 'job_save_open_race',
+      status: 'completed', artifact: { id: 'artifact_save_open_race', bytes },
+    })
+    const selectedParent = join(root, 'selected-parent')
+    const movedParent = join(root, 'selected-parent-original')
+    const retarget = join(root, 'retarget')
+    const destination = join(selectedParent, 'saved.bin')
+    await mkdir(selectedParent)
+    await mkdir(retarget)
+    let swapped = false
+    openProbe.mockImplementation(async (path) => {
+      if (basename(path) !== 'saved.bin' || swapped) return
+      swapped = true
+      await rename(selectedParent, movedParent)
+      await symlink(retarget, selectedParent)
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaSavePath: async () => destination,
+    }))
+    await authenticate(runtime, 'ConversionSaveOpenRace', false)
+    try {
+      await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_save_open_race' }))
+        .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+      expect(swapped).toBe(true)
+      await expect(readFile(join(movedParent, 'saved.bin'))).resolves.toEqual(Buffer.alloc(0))
+      await expect(access(join(retarget, 'saved.bin'))).rejects.toMatchObject({ code: 'ENOENT' })
+      expect((await readdir(movedParent)).filter((name) => name.includes('autoforge-conversion.partial')))
+        .toEqual([])
+      expect((await readdir(retarget)).filter((name) => name.includes('autoforge-conversion.partial')))
+        .toEqual([])
+    } finally {
+      await runtime.close()
+    }
+  })
+
   it('rejects linked artifacts and preserves quarantine evidence across a replacement race', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-delete-races-'))
     directories.push(root)
@@ -9001,7 +9068,65 @@ describe('createApplicationRuntime', () => {
     }
   })
 
-  it('preserves an ambiguous recovery conflict and quarantines ready outputs of non-completed jobs', async () => {
+  it('keeps both identities when a quarantine leaf swaps during post-mark revalidation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-delete-boundary-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversiondeleteboundary'
+    const bytes = Buffer.from('quarantine is durable deletion evidence')
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_delete_boundary', jobId: 'job_delete_boundary',
+      status: 'completed', artifact: { id: 'artifact_delete_boundary', bytes },
+    })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const source = join(conversionRoot, 'results', 'artifact_delete_boundary.png')
+    const sourceMetadata = await lstat(source)
+    const replacement = Buffer.from('replacement introduced after quarantine revalidation opened')
+    let sourceChecks = 0
+    let preservedOriginal: string | undefined
+    lstatProbe.mockImplementation(async (path) => {
+      if (basename(path) !== 'artifact_delete_boundary.png') return
+      sourceChecks += 1
+      if (sourceChecks !== 4) return
+      const trash = join(conversionRoot, '.trash')
+      const candidate = (await readdir(trash))
+        .find((name) => name.startsWith('artifact_delete_boundary.quarantine-'))
+      if (!candidate) throw new Error('expected verified quarantine candidate')
+      const quarantined = join(trash, candidate)
+      preservedOriginal = join(trash, 'artifact_delete_boundary.preserved-original')
+      await rename(quarantined, preservedOriginal)
+      await writeFile(quarantined, replacement)
+    })
+    rmProbe.mockImplementation(async (path) => {
+      if (path.includes('artifact_delete_boundary.quarantine-')) {
+        throw new Error('delete request attempted a post-verification path removal')
+      }
+    })
+    const runtime = createApplicationRuntime(options(root))
+    await authenticate(runtime, 'ConversionDeleteBoundary', false)
+    try {
+      await expect(runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_delete_boundary' }))
+        .resolves.toBeUndefined()
+      const candidates = (await readdir(join(conversionRoot, '.trash')))
+        .filter((name) => name.startsWith('artifact_delete_boundary.quarantine-'))
+      expect(candidates).toHaveLength(1)
+      const quarantined = join(conversionRoot, '.trash', candidates[0]!)
+      expect(sourceChecks).toBe(4)
+      await expect(readFile(quarantined)).resolves.toEqual(replacement)
+      expect(preservedOriginal).toBeTypeOf('string')
+      const quarantinedMetadata = await lstat(preservedOriginal!)
+      expect({ dev: quarantinedMetadata.dev, ino: quarantinedMetadata.ino, nlink: quarantinedMetadata.nlink })
+        .toEqual({ dev: sourceMetadata.dev, ino: sourceMetadata.ino, nlink: 1 })
+      await expect(readFile(preservedOriginal!)).resolves.toEqual(bytes)
+      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      expect(database.conversionArtifacts.getOwned('artifact_delete_boundary', ownerUserId))
+        .toMatchObject({ status: 'deleted' })
+      database.close()
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('preserves recovery candidates and a conflict introduced after validation without path restoration', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-recovery-integrity-'))
     directories.push(root)
     const ownerUserId = 'test_user_recoveryintegrity'
@@ -9036,17 +9161,32 @@ describe('createApplicationRuntime', () => {
     )
     await rename(uniquePath, uniqueCandidate)
 
+    const postCheckConflict = Buffer.from('destination appeared after candidate validation')
+    let injectedPostCheckConflict = false
+    openProbe.mockImplementation(async (path) => {
+      if (basename(path) !== basename(uniqueCandidate) || injectedPostCheckConflict) return
+      injectedPostCheckConflict = true
+      await writeFile(uniquePath, postCheckConflict)
+    })
+
     const runtime = createApplicationRuntime(options(root))
     await authenticate(runtime, 'RecoveryIntegrity', false)
     try {
       await expect(readFile(candidate)).resolves.toEqual(valid)
       await expect(readFile(conflictPath)).resolves.toEqual(corrupt)
-      await expect(readFile(uniquePath)).resolves.toEqual(valid)
-      await expect(access(uniqueCandidate)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(injectedPostCheckConflict).toBe(true)
+      await expect(readFile(uniquePath)).resolves.toEqual(postCheckConflict)
+      await expect(readFile(uniqueCandidate)).resolves.toEqual(valid)
       await expect(runtime.services.conversion.reveal({ artifactId: 'artifact_recovery_conflict' }))
-        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+        .rejects.toMatchObject({ code: 'NOT_FOUND' })
+      await expect(runtime.services.conversion.reveal({ artifactId: 'artifact_unique_recovery' }))
+        .rejects.toMatchObject({ code: 'NOT_FOUND' })
 
       const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      expect(database.conversionJobs.getOwned('job_recovery_conflict', ownerUserId))
+        .toMatchObject({ status: 'interrupted', errorCode: 'CONVERSION_INTERRUPTED' })
+      expect(database.conversionJobs.getOwned('job_unique_recovery', ownerUserId))
+        .toMatchObject({ status: 'interrupted', errorCode: 'CONVERSION_INTERRUPTED' })
       expect(database.conversionArtifacts.getOwned('artifact_orphan_output', ownerUserId))
         .toMatchObject({ status: 'deleted' })
       database.close()

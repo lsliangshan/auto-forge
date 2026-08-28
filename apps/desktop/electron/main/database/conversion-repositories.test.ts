@@ -198,6 +198,35 @@ describe('conversion repositories', () => {
     database.close()
   })
 
+  it('interrupts a completed job only through the artifact-recovery compare-and-set', () => {
+    const { database } = openTestDatabase()
+    createExecution(database, 'execution_artifact_recovery')
+    createJob(database, 'job_artifact_recovery', 'execution_artifact_recovery', 1)
+    const claimed = database.conversionJobs.claimNext('alice')!
+    expect(database.conversionJobs.transition({
+      jobId: claimed.id, ownerUserId: 'alice', expectedEpoch: 0,
+      expectedStatuses: ['downloading_component'],
+      patch: { status: 'completed', progress: 100, endedAt: 10 },
+    })).toBe(true)
+
+    expect(database.conversionJobs.interruptCompletedForArtifactRecovery({
+      jobId: 'job_artifact_recovery', ownerUserId: 'bob', expectedEpoch: 0,
+    })).toBe(false)
+    expect(database.conversionJobs.interruptCompletedForArtifactRecovery({
+      jobId: 'job_artifact_recovery', ownerUserId: 'alice', expectedEpoch: 1,
+    })).toBe(false)
+    expect(database.conversionJobs.interruptCompletedForArtifactRecovery({
+      jobId: 'job_artifact_recovery', ownerUserId: 'alice', expectedEpoch: 0,
+    })).toBe(true)
+    expect(database.conversionJobs.getOwned('job_artifact_recovery', 'alice')).toMatchObject({
+      status: 'interrupted', errorCode: 'CONVERSION_INTERRUPTED',
+    })
+    expect(database.conversionJobs.interruptCompletedForArtifactRecovery({
+      jobId: 'job_artifact_recovery', ownerUserId: 'alice', expectedEpoch: 0,
+    })).toBe(false)
+    database.close()
+  })
+
   it('applies the conversion migration with the owner queue index', () => {
     const { database, path } = openTestDatabase()
     expect(database.schemaVersion()).toBe(16)

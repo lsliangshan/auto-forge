@@ -167,8 +167,14 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     webContents.on?.('destroyed', detachConversionEvents)
   }
   const transitionConversionIdentity = async <Result>(operation: () => Promise<Result>): Promise<Result> => {
+    const previousWebContents = subscribedWebContents
     detachConversionEvents()
-    return operation()
+    try {
+      return await operation()
+    } catch (error) {
+      if (previousWebContents) attachConversionEvents(previousWebContents)
+      throw error
+    }
   }
   const register = <Channel extends RequestChannel>(
     channel: Channel,
@@ -208,12 +214,14 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     return transitionConversionIdentity(() => options.services.auth.loginWithPassword(input))
   }, { anonymous: true })
   register(ipcChannels.authLogout, async (input) => {
+    const previousWebContents = subscribedWebContents
     try {
       const result = await options.services.auth.logout(input)
       if (result.status === 'logged_out') detachConversionEvents()
       return result
     } catch (error) {
       detachConversionEvents()
+      if (previousWebContents) attachConversionEvents(previousWebContents)
       throw error
     }
   }, { anonymous: true })
