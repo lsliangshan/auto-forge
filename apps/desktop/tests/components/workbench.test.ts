@@ -28,6 +28,11 @@ const authSession: AuthSession = {
   authenticatedAt: '2026-08-17T00:00:00.000Z',
 }
 
+const bobSession: AuthSession = {
+  user: { id: 'user_2', account: 'Bob' },
+  authenticatedAt: '2026-08-17T00:02:00.000Z',
+}
+
 const acceptedCloudConsent = {
   purpose: 'cloud_sync' as const,
   state: 'accepted' as const,
@@ -394,6 +399,32 @@ describe('workbench', () => {
     expect(settings.cloudDataError).toBe('')
   })
 
+  it('drops Alice revoke confirmation while Bob password login IPC is pending', async () => {
+    const api = createApi()
+    const confirmation = deferred<unknown>()
+    const bobLogin = deferred<AuthSession>()
+    vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue(acceptedCloudConsent)
+    vi.mocked(api.auth.loginWithPassword).mockReturnValue(bobLogin.promise)
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const auth = useAuthStore(pinia)
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="revoke-cloud-sync-consent"]').exists())
+      .toBe(true))
+    success.mockClear()
+
+    await wrapper.get('[data-testid="revoke-cloud-sync-consent"]').trigger('click')
+    await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
+    const loggingIn = auth.loginWithPassword({ account: 'Bob', password: 'password' })
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(api.settings.revokeCloudSyncConsent).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    bobLogin.resolve(bobSession)
+    await loggingIn
+  })
+
   it.each(['resolve', 'reject'] as const)(
     'drops a late revoke RPC %s after an account switch',
     async (settlement) => {
@@ -460,6 +491,38 @@ describe('workbench', () => {
     expect(api.settings.importLegacyData).not.toHaveBeenCalled()
     expect(success).not.toHaveBeenCalled()
     expect(settings.cloudDataError).toBe('')
+  })
+
+  it('drops Alice legacy confirmation across a rejected Bob login and pending Alice ABA login', async () => {
+    const api = createApi()
+    const confirmation = deferred<unknown>()
+    const aliceLogin = deferred<AuthSession>()
+    vi.mocked(api.settings.previewLegacyImport).mockResolvedValue({
+      ownedCount: 1, unownedCount: 0, requiresUnownedConfirmation: false,
+    })
+    vi.mocked(api.auth.loginWithPassword)
+      .mockRejectedValueOnce({ code: 'AUTH_INVALID_CREDENTIALS' })
+      .mockReturnValueOnce(aliceLogin.promise)
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+    const success = vi.spyOn(ElMessage, 'success')
+    const { wrapper, pinia } = await mountApp('/settings', api)
+    const auth = useAuthStore(pinia)
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="legacy-import-button"]')
+      .attributes('disabled')).toBeUndefined())
+    success.mockClear()
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await vi.waitFor(() => expect(ElMessageBox.confirm).toHaveBeenCalledOnce())
+    await auth.loginWithPassword({ account: 'Bob', password: 'password' })
+    const loggingBackIn = auth.loginWithPassword({ account: 'Alice', password: 'password' })
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.settings.importLegacyData).not.toHaveBeenCalled()
+    expect(success).not.toHaveBeenCalled()
+    aliceLogin.resolve(authSession)
+    await loggingBackIn
   })
 
   it('drops the second deferred legacy confirmation after Alice to Bob to Alice ABA', async () => {

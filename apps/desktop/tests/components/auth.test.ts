@@ -134,6 +134,71 @@ afterEach(() => {
 })
 
 describe('authentication store', () => {
+  it.each(['restore', 'password', 'otp', 'logout'] as const)(
+    'invalidates account work before the first %s identity IPC settles',
+    async (flow) => {
+      const api = createApi()
+      Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+      const auth = useAuthStore()
+      const settings = useSettingsStore()
+      auth.session = authSession
+      settings.bindAccountOwner(authSession.user.id)
+      const aliceGeneration = settings.captureAccountGeneration()
+      let operation: Promise<unknown>
+      let settle: () => void
+
+      if (flow === 'restore') {
+        const request = deferred<AuthSession | null>()
+        vi.mocked(api.auth.getSession).mockReturnValue(request.promise)
+        operation = auth.restore()
+        settle = () => request.resolve(authSession)
+      } else if (flow === 'password') {
+        const request = deferred<AuthSession>()
+        vi.mocked(api.auth.loginWithPassword).mockReturnValue(request.promise)
+        operation = auth.loginWithPassword({ account: 'Bob', password: 'password' })
+        settle = () => request.resolve(bobSession)
+      } else if (flow === 'otp') {
+        const request = deferred<AuthSession>()
+        vi.mocked(api.auth.verifyOtp).mockReturnValue(request.promise)
+        auth.challenge = { challengeId: 'challenge_bob', expiresIn: 300 }
+        operation = auth.verifyOtp('123456')
+        settle = () => request.resolve(bobSession)
+      } else {
+        const request = deferred<Awaited<ReturnType<DesktopAPI['auth']['logout']>>>()
+        vi.mocked(api.auth.logout).mockReturnValue(request.promise)
+        operation = auth.logout()
+        settle = () => request.resolve({ status: 'logged_out' })
+      }
+
+      expect(settings.isAccountGenerationCurrent(aliceGeneration)).toBe(false)
+      settle()
+      await operation
+    },
+  )
+
+  it('keeps an old token stale and reloads Alice authoritative consent after login rejects', async () => {
+    const api = createApi()
+    const rejectedLogin = deferred<AuthSession>()
+    vi.mocked(api.auth.loginWithPassword).mockReturnValue(rejectedLogin.promise)
+    vi.mocked(api.settings.getCloudSyncConsentState).mockResolvedValue(revokedCloudConsent)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const settings = useSettingsStore()
+    auth.session = authSession
+    settings.bindAccountOwner(authSession.user.id)
+    settings.cloudSyncConsentState = acceptedCloudConsent
+    const aliceGeneration = settings.captureAccountGeneration()
+
+    const loggingIn = auth.loginWithPassword({ account: 'Bob', password: 'password' })
+    expect(settings.isAccountGenerationCurrent(aliceGeneration)).toBe(false)
+    rejectedLogin.reject(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
+    await expect(loggingIn).resolves.toBeUndefined()
+
+    expect(settings.isAccountGenerationCurrent(aliceGeneration)).toBe(false)
+    expect(settings.cloudSyncConsentState).toEqual(revokedCloudConsent)
+    expect(api.settings.getCloudSyncConsentState).toHaveBeenCalledOnce()
+  })
+
   it('does not retain or repopulate Alice cloud consent after switching to Bob', async () => {
     const api = createApi()
     const aliceLoad = deferred<PrivacyConsentState | null>()

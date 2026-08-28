@@ -123,14 +123,18 @@ export const useSettingsStore = defineStore('settings', {
       return this._cloudDataOwnerId !== undefined
         && token === this.captureAccountGeneration()
     },
-    bindAccountOwner(ownerId: string | undefined) {
-      const ownerChanged = ownerId !== this._cloudDataOwnerId
+    advanceAccountOperationGeneration() {
       const consentMutationPending = this._cloudConsentMutationPending
       this._accountGeneration += 1
       this._cloudDataReadVersion += 1
       this._cloudConsentMutationVersion += 1
       this._cloudConsentMutationPending = false
-      if (ownerChanged || consentMutationPending) this.saving = false
+      if (consentMutationPending) this.saving = false
+    },
+    bindAccountOwner(ownerId: string | undefined) {
+      const ownerChanged = ownerId !== this._cloudDataOwnerId
+      this.advanceAccountOperationGeneration()
+      if (ownerChanged) this.saving = false
       if (!ownerChanged) return
       this._cloudDataOwnerId = ownerId
       this._tokenUsageVersion += 1

@@ -56,6 +56,11 @@ function finishRestoring(store: { restoring: boolean }): void {
   store.restoring = count > 0
 }
 
+async function reloadCurrentAccountData(store: object, generation: number): Promise<void> {
+  if (generation !== sessionGeneration(store)) return
+  await useSettingsStore().loadCloudData()
+}
+
 function replaceSession(store: { session: AuthSession | null }, session: AuthSession | null): void {
   const previousUserId = store.session?.user.id
   const nextUserId = session?.user.id
@@ -91,6 +96,7 @@ export const useAuthStore = defineStore('auth', {
       if (pending) return pending
 
       const generation = nextSessionGeneration(this)
+      useSettingsStore().advanceAccountOperationGeneration()
       startRestoring(this)
       this.error = ''
       const operation = (async () => {
@@ -159,6 +165,7 @@ export const useAuthStore = defineStore('auth', {
 
       const generation = otpGeneration(this)
       const sessionOwner = nextSessionGeneration(this)
+      useSettingsStore().advanceAccountOperationGeneration()
       startSubmitting(this)
       this.error = ''
       try {
@@ -194,7 +201,10 @@ export const useAuthStore = defineStore('auth', {
         return session
       } catch (error) {
         if (generation === otpGeneration(this) && sessionOwner === sessionGeneration(this)) {
-          this.error = displayError(error, '验证码验证失败')
+          await reloadCurrentAccountData(this, sessionOwner)
+          if (generation === otpGeneration(this) && sessionOwner === sessionGeneration(this)) {
+            this.error = displayError(error, '验证码验证失败')
+          }
         }
         return undefined
       } finally {
@@ -223,6 +233,7 @@ export const useAuthStore = defineStore('auth', {
       if (this.sendingOtp || this.submitting) return undefined
 
       const sessionOwner = nextSessionGeneration(this)
+      useSettingsStore().advanceAccountOperationGeneration()
       startSubmitting(this)
       this.error = ''
       try {
@@ -233,7 +244,10 @@ export const useAuthStore = defineStore('auth', {
         return session
       } catch (error) {
         if (sessionOwner === sessionGeneration(this)) {
-          this.error = displayError(error, '登录失败')
+          await reloadCurrentAccountData(this, sessionOwner)
+          if (sessionOwner === sessionGeneration(this)) {
+            this.error = displayError(error, '登录失败')
+          }
         }
         return undefined
       } finally {
@@ -241,6 +255,7 @@ export const useAuthStore = defineStore('auth', {
       }
     },
     async logout(discardPending = false): Promise<boolean> {
+      useSettingsStore().advanceAccountOperationGeneration()
       startSubmitting(this)
       this.error = ''
       await this.cancelOtp()
@@ -250,10 +265,12 @@ export const useAuthStore = defineStore('auth', {
           discardPending ? { discardPending: true } : undefined,
         )
         if (result.status === 'pending_sync') {
+          await reloadCurrentAccountData(this, sessionOwner)
           this.pendingLogoutCount = result.pendingCount
           return false
         }
         if (result.status === 'sync_timeout') {
+          await reloadCurrentAccountData(this, sessionOwner)
           this.error = '同步仍在进行，请稍后重试退出登录'
           return false
         }
@@ -265,7 +282,10 @@ export const useAuthStore = defineStore('auth', {
         return true
       } catch (error) {
         if (sessionOwner === sessionGeneration(this)) {
-          this.error = displayError(error, '退出登录失败')
+          await reloadCurrentAccountData(this, sessionOwner)
+          if (sessionOwner === sessionGeneration(this)) {
+            this.error = displayError(error, '退出登录失败')
+          }
         }
         return false
       } finally {
