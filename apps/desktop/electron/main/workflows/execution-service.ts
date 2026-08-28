@@ -488,15 +488,6 @@ function terminalConversionError(
   return 'CONVERSION_INTERRUPTED'
 }
 
-function safeOutputDisplayName(value: string): boolean {
-  const normalized = value.trim()
-  return normalized.length > 0
-    && normalized.length <= 1_024
-    && normalized !== '.'
-    && normalized !== '..'
-    && !/[/\\\0]/.test(normalized)
-}
-
 function capabilityContext(
   executionId: string,
   input: ExecutionStartInput,
@@ -1330,17 +1321,16 @@ export class ExecutionService {
         error: toSafeAppError({ code }),
       }
     }
-    const outputs = terminal.outputs.map((output) => {
+    const outputs = terminal.outputs.map((output, outputIndex) => {
       const format = conversionTargetFormatSchema.safeParse(output.detectedFormat)
-      if (!safeOutputDisplayName(output.displayName)
-        || !format.success
+      if (!format.success
         || format.data !== targetFormat
         || !Number.isSafeInteger(output.byteSize)
         || output.byteSize < 0) {
         throw failure('INTERNAL_ERROR')
       }
       return {
-        name: output.displayName,
+        name: `converted-${attachmentIndex + 1}-${outputIndex + 1}.${format.data}`,
         format: format.data,
         byteSize: output.byteSize,
       }

@@ -1067,7 +1067,7 @@ describe('ExecutionService', () => {
       result: {
         accepted: true,
         status: 'completed',
-        outputs: [{ name: 'result.png', format: 'png', byteSize: 64 }],
+        outputs: [{ name: 'converted-1-1.png', format: 'png', byteSize: 64 }],
       },
     })
     const serialized = JSON.stringify(worker.requests)
@@ -1314,15 +1314,26 @@ describe('ExecutionService', () => {
     await harness.service.cancel(execution.id)
   })
 
-  it('rejects an output record whose display name contains a managed path', async () => {
+  it('generates provider-safe output names without reusing untrusted port names', async () => {
+    const untrustedNames = [
+      'job_1',
+      'result-source_asset_1-user_user_1.png',
+      `fingerprint-${'f'.repeat(64)}-sha-${'a'.repeat(64)}.png`,
+      'line\nbreak\tname.png',
+      'https://attacker.example/job_1.png?owner=user_1',
+      '/Users/alice/conversion/results/artifact_secret.png',
+      'C:\\Users\\alice\\conversion\\artifact_secret.png',
+      '\\Users\\alice\\conversion\\artifact_secret.png',
+      '\\\\server\\share\\artifact_secret.png',
+    ]
     const conversion = createFileConversionPort({
       terminal: {
         status: 'completed',
-        outputs: [{
-          displayName: '/Users/alice/conversion/results/artifact_secret.png',
+        outputs: untrustedNames.map((displayName, index) => ({
+          displayName,
           detectedFormat: 'png',
-          byteSize: 64,
-        }],
+          byteSize: index + 1,
+        })),
       },
     })
     const harness = createHarness({
@@ -1342,16 +1353,34 @@ describe('ExecutionService', () => {
     const worker = harness.workerFactory.workers.get(execution.id)!
     worker.respond({ type: 'ready', executionId: execution.id })
     worker.respond({
-      type: 'capability_request', requestId: 'convert_path_name',
+      type: 'capability_request', requestId: 'convert_untrusted_names',
       request: conversionRequest({ background: false }),
     })
     await vi.waitFor(() => expect(worker.requests).toContainEqual({
-      type: 'capability_error',
-      requestId: 'convert_path_name',
-      error: { code: 'INTERNAL_ERROR', message: 'Unexpected application error' },
+      type: 'capability_result',
+      requestId: 'convert_untrusted_names',
+      result: {
+        accepted: true,
+        status: 'completed',
+        outputs: [
+          { name: 'converted-1-1.png', format: 'png', byteSize: 1 },
+          { name: 'converted-1-2.png', format: 'png', byteSize: 2 },
+          { name: 'converted-1-3.png', format: 'png', byteSize: 3 },
+          { name: 'converted-1-4.png', format: 'png', byteSize: 4 },
+          { name: 'converted-1-5.png', format: 'png', byteSize: 5 },
+          { name: 'converted-1-6.png', format: 'png', byteSize: 6 },
+          { name: 'converted-1-7.png', format: 'png', byteSize: 7 },
+          { name: 'converted-1-8.png', format: 'png', byteSize: 8 },
+          { name: 'converted-1-9.png', format: 'png', byteSize: 9 },
+        ],
+      },
     }))
 
-    expect(JSON.stringify(worker.requests)).not.toContain('/Users/alice')
+    const serialized = JSON.stringify(worker.requests)
+    for (const untrustedName of untrustedNames) {
+      expect(serialized).not.toContain(JSON.stringify(untrustedName).slice(1, -1))
+    }
+    expect(serialized).not.toMatch(/job_1|asset_1|user_1|artifact_secret|fingerprint|sha|https?:|Users|server|share/)
     await harness.service.cancel(execution.id)
   })
 
