@@ -225,16 +225,17 @@ function storedConsent(
   database: SqliteDatabase,
   purpose: PrivacyConsentPurpose,
 ): PrivacyConsent | undefined {
+  const state = storedConsentState(database, purpose)
   const unacknowledgedAcceptance = database.prepare(`
     SELECT 1
     FROM outbox_mutations
     WHERE kind = 'privacy.consent'
       AND json_extract(payload_json, '$.purpose') = @purpose
       AND state IN ('pending', 'syncing', 'failed')
+      AND base_revision >= @currentRevision
     LIMIT 1
-  `).get({ purpose })
+  `).get({ purpose, currentRevision: state?.revision ?? 0 })
   if (unacknowledgedAcceptance !== undefined) return undefined
-  const state = storedConsentState(database, purpose)
   if (state?.state !== 'accepted') return undefined
   return privacyConsentSchema.parse({
     purpose: state.purpose,

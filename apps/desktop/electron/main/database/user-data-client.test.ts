@@ -2283,6 +2283,61 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
+  it('authorizes a newer authoritative regrant after an older local acceptance failed', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const accepted: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      id: 'consent_initial_accept', kind: 'privacy.consent',
+      entityId: 'cloud-sync-2026-08', baseRevision: 0,
+      occurredAt: '2026-08-28T00:00:00.000Z', payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    const revoked: Extract<SyncMutation, { kind: 'privacy.consent.revoke' }> = {
+      id: 'consent_initial_revoke', kind: 'privacy.consent.revoke',
+      entityId: 'cloud_sync', baseRevision: 1,
+      occurredAt: '2026-08-28T01:00:00.000Z', payload: {
+        purpose: 'cloud_sync', revokedAt: '2026-08-28T01:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_consent_revoked',
+      mutations: [pulledMutation(accepted, 1), pulledMutation(revoked, 2)],
+    }, 2)
+
+    const failedAcceptance: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      ...accepted, id: 'consent_failed_old_accept', baseRevision: 2,
+      occurredAt: '2026-08-28T02:00:00.000Z',
+      payload: { ...accepted.payload, consentedAt: '2026-08-28T02:00:00.000Z' },
+    }
+    store.outbox.recordWithConsent(failedAcceptance)
+    store.outbox.markSyncing([failedAcceptance.id])
+    store.outbox.markFailed(failedAcceptance.id, 'SYNC_CONFLICT')
+    expect(store.account.getConsent('cloud_sync')).toBeUndefined()
+
+    const authoritativeRegrant: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      ...accepted, id: 'consent_authoritative_regrant', baseRevision: 2,
+      occurredAt: '2026-08-28T03:00:00.000Z',
+      payload: { ...accepted.payload, consentedAt: '2026-08-28T03:00:00.000Z' },
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_consent_regranted',
+      mutations: [pulledMutation(authoritativeRegrant, 3)],
+    }, 3)
+
+    expect(store.outbox.find(failedAcceptance.id)).toMatchObject({
+      state: 'failed', baseRevision: 2,
+    })
+    expect(store.account.getConsentState('cloud_sync')).toEqual({
+      ...authoritativeRegrant.payload, state: 'accepted', revision: 3,
+    })
+    expect(store.account.getConsent('cloud_sync')).toEqual(authoritativeRegrant.payload)
+    manager.close()
+  })
+
   it('assigns consecutive optimistic preference revisions and preserves the newest value across receipts', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open('cloud-alice')
