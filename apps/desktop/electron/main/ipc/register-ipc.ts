@@ -137,11 +137,14 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     }
     unsubscribe?.()
   }
-  const attachConversionEvents = () => {
-    if (disposed || disposeConversionEvents) return
+  const attachConversionEvents = (webContents: WebContentsPort) => {
+    if (disposed) return
     const window = options.getMainWindow()
-    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return
-    const webContents = window.webContents
+    if (!window
+      || window.isDestroyed()
+      || window.webContents !== webContents
+      || webContents.isDestroyed()) return
+    detachConversionEvents()
     const unsubscribe = options.services.conversion.onEvent((event) => {
       if (disposed
         || options.getMainWindow()?.webContents !== webContents
@@ -165,18 +168,14 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   }
   const transitionConversionIdentity = async <Result>(operation: () => Promise<Result>): Promise<Result> => {
     detachConversionEvents()
-    try {
-      const result = await operation()
-      attachConversionEvents()
-      return result
-    } catch (error) {
-      attachConversionEvents()
-      throw error
-    }
+    return operation()
   }
   const register = <Channel extends RequestChannel>(
     channel: Channel,
-    operation: (input: z.infer<(typeof ipcRequestSchemas)[Channel]>) => unknown | Promise<unknown>,
+    operation: (
+      input: z.infer<(typeof ipcRequestSchemas)[Channel]>,
+      event: IpcInvokeEvent,
+    ) => unknown | Promise<unknown>,
     registration: { anonymous?: boolean } = {},
   ) => {
     options.ipcMain.handle(channel, (event, input) => invokeValidated(
@@ -186,7 +185,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
       options,
       (async (value: never) => {
         if (!registration.anonymous) await options.services.auth.requireSession()
-        return operation(value)
+        return operation(value, event)
       }) as (value: never) => unknown | Promise<unknown>,
     ))
     registered.push(channel)
@@ -194,17 +193,11 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
 
   register(ipcChannels.authGetSession, async () => {
     const session = await options.services.auth.getSession()
-    if (session) {
-      detachConversionEvents()
-      attachConversionEvents()
-    }
-    else detachConversionEvents()
+    if (!session) detachConversionEvents()
     return session
   }, { anonymous: true })
   register(ipcChannels.authRefreshAuthorization, async () => {
-    const session = await options.services.auth.refreshAuthorization()
-    attachConversionEvents()
-    return session
+    return options.services.auth.refreshAuthorization()
   })
   register(ipcChannels.authSendOtp, (input) => options.services.auth.sendOtp(input), { anonymous: true })
   register(ipcChannels.authVerifyOtp, async (input) => {
@@ -221,7 +214,6 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
       return result
     } catch (error) {
       detachConversionEvents()
-      attachConversionEvents()
       throw error
     }
   }, { anonymous: true })
@@ -276,6 +268,12 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.conversionSaveCopy, (input) => options.services.conversion.saveCopy(input))
   register(ipcChannels.conversionReveal, (input) => options.services.conversion.reveal(input))
   register(ipcChannels.conversionDeleteArtifact, (input) => options.services.conversion.deleteArtifact(input))
+  register(ipcChannels.conversionSubscribe, (_input, event) => {
+    attachConversionEvents(event.sender)
+  })
+  register(ipcChannels.conversionUnsubscribe, () => {
+    detachConversionEvents()
+  })
   register(ipcChannels.permissionsListGrants, () => options.services.permissions.listGrants())
   register(ipcChannels.permissionsRevoke, (input) => options.services.permissions.revoke(input.grantId))
   register(ipcChannels.settingsGet, () => options.services.settings.get())
@@ -295,8 +293,6 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsClearBrowserData, () => options.services.settings.clearBrowserData())
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
-
-  attachConversionEvents()
 
   const dispose = () => {
     if (disposed) return

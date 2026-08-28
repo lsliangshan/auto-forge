@@ -232,6 +232,8 @@ describe('registerDesktopIpc', () => {
         })
       },
     )
+    expect(listener).toBeUndefined()
+    await app.invoke('conversion:subscribe')
     expect(listener).toBeTypeOf('function')
     const event = {
       type: 'job_updated', job: {
@@ -243,8 +245,12 @@ describe('registerDesktopIpc', () => {
     listener!({ ...event, managedPath: '/private/result.png' } as never)
     expect(app.sent).toEqual([{ channel: ipcChannels.conversionEvent, payload: event }])
 
-    await app.invoke(ipcChannels.authLogout)
+    await app.invoke('conversion:unsubscribe')
     expect(unsubscribe).toHaveBeenCalledOnce()
+
+    await app.invoke('conversion:subscribe')
+    await app.invoke(ipcChannels.authLogout)
+    expect(unsubscribe).toHaveBeenCalledTimes(2)
 
     const destroyUnsubscribe = vi.fn()
     const destroyed = harness(
@@ -254,11 +260,12 @@ describe('registerDesktopIpc', () => {
         vi.mocked(dependencies.conversion.onEvent).mockReturnValue(destroyUnsubscribe)
       },
     )
+    await destroyed.invoke('conversion:subscribe')
     destroyed.destroyWindow()
     expect(destroyUnsubscribe).toHaveBeenCalledOnce()
   })
 
-  it('rebinds conversion events after an authenticated identity transition', async () => {
+  it('requires a fresh authenticated subscription after an identity transition', async () => {
     const listeners: Array<(event: never) => void> = []
     const unsubscribes = [vi.fn(), vi.fn()]
     let subscription = 0
@@ -273,10 +280,14 @@ describe('registerDesktopIpc', () => {
       },
     )
 
+    await app.invoke('conversion:subscribe')
     await app.invoke(ipcChannels.authLoginWithPassword, {
       account: 'Alice_1', password: 'password',
     })
     expect(unsubscribes[0]).toHaveBeenCalledOnce()
+    expect(app.dependencies.conversion.onEvent).toHaveBeenCalledTimes(1)
+
+    await app.invoke('conversion:subscribe')
     expect(app.dependencies.conversion.onEvent).toHaveBeenCalledTimes(2)
 
     const event = {
@@ -288,6 +299,35 @@ describe('registerDesktopIpc', () => {
     }
     listeners[1]!(event as never)
     expect(app.sent).toContainEqual({ channel: ipcChannels.conversionEvent, payload: event })
+  })
+
+  it('closes the list-then-subscribe gap by replaying only after authenticated subscribe', async () => {
+    const terminal = {
+      type: 'job_updated', job: {
+        jobId: 'job_gap', executionId: 'execution_gap', targetFormat: 'pdf',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    } satisfies import('@autoforge/shared').ConversionJobEvent
+    const app = harness(
+      'http://127.0.0.1:5173/chat',
+      { kind: 'development', origin: 'http://127.0.0.1:5173' },
+      (dependencies) => {
+        vi.mocked(dependencies.conversion.listForExecution).mockResolvedValue([{
+          ...terminal.job,
+        }])
+        vi.mocked(dependencies.conversion.onEvent).mockImplementation((listener) => {
+          listener(terminal as never)
+          return () => undefined
+        })
+      },
+    )
+
+    await expect(app.invoke(ipcChannels.conversionListForExecution, { executionId: 'execution_gap' }))
+      .resolves.toEqual([terminal.job])
+    expect(app.sent).toEqual([])
+    await app.invoke('conversion:subscribe')
+    expect(app.sent).toEqual([{ channel: ipcChannels.conversionEvent, payload: terminal }])
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalled()
   })
 
   it('validates owner-free cloud account methods before invoking Main services', async () => {

@@ -76,8 +76,29 @@ describe('conversion repositories', () => {
     })
     expect(database.conversionArtifacts.getOwned(artifact.id, 'bob')).toBeNull()
     expect(database.conversionArtifacts.listForJob(job.id, 'bob')).toEqual([])
-    expect(database.conversionArtifacts.markDeleted(artifact.id, 'bob')).toBe(false)
+    expect(database.conversionArtifacts.markDeleted(artifact.id, 'bob', artifact)).toBe(false)
     expect(database.conversionArtifacts.getOwned(artifact.id, 'alice')?.status).toBe('ready')
+    database.close()
+  })
+
+  it('marks deleted only when the complete ready artifact identity still matches', () => {
+    const { database } = openTestDatabase()
+    createExecution(database, 'execution_artifact_delete_cas')
+    const job = createJob(database, 'job_artifact_delete_cas', 'execution_artifact_delete_cas', 1)
+    const artifact = database.conversionArtifacts.create({
+      id: 'artifact_delete_cas', ownerUserId: 'alice', executionId: 'execution_artifact_delete_cas',
+      conversionJobId: job.id, role: 'output', displayName: 'result.png', detectedFormat: 'png',
+      mimeType: 'image/png', byteSize: 12, sha256: 'a'.repeat(64),
+      relativePath: 'artifacts/result.png', createdAt: 3,
+    })
+
+    expect(database.conversionArtifacts.markDeleted(artifact.id, 'alice', {
+      ...artifact,
+      sha256: 'b'.repeat(64),
+    })).toBe(false)
+    expect(database.conversionArtifacts.getOwned(artifact.id, 'alice')).toMatchObject({ status: 'ready' })
+    expect(database.conversionArtifacts.markDeleted(artifact.id, 'alice', artifact)).toBe(true)
+    expect(database.conversionArtifacts.getOwned(artifact.id, 'alice')).toMatchObject({ status: 'deleted' })
     database.close()
   })
 

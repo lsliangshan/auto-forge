@@ -867,7 +867,11 @@ export interface AppRepositories {
     create(input: NewConversionArtifact): ConversionArtifact
     getOwned(artifactId: string, ownerUserId: string): ConversionArtifact | null
     listForJob(jobId: string, ownerUserId: string): ConversionArtifact[]
-    markDeleted(artifactId: string, ownerUserId: string): boolean
+    markDeleted(
+      artifactId: string,
+      ownerUserId: string,
+      expected: ConversionArtifact,
+    ): boolean
   }
   executionSteps: { insert(value: ExecutionStep): ExecutionStep; list(executionId: string): ExecutionStep[]; listForUser(executionId: string, ownerUserId: string): ExecutionStep[] }
   executionLogs: { insert(value: ExecutionLogInput): ExecutionLog; list(executionId: string): ExecutionLog[]; listForUser(executionId: string, ownerUserId: string): ExecutionLog[] }
@@ -3028,14 +3032,48 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           ORDER BY created_at, id
         `, { jobId, ownerUserId }).map(conversionArtifactFromRow)
       },
-      markDeleted(artifactId, ownerUserId) {
+      markDeleted(artifactId, ownerUserId, expected) {
         return transaction(database, () => {
           const deletedAt = now()
           return database.prepare(`
             UPDATE conversion_artifacts
             SET status = 'deleted', updated_at = @deletedAt, deleted_at = @deletedAt
-            WHERE id = @artifactId AND owner_user_id = @ownerUserId AND status = 'ready'
-          `).run({ artifactId, ownerUserId, deletedAt }).changes === 1
+            WHERE id = @artifactId
+              AND owner_user_id = @ownerUserId
+              AND execution_id = @expectedExecutionId
+              AND conversion_job_id IS @expectedConversionJobId
+              AND role = @expectedRole
+              AND display_name = @expectedDisplayName
+              AND detected_format = @expectedDetectedFormat
+              AND mime_type IS @expectedMimeType
+              AND byte_size = @expectedByteSize
+              AND sha256 = @expectedSha256
+              AND relative_path = @expectedRelativePath
+              AND metadata_json IS @expectedMetadataJson
+              AND status = 'ready'
+              AND created_at = @expectedCreatedAt
+              AND updated_at = @expectedUpdatedAt
+              AND deleted_at IS @expectedDeletedAt
+          `).run({
+            artifactId,
+            ownerUserId,
+            deletedAt,
+            expectedExecutionId: expected.executionId,
+            expectedConversionJobId: expected.conversionJobId ?? null,
+            expectedRole: expected.role,
+            expectedDisplayName: expected.displayName,
+            expectedDetectedFormat: expected.detectedFormat,
+            expectedMimeType: expected.mimeType ?? null,
+            expectedByteSize: expected.byteSize,
+            expectedSha256: expected.sha256,
+            expectedRelativePath: expected.relativePath,
+            expectedMetadataJson: expected.metadata === undefined
+              ? null
+              : JSON.stringify(expected.metadata),
+            expectedCreatedAt: expected.createdAt,
+            expectedUpdatedAt: expected.updatedAt,
+            expectedDeletedAt: expected.deletedAt ?? null,
+          }).changes === 1
         })
       },
     },

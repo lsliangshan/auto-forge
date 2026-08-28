@@ -299,6 +299,12 @@ describe('preload desktop bridge', () => {
 
     const listener = vi.fn()
     const unsubscribe = app.api.conversion.onEvent(listener)
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith('conversion:subscribe', undefined)
+    const subscribeIndex = vi.mocked(app.ipcRenderer.invoke).mock.calls.findIndex(
+      ([channel]) => channel === 'conversion:subscribe',
+    )
+    expect(vi.mocked(app.ipcRenderer.on).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(app.ipcRenderer.invoke).mock.invocationCallOrder[subscribeIndex]!)
     const wrapped = [...app.listeners.get(ipcChannels.conversionEvent)!][0]!
     const event = {
       type: 'job_updated',
@@ -319,6 +325,32 @@ describe('preload desktop bridge', () => {
     unsubscribe()
     unsubscribe()
     expect(app.ipcRenderer.removeListener).toHaveBeenCalledWith(ipcChannels.conversionEvent, wrapped)
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith('conversion:unsubscribe', undefined)
+  })
+
+  it('installs the local conversion listener before Main can replay a terminal transition', () => {
+    const app = harness()
+    const terminal = {
+      type: 'job_updated',
+      job: {
+        jobId: 'job_terminal', executionId: 'execution_terminal', targetFormat: 'png',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    }
+    vi.mocked(app.ipcRenderer.invoke).mockImplementation(async (channel) => {
+      if (channel === 'conversion:subscribe') {
+        for (const listener of app.listeners.get(ipcChannels.conversionEvent) ?? []) {
+          listener({}, terminal)
+        }
+      }
+      return undefined
+    })
+    const listener = vi.fn()
+
+    const unsubscribe = app.api.conversion.onEvent(listener)
+
+    expect(listener).toHaveBeenCalledWith(terminal)
+    unsubscribe()
   })
 
   it('normalizes IPC errors without exposing resolved paths', async () => {

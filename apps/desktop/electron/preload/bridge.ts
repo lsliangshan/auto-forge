@@ -53,6 +53,33 @@ function subscribe<T>(
   }
 }
 
+function subscribeAfterHandshake<T>(
+  ipcRenderer: IpcRendererPort,
+  channel: string,
+  subscribeChannel: string,
+  unsubscribeChannel: string,
+  parse: (payload: unknown) => { success: boolean; data?: T },
+  listener: (event: T) => void,
+): () => void {
+  const wrapped: RendererListener = (_event, payload) => {
+    const result = parse(payload)
+    if (result.success) listener(result.data as T)
+  }
+  let subscribed = true
+  ipcRenderer.on(channel, wrapped)
+  void invoke<void>(ipcRenderer, subscribeChannel).catch(() => {
+    if (!subscribed) return
+    subscribed = false
+    ipcRenderer.removeListener(channel, wrapped)
+  })
+  return () => {
+    if (!subscribed) return
+    subscribed = false
+    ipcRenderer.removeListener(channel, wrapped)
+    void invoke<void>(ipcRenderer, unsubscribeChannel).catch(() => undefined)
+  }
+}
+
 export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBridgePorts): DesktopAPI {
   return {
     auth: {
@@ -139,9 +166,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       saveCopy: (input) => invoke(ipcRenderer, ipcChannels.conversionSaveCopy, input),
       reveal: (input) => invoke(ipcRenderer, ipcChannels.conversionReveal, input),
       deleteArtifact: (input) => invoke(ipcRenderer, ipcChannels.conversionDeleteArtifact, input),
-      onEvent: (listener) => subscribe(
+      onEvent: (listener) => subscribeAfterHandshake(
         ipcRenderer,
         ipcChannels.conversionEvent,
+        ipcChannels.conversionSubscribe,
+        ipcChannels.conversionUnsubscribe,
         (payload) => conversionJobEventSchema.safeParse(payload),
         listener,
       ),

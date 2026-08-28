@@ -83,6 +83,14 @@ describe('cross-process contracts', () => {
     }
   })
 
+  it('keeps conversion event subscription as a payload-free typed handshake', () => {
+    for (const channel of [ipcChannels.conversionSubscribe, ipcChannels.conversionUnsubscribe]) {
+      expect(ipcRequestSchemas[channel].parse(undefined)).toBeUndefined()
+      expect(ipcRequestSchemas[channel].safeParse({ ownerUserId: 'forged' }).success).toBe(false)
+      expect(ipcResponseSchemas[channel].parse(undefined)).toBeUndefined()
+    }
+  })
+
   it('requires an explicit typed discard confirmation for logout', () => {
     expect(logoutRequestSchema.parse(undefined)).toBeUndefined()
     expect(logoutRequestSchema.parse({ discardPending: true })).toEqual({ discardPending: true })

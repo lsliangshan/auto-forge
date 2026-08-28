@@ -524,6 +524,55 @@ describe('conversion job runner', () => {
     database.close()
   })
 
+  it('keeps stop pending until every active promise drains when one interruption CAS throws', async () => {
+    const { database, runner: unusedRunner, runtime } = fixture()
+    void unusedRunner
+    const transition = database.conversionJobs.transition.bind(database.conversionJobs)
+    const throwingJobId = 'failing-stop-1'
+    const runner = createConversionJobRunner({
+      ownerUserId: 'alice',
+      jobs: {
+        ...database.conversionJobs,
+        transition: (input) => {
+          if (input.jobId === throwingJobId && input.patch.status === 'interrupted') {
+            throw new Error('interruption CAS failed')
+          }
+          return transition(input)
+        },
+      },
+      runtime,
+      id: (() => { let nextId = 0; return () => `failing-stop-${++nextId}` })(),
+    })
+    runner.start()
+    const first = runner.submit({
+      executionId: 'execution', sourceKind: 'artifact', sourceId: 'document-stop-cas', targetFormat: 'pdf',
+    })
+    const second = runner.submit({
+      executionId: 'execution', sourceKind: 'artifact', sourceId: 'video-stop-cas', targetFormat: 'mp4',
+    })
+    await waitFor(() => runtime.attempts.size === 2, 'active jobs before failing stop')
+    expect(first.jobId).toBe(throwingJobId)
+
+    let settled = false
+    const stopping = runner.stop()
+      .then(() => undefined, (error: unknown) => { throw error })
+      .finally(() => { settled = true })
+    const observedStopping = stopping.catch((error: unknown) => error)
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    expect(settled).toBe(false)
+
+    runtime.attempts.get(`${first.jobId}:0`)!.reject(conversionFailure('CONVERSION_CANCELLED'))
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    expect(settled).toBe(false)
+    runtime.attempts.get(`${second.jobId}:0`)!.reject(conversionFailure('CONVERSION_CANCELLED'))
+
+    await expect(observedStopping).resolves.toMatchObject({ message: 'interruption CAS failed' })
+    await expect(runner.idle()).resolves.toBeUndefined()
+    expect(runtime.releases.get(`${first.jobId}:0`)).toBe(1)
+    expect(runtime.releases.get(`${second.jobId}:0`)).toBe(1)
+    database.close()
+  })
+
   it('keeps shutdown pending when cancellation is terminal but its active resources have not drained', async () => {
     const { database, runner, runtime } = fixture()
     runner.start()

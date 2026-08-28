@@ -480,20 +480,37 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
       stopTask = (async () => {
         stopping = true
         started = false
-        const claimed = pending.splice(0)
-        for (const { job } of claimed) {
-          if (cas(job.id, job.epoch, 'downloading_component', {
-            status: 'interrupted',
-            errorCode: 'CONVERSION_INTERRUPTED',
-            endedAt: now(),
-          })) publish(job.id, job.epoch, 'interrupted')
+        const failures: unknown[] = []
+        try {
+          const claimed = pending.splice(0)
+          for (const { job } of claimed) {
+            try {
+              if (cas(job.id, job.epoch, 'downloading_component', {
+                status: 'interrupted',
+                errorCode: 'CONVERSION_INTERRUPTED',
+                endedAt: now(),
+              })) publish(job.id, job.epoch, 'interrupted')
+            } catch (error) {
+              failures.push(error)
+            }
+          }
+          const running = [...active.values()]
+          const terminalized = await Promise.allSettled(running.map((job) => (
+            terminalizeActive(job, 'interrupted', 'CONVERSION_INTERRUPTED')
+          )))
+          for (const result of terminalized) {
+            if (result.status === 'rejected') failures.push(result.reason)
+          }
+          const drained = await Promise.allSettled(running.map((job) => job.done))
+          for (const result of drained) {
+            if (result.status === 'rejected') failures.push(result.reason)
+          }
+        } finally {
+          stopped = true
+          stopping = false
+          resolveIdle()
         }
-        await Promise.all([...active.values()].map((running) => (
-          terminalizeActive(running, 'interrupted', 'CONVERSION_INTERRUPTED')
-        )))
-        stopped = true
-        stopping = false
-        resolveIdle()
+        if (failures.length > 0) throw failures[0]
       })()
       return stopTask
     },

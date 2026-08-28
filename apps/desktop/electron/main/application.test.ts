@@ -1,4 +1,16 @@
-import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import {
+  access,
+  copyFile,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -82,7 +94,21 @@ import {
 import { createWorkflowSourceSelectorVault } from './workflows/workflow-source-selector.js'
 
 const directories: string[] = []
-const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
+const { recoveryProbe, renameProbe } = vi.hoisted(() => ({
+  recoveryProbe: vi.fn(),
+  renameProbe: vi.fn<(from: string, to: string) => void | Promise<void>>(),
+}))
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return {
+    ...actual,
+    rename: async (from: string, to: string) => {
+      await renameProbe(from, to)
+      return actual.rename(from, to)
+    },
+  }
+})
 
 vi.mock('./startup.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./startup.js')>()
@@ -897,6 +923,7 @@ afterEach(async () => {
 beforeEach(() => {
   networkProxy = createNetworkProxy()
   recoveryProbe.mockClear()
+  renameProbe.mockReset()
 })
 
 describe('createApplicationRuntime', () => {
@@ -8835,6 +8862,359 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('never overwrites a save-copy leaf and rejects a save-dialog parent symlink retarget', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-save-races-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversionsaveraces'
+    const bytes = Buffer.from('verified conversion output')
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_save_races', jobId: 'job_save_races',
+      status: 'completed', artifact: { id: 'artifact_save_races', bytes },
+    })
+    const existingDestination = join(root, 'existing-copy.bin')
+    const existingBytes = Buffer.from('must not be overwritten')
+    const selectedParent = join(root, 'selected-parent')
+    const movedParent = join(root, 'selected-parent-original')
+    const retarget = join(root, 'retarget')
+    await mkdir(selectedParent)
+    await mkdir(retarget)
+    const chooseMediaSavePath = vi.fn()
+      .mockImplementationOnce(async () => {
+        await writeFile(existingDestination, existingBytes)
+        return existingDestination
+      })
+      .mockImplementationOnce(async () => {
+        await rename(selectedParent, movedParent)
+        await symlink(retarget, selectedParent)
+        return join(selectedParent, 'retargeted-copy.bin')
+      })
+    const runtime = createApplicationRuntime(options(root, { chooseMediaSavePath }))
+    await authenticate(runtime, 'ConversionSaveRaces', false)
+    try {
+      await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_save_races' }))
+        .rejects.toMatchObject({ code: 'CONFLICT' })
+      await expect(readFile(existingDestination)).resolves.toEqual(existingBytes)
+
+      await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_save_races' }))
+        .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+      await expect(access(join(retarget, 'retargeted-copy.bin')))
+        .rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('rejects linked artifacts and preserves quarantine evidence across a replacement race', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-delete-races-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversiondeleteraces'
+    const linkedBytes = Buffer.from('linked conversion output')
+    const racedBytes = Buffer.from('original conversion output')
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_linked_artifact', jobId: 'job_linked_artifact',
+      status: 'completed', artifact: { id: 'artifact_linked', bytes: linkedBytes },
+    })
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_raced_artifact', jobId: 'job_raced_artifact',
+      status: 'completed', artifact: { id: 'artifact_raced', bytes: racedBytes },
+    })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const linkedPath = join(conversionRoot, 'results', 'artifact_linked.png')
+    const linkedAlias = join(root, 'linked-alias.png')
+    await link(linkedPath, linkedAlias)
+    const racedPath = join(conversionRoot, 'results', 'artifact_raced.png')
+    const replacement = Buffer.from('attacker replacement')
+    const runtime = createApplicationRuntime(options(root))
+    await authenticate(runtime, 'ConversionDeleteRaces', false)
+    try {
+      await expect(runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_linked' }))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      await expect(readFile(linkedPath)).resolves.toEqual(linkedBytes)
+      await expect(readFile(linkedAlias)).resolves.toEqual(linkedBytes)
+
+      renameProbe.mockImplementationOnce(async (from, to) => {
+        if (from !== racedPath || !to.includes('.trash')) return
+        await rm(from)
+        await writeFile(from, replacement)
+      })
+      await expect(runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_raced' }))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      expect(database.conversionArtifacts.getOwned('artifact_raced', ownerUserId))
+        .toMatchObject({ status: 'ready' })
+      database.close()
+      const quarantineEntries = (await readdir(join(conversionRoot, '.trash')))
+        .filter((name) => name.startsWith('artifact_raced.quarantine-'))
+      expect(quarantineEntries).toHaveLength(1)
+      await expect(readFile(join(conversionRoot, '.trash', quarantineEntries[0]!)))
+        .resolves.toEqual(replacement)
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('serializes concurrent deletion of the same artifact through one quarantine transition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-delete-serial-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversiondeleteserial'
+    const bytes = Buffer.from('serialized conversion output')
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_delete_serial', jobId: 'job_delete_serial',
+      status: 'completed', artifact: { id: 'artifact_delete_serial', bytes },
+    })
+    const source = join(
+      resolveUserConversionRoot(root, ownerUserId),
+      'results',
+      'artifact_delete_serial.png',
+    )
+    const entered = deferred<void>()
+    const release = deferred<void>()
+    let transitions = 0
+    const runtime = createApplicationRuntime(options(root))
+    await authenticate(runtime, 'ConversionDeleteSerial', false)
+    renameProbe.mockImplementation(async (from, to) => {
+      if (from !== source || !to.includes('.trash')) return
+      transitions += 1
+      if (transitions === 1) {
+        entered.resolve()
+        await release.promise
+      }
+    })
+    try {
+      const first = runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_delete_serial' })
+      const firstOutcome = first.then(
+        () => undefined,
+        (error: unknown) => { throw error },
+      )
+      await entered.promise
+      const second = runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_delete_serial' })
+      const secondOutcome = second.catch((error: unknown) => error)
+      await new Promise<void>((resolve) => { setImmediate(resolve) })
+      expect(transitions).toBe(1)
+      release.resolve()
+      await expect(firstOutcome).resolves.toBeUndefined()
+      await expect(secondOutcome).resolves.toMatchObject({ code: 'NOT_FOUND' })
+      expect(transitions).toBe(1)
+    } finally {
+      release.resolve()
+      await runtime.close()
+    }
+  })
+
+  it('preserves an ambiguous recovery conflict and quarantines ready outputs of non-completed jobs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-recovery-integrity-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_recoveryintegrity'
+    const valid = Buffer.from('valid recovery candidate')
+    const corrupt = Buffer.from('corrupt destination')
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_recovery_conflict', jobId: 'job_recovery_conflict',
+      status: 'completed', artifact: { id: 'artifact_recovery_conflict', bytes: valid },
+    })
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_orphan_output', jobId: 'job_orphan_output',
+      status: 'converting', artifact: { id: 'artifact_orphan_output', bytes: valid },
+    })
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_unique_recovery', jobId: 'job_unique_recovery',
+      status: 'completed', artifact: { id: 'artifact_unique_recovery', bytes: valid },
+    })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const conflictPath = join(conversionRoot, 'results', 'artifact_recovery_conflict.png')
+    const quarantine = join(conversionRoot, '.trash')
+    const candidate = join(
+      quarantine,
+      'artifact_recovery_conflict.quarantine-12345678-1234-4123-8123-123456789abc',
+    )
+    await mkdir(quarantine, { recursive: true })
+    await rename(conflictPath, candidate)
+    await writeFile(conflictPath, corrupt)
+    const uniquePath = join(conversionRoot, 'results', 'artifact_unique_recovery.png')
+    const uniqueCandidate = join(
+      quarantine,
+      'artifact_unique_recovery.quarantine-22345678-1234-4123-8123-123456789abc',
+    )
+    await rename(uniquePath, uniqueCandidate)
+
+    const runtime = createApplicationRuntime(options(root))
+    await authenticate(runtime, 'RecoveryIntegrity', false)
+    try {
+      await expect(readFile(candidate)).resolves.toEqual(valid)
+      await expect(readFile(conflictPath)).resolves.toEqual(corrupt)
+      await expect(readFile(uniquePath)).resolves.toEqual(valid)
+      await expect(access(uniqueCandidate)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(runtime.services.conversion.reveal({ artifactId: 'artifact_recovery_conflict' }))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+
+      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      expect(database.conversionArtifacts.getOwned('artifact_orphan_output', ownerUserId))
+        .toMatchObject({ status: 'deleted' })
+      database.close()
+      await expect(access(join(conversionRoot, 'results', 'artifact_orphan_output.png')))
+        .rejects.toMatchObject({ code: 'ENOENT' })
+      const orphanQuarantines = (await readdir(quarantine))
+        .filter((name) => name.startsWith('artifact_orphan_output.quarantine-'))
+      expect(orphanQuarantines).toHaveLength(1)
+      await expect(readFile(join(quarantine, orphanQuarantines[0]!))).resolves.toEqual(valid)
+      for (const action of [
+        () => runtime.services.conversion.saveCopy({ artifactId: 'artifact_orphan_output' }),
+        () => runtime.services.conversion.reveal({ artifactId: 'artifact_orphan_output' }),
+        () => runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_orphan_output' }),
+      ]) {
+        await expect(action()).rejects.toMatchObject({ code: 'NOT_FOUND' })
+      }
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('stops and drains background conversion before executions clear, then rebuilds the lifecycle', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-clear-drain-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversioncleardrain'
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_clear_conversion',
+      jobId: 'job_clear_conversion', status: 'queued',
+    })
+    const started = deferred<AbortSignal>()
+    let drained = false
+    const conversionRuntime: ConversionJobRuntime = {
+      concurrencyClass: () => 'other',
+      acquirePack: async () => ({
+        name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
+        root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
+      }),
+      createWriter: async () => ({
+        tempPath: join(root, 'conversion-output.partial'),
+        commit: async () => { throw new Error('unexpected commit') },
+        abort: async () => undefined,
+      }),
+      convert: async (_job, _lease, _writer, { signal }) => {
+        started.resolve(signal)
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve()
+          else signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        drained = true
+        throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
+      },
+    }
+    const runtime = createApplicationRuntime(options(root, { conversionRuntime }))
+    await authenticate(runtime, 'ConversionClearDrain', false)
+    const signal = await started.promise
+    const marker = join(resolveUserConversionRoot(root, ownerUserId), 'managed-marker')
+    await writeFile(marker, 'managed')
+    try {
+      await runtime.services.settings.clearLocalData('executions')
+      expect(signal.aborted).toBe(true)
+      expect(drained).toBe(true)
+      await expect(access(marker)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      database.executions.insert({
+        id: 'execution_after_clear', ownerUserId,
+        workflowId: 'file.convert.universal', workflowVersion: '0.1.0',
+        status: 'completed', input: {},
+      })
+      database.conversionJobs.create({
+        id: 'job_after_clear', ownerUserId, executionId: 'execution_after_clear',
+        sourceKind: 'artifact', sourceId: 'source_after_clear', targetFormat: 'png',
+        status: 'completed', progress: 100,
+      })
+      database.close()
+      await expect(runtime.services.conversion.listForExecution({ executionId: 'execution_after_clear' }))
+        .resolves.toEqual([expect.objectContaining({ jobId: 'job_after_clear', status: 'completed' })])
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('drains affected background conversion and purges its managed artifacts before conversation deletion', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-conversation-drain-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const bootstrap = createApplicationRuntime(options(root, { authService }))
+    const session = await authenticate(bootstrap, 'ConvConversationDrain')
+    const conversation = await bootstrap.services.chat.createConversation()
+    await bootstrap.close()
+
+    const stores = new UserDataStoreManager(join(root, 'user-caches'))
+    const store = stores.open(session.user.id)
+    store.chatRuns.insert({
+      id: 'chat_run_conversion_conversation', conversationId: conversation.id,
+      userId: session.user.id, provider: 'openrouter', requestId: 'request_conversion_conversation',
+      model: 'openrouter/test', status: 'completed', startedAt: 1, endedAt: 2,
+    })
+    stores.close()
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.executions.insert({
+      id: 'execution_conversion_conversation', ownerUserId: session.user.id,
+      workflowId: 'file.convert.universal', workflowVersion: '0.1.0',
+      chatRunId: 'chat_run_conversion_conversation', status: 'completed', input: {},
+    })
+    database.conversionJobs.create({
+      id: 'job_conversion_conversation', ownerUserId: session.user.id,
+      executionId: 'execution_conversion_conversation', sourceKind: 'artifact',
+      sourceId: 'artifact_conversion_conversation', targetFormat: 'png', status: 'queued',
+    })
+    const bytes = Buffer.from('conversation conversion source')
+    database.conversionArtifacts.create({
+      id: 'artifact_conversion_conversation', ownerUserId: session.user.id,
+      executionId: 'execution_conversion_conversation', conversionJobId: 'job_conversion_conversation',
+      role: 'input', displayName: 'source.png', detectedFormat: 'png', mimeType: 'image/png',
+      byteSize: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex'),
+      relativePath: 'inputs/artifact_conversion_conversation.png',
+    })
+    database.close()
+    const artifactPath = join(
+      resolveUserConversionRoot(root, session.user.id),
+      'inputs',
+      'artifact_conversion_conversation.png',
+    )
+    await mkdir(dirname(artifactPath), { recursive: true })
+    await writeFile(artifactPath, bytes)
+    const started = deferred<AbortSignal>()
+    let drained = false
+    const conversionRuntime: ConversionJobRuntime = {
+      concurrencyClass: () => 'other',
+      acquirePack: async () => ({
+        name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
+        root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
+      }),
+      createWriter: async () => ({
+        tempPath: join(root, 'conversation-output.partial'),
+        commit: async () => { throw new Error('unexpected commit') },
+        abort: async () => undefined,
+      }),
+      convert: async (_job, _lease, _writer, { signal }) => {
+        started.resolve(signal)
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve()
+          else signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        drained = true
+        throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
+      },
+    }
+    const runtime = createApplicationRuntime(options(root, { authService, conversionRuntime }))
+    await runtime.services.auth.getSession()
+    const signal = await started.promise
+    try {
+      await runtime.services.chat.deleteConversation(conversation.id)
+      expect(signal.aborted).toBe(true)
+      expect(drained).toBe(true)
+      await expect(access(artifactPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      const inspection = openAppDatabase(join(root, 'autoforge.sqlite'))
+      expect(inspection.conversionArtifacts.getOwned(
+        'artifact_conversion_conversation', session.user.id,
+      )).toMatchObject({ status: 'deleted' })
+      inspection.close()
+      await expect(listConversations(runtime)).resolves.toEqual([])
+    } finally {
+      await runtime.close()
+    }
+  })
+
   it('recovers owner partials and interrupted jobs before broadcasting strict snapshots', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-recovery-'))
     directories.push(root)
@@ -8932,6 +9312,79 @@ describe('createApplicationRuntime', () => {
     expect(database.conversionJobs.getOwned('job_conversion_drain', ownerUserId))
       .toMatchObject({ status: 'interrupted' })
     database.close()
+    await runtime.close()
+  })
+
+  it('drains a failed interruption CAS before same-owner recovery and keeps the user store open', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-stop-cas-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_conversionstopcas'
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_conversion_stop_cas',
+      jobId: 'job_conversion_stop_cas', status: 'queued',
+    })
+    const started = deferred<AbortSignal>()
+    let drained = false
+    const conversionRuntime: ConversionJobRuntime = {
+      concurrencyClass: () => 'other',
+      acquirePack: async () => ({
+        name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
+        root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
+      }),
+      createWriter: async () => ({
+        tempPath: join(root, 'stop-cas-output.partial'),
+        commit: async () => { throw new Error('unexpected commit') },
+        abort: async () => undefined,
+      }),
+      convert: async (_job, _lease, _writer, { signal }) => {
+        started.resolve(signal)
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve()
+          else signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        await new Promise<void>((resolve) => { setImmediate(resolve) })
+        const sqlite = new Database(join(root, 'autoforge.sqlite'))
+        sqlite.exec('DROP TRIGGER fail_conversion_interrupt')
+        sqlite.close()
+        drained = true
+        throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
+      },
+    }
+    let closes = 0
+    class ObservedUserDataStores extends UserDataStoreManager {
+      override close(): void {
+        if (this.current()) closes += 1
+        super.close()
+      }
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores: new ObservedUserDataStores(join(root, 'user-caches')),
+      conversionRuntime,
+    }))
+    await authenticate(runtime, 'ConversionStopCas', false)
+    await started.promise
+    const sqlite = new Database(join(root, 'autoforge.sqlite'))
+    sqlite.exec(`
+      CREATE TRIGGER fail_conversion_interrupt
+      BEFORE UPDATE OF status ON conversion_jobs
+      WHEN OLD.id = 'job_conversion_stop_cas' AND NEW.status = 'interrupted'
+      BEGIN
+        SELECT RAISE(ABORT, 'interruption CAS failed');
+      END
+    `)
+    sqlite.close()
+
+    await expect(runtime.services.auth.logout({ discardPending: true })).rejects.toBeDefined()
+    expect(drained).toBe(true)
+    expect(closes).toBe(0)
+    await expect(runtime.services.auth.getSession()).resolves.toMatchObject({
+      user: { id: ownerUserId },
+    })
+    await expect(runtime.services.conversion.listForExecution({
+      executionId: 'execution_conversion_stop_cas',
+    })).resolves.toEqual([expect.objectContaining({
+      jobId: 'job_conversion_stop_cas', status: 'interrupted',
+    })])
     await runtime.close()
   })
 })
