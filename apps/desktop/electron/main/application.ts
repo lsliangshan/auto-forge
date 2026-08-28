@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { appendFile, copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
@@ -70,6 +70,11 @@ import {
 import { OpenRouterProvider } from './chat/openrouter-provider.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
 import { projectAttachmentInputs } from './chat/file-attachment-projection.js'
+import {
+  hasLocalConversionIntent,
+  projectLocalConversionPrompt,
+  type LocalAttachmentProjection,
+} from './chat/local-conversion-intent.js'
 import { resolveChatRoute } from './chat/multimodal-router.js'
 import type { ModelContentPart } from './chat/model-provider.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
@@ -105,6 +110,7 @@ import { UserAdminService } from './user-admin/user-admin-service.js'
 import {
   ExecutionService,
   NodeWorkerFactory,
+  type ExecutionAttachmentBinding,
   type WorkflowExecutionSource,
   type WorkflowExecutionSourceResolver,
 } from './workflows/execution-service.js'
@@ -1786,16 +1792,27 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             throw error
           }
           const resolved = await resolvedInput(input.conversationId, input.assetIds)
+          const localAttachments = resolved.assets.map((asset, index): LocalAttachmentProjection => ({
+            index,
+            name: asset.name,
+            mimeType: asset.mimeType,
+            byteSize: asset.byteSize,
+          }))
+          const localConversionIntent = hasLocalConversionIntent(input.content, localAttachments)
           if (
+            !localConversionIntent
+            &&
             resolved.assets.some((asset) => asset.kind === 'file')
             && requestedOutput !== 'auto'
             && requestedOutput !== 'text'
           ) throw failure('MODEL_MODALITY_UNSUPPORTED')
-          if (resolved.assets.some((asset) => (
+          if (!localConversionIntent && resolved.assets.some((asset) => (
             asset.kind === 'file'
             && chatFileSupport(snapshot.activeProvider, asset.name, asset.mimeType).mode === 'unsupported'
           ))) throw failure('MODEL_MODALITY_UNSUPPORTED')
           if (
+            !localConversionIntent
+            &&
             snapshot.activeProvider === 'deepseek'
             && (resolved.assets.some((asset) => asset.kind !== 'file')
               || (requestedOutput !== 'auto' && requestedOutput !== 'text'))
@@ -1804,7 +1821,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const route = resolveChatRoute({
             provider: snapshot.activeProvider,
             ...(input.model === undefined ? {} : { requestedModel: input.model }),
-            requestedOutput: input.outputType,
+            requestedOutput: localConversionIntent ? 'text' : input.outputType,
             requestedGeneration: input.generation,
             defaults: snapshot.defaultModels,
             conversationPreferences: preferences,
@@ -1814,7 +1831,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               providerSnapshot,
               credentialEpoch,
             ),
-            assets: resolved.assets,
+            assets: localConversionIntent ? [] : resolved.assets,
           })
           if ('selectionRequired' in route || 'modelRequired' in route) {
             throw failure('INVALID_INPUT')
@@ -1842,14 +1859,56 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             userId: session.user.id,
           }
           if (route.outputType === 'text') {
-            const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
-            const projectedAttachments = projectAttachmentInputs(route.provider, modelInputs)
-            const modelContent: string | ModelContentPart[] = projectedAttachments.length === 0
-              ? input.content
-              : [
-                  ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
-                  ...projectedAttachments,
-                ]
+            let modelContent: string | ModelContentPart[]
+            let currentMedia: CurrentMediaMetadata[]
+            let attachmentBindings: readonly ExecutionAttachmentBinding[]
+            if (localConversionIntent) {
+              modelContent = projectLocalConversionPrompt(input.content, localAttachments)
+              currentMedia = []
+              attachmentBindings = Object.freeze(resolved.assets.map((asset, index) => {
+                const record = chatDatabase.mediaAssets.get(asset.id)
+                if (!record
+                  || record.conversationId !== input.conversationId
+                  || record.status !== 'ready'
+                  || record.sha256 === undefined) throw failure('MEDIA_ASSET_UNAVAILABLE')
+                const sourceFingerprint = createHash('sha256')
+                  .update('autoforge-file-conversion-source-v1\0')
+                  .update(session.user.id)
+                  .update('\0')
+                  .update(asset.id)
+                  .update('\0')
+                  .update(record.sha256)
+                  .digest('hex')
+                return Object.freeze({
+                  attachmentIndex: index,
+                  ownerUserId: session.user.id,
+                  conversationId: input.conversationId,
+                  displayName: asset.name,
+                  mimeType: asset.mimeType,
+                  byteSize: asset.byteSize,
+                  source: Object.freeze({ kind: 'media' as const, mediaAssetId: asset.id }),
+                  sourceFingerprint,
+                })
+              }))
+            } else {
+              const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
+              const projectedAttachments = projectAttachmentInputs(route.provider, modelInputs)
+              modelContent = projectedAttachments.length === 0
+                ? input.content
+                : [
+                    ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
+                    ...projectedAttachments,
+                  ]
+              currentMedia = resolved.assets.flatMap<CurrentMediaMetadata>(({
+                kind, mimeType, byteSize, durationMs,
+              }) => {
+                if (kind === 'file') {
+                  return mimeType === 'text/plain' ? [] : [{ kind, byteSize }]
+                }
+                return [{ kind, ...(durationMs === undefined ? {} : { durationMs }) }]
+              })
+              attachmentBindings = Object.freeze([])
+            }
             trackChatWork(requestId, input.conversationId, async () => {
               return agent.run({
                 conversationId: input.conversationId,
@@ -1857,14 +1916,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 userBlocks,
                 modelContent,
                 assetIds: input.assetIds,
-                currentMedia: resolved.assets.flatMap<CurrentMediaMetadata>(({
-                  kind, mimeType, byteSize, durationMs,
-                }) => {
-                  if (kind === 'file') {
-                    return mimeType === 'text/plain' ? [] : [{ kind, byteSize }]
-                  }
-                  return [{ kind, ...(durationMs === undefined ? {} : { durationMs }) }]
-                }),
+                currentMedia,
+                attachmentBindings,
                 allowTools: route.supportsTools,
                 supportsImageInput: route.supportsImageInput,
                 userId: session.user.id,

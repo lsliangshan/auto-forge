@@ -59,11 +59,14 @@ export function sanitizeOpaqueWorkflowArgs(value: unknown): unknown {
 function declaredScopeMatchesCapability(capability: string, scope: Record<string, unknown>): boolean {
   const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
   const needsPaths = capability.startsWith('filesystem.')
+  const needsFormats = capability === 'file.convert'
   return needsOrigins
     ? 'origins' in scope
     : needsPaths
       ? 'paths' in scope
-      : Object.keys(scope).length === 0
+      : needsFormats
+        ? 'formats' in scope
+        : Object.keys(scope).length === 0
 }
 
 const workflowBlockContextSchema = z.object({

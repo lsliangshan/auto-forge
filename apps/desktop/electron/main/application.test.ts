@@ -72,6 +72,7 @@ import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
+import * as mediaAssetModule from './media/media-asset-service.js'
 import {
   browserPermissionMatrix,
   workflowSecurityFingerprint,
@@ -585,6 +586,44 @@ async function installApprovalWorkflow(
       : { browserContinuation: options.browserContinuation }),
     activationExamples: [activation],
     inputSchema: { type: 'object', additionalProperties: false },
+  })
+  await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+  await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+    "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+    'export default defineWorkflow({ async run() { return { ok: true } } })',
+  ].join('\n'))
+  await runtime.services.developer.build(project.id)
+  return runtime.services.workflows.installProject(project.id)
+}
+
+async function installConversionWorkflow(
+  runtime: ReturnType<typeof createApplicationRuntime>,
+) {
+  const project = await runtime.services.developer.createProject('Conversion Workflow')
+  const manifest = JSON.parse(
+    await runtime.services.developer.readFile(project.id, 'workflow.json'),
+  ) as Record<string, unknown>
+  Object.assign(manifest, {
+    id: 'file.convert.test',
+    version: '1.0.0',
+    name: '测试转换',
+    description: '将当前附件转换为指定格式',
+    category: 'file',
+    cities: [],
+    permissions: [{ capability: 'file.convert', scope: { formats: ['pdf', 'png'] } }],
+    activationExamples: ['转换当前附件'],
+    activationNegativeExamples: ['读取附件内容'],
+    inputSchema: {
+      type: 'object', additionalProperties: false, required: ['files', 'targetFormat'],
+      properties: {
+        files: {
+          type: 'array', items: { type: 'integer', minimum: 0 },
+          minItems: 1, maxItems: 5, uniqueItems: true,
+          'x-autoforge-control': 'file-picker',
+        },
+        targetFormat: { type: 'string', enum: ['pdf', 'png'] },
+      },
+    },
   })
   await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
   await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
@@ -4717,6 +4756,130 @@ describe('createApplicationRuntime', () => {
     expect(followUp).not.toContain(png.toString('base64'))
     expect(followUp).not.toContain(source)
     await runtime.close()
+  })
+
+  it('routes current conversion attachments as metadata only and rejects forged persistent approval', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-local-conversion-'))
+    directories.push(root)
+    const historicalSource = join(root, 'historical.txt')
+    const currentSource = join(root, 'current.doc')
+    const historicalBytes = Buffer.from('HISTORICAL_PRIVATE_ATTACHMENT_CONTENT')
+    const currentBytes = Buffer.concat([
+      Buffer.from('d0cf11e0a1b11ae1', 'hex'),
+      Buffer.from('CURRENT_PRIVATE_ATTACHMENT_CONTENT'),
+    ])
+    await writeFile(historicalSource, historicalBytes)
+    await writeFile(currentSource, currentBytes)
+    let selectedFiles = [historicalSource]
+    const captured: ModelStreamRequest[] = []
+    const chatEvents: ChatEvent[] = []
+    const modelInput = vi.fn()
+    const createMediaAssetService = mediaAssetModule.createMediaAssetService
+    vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
+      const service = createMediaAssetService(createOptions)
+      modelInput.mockImplementation(service.modelInput.bind(service))
+      return { ...service, modelInput }
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/local-conversion', 'Local conversion'),
+        supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request: ModelStreamRequest) {
+        captured.push(request)
+        if (!isConversationTitleRequest(request)
+          && JSON.stringify(request.messages).includes('[附件 0: current.doc')) {
+          const toolName = request.tools?.[0]?.function.name
+          if (!toolName) throw new Error('expected conversion workflow tool')
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0,
+            id: 'call_local_conversion', name: toolName,
+            arguments: { input: { files: [0], targetFormat: 'pdf' } },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+          return
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => selectedFiles,
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    try {
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' },
+          openrouter: { text: 'openrouter/local-conversion' },
+        },
+      })
+      await installConversionWorkflow(runtime)
+      const conversation = await runtime.services.chat.createConversation()
+      const [historicalAsset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id, existingAssetIds: [],
+      })
+      const historical = await runtime.services.chat.send({
+        ...chatInput(conversation.id, '读取这个文本附件'),
+        assetIds: [historicalAsset!.id], outputType: 'text',
+      })
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'status', requestId: historical.requestId, status: 'completed',
+      })))
+      expect(modelInput).toHaveBeenCalledTimes(1)
+
+      selectedFiles = [currentSource]
+      const [currentAsset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id, existingAssetIds: [],
+      })
+      const sent = await runtime.services.chat.send({
+        ...chatInput(conversation.id, '把附件转换成 PDF'),
+        assetIds: [currentAsset!.id], outputType: 'text',
+      })
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block', conversationId: conversation.id,
+        block: expect.objectContaining({
+          type: 'approval', executionId: expect.any(String), capability: 'file.convert',
+          actionSummary: expect.stringMatching(/附件 0：current\.doc.*目标格式：pdf/),
+        }),
+      })))
+
+      expect(modelInput).toHaveBeenCalledTimes(1)
+      const conversionRequest = agentRequests(captured).at(-1)!
+      const providerPayload = JSON.stringify(conversionRequest)
+      expect(conversionRequest.toolChoice).toBeUndefined()
+      expect(providerPayload).toContain('[附件 0: current.doc, application/octet-stream, 42 bytes]')
+      expect(providerPayload).not.toContain('x-autoforge-')
+      expect(providerPayload).not.toMatch(/data:|dataBase64|mediaAssetId|sourceFingerprint|absolutePath|relativePath/)
+      expect(providerPayload).not.toContain(currentAsset!.id)
+      expect(providerPayload).not.toContain(currentSource)
+      expect(providerPayload).not.toContain(currentBytes.toString('base64'))
+      expect(providerPayload).not.toContain(currentBytes.toString())
+      expect(providerPayload).not.toContain(historicalBytes.toString())
+
+      const approval = [...chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+        event.type === 'block' && event.block.type === 'approval'
+      ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+      const legacyDecision = vi.spyOn(ExecutionService.prototype, 'decide')
+      await expect(runtime.services.executions.decide({
+        executionId: approval.executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: approval.scopeHash,
+        decision: 'always',
+        workflowId: approval.workflowId,
+        workflowVersion: approval.workflowVersion,
+        capability: approval.capability,
+        scope: approval.scope,
+      })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+      expect(legacyDecision).not.toHaveBeenCalled()
+      await runtime.services.chat.cancel(sent.requestId)
+    } finally {
+      await runtime.close()
+    }
   })
 
   it('projects verified generic files only into the current Provider request and persists metadata', async () => {

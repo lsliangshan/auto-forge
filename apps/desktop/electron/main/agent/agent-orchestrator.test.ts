@@ -16,6 +16,7 @@ import {
   type ProviderUsageRepository,
 } from '../database/repositories.js'
 import { createWorkflowSourceSelectorVault } from '../workflows/workflow-source-selector.js'
+import type { ExecutionAttachmentBinding } from '../workflows/execution-service.js'
 import { APPROVAL_EXPIRY_MS, MAX_AGENT_ACTIVE_MS } from './workflow-tool-loop.js'
 import { BrowserContinuationCatalog } from './browser-continuation-catalog.js'
 import type {
@@ -221,6 +222,25 @@ const developmentApprovalWorkflow: WorkflowDetail = {
     buildHash: 'e'.repeat(64),
   },
 }
+const conversionWorkflow: WorkflowDetail = {
+  ...workflow,
+  id: 'file.convert.universal',
+  name: '万象转换',
+  category: 'file',
+  permissions: [{ capability: 'file.convert', scope: { formats: ['pdf', 'png'] } }],
+  activationExamples: ['将附件转换成 PDF'],
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['files', 'targetFormat'],
+    properties: {
+      files: {
+        type: 'array', items: { type: 'integer', minimum: 0 },
+        minItems: 1, maxItems: 5, uniqueItems: true,
+      },
+      targetFormat: { type: 'string', enum: ['pdf', 'png'] },
+    },
+  },
+  runtimeIdentity: { id: 'file.convert.universal', version: '1.0.0', source: 'installed' },
+}
 const externalApprovalIdentity = {
   permissionIndex: 0,
   scopeHash: scopeHash(approvalWorkflow.permissions[0]!.scope),
@@ -245,9 +265,23 @@ function textRunInput(
     modelContent: input.content,
     assetIds: [],
     currentMedia: [],
+    attachmentBindings: [],
     allowTools: true,
     supportsImageInput: false,
   }
+}
+
+function currentConversionAttachments(): ExecutionAttachmentBinding[] {
+  return [{
+    attachmentIndex: 0,
+    ownerUserId: 'user_1',
+    conversationId: 'conversion_conversation',
+    displayName: '../../private/report.pdf',
+    mimeType: 'application/pdf',
+    byteSize: 12,
+    source: { kind: 'media', mediaAssetId: 'media_private_0' },
+    sourceFingerprint: 'b'.repeat(64),
+  }]
 }
 
 function continuationBinding(
@@ -2725,6 +2759,72 @@ describe('AgentOrchestrator', () => {
       && (event as { block?: { state?: string } }).block?.state === 'pending'
     ))
     expect(approvalBlocks).toHaveLength(1)
+  })
+
+  it('keeps exact conversion bindings in Main and forwards them only after one approval', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_convert', name: 'workflow_1',
+        arguments: { input: { files: [0], targetFormat: 'pdf' } },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已提交本地转换' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [conversionWorkflow]
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const runInput = {
+      ...textRunInput({
+        conversationId: 'conversion_conversation', content: '将附件转换成 PDF',
+        provider: 'openrouter', model: 'model',
+      }),
+      modelContent: '将附件转换成 PDF\n[附件 0: report.pdf, application/pdf, 12 bytes]',
+      assetIds: ['media_private_0'],
+      attachmentBindings: currentConversionAttachments(),
+    }
+
+    const pending = await orchestrator.run(runInput)
+
+    expect(pending).toMatchObject({ status: 'awaiting_approval', executionId: 'reserved_1' })
+    const approvalEvent = dependencies.records.events.find((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'approval'
+    )) as { block: { actionSummary: string } } | undefined
+    expect(approvalEvent?.block.actionSummary).toContain('附件 0：report.pdf')
+    expect(approvalEvent?.block.actionSummary).toContain('目标格式：pdf')
+
+    await expect(orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      permissionIndex: 0,
+      scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
+      decision: 'always',
+      workflowId: conversionWorkflow.id,
+      workflowVersion: conversionWorkflow.version,
+      capability: 'file.convert',
+      scope: conversionWorkflow.permissions[0]!.scope,
+    })).resolves.toMatchObject({ status: 'failed', error: { code: 'INVALID_INPUT' } })
+    expect(dependencies.records.starts).toHaveLength(0)
+
+    const result = await orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      permissionIndex: 0,
+      scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
+      decision: 'once',
+    })
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(dependencies.records.starts).toContainEqual(expect.objectContaining({
+      executionId: 'reserved_1',
+      attachmentBindings: currentConversionAttachments(),
+      fileConvertAuthorization: {
+        executionId: 'reserved_1', capability: 'file.convert', decision: 'once',
+        attachments: [{ index: 0, sourceFingerprint: 'b'.repeat(64) }],
+        formats: ['pdf'],
+      },
+    }))
+    const providerPayload = JSON.stringify(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls)
+    expect(providerPayload).not.toMatch(/media_private_0|b{32}|sourceFingerprint|attachmentBindings/)
   })
 
   it('expires an approval at thirty minutes and pauses active time for a timely approval', async () => {

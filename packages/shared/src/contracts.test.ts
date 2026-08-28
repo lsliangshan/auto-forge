@@ -1305,6 +1305,28 @@ describe('cross-process contracts', () => {
     expect(chatBlockSchema.safeParse({ ...approval, state: 'always' }).success).toBe(false)
   })
 
+  it('accepts only a declared formats scope for file conversion approval blocks', () => {
+    const approval = {
+      type: 'approval' as const,
+      blockId: 'approval_1',
+      state: 'pending' as const,
+      executionId: 'execution_1',
+      workflowId: 'workflow.convert', workflowName: 'Convert file', workflowVersion: '1.0.0',
+      source: 'installed' as const, actionSummary: 'Convert attachment 0 to PDF', permissionIndex: 0,
+      capability: 'file.convert' as const, scope: { formats: ['pdf'] },
+      scopeHash: 'a'.repeat(64),
+    }
+
+    expect(chatBlockSchema.parse(approval)).toMatchObject({
+      capability: 'file.convert', scope: { formats: ['pdf'] },
+    })
+    expect(chatBlockSchema.safeParse({ ...approval, scope: {} }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({
+      ...approval,
+      scope: { origins: ['https://example.com'] },
+    }).success).toBe(false)
+  })
+
   it('requires Main-owned execution availability with strict status semantics', () => {
     const status = {
       type: 'workflow_status' as const,

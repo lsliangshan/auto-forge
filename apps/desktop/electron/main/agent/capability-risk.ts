@@ -1,6 +1,12 @@
 import type { BrowserAction } from '../browser/browser-continuation-types.js'
 
-export type CapabilityRisk = 'safe_navigation' | 'sensitive_read' | 'external_action' | 'unsupported' | 'unknown'
+export type CapabilityRisk =
+  | 'safe_navigation'
+  | 'sensitive_read'
+  | 'sensitive_read_managed_write'
+  | 'external_action'
+  | 'unsupported'
+  | 'unknown'
 
 const capabilityRisks: Readonly<Record<string, CapabilityRisk>> = {
   'browser.open': 'safe_navigation',
@@ -9,6 +15,7 @@ const capabilityRisks: Readonly<Record<string, CapabilityRisk>> = {
   'browser.fill': 'external_action',
   'browser.click': 'external_action',
   'clipboard.read': 'sensitive_read',
+  'file.convert': 'sensitive_read_managed_write',
   'filesystem.write': 'external_action',
   'network.fetch': 'unsupported',
   'filesystem.read': 'unsupported',

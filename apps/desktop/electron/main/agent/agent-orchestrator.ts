@@ -12,6 +12,7 @@ import {
 } from '@autoforge/shared'
 import { z } from 'zod'
 import type { PolicyEngine } from '../permissions/policy-engine.js'
+import type { ExecutionAttachmentBinding } from '../workflows/execution-service.js'
 import type { ExactWorkflowSource, WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import { addUsd } from '../billing/decimal-usd.js'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
@@ -421,6 +422,7 @@ export interface AgentRunInput extends UsageAttribution {
   assetIds: string[]
   contextLength?: number
   currentMedia: CurrentMediaMetadata[]
+  attachmentBindings?: readonly ExecutionAttachmentBinding[]
   allowTools: boolean
   readonly supportsImageInput: boolean
   provider: ModelProviderId
@@ -466,6 +468,7 @@ interface ActiveAgentRun {
   model: string
   contextLength?: number
   readonly supportsImageInput: boolean
+  readonly attachmentBindings: readonly ExecutionAttachmentBinding[]
   blocks: ChatBlock[]
   messages: ModelMessage[]
   tools: ModelTool[]
@@ -523,6 +526,18 @@ interface ActiveAgentRun {
 
 function appFailure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
+}
+
+function immutableClone<T>(value: T, seen = new WeakSet<object>()): T {
+  const clone = structuredClone(value)
+  const freeze = (current: unknown): void => {
+    if (!current || typeof current !== 'object' || seen.has(current)) return
+    seen.add(current)
+    for (const child of Object.values(current)) freeze(child)
+    Object.freeze(current)
+  }
+  freeze(clone)
+  return clone
 }
 
 function asAppError(error: unknown): AppError {
@@ -845,6 +860,7 @@ export class AgentOrchestrator {
         model: input.model,
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
         supportsImageInput: input.supportsImageInput,
+        attachmentBindings: immutableClone(input.attachmentBindings ?? []),
         blocks: [],
         messages: [],
         tools: [],
@@ -1338,6 +1354,7 @@ export class AgentOrchestrator {
       candidate,
       arguments: call.arguments,
       developerMode: this.dependencies.developerMode?.() ?? false,
+      attachmentBindings: active.attachmentBindings,
       budget: this.toolBudget(active),
     })
     if (prepared.kind === 'tool_error') {
