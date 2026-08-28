@@ -60,6 +60,7 @@ function createHandshakeSubscription<T>(
   unsubscribeChannel: string,
   parse: (payload: unknown) => { success: boolean; data?: T },
 ): (listener: (event: T) => void) => () => void {
+  const maxSubscribeAttemptsPerGeneration = 2
   const listeners = new Set<(event: T) => void>()
   const wrapped: RendererListener = (_event, payload) => {
     const result = parse(payload)
@@ -76,21 +77,34 @@ function createHandshakeSubscription<T>(
       while (true) {
         const observedGeneration = generation
         const wantsSubscription = listeners.size > 0
-        if (wantsSubscription !== mainSubscribed) {
-          if (wantsSubscription) {
-            try {
-              await invoke<void>(ipcRenderer, subscribeChannel)
-              mainSubscribed = true
-            } catch {
-              mainSubscribed = false
-            }
-          } else {
+        if (!wantsSubscription) {
+          if (mainSubscribed) {
             try {
               await invoke<void>(ipcRenderer, unsubscribeChannel)
             } catch {
               // Main may already have detached during logout or window cleanup.
             }
             mainSubscribed = false
+          }
+        } else if (!mainSubscribed) {
+          let subscribeAttempts = 0
+          while (listeners.size > 0
+            && generation === observedGeneration
+            && !mainSubscribed
+            && subscribeAttempts < maxSubscribeAttemptsPerGeneration) {
+            subscribeAttempts += 1
+            try {
+              await invoke<void>(ipcRenderer, subscribeChannel)
+              mainSubscribed = true
+            } catch {
+              mainSubscribed = false
+              try {
+                await invoke<void>(ipcRenderer, unsubscribeChannel)
+              } catch {
+                // A rejected subscribe may have attached before its response failed.
+              }
+              mainSubscribed = false
+            }
           }
         }
         if (observedGeneration === generation) {
@@ -113,8 +127,8 @@ function createHandshakeSubscription<T>(
     listeners.add(registered)
     if (installLocalListener) {
       ipcRenderer.on(channel, wrapped)
-      synchronize()
     }
+    synchronize()
     let subscribed = true
     return () => {
       if (!subscribed) return
