@@ -43,6 +43,12 @@ function isTerminal(status: ConversionJobView['status']): boolean {
   return statusRank(status) === 4
 }
 
+function canActOnJob(action: 'cancel' | 'retry', status: ConversionJobView['status']): boolean {
+  return action === 'cancel'
+    ? ['queued', 'downloading_component', 'converting', 'verifying'].includes(status)
+    : ['failed', 'cancelled', 'interrupted'].includes(status)
+}
+
 function mergeArtifacts(current: ConversionJobView['artifacts'], candidate: ConversionJobView['artifacts']) {
   const artifacts = new Map(current.map((artifact) => [artifact.artifactId, artifact]))
   for (const artifact of candidate) {
@@ -103,6 +109,8 @@ export const useConversionStore = defineStore('conversion', {
     loadingByExecution: {} as Record<string, boolean>,
     errorsByExecution: {} as Record<string, string>,
     unavailableByExecution: {} as Record<string, true>,
+    pendingJobIds: {} as Record<string, true>,
+    actionErrorsByJob: {} as Record<string, string>,
     pendingArtifactIds: {} as Record<string, true>,
     actionErrorsByArtifact: {} as Record<string, string>,
     _loadVersions: {} as Record<string, number>,
@@ -125,6 +133,8 @@ export const useConversionStore = defineStore('conversion', {
       this.loadingByExecution = {}
       this.errorsByExecution = {}
       this.unavailableByExecution = {}
+      this.pendingJobIds = {}
+      this.actionErrorsByJob = {}
       this.pendingArtifactIds = {}
       this.actionErrorsByArtifact = {}
       this._loadVersions = {}
@@ -196,6 +206,18 @@ export const useConversionStore = defineStore('conversion', {
       delete this.errorsByExecution[executionId]
       delete this.unavailableByExecution[executionId]
       this.jobsByExecution[executionId] = mergeJobs(this.jobsForExecution(executionId), [event.job])
+    },
+    async actOnJob(action: 'cancel' | 'retry', job: ConversionJobView) {
+      if (!canActOnJob(action, job.status) || this.pendingJobIds[job.jobId]) return
+      this.pendingJobIds[job.jobId] = true
+      delete this.actionErrorsByJob[job.jobId]
+      try {
+        await getDesktopApi().conversion[action]({ jobId: job.jobId })
+      } catch (error) {
+        this.actionErrorsByJob[job.jobId] = displayError(error, '转换任务操作失败，请稍后重试')
+      } finally {
+        delete this.pendingJobIds[job.jobId]
+      }
     },
     async actOnArtifact(action: 'saveCopy' | 'reveal' | 'deleteArtifact', artifact: ConversionArtifactView) {
       if (artifact.status !== 'ready' || this.pendingArtifactIds[artifact.artifactId]) return

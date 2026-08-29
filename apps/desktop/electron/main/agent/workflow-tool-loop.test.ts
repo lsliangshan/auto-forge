@@ -121,6 +121,32 @@ describe('WorkflowToolLoop', () => {
     }
   })
 
+  it('allows only distinct inputs in the explicit separately-approved repeat mode', () => {
+    const loop = new WorkflowToolLoop({ now: () => 0 })
+    expect(loop.startExecution('converter', false, {
+      input: { files: [0], targetFormat: 'ico' },
+    }, true)).toEqual({ kind: 'started', executionIndex: 1 })
+    loop.finishExecution(1, 'completed')
+
+    expect(loop.executionEligibility('converter', false, {
+      input: { files: [0], targetFormat: 'ico' },
+    }, true)).toEqual({ kind: 'failed', code: 'INVALID_TOOL_SEQUENCE' })
+    expect(loop.startExecution('converter', false, {
+      input: { files: [1], targetFormat: 'pdf' },
+    }, true)).toEqual({ kind: 'started', executionIndex: 2 })
+    loop.finishExecution(2, 'completed')
+    expect(loop.startExecution('converter', false, {
+      input: { files: [2], targetFormat: 'webm' },
+    }, true)).toEqual({ kind: 'started', executionIndex: 3 })
+
+    const ordinary = new WorkflowToolLoop({ now: () => 0 })
+    expect(ordinary.startExecution('external', false, { value: 1 })).toMatchObject({ kind: 'started' })
+    ordinary.finishExecution(1, 'completed')
+    expect(ordinary.startExecution('external', false, { value: 2 })).toEqual({
+      kind: 'failed', code: 'INVALID_TOOL_SEQUENCE',
+    })
+  })
+
   it('pauses active time during approval and expires approval at thirty minutes', () => {
     const clock = mutableClock()
     const loop = new WorkflowToolLoop({ now: clock.now })

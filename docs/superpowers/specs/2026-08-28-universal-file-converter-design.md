@@ -733,6 +733,48 @@ No layer may expose paths or generic process execution to the layer above it.
 The implementation plan must break these into independently verifiable tasks
 and keep production pack publication as an explicit external gate.
 
+## Task 14 Implementation Evidence (2026-08-30)
+
+The Task 14 Electron suite exercises the production Renderer, Preload, IPC,
+Main, restricted Worker, signed-pack process runner, SQLite repositories, and
+visible conversion card. With an explicit Task 13 test-pack root, it proves:
+
+- the exact chat request `把图片转成 favicon ico，把文档转成 PDF` binds a PNG and
+  DOCX by attachment index, presents two separately approved sanitized scopes,
+  keeps paths, bytes, base64, and internal identifiers out of Provider input,
+  and produces durable ICO and PDF results whose native saved copies pass
+  signature/content checks;
+- `file.convert.universal` / `万象转换` is discovered through the Renderer
+  workflow page, Debug Panel native selection sends only indexes plus opaque
+  attachment IDs, and a real MP4-to-WebM process result arriving after cancel
+  cannot replace the durable cancelled state;
+- quitting with a conversion in flight and reopening the same local profile
+  recovers the job as interrupted, while explicit retry advances its epoch and
+  produces a verified durable artifact;
+- an invalid signed-pack root fails visibly without consulting a PATH sentinel,
+  and an absent explicit root skips with an external-gate message rather than
+  falling back to host tools;
+- real repository rows and app-owned fixture files cover narrow and wide chat,
+  long unbroken names, page and icon-representation metadata, download,
+  action-pending, error, deleted, remote-only, keyboard-focus, dark, and 200%
+  zoom states. Main's persisted dark setting/native-theme state is asserted;
+  Playwright emulates the corresponding Renderer media query for deterministic
+  screenshot capture. Final computer-use visual inspection remains pending.
+
+The page/representation fixture is visual evidence only. The current job
+runtime still commits one process output per job, and the current card lists
+all artifacts instead of implementing the specified collapsible multi-output
+group. Those are local design gaps and are not represented as real multi-output
+converter-process acceptance by Task 14.
+
+This local Darwin arm64 fixture evidence is not release acceptance. Production
+signing keys and index, hosted packs and CDN behavior, all twelve production
+platform/architecture pack coordinates, third-party license review, real
+Darwin x64 and Windows x64 execution, code signing, hardened runtime,
+notarization, quarantine behavior, production privacy review, and update or
+rollback drills remain external Task 13 gates. Real CloudBase/PostgreSQL sync,
+RLS, storage, and cross-device evidence remains an external Task 12 gate.
+
 ## Technical References
 
 - libvips documents format-specific loaders/savers and bounded file/buffer

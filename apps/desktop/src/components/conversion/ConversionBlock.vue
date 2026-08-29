@@ -36,8 +36,13 @@
         v-for="job in jobs"
         :key="job.jobId"
         class="conversion-job"
+        :aria-busy="isActive(job.status)"
       >
-        <div class="conversion-job-status">
+        <div
+          class="conversion-job-status"
+          role="status"
+          aria-live="polite"
+        >
           <strong>{{ statusLabel(job.status) }}</strong><span>{{ job.targetFormat.toUpperCase() }}</span>
         </div>
         <div
@@ -73,6 +78,41 @@
           role="status"
         >
           转换已中断，请重新发起转换
+        </p>
+        <div
+          v-if="isActive(job.status) || isRetryable(job.status)"
+          class="conversion-job-actions"
+        >
+          <button
+            v-if="isActive(job.status)"
+            type="button"
+            class="af-secondary-button"
+            data-testid="conversion-cancel"
+            :aria-label="`取消 ${job.targetFormat.toUpperCase()} 转换`"
+            :disabled="jobPending(job.jobId)"
+            @click="actOnJob('cancel', job)"
+          >
+            取消转换
+          </button>
+          <button
+            v-else
+            type="button"
+            class="af-secondary-button"
+            data-testid="conversion-retry"
+            :aria-label="`重试 ${job.targetFormat.toUpperCase()} 转换`"
+            :disabled="jobPending(job.jobId)"
+            @click="actOnJob('retry', job)"
+          >
+            重试转换
+          </button>
+        </div>
+        <p
+          v-if="jobActionError(job.jobId)"
+          class="conversion-failure conversion-job-action-error"
+          role="alert"
+          aria-live="assertive"
+        >
+          {{ jobActionError(job.jobId) }}
         </p>
         <div
           v-if="job.status === 'completed'"
@@ -136,7 +176,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted } from 'vue'
-import type { ConversionArtifactView, ConversionJobStatus } from '@autoforge/shared'
+import type { ConversionArtifactView, ConversionJobStatus, ConversionJobView } from '@autoforge/shared'
 import type { UiChatBlock } from '../../stores/chat'
 import { useConversionStore } from '../../stores/conversion'
 
@@ -158,6 +198,10 @@ onUnmounted(() => releaseSubscription?.())
 
 function isActive(status: ConversionJobStatus): boolean {
   return ['queued', 'downloading_component', 'converting', 'verifying'].includes(status)
+}
+
+function isRetryable(status: ConversionJobStatus): boolean {
+  return ['failed', 'cancelled', 'interrupted'].includes(status)
 }
 
 function statusLabel(status: ConversionJobStatus): string {
@@ -183,6 +227,11 @@ function artifactMetadata(artifact: ConversionArtifactView): string {
 
 function pending(artifactId: string): boolean { return Boolean(conversion.pendingArtifactIds[artifactId]) }
 function actionError(artifactId: string): string { return conversion.actionErrorsByArtifact[artifactId] ?? '' }
+function jobPending(jobId: string): boolean { return Boolean(conversion.pendingJobIds[jobId]) }
+function jobActionError(jobId: string): string { return conversion.actionErrorsByJob[jobId] ?? '' }
+function actOnJob(action: 'cancel' | 'retry', job: ConversionJobView): void {
+  void conversion.actOnJob(action, job)
+}
 function act(action: 'saveCopy' | 'reveal' | 'deleteArtifact', artifact: ConversionArtifactView): void {
   void conversion.actOnArtifact(action, artifact)
 }
@@ -196,5 +245,6 @@ function act(action: 'saveCopy' | 'reveal' | 'deleteArtifact', artifact: Convers
 .conversion-job { border-top: 1px solid var(--af-border); padding: 12px 16px; }
 .conversion-job-status { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }.conversion-job-status span { color: var(--af-text-muted); font-size: 11px; }
 .conversion-progress { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; margin-top: 9px; color: var(--af-text-muted); font-size: 11px; }.conversion-progress > span { height: 5px; border-radius: 99px; background: linear-gradient(to right, var(--af-cobalt) var(--conversion-progress), var(--af-border) var(--conversion-progress)); }
-.conversion-results { display: grid; gap: 8px; margin-top: 10px; }.conversion-artifact { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; border: 1px solid var(--af-border); padding: 9px 10px; }.conversion-deleted { color: var(--af-text-muted); }.conversion-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }.conversion-actions button { font-size: 11px; }.conversion-artifact > .conversion-failure { grid-column: 1 / -1; padding: 0; background: transparent; }
+.conversion-job-actions { display: flex; justify-content: flex-end; margin-top: 9px; }.conversion-job-actions button { font-size: 11px; }.conversion-job-action-error { margin-top: 8px; padding: 7px 8px; }
+.conversion-results { display: grid; gap: 8px; margin-top: 10px; }.conversion-artifact { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; border: 1px solid var(--af-border); padding: 9px 10px; }.conversion-artifact > div:first-child { min-width: 0; }.conversion-artifact strong { overflow-wrap: anywhere; word-break: break-word; }.conversion-deleted { color: var(--af-text-muted); }.conversion-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }.conversion-actions button { font-size: 11px; }.conversion-artifact > .conversion-failure { grid-column: 1 / -1; padding: 0; background: transparent; }
 </style>

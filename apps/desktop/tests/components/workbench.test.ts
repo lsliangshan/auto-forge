@@ -351,6 +351,21 @@ describe('workbench', () => {
     expect(wrapper.text()).not.toContain('百度搜索')
   })
 
+  it('passes a plain workflow query snapshot across the desktop bridge', async () => {
+    const api = createApi()
+    vi.mocked(api.workflows.list).mockImplementation(async (query) => {
+      expect(() => structuredClone(query)).not.toThrow()
+      return []
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useWorkflowStore()
+
+    await store.load({ search: '万象转换', source: 'development' })
+
+    expect(api.workflows.list).toHaveBeenCalledWith({ search: '万象转换', source: 'development' })
+    expect(store.error).toBe('')
+  })
+
   it('renders the real developer empty state without inventing a project', async () => {
     const { wrapper, api } = await mountApp('/developer')
     await vi.waitFor(() => expect(api.developer.listProjects).toHaveBeenCalledOnce())

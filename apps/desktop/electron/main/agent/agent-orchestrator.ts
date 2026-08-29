@@ -1419,6 +1419,7 @@ export class AgentOrchestrator {
         ...(prepared.pending.city === undefined ? {} : { resolvedCity: prepared.pending.city }),
         input: prepared.pending.input,
       },
+      this.isDistinctFileConversionCandidate(candidate),
     )
     if (eligibility.kind === 'failed') {
       await this.workflowTools.cancel(prepared.pending)
@@ -1817,6 +1818,7 @@ export class AgentOrchestrator {
             ...(tool.city === undefined ? {} : { resolvedCity: tool.city }),
             input: tool.input,
           },
+          this.isDistinctFileConversionCandidate(tool.candidate),
         )
         if (boundary.kind === 'failed') return { kind: 'tool_error' as const, code: boundary.code }
         loopStart = boundary
@@ -2313,6 +2315,11 @@ export class AgentOrchestrator {
     return candidate.workflow.permissions.every((permission) => (
       classifyCapability(permission.capability) === 'safe_navigation'
     ))
+  }
+
+  private isDistinctFileConversionCandidate(candidate: WorkflowCandidate): boolean {
+    return candidate.workflow.permissions.length > 0
+      && candidate.workflow.permissions.every(({ capability }) => capability === 'file.convert')
   }
 
   private updateWorkflowStatus(

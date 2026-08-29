@@ -148,6 +148,12 @@ function createApi() {
         createdAt: '2026-07-19T00:00:00.000Z', input: {}, output: { success: true }, steps: [], logs: [],
       }),
     },
+    conversion: {
+      listForExecution: vi.fn().mockResolvedValue({ availability: 'local', jobs: [] }),
+      cancel: vi.fn().mockResolvedValue(undefined), retry: vi.fn().mockResolvedValue(undefined),
+      saveCopy: vi.fn().mockResolvedValue({ saved: true }), reveal: vi.fn().mockResolvedValue(undefined),
+      deleteArtifact: vi.fn().mockResolvedValue(undefined), onEvent: vi.fn(() => vi.fn()),
+    },
   }
   return { api: api as unknown as DesktopAPI, raw: api, emit: (event: ExecutionEvent) => executionListener?.(event) }
 }
@@ -943,6 +949,66 @@ describe('developer workbench', () => {
     await vi.waitFor(() => expect(store.debugDetail?.logs).toHaveLength(1))
     await wrapper.vm.$nextTick()
     expect(wrapper.text().split('正在使用百度搜索：今日天气')).toHaveLength(2)
+  })
+
+  it('mounts the real conversion block for a completed debug execution and routes cancel and retry to conversion jobs', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.id = 'file.convert.universal'
+    manifest.permissions = [{ capability: 'file.convert', scope: { formats: ['pdf', 'webm'] } }]
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    raw.conversion.listForExecution.mockResolvedValue({
+      availability: 'local',
+      jobs: [
+        {
+          jobId: 'job_video', executionId: 'exec_1', targetFormat: 'webm', status: 'converting',
+          epoch: 0, progress: 48, artifacts: [],
+        },
+        {
+          jobId: 'job_restart', executionId: 'exec_1', targetFormat: 'pdf', status: 'interrupted',
+          epoch: 0, progress: 35, artifacts: [],
+        },
+      ],
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    store.debugExecutionId = 'exec_1'
+    store.debugStatus = 'completed'
+
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+    await vi.waitFor(() => {
+      expect(raw.conversion.listForExecution).toHaveBeenCalledWith({ executionId: 'exec_1' })
+      expect(wrapper.get('[aria-label="文件转换结果"]').text()).toContain('正在转换')
+    })
+
+    const block = wrapper.get('[aria-label="文件转换结果"]')
+    expect(block.text()).toContain('正在转换')
+    expect(block.text()).toContain('转换已中断')
+    await block.get('[data-testid="conversion-cancel"]').trigger('click')
+    await block.get('[data-testid="conversion-retry"]').trigger('click')
+
+    expect(raw.conversion.cancel).toHaveBeenCalledWith({ jobId: 'job_video' })
+    expect(raw.conversion.retry).toHaveBeenCalledWith({ jobId: 'job_restart' })
+    expect(raw.executions.cancel).not.toHaveBeenCalled()
+  })
+
+  it('does not mount a conversion block for a non-converter debug execution', async () => {
+    const { api, raw } = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    store.debugExecutionId = 'exec_1'
+    store.debugStatus = 'completed'
+
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('[aria-label="文件转换结果"]').exists()).toBe(false)
+    expect(raw.conversion.listForExecution).not.toHaveBeenCalled()
   })
 
   it('isolates execution events, handles approvals, and cancels only the active debug run', async () => {

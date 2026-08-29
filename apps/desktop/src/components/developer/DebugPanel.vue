@@ -54,6 +54,10 @@
       <ol v-if="developer.debugDetail?.steps.length" class="debug-steps"><li v-for="step in developer.debugDetail.steps" :key="step.id">{{ step.label }} · {{ step.status }}</li></ol>
       <div v-if="developer.debugDetail?.logs.length && !hasLiveLogs" class="debug-log"><p v-for="log in developer.debugDetail.logs" :key="log.id">[{{ log.level }}] {{ log.message }}</p></div>
       <pre v-if="developer.debugDetail?.output !== undefined">{{ JSON.stringify(developer.debugDetail.output, null, 2) }}</pre>
+      <ConversionBlock
+        v-if="developer.debugExecutionId && hasFileConversion"
+        :block="developerConversionBlock"
+      />
     </section>
   </div>
 </template>
@@ -61,6 +65,7 @@
 <script setup lang="ts">
 import type { CapabilityScope, ExecutionEvent } from '@autoforge/shared'
 import { computed, reactive, ref, watch } from 'vue'
+import ConversionBlock from '../conversion/ConversionBlock.vue'
 import { useDeveloperStore } from '../../stores/developer'
 
 type JsonSchema = { type?: string; title?: string; enum?: unknown[]; properties?: Record<string, JsonSchema>; required?: string[]; 'x-autoforge-control'?: unknown }
@@ -70,6 +75,9 @@ const complexDrafts = reactive<Record<string, string>>({})
 const draftErrors = reactive<Record<string, string>>({})
 const rootDraft = ref('{}')
 const manifest = computed(() => developer.currentManifest)
+const hasFileConversion = computed(() => manifest.value?.permissions.some(
+  (permission) => permission.capability === 'file.convert',
+) ?? false)
 const inputSchema = computed(() => manifest.value?.inputSchema as JsonSchema | undefined)
 const inputSchemaKey = computed(() => `${developer.selectedProjectId}\n${JSON.stringify(inputSchema.value ?? null)}`)
 const objectFields = computed<Field[]>(() => {
@@ -84,6 +92,13 @@ const objectFields = computed<Field[]>(() => {
 const active = computed(() => ['starting', 'queued', 'awaiting_approval', 'running'].includes(developer.debugStatus))
 const statusLabel = computed(() => ({ idle: '未运行', starting: '启动中', queued: '排队中', awaiting_approval: '等待授权', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' })[developer.debugStatus])
 const hasLiveLogs = computed(() => developer.debugEvents.some((event) => event.type === 'log'))
+const developerConversionBlock = computed(() => ({
+  id: `developer:${developer.debugExecutionId}:conversion`,
+  type: 'conversion' as const,
+  blockId: `developer_${developer.debugExecutionId}_conversion`,
+  executionId: developer.debugExecutionId,
+  state: active.value ? 'active' as const : 'terminal' as const,
+}))
 
 function setPrimitive(field: Field, value: string) {
   if (!value) { delete inputObject()[field.name]; return }

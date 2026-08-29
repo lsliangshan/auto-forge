@@ -12,8 +12,9 @@ describe('workspace', () => {
       pretest: 'pnpm --filter @autoforge/desktop prepare:native-electron',
       typecheck: 'pnpm -r --if-present typecheck',
       test: 'node apps/desktop/scripts/run-vitest-electron.mjs run',
-      build: 'pnpm -r --filter "./packages/**" build && pnpm --filter @autoforge/desktop build && pnpm build:e2e:cloud-user-data-sync',
+      build: 'pnpm -r --filter "./packages/**" build && pnpm --filter @autoforge/desktop build && pnpm build:e2e:cloud-user-data-sync && pnpm build:e2e:universal-file-converter',
       'build:e2e:cloud-user-data-sync': 'pnpm --filter @autoforge/desktop exec tsup electron/e2e/cloud-user-data-sync-main.ts --format esm --platform node --external electron --external better-sqlite3 --loader .sql=text --out-dir .e2e/main --clean false',
+      'build:e2e:universal-file-converter': 'pnpm --filter @autoforge/desktop exec tsup tests/e2e/universal-file-converter-fixture.ts --format esm --platform node --external electron --external better-sqlite3 --loader .sql=text --out-dir .e2e/main --clean false',
     })
     expect(desktop.scripts).toMatchObject({
       predev: 'pnpm prepare:native-electron',

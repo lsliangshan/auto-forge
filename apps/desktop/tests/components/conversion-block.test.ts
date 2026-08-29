@@ -114,6 +114,62 @@ describe('conversion chat block', () => {
     expect(wrapper.get('[data-testid="conversion-save-copy"]').attributes('disabled')).toBeUndefined()
   })
 
+  it('offers an accessible cancel action for an active job and prevents duplicate cancellation while pending', async () => {
+    const { api } = apiFor([job('converting')])
+    const cancel = deferred<void>()
+    vi.mocked(api.conversion.cancel).mockReturnValue(cancel.promise)
+    const wrapper = mountBlock(api)
+    await flushPromises()
+
+    const button = wrapper.get('[data-testid="conversion-cancel"]')
+    expect(button.attributes('aria-label')).toBe('取消 PNG 转换')
+    await button.trigger('click')
+    await button.trigger('click')
+
+    expect(api.conversion.cancel).toHaveBeenCalledOnce()
+    expect(api.conversion.cancel).toHaveBeenCalledWith({ jobId: 'job_1' })
+    expect(button.attributes('disabled')).toBeDefined()
+    cancel.resolve(undefined)
+    await flushPromises()
+    expect(button.attributes('disabled')).toBeUndefined()
+  })
+
+  it.each(['failed', 'cancelled', 'interrupted'] as const)(
+    'offers an accessible retry action for a %s job and prevents duplicate retries while pending',
+    async (status) => {
+      const { api } = apiFor([job(status)])
+      const retry = deferred<void>()
+      vi.mocked(api.conversion.retry).mockReturnValue(retry.promise)
+      const wrapper = mountBlock(api, 'terminal')
+      await flushPromises()
+
+      const button = wrapper.get('[data-testid="conversion-retry"]')
+      expect(button.attributes('aria-label')).toBe('重试 PNG 转换')
+      await button.trigger('click')
+      await button.trigger('click')
+
+      expect(api.conversion.retry).toHaveBeenCalledOnce()
+      expect(api.conversion.retry).toHaveBeenCalledWith({ jobId: 'job_1' })
+      expect(button.attributes('disabled')).toBeDefined()
+      retry.resolve(undefined)
+      await flushPromises()
+      expect(button.attributes('disabled')).toBeUndefined()
+    },
+  )
+
+  it('keeps a failed retry visible without exposing the underlying error', async () => {
+    const { api } = apiFor([job('interrupted')])
+    vi.mocked(api.conversion.retry).mockRejectedValue(new Error('/private/converter failed'))
+    const wrapper = mountBlock(api, 'terminal')
+    await flushPromises()
+
+    await wrapper.get('[data-testid="conversion-retry"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('转换任务操作失败，请稍后重试')
+    expect(wrapper.text()).not.toContain('/private/converter failed')
+  })
+
   it('shows the cross-device local-only result notice without a local job', async () => {
     const { api } = apiFor([])
     vi.mocked(api.conversion.listForExecution).mockResolvedValue({ availability: 'unavailable', jobs: [] })

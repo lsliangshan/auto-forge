@@ -14,6 +14,7 @@ interface StartedCandidate {
   executionIndex: number
   inputJson: string
   retryable: boolean
+  repeatableDistinctInput: boolean
   status?: ExecutionStatus
 }
 
@@ -63,11 +64,17 @@ export class WorkflowToolLoop {
     candidateKey: string,
     retryable: boolean,
     input: unknown,
+    repeatableDistinctInput = false,
   ): { kind: 'started'; executionIndex: number } | LoopFailure {
     if (this.activeExpired()) return { kind: 'failed', code: 'MODEL_PROVIDER_TIMEOUT' }
     if (this.starts >= MAX_WORKFLOW_EXECUTIONS) return { kind: 'failed', code: 'TOOL_CALL_LIMIT' }
 
-    const eligibility = this.stableExecutionEligibility(candidateKey, retryable, input)
+    const eligibility = this.stableExecutionEligibility(
+      candidateKey,
+      retryable,
+      input,
+      repeatableDistinctInput,
+    )
     if (eligibility.kind === 'failed') return eligibility
     const inputJson = eligibility.inputJson
     const previous = this.startsByCandidate.get(candidateKey) ?? []
@@ -77,6 +84,7 @@ export class WorkflowToolLoop {
       executionIndex: this.starts,
       inputJson,
       retryable,
+      repeatableDistinctInput,
     }
     previous.push(started)
     this.startsByCandidate.set(candidateKey, previous)
@@ -88,8 +96,14 @@ export class WorkflowToolLoop {
     candidateKey: string,
     retryable: boolean,
     input: unknown,
+    repeatableDistinctInput = false,
   ): { kind: 'eligible' } | LoopFailure {
-    const eligibility = this.stableExecutionEligibility(candidateKey, retryable, input)
+    const eligibility = this.stableExecutionEligibility(
+      candidateKey,
+      retryable,
+      input,
+      repeatableDistinctInput,
+    )
     return eligibility.kind === 'eligible' ? { kind: 'eligible' } : eligibility
   }
 
@@ -97,6 +111,7 @@ export class WorkflowToolLoop {
     candidateKey: string,
     retryable: boolean,
     input: unknown,
+    repeatableDistinctInput: boolean,
   ): { kind: 'eligible'; inputJson: string } | LoopFailure {
     let inputJson: string
     try { inputJson = canonicalJson(input) } catch { return { kind: 'failed', code: 'INVALID_INPUT' } }
@@ -108,7 +123,11 @@ export class WorkflowToolLoop {
       && first.retryable
       && retryable
       && first.inputJson !== inputJson
-    return isChangedFailedReadOnlyRetry
+    const isDistinctExplicitRepeat = repeatableDistinctInput
+      && previous.every((started) => (
+        started.repeatableDistinctInput && started.inputJson !== inputJson
+      ))
+    return isChangedFailedReadOnlyRetry || isDistinctExplicitRepeat
       ? { kind: 'eligible', inputJson }
       : { kind: 'failed', code: 'INVALID_TOOL_SEQUENCE' }
   }
