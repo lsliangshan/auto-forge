@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { hasBusinessCapability, type AuthCredentials, type AuthOtpChallenge, type AuthOtpRequest, type AuthSession } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
+import { useDeveloperStore } from './developer'
 import { useExecutionStore } from './execution'
 import { useConversionStore } from './conversion'
 
@@ -60,6 +61,7 @@ function replaceSession(store: { session: AuthSession | null }, session: AuthSes
   const nextUserId = session?.user.id
   if (previousUserId !== undefined && previousUserId !== nextUserId) {
     useChatStore().resetLocalData()
+    useDeveloperStore().resetDebug()
     useExecutionStore().resetLocalData()
     useConversionStore().resetLocalData()
   }

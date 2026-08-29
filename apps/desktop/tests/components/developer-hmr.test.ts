@@ -28,6 +28,8 @@ describe('developer store hot updates', () => {
     const firstModule = await import('../../src/stores/developer')
     const store = firstModule.useDeveloperStore(pinia)
     store.debugExecutionId = 'exec_1'
+    store.debugExecutionConversionCapable = true
+    store.debugStatus = 'running'
     store.ensureExecutionSubscription()
 
     vi.resetModules()
@@ -42,12 +44,18 @@ describe('developer store hot updates', () => {
     for (const listener of listeners) listener(event)
 
     expect(store.debugEvents).toEqual([event])
+    expect(store.debugExecutionId).toBe('exec_1')
+    expect(store.debugExecutionConversionCapable).toBe(true)
+    expect(store.debugStatus).toBe('running')
     store.selectedProjectId = 'project_1'
     ;(store as unknown as { developerAttachments: unknown[] }).developerAttachments = [{
       id: 'draft_hmr', name: 'source.png', mimeType: 'image/png', byteSize: 10,
     }]
     store.$dispose()
     expect(api.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' })
+    expect(store.debugExecutionId).toBe('')
+    expect(store.debugExecutionConversionCapable).toBe(false)
+    expect(store.debugStatus).toBe('idle')
   })
 
   it('clears Main-owned drafts when HMR removes the picker annotation', async () => {

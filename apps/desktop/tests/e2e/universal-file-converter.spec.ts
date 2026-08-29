@@ -132,6 +132,14 @@ async function attachFixtureFiles(profile: LaunchedProfile, names: string[]): Pr
   await expect(profile.page.getByTestId('attachment-card')).toHaveCount(names.length)
 }
 
+async function replaceMonacoContent(page: Page, content: string): Promise<void> {
+  const input = page.getByRole('textbox', { name: 'Editor content' })
+  await input.focus()
+  await page.keyboard.press('Meta+A')
+  await page.keyboard.press('Backspace')
+  await page.keyboard.insertText(content)
+}
+
 async function screenshot(page: Page, name: string): Promise<void> {
   await mkdir(artifactRoot, { recursive: true })
   await page.screenshot({ path: join(artifactRoot, `${name}.png`), fullPage: true })
@@ -286,6 +294,22 @@ test.describe.serial('universal file conversion through Electron', () => {
 
     const conversionBlock = profile.page.getByLabel('文件转换结果')
     await expect(conversionBlock).toContainText('正在转换')
+
+    await profile.page.getByTestId('tree-entry-workflow.json').click()
+    await replaceMonacoContent(profile.page, JSON.stringify({
+      permissions: [],
+      inputSchema: { type: 'object' },
+    }))
+    await expect(profile.page.locator('.permissions')).not.toContainText('file.convert')
+    await expect(conversionBlock).toContainText('正在转换')
+
+    await replaceMonacoContent(profile.page, '{ invalid')
+    await expect(profile.page.getByText('workflow.json 不是有效 JSON，无法生成调试表单。')).toBeVisible()
+    await expect(conversionBlock).toContainText('正在转换')
+    await profile.page.getByTestId('tree-entry-src/index.ts').click()
+    await expect(conversionBlock).toContainText('正在转换')
+    await screenshot(profile.page, 'developer-conversion-snapshot-invalid-manifest')
+
     await conversionBlock.getByTestId('conversion-cancel').click()
     await expect(conversionBlock).toContainText('转换已取消')
     await command(profile.app, 'releaseHeld')

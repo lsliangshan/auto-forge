@@ -121,6 +121,7 @@ export const useDeveloperStore = defineStore('developer', {
     debugEvents: [] as ExecutionEvent[],
     debugDetail: undefined as ExecutionDetail | undefined,
     debugExecutionId: '',
+    debugExecutionConversionCapable: false,
     debugStatus: 'idle' as 'idle' | 'starting' | 'queued' | 'awaiting_approval' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted',
     debugError: '',
   }),
@@ -170,6 +171,7 @@ export const useDeveloperStore = defineStore('developer', {
         for (const timer of state.timers.values()) clearTimeout(timer)
         state.timers.clear()
         state.unsubscribe?.()
+        this.resetDebug()
         Reflect.deleteProperty(this, runtimeKey)
         dispose()
       }
@@ -185,6 +187,7 @@ export const useDeveloperStore = defineStore('developer', {
           this.selectedProjectId = first?.id ?? ''
           this.selectedPath = ''
           if (first) await this.selectProject(first.id)
+          else this.resetDebug()
         }
       } catch (error) {
         this.error = displayError(error, '项目列表加载失败')
@@ -658,6 +661,9 @@ export const useDeveloperStore = defineStore('developer', {
         if (!isCurrent()) return
         this._upsertProject(built)
         if (!await this._refreshBuiltManifest(projectId, isCurrent) || !isCurrent()) return
+        const executionConversionCapable = this.manifests[projectId]?.permissions.some(
+          (permission) => permission.capability === 'file.convert',
+        ) ?? false
         const validation = await getDesktopApi().developer.validate(projectId)
         if (!isCurrent()) return
         this._applyValidation(validation)
@@ -689,8 +695,11 @@ export const useDeveloperStore = defineStore('developer', {
           return
         }
         const { executionId } = runResult
-        this.debugExecutionId = executionId
-        this.debugStatus = 'queued'
+        this.$patch({
+          debugExecutionId: executionId,
+          debugExecutionConversionCapable: executionConversionCapable,
+          debugStatus: 'queued',
+        })
         for (const event of state.pendingEvents) if (event.executionId === executionId) this._applyExecutionEvent(event)
       } catch (error) {
         if (!isCurrent()) return
@@ -700,11 +709,15 @@ export const useDeveloperStore = defineStore('developer', {
       } finally { if (isCurrent()) state.pendingEvents = [] }
     },
     resetDebug() {
-      this.debugEvents = []
-      this.debugDetail = undefined
-      this.debugExecutionId = ''
-      this.debugStatus = 'idle'
-      this.debugError = ''
+      this._runToken += 1
+      this.$patch({
+        debugEvents: [],
+        debugDetail: undefined,
+        debugExecutionId: '',
+        debugExecutionConversionCapable: false,
+        debugStatus: 'idle',
+        debugError: '',
+      })
       const state = runtime(this)
       state.pendingEvents = []
     },

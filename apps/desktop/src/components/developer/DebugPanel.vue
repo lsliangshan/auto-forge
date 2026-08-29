@@ -55,7 +55,7 @@
       <div v-if="developer.debugDetail?.logs.length && !hasLiveLogs" class="debug-log"><p v-for="log in developer.debugDetail.logs" :key="log.id">[{{ log.level }}] {{ log.message }}</p></div>
       <pre v-if="developer.debugDetail?.output !== undefined">{{ JSON.stringify(developer.debugDetail.output, null, 2) }}</pre>
       <ConversionBlock
-        v-if="developer.debugExecutionId && hasFileConversion"
+        v-if="developer.debugExecutionId && developer.debugExecutionConversionCapable"
         :block="developerConversionBlock"
       />
     </section>
@@ -75,9 +75,6 @@ const complexDrafts = reactive<Record<string, string>>({})
 const draftErrors = reactive<Record<string, string>>({})
 const rootDraft = ref('{}')
 const manifest = computed(() => developer.currentManifest)
-const hasFileConversion = computed(() => manifest.value?.permissions.some(
-  (permission) => permission.capability === 'file.convert',
-) ?? false)
 const inputSchema = computed(() => manifest.value?.inputSchema as JsonSchema | undefined)
 const inputSchemaKey = computed(() => `${developer.selectedProjectId}\n${JSON.stringify(inputSchema.value ?? null)}`)
 const objectFields = computed<Field[]>(() => {

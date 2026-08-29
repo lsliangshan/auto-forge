@@ -9,6 +9,7 @@ import AppRail from '../../src/components/AppRail.vue'
 import { createAuthGuard, routes, safeRedirect } from '../../src/router'
 import { useAuthStore } from '../../src/stores/auth'
 import { useChatStore } from '../../src/stores/chat'
+import { useDeveloperStore } from '../../src/stores/developer'
 import { useExecutionStore } from '../../src/stores/execution'
 
 const authSession: AuthSession = {
@@ -173,6 +174,23 @@ describe('authentication store', () => {
     expect(execution.items).toEqual([])
     expect(execution.selectedId).toBe('')
     expect(execution.details).toEqual({})
+  })
+
+  it('invalidates the developer execution snapshot after logout succeeds', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const developer = useDeveloperStore()
+    auth.session = authSession
+    developer.debugExecutionId = 'exec_conversion'
+    developer.debugExecutionConversionCapable = true
+    developer.debugStatus = 'running'
+
+    await expect(auth.logout()).resolves.toBe(true)
+
+    expect(developer.debugExecutionId).toBe('')
+    expect(developer.debugExecutionConversionCapable).toBe(false)
+    expect(developer.debugStatus).toBe('idle')
   })
 
   it('deduplicates concurrent session restoration', async () => {
