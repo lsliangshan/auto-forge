@@ -5085,6 +5085,13 @@ describe('createApplicationRuntime', () => {
     'Either explain which formats this tool can convert to or convert this file to PDF',
     'You can explain which formats it can convert to or save this image as WebP',
     'Explain which formats are supported, then convert this file to PDF',
+    'Convert conversation.png to WebP',
+    '转换聊天记录.png为WebP',
+    'Can this tool convert PNG or JPG or I want you to convert this attachment to PDF',
+    'Could it convert HEIC otherwise convert this file to WebP',
+    'No matter what this tool can convert, convert this attachment to PDF',
+    '不要 .heif，而是 .jxl',
+    '不要 HEIF，而是 JXL',
   ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
@@ -5109,7 +5116,7 @@ describe('createApplicationRuntime', () => {
     const provider = snapshotProvider('openrouter', {
       listModels: async () => [{
         ...visionTextModelInfo('openrouter/implicit-conversion'),
-        supportsTools: content !== 'convert the attached conversation.png to WebP',
+        supportsTools: content !== 'Convert conversation.png to WebP',
       }],
       validateCredential: async () => ({ valid: true }),
       stream: async function* (request) {
@@ -5173,7 +5180,7 @@ describe('createApplicationRuntime', () => {
     const agentPayload = JSON.stringify(agentRequests(captured)[0])
     expect(agentPayload).toContain(`[附件 0: 文件-1, image/png, ${privateBytes.byteLength} bytes]`)
     expect(agentPayload).not.toContain('附件 9：private-source.png')
-    expect(agentPayload).toContain(content === 'convert the attached conversation.png to WebP'
+    expect(agentPayload).toContain(content === 'Convert conversation.png to WebP'
       ? '当前所选模型或本次请求不允许调用工作流或浏览器工具'
       : '你是由 AutoForge Main 管理的工作流 Agent')
     const titleRequest = captured.find(isConversationTitleRequest)
@@ -5250,6 +5257,20 @@ describe('createApplicationRuntime', () => {
     "don't convert this file; and export it as PDF",
     '不要转换这个附件，和保存为 PDF',
     '不要转换这个附件；并导出为 PDF',
+    'Explain just how to convert this file',
+    'Explain how to convert and how to save this file',
+    '说明直接如何转换这个附件',
+    '介绍如何转换以及如何导出这个文件',
+    'Convert this conversation and save it as PDF',
+    'Review this chat history, then export it as PDF',
+    '查看这段对话，然后把它导出为 PDF',
+    '总结聊天记录；将它保存为 PDF',
+    'Convert this conversation about the attachment to PDF',
+    'Save the conversation with this image as PDF',
+    '把关于当前图片的对话转换为 PDF',
+    '将包含这个附件的聊天记录导出为 PDF',
+    '不要黑暗，而是鲜艳',
+    '不要苹果，而是香蕉',
   ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
     directories.push(root)

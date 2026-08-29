@@ -104,6 +104,13 @@ describe('local conversion intent', () => {
     'Either explain which formats this tool can convert to or convert this file to PDF',
     'You can explain which formats it can convert to or save this image as WebP',
     'Explain which formats are supported, then convert this file to PDF',
+    'Convert conversation.png to WebP',
+    '转换聊天记录.png为WebP',
+    'Can this tool convert PNG or JPG or I want you to convert this attachment to PDF',
+    'Could it convert HEIC otherwise convert this file to WebP',
+    'No matter what this tool can convert, convert this attachment to PDF',
+    '不要 .heif，而是 .jxl',
+    '不要 HEIF，而是 JXL',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -205,6 +212,20 @@ describe('local conversion intent', () => {
     ["don't convert this file; and export it as PDF", attachments],
     ['不要转换这个附件，和保存为 PDF', attachments],
     ['不要转换这个附件；并导出为 PDF', attachments],
+    ['Explain just how to convert this file', attachments],
+    ['Explain how to convert and how to save this file', attachments],
+    ['说明直接如何转换这个附件', attachments],
+    ['介绍如何转换以及如何导出这个文件', attachments],
+    ['Convert this conversation and save it as PDF', attachments],
+    ['Review this chat history, then export it as PDF', attachments],
+    ['查看这段对话，然后把它导出为 PDF', attachments],
+    ['总结聊天记录；将它保存为 PDF', attachments],
+    ['Convert this conversation about the attachment to PDF', attachments],
+    ['Save the conversation with this image as PDF', attachments],
+    ['把关于当前图片的对话转换为 PDF', attachments],
+    ['将包含这个附件的聊天记录导出为 PDF', attachments],
+    ['不要黑暗，而是鲜艳', attachments],
+    ['不要苹果，而是香蕉', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)
@@ -249,6 +270,11 @@ describe('local conversion intent', () => {
       '[附件 1: 文件-2, application/octet-stream, 34 bytes]',
     ].join('\n'))
     expect(prompt).not.toMatch(/data:|secret|private|\\|\.\./i)
+  })
+
+  it('keeps a long non-conversion attachment request non-local', () => {
+    const text = `总结这段对话 ${'ordinary context '.repeat(2_000)} 并描述附件`
+    expect(hasLocalConversionIntent(text, attachments)).toBe(false)
   })
 
   it.each([
