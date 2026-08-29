@@ -1526,11 +1526,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       && (candidate as { executionId?: unknown }).executionId === executionId
       && (candidate as { state?: unknown }).state === 'active'
     )
-    const message = chatDatabase.messages.listForConversation(run.conversationId).find((candidate) => (
-      candidate.role === 'assistant' && candidate.blocks.some(activeConversion)
+    const matches = chatDatabase.messages.listForConversation(run.conversationId).flatMap((candidate) => (
+      candidate.role !== 'assistant' ? [] : candidate.blocks.filter(activeConversion).map((block) => ({ candidate, block }))
     ))
-    const block = message?.blocks.find(activeConversion)
-    if (!message || !block) return
+    if (matches.length !== 1) return
+    const { candidate: message, block } = matches[0]!
     const replacement = { ...block, state: 'terminal' as const }
     chatDatabase.messages.replaceBlock(message.id, block.blockId, replacement)
     queueUserDataFlush()
