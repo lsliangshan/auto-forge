@@ -5,6 +5,7 @@ import ChatView from '../views/ChatView.vue'
 import DeveloperView from '../views/DeveloperView.vue'
 import ExecutionsView from '../views/ExecutionsView.vue'
 import LoginView from '../views/LoginView.vue'
+import KnowledgeView from '../views/KnowledgeView.vue'
 import ProfileView from '../views/ProfileView.vue'
 import RegisterView from '../views/RegisterView.vue'
 import SettingsView from '../views/SettingsView.vue'
@@ -49,6 +50,7 @@ export const routes: RouteRecordRaw[] = [
       { path: '', redirect: '/chat' },
       { path: 'chat', name: 'chat', component: ChatView, meta: { title: '聊天', inspector: true } },
       { path: 'workflows', name: 'workflows', component: WorkflowsView, meta: { title: '工作流', inspector: true } },
+      { path: 'knowledge', name: 'knowledge', component: KnowledgeView, meta: { title: '个人知识库', inspector: false } },
       { path: 'developer', name: 'developer', component: DeveloperView, meta: { title: '开发', inspector: true } },
       { path: 'executions', name: 'executions', component: ExecutionsView, meta: { title: '执行记录', inspector: true } },
       { path: 'users', name: 'users', component: () => import('../views/UserManagementView.vue'), meta: { title: '用户管理', inspector: false, capability: 'manage_users' } },

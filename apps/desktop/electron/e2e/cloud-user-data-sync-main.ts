@@ -15,10 +15,13 @@ import {
   chatEventSchema,
   executionEventSchema,
   ipcChannels,
+  knowledgeEventSchema,
   toSafeAppError,
   type AuthSession,
+  type ChatEvent,
+  type KnowledgeEntitlementState,
 } from '@autoforge/shared'
-import { createApplicationRuntime } from '../main/application.js'
+import { createApplicationRuntime, type ApplicationModelProviderPort } from '../main/application.js'
 import type { AuthService } from '../main/auth/auth-service.js'
 import { CloudBaseUserDataPort } from '../main/cloud/cloudbase-user-data-port.js'
 import { openAppDatabase } from '../main/database/client.js'
@@ -31,6 +34,10 @@ import { registerDesktopIpc } from '../main/ipc/register-ipc.js'
 import { createMediaProtocolHandler } from '../main/media/media-protocol.js'
 import type { NetworkProxyPort } from '../main/network/network-proxy-service.js'
 import { createSecureWindow } from '../main/window.js'
+import { KnowledgeStoreFactory } from '../main/knowledge/encrypted-database.js'
+import { createLocalKnowledgeService, type LocalKnowledgeService } from '../main/knowledge/knowledge-service.js'
+import type { CloudKnowledgeRemote } from '../main/knowledge/sync-service.js'
+import type { ModelStreamRequest } from '../main/chat/model-provider.js'
 
 type FixtureUser = 'alice' | 'bob'
 
@@ -48,6 +55,7 @@ function fixtureUser(value: string): FixtureUser {
 const desktopRoot = requiredEnvironment('AUTOFORGE_E2E_DESKTOP_ROOT')
 const userData = requiredEnvironment('AUTOFORGE_E2E_USER_DATA')
 const fixtureOrigin = new URL(requiredEnvironment('AUTOFORGE_E2E_USER_DATA_FIXTURE')).origin
+const knowledgeReleaseSmoke = process.env.AUTOFORGE_E2E_KNOWLEDGE_RELEASE === '1'
 const databasePath = join(userData, 'autoforge.sqlite')
 const password = 'password-e2e'
 
@@ -163,11 +171,107 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspacePort {
       return { x: 0, y: 0, width: 1, height: 1, viewportWidth: 1, viewportHeight: 1 }
     },
     async captureNodeScreenshot() { return '' },
+    async capturePageScreenshot() { return '' },
     onPageInvalidated() { return () => undefined },
   }
 }
 
 let providerRequestCount = 0
+let knowledgeSnippetDisclosureCount = 0
+let knowledgeCloudCallCount = 0
+const recordedChatEvents: ChatEvent[] = []
+
+function countedCloudRemote(): CloudKnowledgeRemote {
+  const count = <T>(result: T): Promise<T> => {
+    knowledgeCloudCallCount += 1
+    return Promise.resolve(result)
+  }
+  return {
+    beginSync: input => count({
+      knowledgeBaseId: input.knowledgeBaseId, generationId: input.generationId, status: 'staging',
+    }),
+    pushMutation: input => count({
+      mutationId: input.mutationId, status: 'applied', sequence: 1, revision: 'e2e-cloud-revision',
+    }),
+    pullChanges: () => count({ kind: 'incremental', nextSequence: 0, hasMore: false, changes: [] }),
+    fullResync: () => count({ kind: 'snapshot', nextSequence: 0, changes: [] }),
+    publishGeneration: input => count({
+      generationId: input.generationId, previousGenerationId: null, sequence: 1,
+    }),
+    deleteKnowledgeBase: () => count({ deletionJobId: 'e2e-delete-job' }),
+    getJob: input => count({ jobId: input.jobId, state: 'completed', errorCode: null }),
+    cancelJob: () => count(undefined),
+    cleanupOrphans: () => count({ removed: 0 }),
+  }
+}
+
+const deterministicProvider: ApplicationModelProviderPort = {
+  async listModels() {
+    return [{
+      id: 'e2e-knowledge-model', name: 'E2E Knowledge',
+      inputModalities: ['text'], outputModalities: ['text'], supportsTools: true,
+      generation: {},
+    }]
+  },
+  async validateCredential() { return { valid: true } },
+  async *stream(request: ModelStreamRequest) {
+    providerRequestCount += 1
+    const hasKnowledgeResult = request.messages.some(message => (
+      message.role === 'tool'
+      && typeof message.content === 'string'
+      && message.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+    ))
+    if (hasKnowledgeResult) {
+      knowledgeSnippetDisclosureCount += 1
+      const rawToolContent = request.messages.find(message => (
+        message.role === 'tool'
+        && typeof message.content === 'string'
+        && message.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+      ))?.content ?? ''
+      const toolContent = typeof rawToolContent === 'string' ? rawToolContent : ''
+      const evidenceId = /"evidenceId":"([^"]+)"/u.exec(toolContent)?.[1]
+      if (!evidenceId) throw new Error('E2E knowledge evidence ID is missing')
+      yield { type: 'text_delta' as const, choiceIndex: 0, text: `AutoForge knowledge smoke [[kb:${evidenceId}]]` }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      return
+    }
+    const consentRequired = request.messages.some(message => (
+      message.role === 'tool' && typeof message.content === 'string' && message.content.includes('consent_required')
+    ))
+    if (consentRequired) {
+      yield { type: 'text_delta' as const, choiceIndex: 0, text: '等待知识库授权。' }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      return
+    }
+    if (request.tools?.some(tool => tool.function.name === 'knowledge_search')) {
+      yield {
+        type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'e2e_knowledge_search',
+        name: 'knowledge_search', arguments: { query: 'AutoForge knowledge smoke' },
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      return
+    }
+    yield { type: 'text_delta' as const, choiceIndex: 0, text: '知识库问答' }
+    yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+  },
+  async acquireSnapshot() {
+    return { providerId: 'openrouter', provider: deterministicProvider, apiKeyFingerprint: 'e2e' }
+  },
+}
+
+const deterministicDeepseekProvider: ApplicationModelProviderPort = {
+  ...deterministicProvider,
+  async listModels() {
+    return [{
+      id: 'deepseek-chat', name: 'E2E DeepSeek',
+      inputModalities: ['text'], outputModalities: ['text'], supportsTools: true,
+      generation: {},
+    }]
+  },
+  async acquireSnapshot() {
+    return { providerId: 'deepseek', provider: deterministicDeepseekProvider, apiKeyFingerprint: 'e2e-deepseek' }
+  },
+}
 
 const networkProxy: NetworkProxyPort = {
   async initialize() { /* local-only */ },
@@ -187,6 +291,11 @@ let mainWindow: BrowserWindow | null = null
 let runtime: ReturnType<typeof createApplicationRuntime> | undefined
 let disposeIpc: (() => void) | undefined
 let userDataStores: UserDataStoreManager | undefined
+let e2eKnowledgeNow = Date.parse('2026-08-28T00:00:00.000Z')
+const e2eKnowledgeEntitlement: KnowledgeEntitlementState = {
+  tier: 'member', status: 'active', localEnabled: true, betaEnabled: true, cloudEnabled: true,
+  expiresAt: '2026-08-29T00:00:00.000Z', graceEndsAt: '2026-08-31T00:00:00.000Z',
+}
 
 function emit(channel: string, value: unknown): void {
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
@@ -228,6 +337,63 @@ function seedLegacyData(): void {
     insertMessages()
   } finally {
     database.close()
+  }
+}
+
+async function runStrictKnowledgeAsk(baseId: string, content: string): Promise<{
+  consentRequired: boolean
+  providerSnippetDisclosures: number
+  providerSnippetDisclosureDelta: number
+  terminalStatus: 'completed'
+}> {
+  if (!runtime) throw new Error('Cloud user-data E2E runtime is unavailable')
+  const conversation = await runtime.services.chat.createConversation()
+  const preferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
+  await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+    ...preferences,
+    knowledgeBaseIds: [baseId],
+    knowledgeMode: 'strict',
+  })
+  const beforeEvents = recordedChatEvents.length
+  const beforeDisclosure = knowledgeSnippetDisclosureCount
+  await runtime.services.chat.send({
+    conversationId: conversation.id,
+    content,
+    assetIds: [],
+    outputType: 'auto',
+    generation: {
+      image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      audio: { format: 'mp3' },
+      video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+    },
+  })
+  let terminalStatus: 'completed' | 'cancelled' | 'failed' | undefined
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const terminal = recordedChatEvents.slice(beforeEvents).find(event => (
+      event.type === 'status'
+      && event.conversationId === conversation.id
+      && ['completed', 'cancelled', 'failed'].includes(event.status)
+    ))
+    if (terminal?.type === 'status' && terminal.status !== 'running') {
+      terminalStatus = terminal.status
+      break
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  if (terminalStatus !== 'completed') {
+    throw new Error(`Knowledge consent ask did not complete: ${terminalStatus ?? 'timeout'}`)
+  }
+  const consentRequired = recordedChatEvents.slice(beforeEvents).some(event => (
+    (event.type === 'block' || event.type === 'block_update')
+    && event.conversationId === conversation.id
+    && event.block.type === 'knowledge_status'
+    && event.block.status === 'consent_required'
+  ))
+  return {
+    consentRequired,
+    providerSnippetDisclosures: knowledgeSnippetDisclosureCount,
+    providerSnippetDisclosureDelta: knowledgeSnippetDisclosureCount - beforeDisclosure,
+    terminalStatus,
   }
 }
 
@@ -273,6 +439,120 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     }
   }
   if (name === 'providerRequestCount') return providerRequestCount
+  if (name === 'knowledgeAvailability') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    return runtime.services.knowledge.getAvailability({ userId: session.user.id })
+  }
+  if (name === 'knowledgeEntitlement') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    return runtime.services.knowledge.getEntitlement({ userId: session.user.id })
+  }
+  if (name === 'providerSnippetConsentRevocation') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    const owner = { userId: session.user.id }
+    const knowledge = runtime.services.knowledge as LocalKnowledgeService
+    const retainedBase = (await knowledge.list(owner)).find(base => base.readOnly !== true)
+    if (!retainedBase) throw new Error('Retained knowledge base is unavailable before consent revocation')
+    const consent = await knowledge.revokeConsent(owner, 'openrouter')
+    return {
+      provider: 'openrouter',
+      consent,
+      ...await runStrictKnowledgeAsk(retainedBase.id, 'Ask after Provider snippet consent revoke'),
+    }
+  }
+  if (name === 'expireKnowledgeEntitlement') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    const owner = { userId: session.user.id }
+    const knowledge = runtime.services.knowledge as LocalKnowledgeService
+    const retainedBase = (await knowledge.list(owner))
+      .find(base => base.name === '发布门禁资料')
+    if (!retainedBase) throw new Error('Retained knowledge base is unavailable')
+    const retainedDocument = (await knowledge.listDocuments(owner, retainedBase.id))[0]
+    if (!retainedDocument) throw new Error('Retained knowledge document is unavailable')
+
+    const extraBase = await knowledge.create(owner, '到期后只读资料')
+    const extraHandle = (await knowledge.pickImportFiles(owner))[0]
+    if (!extraHandle) throw new Error('Extra knowledge import handle is unavailable')
+    const extraDocument = await knowledge.importDocument(owner, extraBase.id, extraHandle.id)
+    if (!extraDocument) throw new Error('Extra knowledge document was not queued')
+    let extraReady = false
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = (await knowledge.listDocuments(owner, extraBase.id))[0]
+      if (current?.status === 'ready') {
+        extraReady = true
+        break
+      }
+      if (current?.status === 'failed') throw new Error('Extra knowledge document failed to parse')
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    if (!extraReady) throw new Error('Extra knowledge document did not become ready')
+
+    e2eKnowledgeNow = Date.parse('2026-09-01T00:00:00.001Z')
+    await knowledge.getEntitlement(owner)
+    const entitlement = await knowledge.retainFreeAllowance(owner, {
+      baseId: retainedBase.id,
+      documentId: retainedDocument.id,
+    })
+    const retainedSearch = await knowledge.searchSelected(
+      owner, 'AutoForge knowledge smoke', [retainedBase.id],
+    )
+    const extraSearch = await knowledge.searchSelected(
+      owner, 'AutoForge knowledge smoke', [extraBase.id],
+    )
+    const blockedHandle = (await knowledge.pickImportFiles(owner))[0]
+    if (!blockedHandle) throw new Error('Blocked import handle is unavailable')
+    let extraImport: { blocked: boolean; code?: string } = { blocked: false }
+    try {
+      await knowledge.importDocument(owner, extraBase.id, blockedHandle.id)
+    } catch (error) {
+      extraImport = {
+        blocked: true,
+        code: typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code: unknown }).code)
+          : 'UNKNOWN',
+      }
+    }
+    const projected = await knowledge.list(owner)
+    const availability = await knowledge.getAvailability(owner)
+    return {
+      entitlement,
+      retainedSearch: {
+        kind: retainedSearch.kind,
+        evidenceCount: retainedSearch.kind === 'results' ? retainedSearch.evidence.length : 0,
+      },
+      extraSearch: {
+        kind: extraSearch.kind,
+        evidenceCount: extraSearch.kind === 'results' ? extraSearch.evidence.length : 0,
+      },
+      extraImport,
+      cloud: { available: availability.cloud.available, calls: knowledgeCloudCallCount },
+      extrasReadOnly: projected.find(base => base.id === extraBase.id)?.readOnly === true,
+    }
+  }
+  if (name === 'switchKnowledgeProvider') {
+    const settings = await runtime.services.settings.update({ activeProvider: 'deepseek' })
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    const bases = await runtime.services.knowledge.list({ userId: session.user.id })
+    const retainedBase = bases.find(base => base.readOnly !== true)
+    if (!retainedBase) throw new Error('Retained knowledge base is unavailable after Provider switch')
+    return {
+      provider: settings.activeProvider,
+      ...await runStrictKnowledgeAsk(retainedBase.id, 'Ask after Provider switch'),
+    }
+  }
+  if (name === 'deepseekKnowledgeConsent') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    return {
+      ...await runtime.services.knowledge.getConsent({ userId: session.user.id }, 'deepseek'),
+      providerSnippetDisclosures: knowledgeSnippetDisclosureCount,
+    }
+  }
   throw new Error(`Unknown cloud user-data E2E command: ${name}`)
 }
 
@@ -280,6 +560,44 @@ async function initialize(): Promise<void> {
   await mkdir(userData, { recursive: true })
   if (process.env.AUTOFORGE_E2E_SEED_LEGACY === '1') seedLegacyData()
   const authService = testAuthService(fixtureUser(requiredEnvironment('AUTOFORGE_E2E_USER')))
+  const safeStoragePort = {
+    isAvailable: async () => true,
+    encrypt: async (value: string) => Buffer.from(value, 'utf8'),
+    decrypt: async (value: Buffer) => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
+  }
+  const knowledgeStoreFactory = new KnowledgeStoreFactory(join(userData, 'knowledge'), safeStoragePort)
+  const knowledgeService = createLocalKnowledgeService({
+    openStore: ownerId => knowledgeStoreFactory.open(ownerId),
+    selectImportFiles: async () => [{
+      name: 'e2e-guide.txt',
+      mimeType: 'text/plain',
+      bytes: Buffer.from('AutoForge knowledge smoke'),
+    }],
+    createParser: async () => ({
+      parse: async () => ({
+        mediaType: 'text/plain',
+        text: 'AutoForge knowledge smoke',
+        blocks: [{
+          id: 'e2e-block-1',
+          text: 'AutoForge knowledge smoke',
+          coordinate: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 25 },
+        }],
+      }),
+      terminateAll: async () => undefined,
+    }),
+    saveExport: async () => undefined,
+    isMember: () => knowledgeReleaseSmoke,
+    ...(knowledgeReleaseSmoke ? {
+      entitlement: () => e2eKnowledgeEntitlement,
+      now: () => e2eKnowledgeNow,
+      cloudKillSwitchEnabled: () => true,
+    } : {}),
+    emit: event => {
+      const parsed = knowledgeEventSchema.safeParse(event)
+      if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)
+    },
+  })
+  knowledgeService.configureCloudRemote!(countedCloudRemote())
   userDataStores = new UserDataStoreManager(join(userData, 'user-caches'))
   const cloudPort = new CloudBaseUserDataPort({
     async callFunction(input) {
@@ -308,16 +626,14 @@ async function initialize(): Promise<void> {
       workflowRunner: join(desktopRoot, 'out/workers/workflow-runner.cjs'),
       temporary: join(userData, 'temporary'),
     },
-    safeStorage: {
-      isAvailable: async () => true,
-      encrypt: async (value) => Buffer.from(value, 'utf8'),
-      decrypt: async (value) => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
-    },
+    safeStorage: safeStoragePort,
     authService,
     userDataStores,
     userDataSyncPort: cloudPort,
     networkProxy,
     browserWorkspace: createBrowserWorkspace(),
+    knowledgeService,
+    modelProviders: { openrouter: deterministicProvider, deepseek: deterministicDeepseekProvider },
     chooseProjectDirectory: async () => undefined,
     chooseMediaFiles: async () => [],
     chooseAvatarFile: async () => undefined,
@@ -327,7 +643,10 @@ async function initialize(): Promise<void> {
     openExternal: async () => undefined,
     emitChat: (event) => {
       const parsed = chatEventSchema.safeParse(event)
-      if (parsed.success) emit(ipcChannels.chatEvent, parsed.data)
+      if (parsed.success) {
+        recordedChatEvents.push(parsed.data)
+        emit(ipcChannels.chatEvent, parsed.data)
+      }
     },
     emitExecution: (event) => {
       const parsed = executionEventSchema.safeParse(event)
@@ -335,6 +654,15 @@ async function initialize(): Promise<void> {
     },
     applyTheme: (theme) => { nativeTheme.themeSource = theme },
     appInfo: { version: '0.1.0-e2e', platform: process.platform === 'win32' ? 'win32' : 'darwin' },
+  })
+  await runtime.services.settings.saveProviderApiKey('openrouter', 'e2e-openrouter-key')
+  await runtime.services.settings.saveProviderApiKey('deepseek', 'e2e-deepseek-key')
+  await runtime.services.settings.update({
+    activeProvider: 'openrouter',
+    defaultModels: {
+      openrouter: { text: 'e2e-knowledge-model' },
+      deepseek: { text: 'deepseek-chat' },
+    },
   })
   await runtime.recover()
   await protocol.handle('autoforge-media', createMediaProtocolHandler(runtime.mediaAssets))

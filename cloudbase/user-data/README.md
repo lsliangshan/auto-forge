@@ -31,6 +31,9 @@ This directory contains versioned code artifacts only:
 
 - `migrations/0001_user_data_foundation.sql` is the canonical forward schema and RPC definition.
 - `migrations/0001_user_data_foundation.rollback.sql` revokes and removes the user-data RPC surface while preserving accepted data tables and rows.
+- `migrations/0002_conversation_knowledge_preferences.sql` widens the existing conversation preference validator.
+- `migrations/0003_privacy_consent_revocation.sql` adds the owner/purpose current-state projection and OCC handling for `privacy.consent` and `privacy.consent.revoke`; accepted history remains in `app_privacy_consents`.
+- `migrations/0003_privacy_consent_revocation.rollback.sql` preserves both accepted/revoked state and history while withdrawing no data.
 - `function/` is the deployable CloudBase function source.
 
 None of these files applies itself. Builds, tests, commits, and the local Electron acceptance suite do not modify a CloudBase environment. An authorized operator must separately apply the schema, configure server-side environment values, deploy the function, and advance each rollout gate in the [user-data foundation runbook](../../docs/runbooks/cloudbase-user-data-foundation.md).

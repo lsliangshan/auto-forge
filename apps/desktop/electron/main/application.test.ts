@@ -1,5 +1,5 @@
 import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { createHash } from 'node:crypto'
+import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -26,14 +26,14 @@ import {
 } from '@autoforge/shared'
 import {
   createApplicationFailureRecorder,
-  createApplicationRuntime,
+  createApplicationRuntime as createApplicationRuntimeImpl,
   createWorkflowExecutionSourceResolver,
   MaintenanceGate,
   observeAuthService,
 } from './application.js'
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
-import type { BusinessRoleService } from './auth/cloudbase-role-service.js'
+import { CloudBaseRoleService, type BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
 import { BrowserManualResumeCoordinator } from './browser/browser-manual-resume-coordinator.js'
 import type {
@@ -70,6 +70,11 @@ import {
 } from './network/network-proxy-service.js'
 import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
+import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
+import { createLocalKnowledgeService } from './knowledge/knowledge-service.js'
+import { canonicalizeEntitlementPayload, KnowledgeEntitlementVerifier } from './knowledge/entitlement-verifier.js'
+import type { KnowledgeParserPort } from './knowledge/import-job-runner.js'
+import { memoryKnowledgeStore, parsedText } from './knowledge/knowledge-test-support.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
 import {
@@ -235,7 +240,47 @@ function serializedProxyHarness() {
 }
 
 let networkProxy = createNetworkProxy()
-type RuntimeOptions = Parameters<typeof createApplicationRuntime>[0]
+type RuntimeOptions = Parameters<typeof createApplicationRuntimeImpl>[0]
+
+function consentAcknowledgingUserDataSyncPort(
+  delegate?: RuntimeOptions['userDataSyncPort'],
+): NonNullable<RuntimeOptions['userDataSyncPort']> {
+  let consentEstablished = false
+  return {
+    call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+      const includesConsent = input.action === 'syncPush'
+        && input.mutations.some((mutation) => mutation.kind === 'privacy.consent'
+          || mutation.kind === 'privacy.consent.revoke')
+      if (input.action === 'syncPush' && (includesConsent || !consentEstablished)) {
+        consentEstablished ||= includesConsent
+        return { ok: true, data: {
+          results: input.mutations.map((mutation) => ({
+            id: mutation.id, status: 'applied' as const,
+            revision: mutation.baseRevision + 1,
+          })),
+          cursor: 'cursor_test_consent_push',
+        } }
+      }
+      if (input.action === 'syncPull' && !consentEstablished) {
+        return { ok: true, data: { mutations: [], cursor: null } }
+      }
+      if (delegate) return delegate.call(input)
+      if (input.action === 'syncPull') {
+        return { ok: true, data: { mutations: [], cursor: null } }
+      }
+      throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' })
+    }),
+  }
+}
+
+function createApplicationRuntime(input: RuntimeOptions) {
+  return createApplicationRuntimeImpl({
+    ...input,
+    ...('userDataSyncPort' in input ? {} : {
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort(),
+    }),
+  })
+}
 
 function createTestAuthService(): AuthService {
   const users = new Map<string, { session: AuthSession; password: string; target: string }>()
@@ -327,6 +372,36 @@ function createTestAuthService(): AuthService {
   }
 }
 
+function createGatedGetSessionAuth(
+  shouldPause: (call: number, session: AuthSession | null) => boolean,
+) {
+  const delegate = createTestAuthService()
+  const started = deferred<AuthSession | null>()
+  const release = deferred<void>()
+  let armed = false
+  let calls = 0
+  return {
+    authService: {
+      ...delegate,
+      async getSession() {
+        const session = await delegate.getSession()
+        if (armed && shouldPause(++calls, session)) {
+          armed = false
+          started.resolve(session)
+          await release.promise
+        }
+        return session
+      },
+    } satisfies AuthService,
+    arm() {
+      calls = 0
+      armed = true
+    },
+    started: started.promise,
+    release: () => release.resolve(),
+  }
+}
+
 function snapshotProvider(
   providerId: 'openrouter' | 'deepseek',
   provider: ModelProvider,
@@ -373,6 +448,7 @@ function options(
   overrides: Partial<RuntimeOptions> = {},
 ): RuntimeOptions {
   const authService = createTestAuthService()
+  const userDataSyncPort = consentAcknowledgingUserDataSyncPort()
   return {
     paths: {
       database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
@@ -395,6 +471,7 @@ function options(
     networkProxy,
     browserWorkspace: createBrowserWorkspace(),
     authService,
+    userDataSyncPort,
     ...overrides,
   }
 }
@@ -441,6 +518,13 @@ async function authenticate(
       purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
       consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
     })
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const state = await runtime.services.settings.getCloudSyncConsentState()
+      if (state?.state === 'accepted') break
+      await Promise.resolve()
+    }
+    const state = await runtime.services.settings.getCloudSyncConsentState()
+    if (state?.state !== 'accepted') throw new Error('Test consent was not acknowledged')
   }
   return session
 }
@@ -824,7 +908,20 @@ describe('createApplicationRuntime', () => {
   it('requires persisted cloud-sync consent before the first conversation without mutating cache or outbox', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-cloud-consent-'))
     directories.push(root)
-    const runtime = createApplicationRuntime(options(root))
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => (
+        input.action === 'syncPush'
+          ? { ok: true, data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const,
+              revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'cursor_cloud_consent_push',
+          } }
+          : { ok: true, data: { mutations: [], cursor: null } }
+      )),
+    }
+    const runtime = createApplicationRuntime(options(root, { userDataSyncPort }))
     const session = await authenticate(runtime, 'ConsentAlice', false)
 
     await expect(runtime.services.chat.createConversation())
@@ -841,8 +938,11 @@ describe('createApplicationRuntime', () => {
       purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
       consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
     })
+    await vi.waitFor(() => expect(withUserData(
+      root, session.user.id, (store) => store.account.getConsent('cloud_sync'),
+    )).toMatchObject({ documentVersion: 'cloud-sync-2026-08' }))
     await expect(runtime.services.chat.createConversation())
-      .resolves.toMatchObject({ title: '新会话', syncState: 'pending' })
+      .resolves.toMatchObject({ title: '新会话' })
     expect(withUserData(root, session.user.id, (store) => store.account.getConsent('cloud_sync')))
       .toMatchObject({ documentVersion: 'cloud-sync-2026-08' })
     await runtime.close()
@@ -1155,10 +1255,14 @@ describe('createApplicationRuntime', () => {
       VALUES ('legacy_quarantine', 'Legacy quarantine', 'user_named', NULL, 1, 1)
     `).run()
     seeded.close()
+    let pullCount = 0
     const userDataSyncPort = {
       call: vi.fn(async (input: CloudBaseUserDataCall) => {
         if (input.action === 'syncPull') {
-          return { ok: false as const, error: { code: 'INVALID_INPUT' as const } }
+          pullCount += 1
+          return pullCount === 1
+            ? { ok: true as const, data: { mutations: [], cursor: 'cursor_quarantine_initial' } }
+            : { ok: false as const, error: { code: 'INVALID_INPUT' as const } }
         }
         if (input.action === 'importLegacyBatch') {
           return {
@@ -1169,7 +1273,13 @@ describe('createApplicationRuntime', () => {
           }
         }
         if (input.action === 'syncPush') {
-          return { ok: true as const, data: { results: [], cursor: 'quarantine_push' } }
+          return { ok: true as const, data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const,
+              revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'cursor_quarantine_push',
+          } }
         }
         throw toSafeAppError({ code: 'INTERNAL_ERROR' })
       }),
@@ -1347,6 +1457,904 @@ describe('createApplicationRuntime', () => {
     await expect(reading).resolves.toMatchObject({ timezone: 'UTC', totalTokens: 3 })
     await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_cloudreadbobby' } })
     await runtime.close()
+  })
+
+  it('gates in-flight knowledge work during an authenticated identity switch and fails closed before storage exists', async () => {
+    // Catches knowledge operations that bypass UserDataAdmissionGate and race a user-data identity transition.
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-admission-race-'))
+    directories.push(root)
+    const started = deferred<void>()
+    const release = deferred<void>()
+    const runtime = createApplicationRuntime(options(root))
+    await authenticate(runtime, 'KnowledgeAlice')
+    await authenticate(runtime, 'KnowledgeBobby')
+    await runtime.services.auth.loginWithPassword({ account: 'KnowledgeAlice', password: 'password' })
+    const owner = { userId: 'test_user_knowledgealice' }
+
+    await expect(runtime.services.knowledge.getAvailability(owner)).resolves.toEqual({
+      encryption: { available: false, reason: 'encryption_unavailable' },
+      parser: { available: false, reason: 'parser_unavailable' },
+      cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+      embedding: { available: false, reason: 'embedding_unavailable' },
+      entitlement: { available: false, reason: 'entitlement_unavailable' },
+      beta: { available: false, reason: 'beta_disabled' },
+      cloud: { available: false, reason: 'cloud_disabled' },
+    })
+    await expect(runtime.services.knowledge.list(owner)).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+
+    runtime.services.knowledge.list = vi.fn(async () => {
+      started.resolve()
+      await release.promise
+      return []
+    })
+    const listing = runtime.services.knowledge.list(owner)
+    await started.promise
+    let switched = false
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'KnowledgeBobby', password: 'password',
+    }).then((session) => { switched = true; return session })
+    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+
+    expect(switched).toBe(false)
+    release.resolve()
+    await expect(listing).resolves.toEqual([])
+    await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_knowledgebobby' } })
+    await runtime.close()
+  })
+
+  it('invalidates the knowledge owner before identity awaits and drains before rebinding or shutdown', async () => {
+    // Catches late parser/job callbacks that survive an account switch or shutdown under the old owner.
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-owner-epoch-'))
+    directories.push(root)
+    const listingStarted = deferred<void>()
+    const releaseListing = deferred<void>()
+    const lifecycle: string[] = []
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async (ownerId: string) => { lifecycle.push(`bind:${ownerId}`) }),
+      invalidate: vi.fn(() => { lifecycle.push('invalidate') }),
+      drain: vi.fn(async () => { lifecycle.push('drain') }),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+      list: vi.fn(async () => {
+        listingStarted.resolve()
+        await releaseListing.promise
+        return []
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, { knowledgeService }))
+    await authenticate(runtime, 'KnowledgeAlice')
+    await authenticate(runtime, 'KnowledgeBobby')
+    await runtime.services.auth.loginWithPassword({ account: 'KnowledgeAlice', password: 'password' })
+    const owner = { userId: 'test_user_knowledgealice' }
+    const listing = runtime.services.knowledge.list(owner)
+    await listingStarted.promise
+
+    const invalidationsBeforeSwitch = knowledgeService.invalidate.mock.calls.length
+    const switchRoundStart = lifecycle.length
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'KnowledgeBobby', password: 'password',
+    })
+    expect(knowledgeService.invalidate).toHaveBeenCalledTimes(invalidationsBeforeSwitch + 1)
+    expect(lifecycle.at(-1)).toBe('invalidate')
+
+    releaseListing.resolve()
+    await listing
+    await switching
+    const switchRound = lifecycle.slice(switchRoundStart)
+    expect(switchRound[0]).toBe('invalidate')
+    expect(switchRound).toContain('drain')
+    expect(switchRound).toContain('bind:test_user_knowledgebobby')
+    expect(switchRound.indexOf('drain')).toBeLessThan(switchRound.indexOf('bind:test_user_knowledgebobby'))
+
+    const beforeClose = lifecycle.length
+    await runtime.close()
+    expect(lifecycle.slice(beforeClose, beforeClose + 2)).toEqual(['invalidate', 'drain'])
+  })
+
+  it('forwards only the existing authorization refresh snapshot to Main entitlement verification', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-entitlement-'))
+    directories.push(root)
+    const signed = { payload: 'eA', signature: 'eA' }
+    const refreshEntitlement = vi.fn(async () => undefined)
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined),
+      refreshEntitlement,
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService,
+      roleService: new CloudBaseRoleService({
+        callFunction: vi.fn(async () => ({ result: { ok: true, data: {
+          userId: 'test_user_entitlementalice', role: 'user', capabilities: [], version: 1,
+          updatedAt: '2026-08-28T00:00:00.000Z', knowledgeEntitlement: signed,
+        } } })),
+      }),
+    }))
+    const session = await authenticate(runtime, 'EntitlementAlice')
+    refreshEntitlement.mockClear()
+
+    await runtime.services.auth.refreshAuthorization()
+
+    expect(refreshEntitlement).toHaveBeenCalledWith(session.user.id, signed, true)
+    await runtime.close()
+  })
+
+  it('binds Knowledge to the authoritative cloud_sync revision across accept, revoke, and regrant', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-cloud-consent-'))
+    directories.push(root)
+    const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async (...args: [string, boolean?]) => { void args }),
+      setCloudSyncConsent: vi.fn(),
+      refreshEntitlement: vi.fn(async () => undefined),
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({
+        kind: 'results' as const, strategy: 'trigram' as const, evidence: [],
+      })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const pushedConsents: SyncMutation[] = []
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+        if (input.action === 'syncPush') {
+          pushedConsents.push(...input.mutations.filter((mutation) => (
+            mutation.kind === 'privacy.consent' || mutation.kind === 'privacy.consent.revoke'
+          )))
+          return { ok: true, data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const,
+              revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'cursor_authoritative_consent_push',
+          } }
+        }
+        return { ok: true, data: { mutations: [], cursor: null } }
+      }),
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores, knowledgeService, userDataSyncPort,
+    }))
+    const session = await authenticate(runtime, 'KnowledgeConsentAlice', false)
+
+    expect(knowledgeService.bind).toHaveBeenLastCalledWith(session.user.id, false)
+    const oldConsent: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      id: 'old-cloud-consent', kind: 'privacy.consent',
+      entityId: 'cloud-sync-2025-01', baseRevision: 0,
+      occurredAt: '2026-08-25T00:00:00.000Z',
+      payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2025-01',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    userDataStores.current()!.outbox.recordWithConsent(oldConsent)
+    userDataStores.current()!.outbox.markSyncing([oldConsent.id])
+    userDataStores.current()!.outbox.acknowledgePushResults(
+      [oldConsent], [{ id: oldConsent.id, status: 'applied', revision: 1 }],
+    )
+    await runtime.services.auth.loginWithPassword({
+      account: 'KnowledgeConsentAlice', password: 'password',
+    })
+    expect(knowledgeService.bind).toHaveBeenLastCalledWith(session.user.id, false)
+
+    await runtime.services.settings.recordPrivacyConsent({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+    })
+    await vi.waitFor(async () => {
+      await expect(runtime.services.settings.getCloudSyncConsentState()).resolves.toEqual({
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-28T00:00:00.000Z', clientVersion: '0.1.0',
+        state: 'accepted', revision: 2,
+      })
+      expect(knowledgeService.setCloudSyncConsent)
+        .toHaveBeenLastCalledWith(session.user.id, true)
+    })
+
+    await expect(runtime.services.settings.revokeCloudSyncConsent({ confirmed: true }))
+      .resolves.toMatchObject({
+        purpose: 'cloud_sync', state: 'revoked', revision: 3, clientVersion: '0.1.0',
+      })
+    expect(knowledgeService.setCloudSyncConsent)
+      .toHaveBeenLastCalledWith(session.user.id, false)
+    expect(userDataStores.current()!.account.getConsent('cloud_sync')).toBeUndefined()
+    await expect(runtime.services.settings.getCloudSyncConsentState())
+      .resolves.toMatchObject({ state: 'revoked', revision: 3 })
+    await expect(runtime.services.settings.revokeCloudSyncConsent(
+      { confirmed: false } as never,
+    )).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+
+    await runtime.services.settings.recordPrivacyConsent({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-28T02:00:00.000Z', clientVersion: '0.1.0',
+    })
+    await vi.waitFor(async () => {
+      await expect(runtime.services.settings.getCloudSyncConsentState())
+        .resolves.toMatchObject({ state: 'accepted', revision: 4 })
+      expect(knowledgeService.setCloudSyncConsent)
+        .toHaveBeenLastCalledWith(session.user.id, true)
+    })
+    expect(pushedConsents
+      .map(({ kind, baseRevision }) => ({ kind, baseRevision }))).toEqual([
+      { kind: 'privacy.consent', baseRevision: 1 },
+      { kind: 'privacy.consent.revoke', baseRevision: 2 },
+      { kind: 'privacy.consent', baseRevision: 3 },
+    ])
+    await runtime.close()
+  })
+
+  it('advances Knowledge consent synchronously when a current-owner pull applies revocation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-cloud-revoke-pull-'))
+    directories.push(root)
+    let pullCount = 0
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async (...args: [string, boolean?]) => { void args }),
+      setCloudSyncConsent: vi.fn(),
+      refreshEntitlement: vi.fn(async () => undefined),
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({
+        kind: 'results' as const, strategy: 'trigram' as const, evidence: [],
+      })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+        if (input.action === 'syncPush') return {
+          ok: true,
+          data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const,
+              revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'consent-push',
+          },
+        }
+        if (input.action === 'syncPull') {
+          pullCount += 1
+          if (pullCount === 3) {
+            return {
+              ok: true,
+              data: {
+                mutations: [{
+                  id: 'remote-cloud-sync-revoke', kind: 'privacy.consent.revoke',
+                  entityId: 'cloud_sync', baseRevision: 1, resultRevision: 2,
+                  receivedAt: '2026-08-28T03:00:00.000Z',
+                  payload: {
+                    purpose: 'cloud_sync', revokedAt: '2026-08-28T03:00:00.000Z',
+                    clientVersion: '0.1.0',
+                  },
+                }],
+                cursor: 'cursor_consent_revoked',
+              },
+            }
+          }
+          return { ok: true, data: { mutations: [], cursor: `cursor_consent_empty_${pullCount}` } }
+        }
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }),
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService, userDataSyncPort,
+    }))
+    const session = await authenticate(runtime, 'KnowledgeRemoteRevoke')
+    knowledgeService.setCloudSyncConsent.mockClear()
+
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    await runtime.services.chat.listConversations({ limit: 50 })
+    await vi.waitFor(() => expect(pullCount).toBeGreaterThanOrEqual(2))
+    await vi.waitFor(() => expect(knowledgeService.setCloudSyncConsent)
+      .toHaveBeenCalledWith(session.user.id, false))
+    await expect(runtime.services.settings.getCloudSyncConsentState())
+      .resolves.toMatchObject({ state: 'revoked', revision: 2 })
+    await runtime.close()
+  })
+
+  it('refreshes the knowledge entitlement projection on an authoritative same-UID getSession', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-session-refresh-'))
+    directories.push(root)
+    const before = { payload: 'YmVmb3Jl', signature: 'YmVmb3Jl' }
+    const after = { payload: 'YWZ0ZXI', signature: 'YWZ0ZXI' }
+    const refreshEntitlement = vi.fn(async () => undefined)
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined),
+      refreshEntitlement,
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        userId: 'test_user_sessionrefreshalice', role: 'user', capabilities: [], version: 1,
+        updatedAt: '2026-08-28T00:00:00.000Z', knowledgeEntitlement: before,
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        userId: 'test_user_sessionrefreshalice', role: 'user', capabilities: [], version: 2,
+        updatedAt: '2026-08-28T00:00:01.000Z', knowledgeEntitlement: after,
+      } } })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService,
+      roleService: new CloudBaseRoleService({ callFunction }),
+    }))
+    const session = await authenticate(runtime, 'SessionRefreshAlice')
+    refreshEntitlement.mockClear()
+
+    await expect(runtime.services.auth.getSession()).resolves.toMatchObject({
+      user: { id: session.user.id }, authorization: { version: 2, knowledgeEntitlement: after },
+    })
+
+    expect(refreshEntitlement).toHaveBeenCalledOnce()
+    expect(refreshEntitlement).toHaveBeenCalledWith(session.user.id, after, true)
+    await runtime.close()
+  })
+
+  it('admits a signed member through the real role transport and preserves it across a refresh outage', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-real-role-entitlement-'))
+    directories.push(root)
+    const memory = memoryKnowledgeStore()
+    const keys = generateKeyPairSync('ed25519')
+    const canonical = canonicalizeEntitlementPayload({
+      userId: 'test_user_entitlementmember',
+      entitlements: ['knowledge_base_beta', 'knowledge_base_cloud'],
+      issuedAt: '2026-08-27T00:00:00.000Z',
+      expiresAt: '2026-08-29T00:00:00.000Z',
+      keyId: 'primary',
+    })
+    const signed = {
+      payload: Buffer.from(canonical).toString('base64url'),
+      signature: sign(null, Buffer.from(canonical), keys.privateKey).toString('base64url'),
+    }
+    const verifier = new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        primary: { publicKey: keys.publicKey, generation: 1, status: 'active' },
+      },
+      now: () => Date.parse('2026-08-28T00:00:00.000Z'),
+    })
+    const knowledgeService = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      now: () => Date.parse('2026-08-28T00:00:00.000Z'),
+      verifyEntitlement: (ownerId, snapshot, observedAt) => verifier.verify(ownerId, snapshot, observedAt),
+    })
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        userId: 'test_user_entitlementmember', role: 'user', capabilities: [], version: 1,
+        updatedAt: '2026-08-28T00:00:00.000Z', knowledgeEntitlement: signed,
+      } } })
+      .mockRejectedValueOnce(new Error('temporary role transport outage'))
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService,
+      roleService: new CloudBaseRoleService({ callFunction }),
+    }))
+    const session = await authenticate(runtime, 'EntitlementMember')
+
+    await expect(runtime.services.knowledge.getEntitlement({ userId: session.user.id }))
+      .resolves.toMatchObject({ tier: 'member', status: 'active', cloudEnabled: true })
+    await expect(runtime.services.auth.refreshAuthorization()).resolves.toMatchObject({
+      authorization: { confirmed: false, knowledgeEntitlement: signed },
+    })
+    await expect(runtime.services.knowledge.getEntitlement({ userId: session.user.id }))
+      .resolves.toMatchObject({ tier: 'member', status: 'active', cloudEnabled: true })
+    await runtime.close()
+  })
+
+  it('continues knowledge shutdown after synchronous invalidation fails and reports the earliest error', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-drain-failure-'))
+    directories.push(root)
+    const invalidationFailure = new Error('knowledge owner fence failed')
+    const drainFailure = new Error('knowledge parser termination failed')
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined),
+      invalidate: vi.fn(() => { throw invalidationFailure }),
+      drain: vi.fn(async () => { throw drainFailure }),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const runtime = createApplicationRuntime(options(root, { knowledgeService }))
+
+    await expect(runtime.close()).rejects.toBe(invalidationFailure)
+    expect(knowledgeService.invalidate).toHaveBeenCalledOnce()
+    expect(knowledgeService.drain).toHaveBeenCalledOnce()
+  })
+
+  it('captures conversation knowledge preferences before Main retrieval and emits a citation block', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-agent-'))
+    directories.push(root)
+    const emitted: ChatEvent[] = []
+    const admittedScope = Object.freeze({
+      scopeId: 'scope_1', ownerId: 'test_user_testuser', ownerEpoch: 1,
+      cloudAllowed: false,
+      baseIds: Object.freeze(['base_selected']),
+      entries: Object.freeze([Object.freeze({
+        baseId: 'base_selected', documentId: 'document_1', versionId: 'version_1',
+        publicationGeneration: 1, cloudGenerationId: null,
+      })]),
+    })
+    const captureSearchScope = vi.fn(async () => admittedScope)
+    const releaseSearchScope = vi.fn()
+    const searchSelected = vi.fn(async () => ({
+      kind: 'results' as const,
+      strategy: 'trigram' as const,
+      evidence: [{
+        id: 'evidence:contract', baseId: 'base_selected', documentId: 'document_1', versionId: 'version_1',
+        snippet: '合同经双方签字后生效。', score: 1,
+        citation: {
+          evidenceId: 'evidence:contract', documentId: 'document_1', versionId: 'version_1',
+          coordinate: { kind: 'text' as const, line: 8, startOffset: 0, endOffset: 11 },
+        },
+      }],
+    }))
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
+      captureSearchScope,
+      releaseSearchScope,
+      searchSelected,
+      sourceAvailable: vi.fn(async () => true),
+      sourceVerifiable: vi.fn(async () => true),
+      getConsent: vi.fn(async () => ({
+        provider: 'openrouter' as const, status: 'granted' as const, updatedAt: '2026-08-28T00:00:00.000Z',
+      })),
+    })
+    let turn = 0
+    const openrouter = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/knowledge', 'Knowledge'), supportsTools: true }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request: ModelStreamRequest) {
+        turn += 1
+        if (turn === 1) {
+          expect(request.tools?.map(tool => tool.function.name)).toContain('knowledge_search')
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'knowledge_call',
+            name: 'knowledge_search', arguments: { query: '合同何时生效' },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+          return
+        }
+        expect(JSON.stringify(request.messages)).toContain('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService,
+      modelProviders: { openrouter },
+      emitChat: event => { emitted.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { openrouter: { text: 'openrouter/knowledge' }, deepseek: { text: 'deepseek-chat' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const currentPreferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
+    await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+      ...currentPreferences, knowledgeBaseIds: ['base_selected'], knowledgeMode: 'strict',
+    })
+
+    await runtime.services.chat.send(chatInput(conversation.id, '合同何时生效？'))
+    await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+      type: 'status', conversationId: conversation.id, status: 'completed',
+    })))
+
+    expect(searchSelected).toHaveBeenCalledWith(
+      { userId: 'test_user_testuser' }, '合同何时生效', ['base_selected'], expect.any(AbortSignal),
+      admittedScope,
+    )
+    expect(captureSearchScope).toHaveBeenCalledWith(
+      { userId: 'test_user_testuser' }, ['base_selected'],
+    )
+    expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
+    expect(emitted).toContainEqual(expect.objectContaining({
+      type: 'block', conversationId: conversation.id,
+      block: expect.objectContaining({ type: 'knowledge_citation', evidenceId: 'evidence:contract' }),
+    }))
+    await runtime.close()
+  })
+
+  it.each(['shutdown', 'conversation deletion', 'owner logout'] as const)(
+    'keeps a Main-captured knowledge scope pinned while approval waits and releases it once during %s',
+    async (terminalBoundary) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-approval-scope-'))
+      directories.push(root)
+      const emitted: ChatEvent[] = []
+      const admittedScope = Object.freeze({
+        scopeId: 'scope_shutdown', ownerId: 'test_user_testuser', ownerEpoch: 1,
+        cloudAllowed: false, baseIds: Object.freeze(['base_selected']), entries: Object.freeze([]),
+      })
+      const releaseSearchScope = vi.fn()
+      const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+        bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
+        captureSearchScope: vi.fn(async () => admittedScope),
+        releaseSearchScope,
+        searchSelected: vi.fn(async () => ({
+          kind: 'results' as const, strategy: 'trigram' as const, evidence: [],
+        })),
+        sourceAvailable: vi.fn(async () => false),
+        getConsent: vi.fn(async () => ({
+          provider: 'openrouter' as const, status: 'granted' as const,
+          updatedAt: '2026-08-28T00:00:00.000Z',
+        })),
+      })
+      const provider = snapshotProvider('openrouter', {
+        listModels: vi.fn(async () => [{
+          ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true,
+        }]),
+        validateCredential: vi.fn(async () => ({ valid: true })),
+        stream: vi.fn(async function* (request: ModelStreamRequest) {
+          const workflowTool = request.tools?.find(tool => tool.function.name !== 'knowledge_search')
+          if (!workflowTool) throw new Error('Expected workflow tool')
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'call_scope_shutdown',
+            name: workflowTool.function.name, arguments: { input: {} },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+        }),
+      })
+      const runtime = createApplicationRuntime(options(root, {
+        knowledgeService, modelProviders: { openrouter: provider },
+        emitChat: event => { emitted.push(event) },
+      }))
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' }, openrouter: { text: 'openrouter/tools' },
+        },
+      })
+      await installApprovalWorkflow(runtime)
+      const conversation = await runtime.services.chat.createConversation()
+      const currentPreferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
+      await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+        ...currentPreferences, knowledgeBaseIds: ['base_selected'], knowledgeMode: 'strict',
+      })
+
+      await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+      await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+        type: 'block', block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+      })))
+
+      expect(releaseSearchScope).not.toHaveBeenCalled()
+      if (terminalBoundary === 'conversation deletion') {
+        const foreignConversation = await runtime.services.chat.createConversation()
+        const foreign = await runtime.services.chat.send(chatInput(
+          foreignConversation.id, 'foreign approval workflow',
+        ))
+        await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+          type: 'block', conversationId: foreignConversation.id,
+          block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+        })))
+        await expect(runtime.services.chat.deleteConversation(conversation.id))
+          .rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(releaseSearchScope).not.toHaveBeenCalled()
+        await runtime.services.chat.cancel(foreign.requestId)
+        await runtime.services.chat.deleteConversation(conversation.id)
+        await expect(runtime.services.chat.listConversations({ limit: 50 }))
+          .resolves.toEqual({ items: [expect.objectContaining({ id: foreignConversation.id })] })
+      } else if (terminalBoundary === 'owner logout') {
+        await expect(runtime.services.auth.logout({ discardPending: true }))
+          .resolves.toEqual({ status: 'logged_out' })
+      }
+      if (terminalBoundary !== 'shutdown') expect(releaseSearchScope).toHaveBeenCalledOnce()
+      await runtime.close()
+      expect(releaseSearchScope).toHaveBeenCalledOnce()
+      expect(releaseSearchScope).toHaveBeenCalledWith(admittedScope)
+    },
+  )
+
+  it.each(['chat cancellation', 'approval decision'] as const)(
+    'surfaces an approval persistence failure and clears stale request tracking after %s',
+    async (failureBoundary) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-approval-failure-'))
+      directories.push(root)
+      const emitted: ChatEvent[] = []
+      let inspectedAgent!: AgentOrchestrator
+      const provider = snapshotProvider('openrouter', {
+        listModels: vi.fn(async () => [{
+          ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true,
+        }]),
+        validateCredential: vi.fn(async () => ({ valid: true })),
+        stream: vi.fn(async function* (request: ModelStreamRequest) {
+          if (request.messages.some(message => message.role === 'tool')) {
+            yield { type: 'text_delta' as const, choiceIndex: 0, text: '已停止工作流。' }
+            yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+            return
+          }
+          const workflowTool = request.tools?.find(tool => tool.function.name !== 'knowledge_search')
+          if (!workflowTool) throw new Error('Expected workflow tool')
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0,
+            id: 'call_approval_failure', name: workflowTool.function.name, arguments: { input: {} },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+        }),
+      })
+      const runtime = createApplicationRuntime(options(root, {
+        modelProviders: { openrouter: provider },
+        emitChat: event => { emitted.push(event) },
+        inspectAgent: agent => { inspectedAgent = agent as AgentOrchestrator },
+      }))
+      const persistenceFailure = new Error(`approval ${failureBoundary} persistence failed`)
+      try {
+        await authenticate(runtime)
+        await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+        await runtime.services.settings.update({
+          activeProvider: 'openrouter',
+          defaultModels: {
+            deepseek: { text: 'deepseek-v4-flash' }, openrouter: { text: 'openrouter/tools' },
+          },
+        })
+        await installApprovalWorkflow(runtime)
+        const conversation = await runtime.services.chat.createConversation()
+        const sent = await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+        await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+          type: 'block', block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+        })))
+        const approval = emitted.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+          event.type === 'block' && event.block.type === 'approval'
+        ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+        const agentInternals = inspectedAgent as unknown as {
+          dependencies: {
+            persistence: {
+              replaceAssistantBlock: (...args: unknown[]) => unknown
+              finalize: (...args: unknown[]) => unknown
+            }
+          }
+        }
+        if (failureBoundary === 'chat cancellation') {
+          agentInternals.dependencies.persistence.replaceAssistantBlock = vi.fn(() => {
+            throw persistenceFailure
+          })
+        } else {
+          agentInternals.dependencies.persistence.finalize = vi.fn(() => {
+            throw persistenceFailure
+          })
+        }
+
+        const failingOperation = failureBoundary === 'chat cancellation'
+          ? runtime.services.chat.cancel(sent.requestId)
+          : runtime.services.executions.decide({
+              executionId: approval.executionId,
+              permissionIndex: approval.permissionIndex,
+              scopeHash: approval.scopeHash,
+              decision: 'deny',
+            })
+        await expect(failingOperation).rejects.toBe(persistenceFailure)
+        expect(inspectedAgent.hasActiveRuns()).toBe(false)
+        const clearToken = await runtime.services.settings.captureDataClearToken()
+        await expect(runtime.services.settings.clearLocalData('conversations', clearToken))
+          .resolves.toBe('applied')
+        await expect(runtime.close()).rejects.toBe(persistenceFailure)
+      } finally {
+        await runtime.close().catch(() => undefined)
+      }
+    },
+  )
+
+  it('fences knowledge disclosure across concurrent revoke and re-grant before any consent await', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-consent-fence-'))
+    directories.push(root)
+    const emitted: ChatEvent[] = []
+    const providerRequests: ModelStreamRequest[] = []
+    const firstSearch = deferred<{
+      kind: 'results'; strategy: 'trigram'; evidence: Array<{
+        id: string; baseId: string; documentId: string; versionId: string; snippet: string; score: number
+        citation: {
+          evidenceId: string; documentId: string; versionId: string
+          coordinate: { kind: 'text'; line: number; startOffset: number; endOffset: number }
+        }
+      }>
+    }>()
+    const revokeStarted = deferred<void>()
+    const releaseRevoke = deferred<void>()
+    const grantStarted = deferred<void>()
+    const releaseGrant = deferred<void>()
+    const grantCommitted = deferred<void>()
+    const evidence = {
+      id: 'evidence:consent-fence', baseId: 'base_selected',
+      documentId: 'document_1', versionId: 'version_1', snippet: '撤销期间不得泄漏的依据', score: 1,
+      citation: {
+        evidenceId: 'evidence:consent-fence', documentId: 'document_1', versionId: 'version_1',
+        coordinate: { kind: 'text' as const, line: 1, startOffset: 0, endOffset: 12 },
+      },
+    }
+    let consentStatus: 'granted' | 'unknown' = 'granted'
+    let waitForGrantCommit = false
+    let searchCount = 0
+    const searchSelected = vi.fn(async () => {
+      searchCount += 1
+      if (searchCount === 1) return firstSearch.promise
+      return { kind: 'results' as const, strategy: 'trigram' as const, evidence: [evidence] }
+    })
+    const getConsent = vi.fn(async () => {
+      if (waitForGrantCommit) await grantCommitted.promise
+      return {
+        provider: 'openrouter' as const, status: consentStatus,
+        ...(consentStatus === 'granted' ? { updatedAt: '2026-08-28T00:00:00.000Z' } : {}),
+      }
+    })
+    const setConsent = vi.fn(async (_owner, provider: 'openrouter', status: 'granted' | 'denied') => {
+      grantStarted.resolve()
+      await releaseGrant.promise
+      consentStatus = status === 'granted' ? 'granted' : 'unknown'
+      grantCommitted.resolve()
+      return { provider, status, updatedAt: '2026-08-28T00:00:01.000Z' }
+    })
+    const revokeConsent = vi.fn(async (_owner, provider: 'openrouter') => {
+      revokeStarted.resolve()
+      await releaseRevoke.promise
+      consentStatus = 'unknown'
+      return { provider, status: 'unknown' as const }
+    })
+    const admittedScope = Object.freeze({
+      scopeId: 'scope_consent_fence', ownerId: 'test_user_testuser', ownerEpoch: 1,
+      cloudAllowed: false, baseIds: Object.freeze(['base_selected']), entries: Object.freeze([]),
+    })
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => admittedScope), releaseSearchScope: vi.fn(),
+      searchSelected, sourceAvailable: vi.fn(async () => true),
+      sourceVerifiable: vi.fn(async () => true), getConsent, setConsent, revokeConsent,
+    })
+    let toolCall = 0
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/knowledge-fence', 'Knowledge fence'), supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request: ModelStreamRequest) {
+        providerRequests.push(structuredClone(request))
+        const toolResult = [...request.messages].reverse().find(message => message.role === 'tool')
+        if (!toolResult) {
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0,
+            id: `knowledge_fence_${++toolCall}`, name: 'knowledge_search',
+            arguments: { query: '撤销与授权竞态' },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+          return
+        }
+        const hasEvidence = toolResult.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+        yield {
+          type: 'text_delta' as const, choiceIndex: 0,
+          text: hasEvidence
+            ? '只有授权后新接纳的请求可使用依据。[[kb:evidence:consent-fence]]'
+            : '未使用知识库依据。',
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService, modelProviders: { openrouter: provider },
+      emitChat: event => { emitted.push(event) },
+    }))
+    const session = await authenticate(runtime)
+    const owner = { userId: session.user.id }
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/knowledge-fence' },
+      },
+    })
+    const createSelectedConversation = async () => {
+      const conversation = await runtime.services.chat.createConversation()
+      const current = await runtime.services.chat.getGenerationPreferences(conversation.id)
+      await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+        ...current, knowledgeBaseIds: ['base_selected'], knowledgeMode: 'strict',
+      })
+      return conversation
+    }
+    const waitForTerminal = async (conversationId: string) => {
+      await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+        type: 'status', conversationId, status: expect.stringMatching(/completed|cancelled|failed/u),
+      })))
+    }
+
+    const oldConversation = await createSelectedConversation()
+    await runtime.services.chat.send(chatInput(oldConversation.id, 'old run'))
+    await vi.waitFor(() => expect(searchSelected).toHaveBeenCalledOnce())
+
+    const revoking = runtime.services.knowledge.revokeConsent(owner, 'openrouter')
+    await revokeStarted.promise
+    const duringRevoke = await createSelectedConversation()
+    await runtime.services.chat.send(chatInput(duringRevoke.id, 'during revoke'))
+    await waitForTerminal(duringRevoke.id)
+
+    const granting = runtime.services.knowledge.setConsent(owner, 'openrouter', 'granted')
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    expect(setConsent).not.toHaveBeenCalled()
+    releaseRevoke.resolve()
+    await revoking
+    await grantStarted.promise
+    firstSearch.resolve({ kind: 'results', strategy: 'trigram', evidence: [evidence] })
+    await waitForTerminal(oldConversation.id)
+
+    waitForGrantCommit = true
+    const duringGrant = await createSelectedConversation()
+    await runtime.services.chat.send(chatInput(duringGrant.id, 'during grant'))
+    await new Promise<void>(resolve => { setImmediate(resolve) })
+    releaseGrant.resolve()
+    await granting
+    await waitForTerminal(duringGrant.id)
+    waitForGrantCommit = false
+
+    const afterGrant = await createSelectedConversation()
+    await runtime.services.chat.send(chatInput(afterGrant.id, 'after grant'))
+    await waitForTerminal(afterGrant.id)
+
+    expect(searchSelected).toHaveBeenCalledTimes(2)
+    const evidenceRequests = providerRequests.filter(request => (
+      JSON.stringify(request.messages).includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+    ))
+    expect(evidenceRequests.length).toBeGreaterThan(0)
+    expect(evidenceRequests.every(request => (
+      JSON.stringify(request.messages).includes('after grant')
+      && !JSON.stringify(request.messages).includes('during revoke')
+      && !JSON.stringify(request.messages).includes('during grant')
+    ))).toBe(true)
+    expect(revokeConsent).toHaveBeenCalledOnce()
+    expect(setConsent).toHaveBeenCalledOnce()
+    await runtime.close()
+  })
+
+  it('records a stale bind cleanup failure retained by the real knowledge lifecycle tail', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-bind-failure-'))
+    directories.push(root)
+    const alice = memoryKnowledgeStore()
+    const bob = memoryKnowledgeStore()
+    const parserStarted = deferred<void>()
+    const parserGate = deferred<KnowledgeParserPort>()
+    const terminateFailure = new Error('stale parser termination failed')
+    const closeAlice = vi.fn(async () => { throw new Error('stale store close failed') })
+    const knowledgeService = createLocalKnowledgeService({
+      openStore: async ownerId => ownerId === 'alice' ? { ...alice.store, close: closeAlice } : bob.store,
+      selectImportFiles: async () => [],
+      createParser: store => {
+        if (store.database !== alice.database) {
+          return { parse: async () => parsedText('bob'), terminateAll: async () => undefined }
+        }
+        parserStarted.resolve()
+        return parserGate.promise
+      },
+      saveExport: async () => undefined,
+      isMember: () => false,
+    })
+    const bindingAlice = knowledgeService.bind('alice')
+    await parserStarted.promise
+    knowledgeService.invalidate()
+    const bindingBob = knowledgeService.bind('bob')
+    parserGate.resolve({
+      parse: async () => parsedText('alice'),
+      terminateAll: async () => { throw terminateFailure },
+    })
+    await expect(bindingAlice).rejects.toBe(terminateFailure)
+    await bindingBob
+    const runtime = createApplicationRuntime(options(root, { knowledgeService }))
+
+    await expect(runtime.close()).rejects.toBe(terminateFailure)
+    expect(closeAlice).toHaveBeenCalledOnce()
   })
 
   it('drains an A legacy import before an authenticated A-to-B switch', async () => {
@@ -2120,6 +3128,8 @@ describe('createApplicationRuntime', () => {
         await new Promise<void>((resolve) => { setImmediate(resolve) })
       }
     }
+    await settleEvents()
+    emitChat.mockClear()
 
     await runtime.services.auth.logout({ discardPending: true })
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'anonymous')))
@@ -4054,7 +5064,7 @@ describe('createApplicationRuntime', () => {
     await authenticate(runtime)
     const conversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.getGenerationPreferences(conversation.id)).toMatchObject({
-      outputType: 'auto', models: {},
+      outputType: 'auto', models: {}, knowledgeBaseIds: [], knowledgeMode: 'mixed',
     })
     const preferences = {
       outputType: 'image' as const, models: { image: 'image-model' },
@@ -4507,7 +5517,7 @@ describe('createApplicationRuntime', () => {
     })
     const emitChat = vi.fn()
     const provider = snapshotProvider('openrouter', {
-      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 1_000 }]),
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 8_192 }]),
       validateCredential: vi.fn(async () => ({ valid: true })),
       stream,
     })
@@ -5462,11 +6472,13 @@ describe('createApplicationRuntime', () => {
       existingAssetIds: [],
     })
     const preservedDirectory = join(mediaRoot, preserved.id)
-    await runtime.services.settings.clearLocalData('executions')
+    const executionClearToken = await runtime.services.settings.captureDataClearToken()
+    await runtime.services.settings.clearLocalData('executions', executionClearToken)
     await expect(access(preservedDirectory)).resolves.toBeUndefined()
     expect(await listConversations(runtime)).toHaveLength(1)
 
-    await runtime.services.settings.clearLocalData('all')
+    const allClearToken = await runtime.services.settings.captureDataClearToken()
+    await runtime.services.settings.clearLocalData('all', allClearToken)
     await expect(access(preservedDirectory)).rejects.toMatchObject({ code: 'ENOENT' })
     expect(await listConversations(runtime)).toEqual([])
     await runtime.close()
@@ -6531,7 +7543,10 @@ describe('createApplicationRuntime', () => {
       },
     })
     const conversation = await runtime.services.chat.createConversation()
-    expect(await listConversations(runtime)).toEqual([conversation])
+    expect(await listConversations(runtime)).toEqual([{
+      ...conversation,
+      syncState: expect.stringMatching(/^(pending|syncing)$/),
+    }])
     expect(await listMessages(runtime, conversation.id)).toEqual([])
     expect(await runtime.services.chat.renameConversation(conversation.id, 'Renamed')).toMatchObject({ title: 'Renamed' })
     await runtime.services.chat.send(chatInput(conversation.id, 'persist me'))
@@ -6649,7 +7664,8 @@ describe('createApplicationRuntime', () => {
     const conversation = await runtime.services.chat.createConversation()
     await runtime.services.chat.send(chatInput(conversation.id, 'hello'))
 
-    await expect(runtime.services.settings.clearLocalData('conversations'))
+    const blockedClearToken = await runtime.services.settings.captureDataClearToken()
+    await expect(runtime.services.settings.clearLocalData('conversations', blockedClearToken))
       .rejects.toMatchObject({ code: 'CONFLICT' })
     await expect(runtime.services.workflows.remove('workflow.active', '1.0.0'))
       .rejects.toMatchObject({ code: 'CONFLICT' })
@@ -6660,7 +7676,8 @@ describe('createApplicationRuntime', () => {
       await Promise.resolve()
     }
     await new Promise<void>((resolve) => { setImmediate(resolve) })
-    await runtime.services.settings.clearLocalData('conversations')
+    const clearToken = await runtime.services.settings.captureDataClearToken()
+    await runtime.services.settings.clearLocalData('conversations', clearToken)
     expect(await listConversations(runtime)).toEqual([])
     await runtime.close()
   })
@@ -7599,16 +8616,195 @@ describe('createApplicationRuntime', () => {
       userId: alice.user.id, conversationId: aliceConversation.id, runId: 'active_clear_run',
     })
 
-    await expect(runtime.services.settings.clearBrowserData())
+    const blockedClearToken = await runtime.services.settings.captureDataClearToken()
+    await expect(runtime.services.settings.clearBrowserData(blockedClearToken))
       .rejects.toMatchObject({ code: 'CONFLICT' })
     expect(workspace.clearUserData).not.toHaveBeenCalled()
     await lease.release()
 
-    await runtime.services.settings.clearBrowserData()
+    const clearToken = await runtime.services.settings.captureDataClearToken()
+    await runtime.services.settings.clearBrowserData(clearToken)
 
     expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
     expect(registry.list(alice.user.id, aliceConversation.id)).toEqual([])
     expect(registry.list(bob.user.id, bobConversation.id)).toHaveLength(1)
+    await runtime.close()
+  })
+
+  it('rejects Main-issued destructive-clear tokens after owner switch and UID ABA', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-token-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    await authenticate(runtime, 'ClearAlice')
+    const aliceConversation = await runtime.services.chat.createConversation()
+    const aliceLocalToken = await runtime.services.settings.captureDataClearToken()
+    const aliceBrowserToken = await runtime.services.settings.captureDataClearToken()
+    const aliceAbaLocalToken = await runtime.services.settings.captureDataClearToken()
+    const aliceAbaBrowserToken = await runtime.services.settings.captureDataClearToken()
+
+    await authenticate(runtime, 'ClearBobby')
+    const bobConversation = await runtime.services.chat.createConversation()
+    await expect(runtime.services.settings.clearLocalData('all', aliceLocalToken))
+      .resolves.toBe('stale')
+    await expect(runtime.services.settings.clearBrowserData(aliceBrowserToken))
+      .resolves.toBe('stale')
+    expect(await listConversations(runtime)).toEqual([
+      expect.objectContaining({ id: bobConversation.id }),
+    ])
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+
+    await runtime.services.auth.loginWithPassword({ account: 'ClearAlice', password: 'password' })
+    await expect(runtime.services.settings.clearLocalData('all', aliceAbaLocalToken))
+      .resolves.toBe('stale')
+    await expect(runtime.services.settings.clearBrowserData(aliceAbaBrowserToken))
+      .resolves.toBe('stale')
+    expect(await listConversations(runtime)).toEqual([
+      expect.objectContaining({ id: aliceConversation.id }),
+    ])
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('settles an in-flight browser clear as stale when Main begins an owner transition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-transition-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const clearStarted = deferred<void>()
+    const releaseClear = deferred<void>()
+    vi.mocked(workspace.clearUserData).mockImplementation(async () => {
+      clearStarted.resolve()
+      await releaseClear.promise
+    })
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    const alice = await authenticate(runtime, 'ClearRaceAlice')
+    await authenticate(runtime, 'ClearRaceBobby')
+    await runtime.services.auth.loginWithPassword({ account: 'ClearRaceAlice', password: 'password' })
+    const token = await runtime.services.settings.captureDataClearToken()
+
+    const clearing = runtime.services.settings.clearBrowserData(token)
+    await clearStarted.promise
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'ClearRaceBobby', password: 'password',
+    })
+    await Promise.resolve()
+    releaseClear.resolve()
+
+    await expect(clearing).resolves.toBe('stale')
+    await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_clearracebobby' } })
+    expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
+    await runtime.close()
+  })
+
+  it('does not enter destructive browser clear after its authoritative session check crosses an owner transition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-session-race-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const gatedAuth = createGatedGetSessionAuth((call) => call === 1)
+    const runtime = createApplicationRuntime(options(root, {
+      authService: gatedAuth.authService,
+      browserWorkspace: workspace,
+    }))
+    await authenticate(runtime, 'ClearSessionAlice')
+    await authenticate(runtime, 'ClearSessionBobby')
+    await runtime.services.auth.loginWithPassword({
+      account: 'ClearSessionAlice', password: 'password',
+    })
+    const token = await runtime.services.settings.captureDataClearToken()
+    gatedAuth.arm()
+
+    const clearing = runtime.services.settings.clearBrowserData(token)
+    await expect(gatedAuth.started).resolves.toMatchObject({
+      user: { id: 'test_user_clearsessionalice' },
+    })
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'ClearSessionBobby', password: 'password',
+    })
+    await Promise.resolve()
+    gatedAuth.release()
+
+    await expect(clearing).resolves.toBe('stale')
+    await expect(switching).resolves.toMatchObject({
+      user: { id: 'test_user_clearsessionbobby' },
+    })
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('revalidates a clear token at maintenance entry across owner switch, UID ABA, and replay', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-entry-race-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const gatedAuth = createGatedGetSessionAuth((call) => call === 2)
+    const runtime = createApplicationRuntime(options(root, {
+      authService: gatedAuth.authService,
+      browserWorkspace: workspace,
+    }))
+    await authenticate(runtime, 'ClearEntryAlice')
+    await authenticate(runtime, 'ClearEntryBobby')
+    await runtime.services.auth.loginWithPassword({
+      account: 'ClearEntryAlice', password: 'password',
+    })
+    const token = await runtime.services.settings.captureDataClearToken()
+    gatedAuth.arm()
+
+    const clearing = runtime.services.settings.clearBrowserData(token)
+    await expect(gatedAuth.started).resolves.toMatchObject({
+      user: { id: 'test_user_clearentryalice' },
+    })
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'ClearEntryBobby', password: 'password',
+    })
+    await Promise.resolve()
+    gatedAuth.release()
+
+    await expect(clearing).resolves.toBe('stale')
+    await expect(switching).resolves.toMatchObject({
+      user: { id: 'test_user_clearentrybobby' },
+    })
+    await runtime.services.auth.loginWithPassword({
+      account: 'ClearEntryAlice', password: 'password',
+    })
+    await expect(runtime.services.settings.clearBrowserData(token)).resolves.toBe('stale')
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('settles a completed clear as stale when its final authoritative session check crosses an owner transition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-clear-settle-race-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const gatedAuth = createGatedGetSessionAuth(() => (
+      vi.mocked(workspace.clearUserData).mock.calls.length > 0
+    ))
+    const runtime = createApplicationRuntime(options(root, {
+      authService: gatedAuth.authService,
+      browserWorkspace: workspace,
+    }))
+    const alice = await authenticate(runtime, 'ClearSettleAlice')
+    await authenticate(runtime, 'ClearSettleBobby')
+    await runtime.services.auth.loginWithPassword({
+      account: 'ClearSettleAlice', password: 'password',
+    })
+    const token = await runtime.services.settings.captureDataClearToken()
+    gatedAuth.arm()
+
+    const clearing = runtime.services.settings.clearBrowserData(token)
+    await expect(gatedAuth.started).resolves.toMatchObject({
+      user: { id: alice.user.id },
+    })
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'ClearSettleBobby', password: 'password',
+    })
+    await Promise.resolve()
+    gatedAuth.release()
+
+    await expect(clearing).resolves.toBe('stale')
+    await expect(switching).resolves.toMatchObject({
+      user: { id: 'test_user_clearsettlebobby' },
+    })
+    expect(workspace.clearUserData).toHaveBeenCalledOnce()
+    expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
     await runtime.close()
   })
 
@@ -7744,7 +8940,7 @@ describe('createApplicationRuntime', () => {
     }
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
-      userDataSyncPort,
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort(userDataSyncPort),
     }))
 
     const alice = await authenticate(runtime, 'CacheAlice')
@@ -7757,7 +8953,7 @@ describe('createApplicationRuntime', () => {
     expect(userDataStores.current()?.conversations.get(aliceConversation.id)?.userId)
       .toBe(alice.user.id)
 
-    await authenticate(runtime, 'CacheBob')
+    await authenticate(runtime, 'CacheBob', false)
     expect(await runtime.services.chat.listConversations({ limit: 50 })).toEqual({ items: [] })
 
     await runtime.services.auth.loginWithPassword({ account: 'CacheAlice', password: 'password' })
@@ -7781,11 +8977,23 @@ describe('createApplicationRuntime', () => {
     ]))
     const userDataRoot = join(root, 'user-caches')
     const userDataStores = new UserDataStoreManager(userDataRoot)
+    const knowledgeLifecycle: string[] = []
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => { knowledgeLifecycle.push('bind') }),
+      refreshEntitlement: vi.fn(async () => undefined),
+      invalidate: vi.fn(() => { knowledgeLifecycle.push('invalidate') }),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
-      userDataSyncPort: {
+      knowledgeService,
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort({
         call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
-      },
+      }),
       chooseMediaFiles: async () => [source],
     }))
     const session = await authenticate(runtime, 'LogoutPendingAlice')
@@ -7798,8 +9006,9 @@ describe('createApplicationRuntime', () => {
     await expect(access(mediaPath)).resolves.toBeUndefined()
 
     await expect(runtime.services.auth.logout()).resolves.toEqual({
-      status: 'pending_sync', pendingCount: 2,
+      status: 'pending_sync', pendingCount: 1,
     })
+    expect(knowledgeLifecycle.slice(-2)).toEqual(['invalidate', 'bind'])
     await expect(runtime.services.auth.requireSession()).resolves.toMatchObject({
       user: { account: 'LogoutPendingAlice' },
     })
@@ -7887,8 +9096,20 @@ describe('createApplicationRuntime', () => {
     let hangPull = false
     const userDataRoot = join(root, 'user-caches')
     const userDataStores = new UserDataStoreManager(userDataRoot)
+    const knowledgeLifecycle: string[] = []
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => { knowledgeLifecycle.push('bind') }),
+      refreshEntitlement: vi.fn(async () => undefined),
+      invalidate: vi.fn(() => { knowledgeLifecycle.push('invalidate') }),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
+      knowledgeService,
       userDataSyncPort: {
         call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
           if (input.action === 'syncPull') {
@@ -7923,6 +9144,7 @@ describe('createApplicationRuntime', () => {
       runtime.services.auth.logout(),
       new Promise((_, reject) => setTimeout(() => reject(new Error('logout remained hung')), 250)),
     ])).resolves.toEqual({ status: 'sync_timeout' })
+    expect(knowledgeLifecycle.slice(-2)).toEqual(['invalidate', 'bind'])
     await expect(runtime.services.auth.requireSession()).resolves.toMatchObject({
       user: { account: 'LogoutHungPullAlice' },
     })
@@ -7944,9 +9166,9 @@ describe('createApplicationRuntime', () => {
     const userDataStores = new UserDataStoreManager(userDataRoot)
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
-      userDataSyncPort: {
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort({
         call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
-      },
+      }),
       chooseMediaFiles: async () => [source],
     }))
     const session = await authenticate(runtime, 'PreservePendingAlice')
@@ -7956,7 +9178,7 @@ describe('createApplicationRuntime', () => {
     })
     const mediaRoot = join(root, 'user-media', userMediaScope(session.user.id))
     const mediaPath = join(mediaRoot, conversation.id, `${asset!.id}.png`)
-    expect(userDataStores.current()?.outbox.countPending()).toBe(2)
+    expect(userDataStores.current()?.outbox.countPending()).toBe(1)
 
     await expect(runtime.services.auth.logout({ preservePending: true }))
       .resolves.toEqual({ status: 'logged_out' })
@@ -7967,7 +9189,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.auth.loginWithPassword({
       account: 'PreservePendingAlice', password: 'password',
     })
-    expect(userDataStores.current()?.outbox.countPending()).toBe(2)
+    expect(userDataStores.current()?.outbox.countPending()).toBe(1)
     await runtime.close()
   })
 
@@ -8288,9 +9510,9 @@ describe('createApplicationRuntime', () => {
     })
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
-      userDataSyncPort: {
+      userDataSyncPort: consentAcknowledgingUserDataSyncPort({
         call: userDataSyncCall,
-      },
+      }),
       modelProviders: snapshotProviders({ deepseek: {
         listModels: async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')],
         validateCredential: async () => ({ valid: true }),

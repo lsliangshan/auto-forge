@@ -8,6 +8,7 @@ import {
   byokUsageEventSchema,
   chatFileSupport,
   chatBlockSchema,
+  cloudSyncConsentRevokeRequestSchema,
   conversationGenerationPreferencesSchema,
   legacyImportRequestSchema,
   openExternalRequestSchema,
@@ -28,6 +29,7 @@ import {
   type ExecutionSummary,
   type ModelProviderId,
   type PermissionGrant,
+  type PrivacyConsentState,
   type ProviderCredentialStatus,
   type WorkflowChatAvailability,
   type WorkflowDetail,
@@ -78,6 +80,7 @@ import { UserDataStoreManager, type UserDataStore } from './database/user-data-c
 import { CloudBaseUserDataPort } from './cloud/cloudbase-user-data-port.js'
 import { UserDataSyncEngine } from './sync/user-data-sync-engine.js'
 import { LegacyUserDataImporter } from './sync/legacy-user-data-import.js'
+import { CloudBaseKnowledgeClient } from './knowledge/cloudbase-knowledge-client.js'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
@@ -97,6 +100,8 @@ import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pin
 import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
+import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
+import type { KnowledgeSearchScope, LocalKnowledgeService } from './knowledge/knowledge-service.js'
 import { createTokenUsageSnapshot } from './token-usage.js'
 import { QiniuAvatarUploader } from './profile/avatar-uploader.js'
 import { ProfileService } from './profile/profile-service.js'
@@ -143,6 +148,7 @@ type ApplicationFailureSource =
   | 'reconciliation-stop'
   | 'video-stop'
   | 'admission-drain'
+  | 'knowledge-drain'
   | 'agent-cancel'
   | 'media-cancel'
   | 'chat-drain'
@@ -150,6 +156,7 @@ type ApplicationFailureSource =
   | 'continuation-shutdown'
   | 'browser-shutdown'
   | 'sync-pause'
+  | 'diagnostic-flush'
   | 'user-cache-close'
   | 'database-close'
 
@@ -170,15 +177,21 @@ type LegacyImportDiagnostic = {
   messageCount?: number
 }
 
-function createLegacyImportDiagnosticLog(directory: string): (diagnostic: LegacyImportDiagnostic) => void {
+type LegacyImportDiagnosticLog = ((diagnostic: LegacyImportDiagnostic) => void) & {
+  flush(): Promise<void>
+}
+
+function createLegacyImportDiagnosticLog(directory: string): LegacyImportDiagnosticLog {
   let tail = Promise.resolve()
-  return (diagnostic) => {
+  const log = (diagnostic: LegacyImportDiagnostic) => {
     tail = tail.then(async () => {
       const line = `${JSON.stringify({ occurredAt: new Date().toISOString(), ...diagnostic })}\n`
       await mkdir(directory, { recursive: true })
       await appendFile(join(directory, LEGACY_IMPORT_DIAGNOSTIC_LOG), line, 'utf8')
     }).catch(() => undefined)
   }
+  log.flush = async () => { await tail }
+  return log
 }
 
 interface ApplicationFailureRecord {
@@ -195,6 +208,7 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'reconciliation-stop': 10,
   'video-stop': 20,
   'admission-drain': 30,
+  'knowledge-drain': 35,
   'agent-cancel': 40,
   'media-cancel': 50,
   'chat-drain': 60,
@@ -202,6 +216,7 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'continuation-shutdown': 80,
   'browser-shutdown': 90,
   'sync-pause': 95,
+  'diagnostic-flush': 96,
   'user-cache-close': 96,
   'database-close': 100,
 }
@@ -260,6 +275,8 @@ export interface ApplicationRuntimeOptions {
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
   /** @internal Allows deterministic bounded-logout tests. */
   logoutSyncTimeoutMs?: number
+  /** @internal Allows deterministic knowledge lifecycle tests; production supplies the local service. */
+  knowledgeService?: LocalKnowledgeService
 }
 
 interface ObservedAuthService extends AuthService {
@@ -394,6 +411,9 @@ export function observeAuthService(
           version: currentAuthorization?.version ?? 0,
           updatedAt: currentAuthorization?.updatedAt ?? session.authenticatedAt,
           confirmed: false,
+          ...(currentAuthorization?.knowledgeEntitlement
+            ? { knowledgeEntitlement: currentAuthorization.knowledgeEntitlement }
+            : {}),
         }
         authenticated = true
         currentUserId = session.user.id
@@ -414,6 +434,8 @@ const defaultGenerationPreferences = conversationGenerationPreferencesSchema.par
   outputType: 'auto',
   models: {},
   generation: { image: { count: 1 }, audio: {}, video: {} },
+  knowledgeBaseIds: [],
+  knowledgeMode: 'mixed',
 })
 
 export class MaintenanceGate {
@@ -477,6 +499,7 @@ class UserDataAdmissionGate {
   private closed = false
   private stopped = false
   private active = 0
+  private generation = 0
   private readonly drainWaiters = new Set<() => void>()
 
   private resolveDrainWaiters(): void {
@@ -487,6 +510,15 @@ class UserDataAdmissionGate {
 
   acceptsNewWork(): boolean {
     return !this.closed && !this.stopped
+  }
+
+  captureGeneration(): number {
+    if (!this.acceptsNewWork()) throw failure('CONFLICT')
+    return this.generation
+  }
+
+  isCurrent(generation: number): boolean {
+    return this.acceptsNewWork() && this.generation === generation
   }
 
   async run<T>(operation: () => T | Promise<T>): Promise<T> {
@@ -503,6 +535,7 @@ class UserDataAdmissionGate {
   async transition<T>(operation: (waitForActive: () => Promise<void>) => Promise<T>): Promise<T> {
     if (this.closed || this.stopped) throw failure('CONFLICT')
     this.closed = true
+    this.generation += 1
     try {
       return await operation(async () => {
         if (this.active === 0) return
@@ -516,6 +549,7 @@ class UserDataAdmissionGate {
   async stopAndDrain(): Promise<void> {
     this.stopped = true
     this.closed = true
+    this.generation += 1
     if (this.active === 0) return
     await new Promise<void>((resolve) => { this.drainWaiters.add(resolve) })
   }
@@ -740,9 +774,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let notifySyncWarning: (
     binding: { userId: string; generation: number }, warningSince?: number,
   ) => void = () => undefined
+  let notifyConsentChanged: (
+    binding: { userId: string; generation: number },
+    state: PrivacyConsentState | undefined,
+  ) => void = () => undefined
   const userDataSync = new UserDataSyncEngine(userDataSyncPort, userDataStores, {
     onConversationChanged: (conversationIds) => { notifyConversationChanges(conversationIds) },
     onWarningChanged: (binding, warningSince) => { notifySyncWarning(binding, warningSince) },
+    onConsentChanged: (binding, state) => { notifyConsentChanged(binding, state) },
   })
   const legacyUserDataImporter = new LegacyUserDataImporter(database, userDataSync)
   const storedDeviceId = database.appSettings.get('user-data.device-id.v1')?.value
@@ -764,22 +803,65 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let bindUserMedia: (session: AuthSession) => Promise<void> = async () => undefined
   let pauseUserMedia = (): void => undefined
   let deleteUserMedia: (userId: string) => Promise<void> = async () => undefined
+  const knowledge = options.knowledgeService
+  knowledge?.configureCloudRemote?.(
+    cloudBasePorts ? new CloudBaseKnowledgeClient(cloudBasePorts.functions) : undefined,
+  )
+  const currentCloudSyncConsentAccepted = (): boolean => (
+    userDataStores.current()?.account.getConsent('cloud_sync')?.documentVersion
+      === CLOUD_SYNC_DOCUMENT_VERSION
+  )
+  const applyCurrentCloudSyncConsent = (ownerId: string): void => {
+    knowledge?.setCloudSyncConsent?.(ownerId, currentCloudSyncConsentAccepted())
+  }
+  notifyConsentChanged = (token, state) => {
+    if (state?.purpose !== 'cloud_sync'
+      || boundUserId !== token.userId
+      || auth.currentUserId() !== token.userId) return
+    let currentToken: { userId: string; generation: number }
+    try {
+      currentToken = userDataSync.captureBinding(token.userId)
+    } catch {
+      return
+    }
+    if (currentToken.generation !== token.generation) return
+    knowledge?.setCloudSyncConsent?.(
+      token.userId,
+      state.state === 'accepted' && state.documentVersion === CLOUD_SYNC_DOCUMENT_VERSION,
+    )
+  }
+  const pullUserData = async (ownerId: string): Promise<void> => {
+    await userDataSync.pull()
+    applyCurrentCloudSyncConsent(ownerId)
+  }
   const bindUserData = (session: AuthSession): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
+        await knowledge?.bind(session.user.id, currentCloudSyncConsentAccepted())
+        await knowledge?.refreshEntitlement?.(
+          session.user.id,
+          session.authorization?.knowledgeEntitlement,
+          session.authorization?.confirmed === true,
+        )
         await bindUserMedia(session)
         activateUserReconciliation(runtimeRecovered)
         await activateVideoJobs(runtimeRecovered)
         return
       }
       await userDataSync.start(session.user.id, deviceId)
+      await knowledge?.bind(session.user.id, currentCloudSyncConsentAccepted())
+      await knowledge?.refreshEntitlement?.(
+        session.user.id,
+        session.authorization?.knowledgeEntitlement,
+        session.authorization?.confirmed === true,
+      )
       await bindUserMedia(session)
       boundUserId = session.user.id
       const warningSince = userDataSync.status().warningSince
       if (warningSince !== undefined) {
         notifySyncWarning(userDataSync.captureBinding(session.user.id), warningSince)
       }
-      await userDataSync.pull()
+      await pullUserData(session.user.id)
       activateUserReconciliation(runtimeRecovered)
       await activateVideoJobs(runtimeRecovered)
     })
@@ -787,7 +869,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return operation
   }
   const pauseUserData = (): Promise<void> => {
+    knowledge?.invalidate()
     const operation = userDataLifecycleTail.then(async () => {
+      await knowledge?.drain()
       await pauseVideoJobs()
       await pauseUserReconciliation()
       await userDataSync.pause()
@@ -799,7 +883,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return operation
   }
   const prepareUserDataDiscard = (): Promise<void> => {
+    knowledge?.invalidate()
     const operation = userDataLifecycleTail.then(async () => {
+      await knowledge?.drain()
       await pauseVideoJobs()
       await pauseUserReconciliation()
       userDataSync.discard()
@@ -834,6 +920,35 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   const maintenance = new MaintenanceGate()
   const userDataAdmission = new UserDataAdmissionGate()
+  const issuedDataClearTokens = new Map<string, { userId: string; generation: number }>()
+  const issueDataClearToken = (userId: string): string => {
+    while (issuedDataClearTokens.size >= 64) {
+      issuedDataClearTokens.delete(issuedDataClearTokens.keys().next().value as string)
+    }
+    const token = `${randomUUID().replaceAll('-', '')}${randomUUID().replaceAll('-', '')}`
+    issuedDataClearTokens.set(token, { userId, generation: userDataAdmission.captureGeneration() })
+    return token
+  }
+  const consumeCurrentDataClearToken = async (
+    token: string,
+  ): Promise<{ userId: string; generation: number } | undefined> => {
+    const binding = issuedDataClearTokens.get(token)
+    issuedDataClearTokens.delete(token)
+    if (!binding || !userDataAdmission.isCurrent(binding.generation)) return undefined
+    const session = await auth.getSession()
+    return userDataAdmission.isCurrent(binding.generation)
+      && session?.user.id === binding.userId
+      ? binding
+      : undefined
+  }
+  const dataClearBindingIsCurrent = async (
+    binding: { userId: string; generation: number },
+  ): Promise<boolean> => {
+    if (!userDataAdmission.isCurrent(binding.generation)) return false
+    const session = await auth.getSession().catch(() => null)
+    return userDataAdmission.isCurrent(binding.generation)
+      && session?.user.id === binding.userId
+  }
   const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
@@ -1389,9 +1504,63 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       catalog: browserContinuationCatalog,
       executor: browserContinuationExecutor,
     },
+    ...(knowledge === undefined ? {} : {
+      knowledge: {
+        search: ({ ownerId, baseIds, query, signal, scope }: {
+          ownerId: string
+          conversationId: string
+          baseIds: readonly string[]
+          query: string
+          signal: AbortSignal
+          scope?: KnowledgeSearchScope
+        }) => knowledge.searchSelected({ userId: ownerId }, query, baseIds, signal, scope),
+        getProviderConsent: async ({ ownerId, provider }: { ownerId: string; provider: ModelProviderId }) => {
+          const consent = await knowledge.getConsent({ userId: ownerId }, provider)
+          return consent.status
+        },
+        sourceVerifiable: ({ ownerId, baseId, documentId, versionId, signal, scope }: {
+          ownerId: string
+          baseId: string
+          documentId: string
+          versionId: string
+          signal: AbortSignal
+          scope?: KnowledgeSearchScope
+        }) => scope === undefined || knowledge.sourceVerifiable === undefined
+          ? Promise.resolve(false)
+          : knowledge.sourceVerifiable(
+              { userId: ownerId }, baseId, documentId, versionId, signal, scope,
+            ),
+        releaseSearchScope: (scope: KnowledgeSearchScope) => {
+          knowledge.releaseSearchScope(scope)
+        },
+      },
+    }),
   })
   isBrowserRunActive = (runId) => agent.ownsBrowserRun(runId)
   options.inspectAgent?.(agent)
+  const pruneInactiveAgentRequests = () => {
+    for (const requestId of activeRequests) {
+      if (!activeChatWork.has(requestId) && !agent.hasActiveRequest(requestId)) {
+        activeRequests.delete(requestId)
+      }
+    }
+  }
+  const knowledgeConsentMutationTails = new Map<string, Promise<void>>()
+  const runKnowledgeConsentMutation = <Result>(
+    ownerId: string,
+    provider: ModelProviderId,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const key = `${ownerId}\0${provider}`
+    const previous = knowledgeConsentMutationTails.get(key) ?? Promise.resolve()
+    const result = previous.then(operation)
+    const tail = result.then(() => undefined, () => undefined)
+    knowledgeConsentMutationTails.set(key, tail)
+    void tail.then(() => {
+      if (knowledgeConsentMutationTails.get(key) === tail) knowledgeConsentMutationTails.delete(key)
+    })
+    return result
+  }
   const persistence = createAgentPersistence(chatDatabase)
   const mediaGeneration = new MediaGenerationOrchestrator({
     providers: providerRegistry,
@@ -1537,6 +1706,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       chatDatabase.chatRuns.getByRequestId(requestId)?.userId === userId
     ))
     const results = await Promise.allSettled(requestIds.map((requestId) => agent.cancel(requestId)))
+    pruneInactiveAgentRequests()
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
     if (failed) throw failed.reason
   }
@@ -1551,6 +1721,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     waitForActive: () => Promise<void>,
     pause = true,
   ): Promise<void> => {
+    knowledge?.invalidate()
     const current = await auth.getSession()
     if (current) {
       await resetBrowserIdentity(current.user.id)
@@ -1635,12 +1806,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const deadline = Date.now() + (options.logoutSyncTimeoutMs ?? 5_000)
         await beforeAuthIdentityChange(waitForActive, false)
         const flushed = await flushForLogout(Math.max(0, deadline - Date.now()))
-        if (!flushed) return { status: 'sync_timeout' as const }
+        if (!flushed) {
+          await bindUserData(session)
+          return { status: 'sync_timeout' as const }
+        }
         if (input && 'discardPending' in input) {
           await prepareUserDataDiscard()
         } else {
           const pendingCount = currentUserData().outbox.countPending()
           if (!input && pendingCount > 0) {
+            await bindUserData(session)
             return { status: 'pending_sync' as const, pendingCount }
           }
           await pauseUserData()
@@ -1673,10 +1848,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     chat: {
       listConversations: async (input) => {
-        await requireAuthenticatedSession()
+        const session = await requireAuthenticatedSession()
         const page = currentUserData().conversations.listPage(input)
         const warningSince = userDataSync.status().warningSince
-        void userDataSync.pull().catch(() => undefined)
+        void pullUserData(session.user.id).catch(() => undefined)
         return {
           ...page,
           ...(warningSince === undefined ? {} : {
@@ -1688,7 +1863,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const session = await requireAuthenticatedSession()
         requireOwnedConversation(input.conversationId, session.user.id)
         const page = currentUserData().messages.listPage(input)
-        void userDataSync.pull().catch(() => undefined)
+        void pullUserData(session.user.id).catch(() => undefined)
         return page
       },
       createConversation: async () => {
@@ -1734,16 +1909,24 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const session = await requireAuthenticatedSession()
         requireOwnedConversation(conversationId, session.user.id)
         return maintenance.runExclusive(
-          () => [...activeChatWork.values()].some((work) => work.conversationId !== conversationId)
-            || [...activeConversationTitleWork.values()].some(
-              (work) => work.conversationId !== conversationId,
+          () => {
+            const targetAgentActive = agent.hasActiveConversation(conversationId)
+            const foreignExecution = [...activeExecutions].some(
+              executionId => !agent.ownsExecutionForConversation(executionId, conversationId),
             )
-            || mediaGeneration.hasActiveRuns()
-            || chatDatabase.mediaGenerationJobs.listActive().length > 0
-            || activeExecutions.size > 0
-            || executions.hasActiveExecutions()
-            || browser.hasActiveContexts(),
+            return [...activeChatWork.values()].some((work) => work.conversationId !== conversationId)
+              || agent.hasActiveConversationOtherThan(conversationId)
+              || [...activeConversationTitleWork.values()].some(
+                (work) => work.conversationId !== conversationId,
+              )
+              || mediaGeneration.hasActiveRuns()
+              || chatDatabase.mediaGenerationJobs.listActive().length > 0
+              || foreignExecution
+              || (executions.hasActiveExecutions() && !targetAgentActive)
+              || browser.hasActiveContexts()
+          },
           async () => {
+            await agent.cancelConversation(conversationId)
             const requests = [...activeChatWork.entries()]
               .filter(([, work]) => work.conversationId === conversationId)
             await Promise.all(requests.map(([requestId]) => agent.cancel(requestId)))
@@ -1850,6 +2033,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                   ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
                   ...projectedAttachments,
                 ]
+            const knowledgeSelection = {
+              baseIds: [...(preferences.knowledgeBaseIds ?? [])],
+              mode: preferences.knowledgeMode ?? 'mixed',
+            } as const
+            const knowledgeSearchScope = knowledge && knowledgeSelection.baseIds.length > 0
+              ? await knowledge.captureSearchScope(
+                  { userId: session.user.id }, knowledgeSelection.baseIds,
+                )
+              : undefined
             trackChatWork(requestId, input.conversationId, async () => {
               return agent.run({
                 conversationId: input.conversationId,
@@ -1873,6 +2065,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 model: route.model,
                 ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
                 requestId,
+                knowledgeSelection: knowledgeSelection
+                  ? { baseIds: [...knowledgeSelection.baseIds], mode: knowledgeSelection.mode }
+                  : undefined,
+                ...(knowledgeSearchScope === undefined ? {} : { knowledgeSearchScope }),
               })
             })
           } else if (route.outputType === 'image') {
@@ -1910,10 +2106,21 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           ?? chatDatabase.chatRuns.getByRequestId(requestId)?.conversationId
         if (!conversationId) throw failure('NOT_FOUND')
         requireOwnedConversation(conversationId, session.user.id)
-        await Promise.allSettled([
-          agent.cancel(requestId),
-          mediaGeneration.cancel(requestId),
-        ])
+        const cancellations = [
+          { source: 'agent-cancel' as const, operation: agent.cancel(requestId) },
+          { source: 'media-cancel' as const, operation: mediaGeneration.cancel(requestId) },
+        ]
+        const results = await Promise.allSettled(cancellations.map(({ operation }) => operation))
+        pruneInactiveAgentRequests()
+        results.forEach((result, index) => {
+          if (result.status === 'rejected') {
+            recordFailure(result.reason, cancellations[index]!.source)
+          }
+        })
+        const failed = results.find(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        )
+        if (failed) throw failed.reason
       },
       takeOverBrowser: async (input) => {
         const session = await auth.requireSession()
@@ -2183,6 +2390,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         try {
           result = await agent.resumeApproval(decision)
         } catch (error) {
+          pruneInactiveAgentRequests()
           recordFailure(error, 'background-chat')
           throw error
         }
@@ -2278,7 +2486,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
       },
       recordPrivacyConsent: async (input) => {
-        await requireAuthenticatedSession()
+        const session = await requireAuthenticatedSession()
         const consent = privacyConsentSchema.safeParse(input)
         if (!consent.success
           || consent.data.purpose !== 'cloud_sync'
@@ -2286,12 +2494,48 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           throw failure('INVALID_INPUT')
         }
         const store = currentUserData()
-        if (JSON.stringify(store.account.getConsent('cloud_sync')) === JSON.stringify(consent.data)) return
+        if (JSON.stringify(store.account.getConsent('cloud_sync')) === JSON.stringify(consent.data)) {
+          applyCurrentCloudSyncConsent(session.user.id)
+          return
+        }
         store.outbox.recordWithConsent({
           id: randomUUID(), kind: 'privacy.consent', entityId: consent.data.documentVersion,
-          baseRevision: 0, occurredAt: consent.data.consentedAt, payload: consent.data,
+          baseRevision: store.account.getConsentState('cloud_sync')?.revision ?? 0,
+          occurredAt: consent.data.consentedAt, payload: consent.data,
         })
+        applyCurrentCloudSyncConsent(session.user.id)
+        await userDataSync.flush()
+        applyCurrentCloudSyncConsent(session.user.id)
+      },
+      getCloudSyncConsentState: async () => {
+        await requireAuthenticatedSession()
+        return currentUserData().account.getConsentState('cloud_sync') ?? null
+      },
+      revokeCloudSyncConsent: async (input) => {
+        const session = await requireAuthenticatedSession()
+        if (!cloudSyncConsentRevokeRequestSchema.safeParse(input).success) {
+          throw failure('INVALID_INPUT')
+        }
+        const store = currentUserData()
+        const currentState = store.account.getConsentState('cloud_sync')
+        if (currentState?.state === 'revoked') {
+          applyCurrentCloudSyncConsent(session.user.id)
+          return currentState
+        }
+        const revokedAt = new Date().toISOString()
+        store.outbox.recordWithConsent({
+          id: randomUUID(), kind: 'privacy.consent.revoke', entityId: 'cloud_sync',
+          baseRevision: currentState?.revision ?? 0, occurredAt: revokedAt,
+          payload: {
+            purpose: 'cloud_sync', revokedAt,
+            clientVersion: options.appInfo?.version ?? '0.1.0',
+          },
+        })
+        applyCurrentCloudSyncConsent(session.user.id)
         queueUserDataFlush()
+        const revoked = store.account.getConsentState('cloud_sync')
+        if (revoked?.state !== 'revoked') throw failure('INTERNAL_ERROR')
+        return revoked
       },
       previewLegacyImport: async () => {
         const session = await requireAuthenticatedSession()
@@ -2349,17 +2593,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             batchId,
           })
         } catch (error) {
+          const failedStatus = userDataSync.status()
           logLegacyImportDiagnostic({
             stage: 'importer_failed',
             code: toSafeAppError(error).code,
-            syncState: userDataSync.status().state,
-            ...('errorCode' in userDataSync.status() && userDataSync.status().errorCode
-              ? { syncErrorCode: userDataSync.status().errorCode }
+            syncState: failedStatus.state,
+            ...('errorCode' in failedStatus && failedStatus.errorCode
+              ? { syncErrorCode: failedStatus.errorCode }
               : {}),
           })
           throw error
         }
-        await userDataSync.pull()
+        await pullUserData(session.user.id)
         const pullStatus = userDataSync.status()
         // A prior background-sync quarantine must not turn a successful import into a false failure.
         const pullWasAlreadyQuarantined = syncStatusBeforeImport.state === 'quarantined'
@@ -2460,8 +2705,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           ...(checkpoint ? { lastSyncAt: new Date(checkpoint.updatedAt).toISOString() } : {}),
         })
       },
-      clearLocalData: async (scope) => {
-        await maintenance.runExclusive(
+      captureDataClearToken: async () => {
+        const session = await requireAuthenticatedSession()
+        return issueDataClearToken(session.user.id)
+      },
+      clearLocalData: async (scope, token) => {
+        const binding = await consumeCurrentDataClearToken(token)
+        if (!binding) return 'stale' as const
+        const cleared = await maintenance.runExclusive(
           () => activeRequests.size > 0
             || activeChatWork.size > 0
             || activeConversationTitleWork.size > 0
@@ -2472,32 +2723,64 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || executions.hasActiveExecutions()
             || browser.hasActiveContexts(),
           async () => {
+            if (!await dataClearBindingIsCurrent(binding)) return false
             if (scope === 'conversations' || scope === 'all') {
               await currentMediaLifecycle().clearConversations()
             }
             if (scope === 'executions' || scope === 'all') {
               database.clearLocalData('executions')
             }
+            return true
           },
         )
+        if (!cleared) return 'stale' as const
+        return await dataClearBindingIsCurrent(binding) ? 'applied' as const : 'stale' as const
       },
-      clearBrowserData: async () => {
-        const session = await auth.requireSession()
-        await maintenance.runExclusive(
+      clearBrowserData: async (token) => {
+        const binding = await consumeCurrentDataClearToken(token)
+        if (!binding) return 'stale' as const
+        const cleared = await maintenance.runExclusive(
           () => activeRequests.size > 0
             || activeChatWork.size > 0
             || activeExecutions.size > 0
             || agent.hasActiveRuns()
-            || browserContinuations.hasActiveLease(session.user.id)
+            || browserContinuations.hasActiveLease(binding.userId)
             || executions.hasActiveExecutions()
             || browser.hasActiveContexts(),
           async () => {
-            await browserContinuations.revokeUser(session.user.id, 'CANCELLED')
-            await options.browserWorkspace.clearUserData(session.user.id)
+            if (!await dataClearBindingIsCurrent(binding)) return false
+            await browserContinuations.revokeUser(binding.userId, 'CANCELLED')
+            await options.browserWorkspace.clearUserData(binding.userId)
+            return true
           },
         )
+        if (!cleared) return 'stale' as const
+        return await dataClearBindingIsCurrent(binding) ? 'applied' as const : 'stale' as const
       },
     },
+    knowledge: knowledge ? {
+      ...knowledge,
+      setConsent: async (owner, provider, status) => {
+        const change = agent.beginKnowledgeProviderConsentChange(owner.userId, provider)
+        void change.cancellations.catch(() => undefined)
+        return runKnowledgeConsentMutation(owner.userId, provider, async () => {
+          await change.cancellations
+          const result = await knowledge.setConsent(owner, provider, status)
+          agent.completeKnowledgeProviderConsentChange(owner.userId, provider, change.generation)
+          return result
+        })
+      },
+      revokeConsent: async (owner, provider) => {
+        const change = agent.beginKnowledgeProviderConsentChange(owner.userId, provider)
+        void change.cancellations.catch(() => undefined)
+        return runKnowledgeConsentMutation(owner.userId, provider, async () => {
+          await change.cancellations
+          const result = await knowledge.revokeConsent(owner, provider)
+          agent.completeKnowledgeProviderConsentChange(owner.userId, provider, change.generation)
+          return result
+        })
+      },
+    } : createUnavailableKnowledgeService(),
     system: {
       openExternal: async (url) => {
         const parsed = openExternalRequestSchema.safeParse({ url })
@@ -2525,11 +2808,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     chat: gateUserDataService(ungatedServices.chat),
     media: gateUserDataService(ungatedServices.media),
     executions: gateUserDataService(ungatedServices.executions),
+    knowledge: gateUserDataService(ungatedServices.knowledge),
     settings: {
       ...ungatedServices.settings,
       getTokenUsage: () => userDataAdmission.run(ungatedServices.settings.getTokenUsage),
       recordPrivacyConsent: (input) => userDataAdmission.run(
         () => ungatedServices.settings.recordPrivacyConsent(input),
+      ),
+      getCloudSyncConsentState: () => userDataAdmission.run(
+        ungatedServices.settings.getCloudSyncConsentState,
+      ),
+      revokeCloudSyncConsent: (input) => userDataAdmission.run(
+        () => ungatedServices.settings.revokeCloudSyncConsent(input),
       ),
       previewLegacyImport: () => userDataAdmission.run(
         ungatedServices.settings.previewLegacyImport,
@@ -2544,10 +2834,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         () => ungatedServices.settings.updateAccountDataPreferences(input),
       ),
       getRemoteUsage: () => userDataAdmission.run(ungatedServices.settings.getRemoteUsage),
-      clearLocalData: (scope) => userDataAdmission.run(
-        () => ungatedServices.settings.clearLocalData(scope),
+      captureDataClearToken: () => userDataAdmission.run(
+        ungatedServices.settings.captureDataClearToken,
       ),
-      clearBrowserData: () => userDataAdmission.run(ungatedServices.settings.clearBrowserData),
+      clearLocalData: (scope, token) => userDataAdmission.run(
+        () => ungatedServices.settings.clearLocalData(scope, token),
+      ),
+      clearBrowserData: (token) => userDataAdmission.run(
+        () => ungatedServices.settings.clearBrowserData(token),
+      ),
     },
   }
 
@@ -2598,7 +2893,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         ): Promise<void> => {
           try { await Promise.resolve().then(operation) } catch (error) { recordFailure(error, source) }
         }
+        try { knowledge?.invalidate() } catch (error) { recordFailure(error, 'knowledge-drain') }
         await capture('admission-drain', () => userDataAdmission.stopAndDrain())
+        await capture('knowledge-drain', () => knowledge?.drain())
         await capture('admission-drain', () => maintenance.stopAndDrain())
         const reconciliationStopped = Promise.resolve()
           .then(() => pauseUserReconciliation())
@@ -2638,6 +2935,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await capture('browser-shutdown', () => browser.shutdown())
         await reconciliationStopped
         await capture('sync-pause', () => userDataSync.pause())
+        await capture('diagnostic-flush', async () => {
+          await logLegacyImportDiagnostic.flush()
+          await providerDiagnostics.flush()
+        })
         await capture('user-cache-close', () => {
           userDataStores.close()
           boundUserId = undefined

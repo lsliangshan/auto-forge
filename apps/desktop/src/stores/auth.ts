@@ -3,6 +3,8 @@ import { hasBusinessCapability, type AuthCredentials, type AuthOtpChallenge, typ
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
 import { useExecutionStore } from './execution'
+import { useKnowledgeStore } from './knowledge'
+import { useSettingsStore, type AccountOperationAttemptToken } from './settings'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
@@ -54,14 +56,46 @@ function finishRestoring(store: { restoring: boolean }): void {
   store.restoring = count > 0
 }
 
-function replaceSession(store: { session: AuthSession | null }, session: AuthSession | null): void {
+async function settleFailedAccountTransition(
+  store: { session: AuthSession | null },
+  attempt: AccountOperationAttemptToken,
+): Promise<boolean> {
+  const settings = useSettingsStore()
+  let session: AuthSession | null
+  try {
+    session = await getDesktopApi().auth.getSession()
+  } catch {
+    session = null
+  }
+  const recovery = await settings.recoverAccountOperationAdmission(
+    session?.user.id,
+    attempt,
+  )
+  if (recovery === 'stale') return false
+  return replaceSession(store, session, attempt)
+}
+
+function replaceSession(
+  store: { session: AuthSession | null },
+  session: AuthSession | null,
+  attempt: AccountOperationAttemptToken,
+  terminalClose = false,
+): boolean {
   const previousUserId = store.session?.user.id
   const nextUserId = session?.user.id
-  if (previousUserId !== undefined && previousUserId !== nextUserId) {
-    useChatStore().resetLocalData()
-    useExecutionStore().resetLocalData()
+  const binding = terminalClose && nextUserId === undefined
+    ? useSettingsStore().closeAccountOwner()
+    : useSettingsStore().bindAccountOwner(nextUserId, attempt)
+  if (binding !== 'applied') return false
+  if (previousUserId !== nextUserId) {
+    if (previousUserId !== undefined) {
+      useChatStore().resetLocalData()
+      useExecutionStore().resetLocalData()
+      useKnowledgeStore().resetLocalData()
+    }
   }
   store.session = session
+  return true
 }
 
 export const useAuthStore = defineStore('auth', {
@@ -85,17 +119,18 @@ export const useAuthStore = defineStore('auth', {
       if (pending) return pending
 
       const generation = nextSessionGeneration(this)
+      const accountAttempt = useSettingsStore().suspendAccountOperationAdmission()
       startRestoring(this)
       this.error = ''
       const operation = (async () => {
         try {
           const session = await getDesktopApi().auth.getSession()
           if (generation !== sessionGeneration(this)) return
-          replaceSession(this, session)
+          if (!replaceSession(this, session, accountAttempt)) return
           this.initialized = true
         } catch (error) {
           if (generation !== sessionGeneration(this)) return
-          replaceSession(this, null)
+          if (!replaceSession(this, null, accountAttempt)) return
           this.initialized = true
           this.error = displayError(error, '登录状态恢复失败')
         } finally {
@@ -153,6 +188,7 @@ export const useAuthStore = defineStore('auth', {
 
       const generation = otpGeneration(this)
       const sessionOwner = nextSessionGeneration(this)
+      const accountAttempt = useSettingsStore().suspendAccountOperationAdmission()
       startSubmitting(this)
       this.error = ''
       try {
@@ -163,7 +199,7 @@ export const useAuthStore = defineStore('auth', {
             const result = await getDesktopApi().auth.logout({ preservePending: true })
             if (result.status !== 'logged_out') {
               if (cleanupOwner === sessionGeneration(this)) {
-                replaceSession(this, session)
+                if (!replaceSession(this, session, accountAttempt)) return undefined
                 this.initialized = true
                 this.error = '同步仍在进行，请稍后重试退出登录'
               }
@@ -171,24 +207,28 @@ export const useAuthStore = defineStore('auth', {
             }
           } catch {
             if (cleanupOwner === sessionGeneration(this)) {
-              replaceSession(this, session)
+              if (!replaceSession(this, session, accountAttempt)) return undefined
               this.initialized = true
               this.error = '退出登录失败'
             }
             return undefined
           }
           nextSessionGeneration(this)
-          replaceSession(this, null)
+          replaceSession(this, null, accountAttempt, true)
           this.initialized = true
           this.error = ''
           return undefined
         }
-        replaceSession(this, session)
+        if (!replaceSession(this, session, accountAttempt)) return undefined
         this.initialized = true
         return session
       } catch (error) {
         if (generation === otpGeneration(this) && sessionOwner === sessionGeneration(this)) {
-          this.error = displayError(error, '验证码验证失败')
+          const settled = await settleFailedAccountTransition(this, accountAttempt)
+          if (settled && generation === otpGeneration(this)
+            && sessionOwner === sessionGeneration(this)) {
+            this.error = displayError(error, '验证码验证失败')
+          }
         }
         return undefined
       } finally {
@@ -217,17 +257,21 @@ export const useAuthStore = defineStore('auth', {
       if (this.sendingOtp || this.submitting) return undefined
 
       const sessionOwner = nextSessionGeneration(this)
+      const accountAttempt = useSettingsStore().suspendAccountOperationAdmission()
       startSubmitting(this)
       this.error = ''
       try {
         const session = await getDesktopApi().auth.loginWithPassword(credentials)
         if (sessionOwner !== sessionGeneration(this)) return undefined
-        replaceSession(this, session)
+        if (!replaceSession(this, session, accountAttempt)) return undefined
         this.initialized = true
         return session
       } catch (error) {
         if (sessionOwner === sessionGeneration(this)) {
-          this.error = displayError(error, '登录失败')
+          const settled = await settleFailedAccountTransition(this, accountAttempt)
+          if (settled && sessionOwner === sessionGeneration(this)) {
+            this.error = displayError(error, '登录失败')
+          }
         }
         return undefined
       } finally {
@@ -235,6 +279,7 @@ export const useAuthStore = defineStore('auth', {
       }
     },
     async logout(discardPending = false): Promise<boolean> {
+      const accountAttempt = useSettingsStore().suspendAccountOperationAdmission()
       startSubmitting(this)
       this.error = ''
       await this.cancelOtp()
@@ -244,22 +289,27 @@ export const useAuthStore = defineStore('auth', {
           discardPending ? { discardPending: true } : undefined,
         )
         if (result.status === 'pending_sync') {
-          this.pendingLogoutCount = result.pendingCount
+          const settled = await settleFailedAccountTransition(this, accountAttempt)
+          if (settled) this.pendingLogoutCount = result.pendingCount
           return false
         }
         if (result.status === 'sync_timeout') {
-          this.error = '同步仍在进行，请稍后重试退出登录'
+          const settled = await settleFailedAccountTransition(this, accountAttempt)
+          if (settled) this.error = '同步仍在进行，请稍后重试退出登录'
           return false
         }
         nextSessionGeneration(this)
-        replaceSession(this, null)
+        replaceSession(this, null, accountAttempt, true)
         this.initialized = true
         this.pendingLogoutCount = 0
         this.error = ''
         return true
       } catch (error) {
         if (sessionOwner === sessionGeneration(this)) {
-          this.error = displayError(error, '退出登录失败')
+          const settled = await settleFailedAccountTransition(this, accountAttempt)
+          if (settled && sessionOwner === sessionGeneration(this)) {
+            this.error = displayError(error, '退出登录失败')
+          }
         }
         return false
       } finally {
@@ -271,7 +321,8 @@ export const useAuthStore = defineStore('auth', {
       const sessionOwner = sessionGeneration(this)
       try {
         const session = await getDesktopApi().auth.refreshAuthorization()
-        if (sessionOwner === sessionGeneration(this)) replaceSession(this, session)
+        if (sessionOwner === sessionGeneration(this)
+          && session.user.id === this.session?.user.id) this.session = session
       } catch (error) {
         if (sessionOwner !== sessionGeneration(this) || !this.session) return
         this.session = {

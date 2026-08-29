@@ -155,7 +155,8 @@ function unwrapFunctionEvent(rawEvent) {
     if (payload) return payload
   }
   if (typeof rawEvent.action === 'string' && Object.hasOwn(rawEvent, 'tcbContext')) {
-    const { tcbContext: _tcbContext, ...payload } = rawEvent
+    const payload = { ...rawEvent }
+    delete payload.tcbContext
     return payload
   }
   return rawEvent
@@ -220,6 +221,13 @@ function validateConsent(value, requiredPurpose) {
     && (requiredPurpose === undefined || value.purpose === requiredPurpose)
     && nonEmptyString(value.documentVersion, 128)
     && timestamp(value.consentedAt)
+    && nonEmptyString(value.clientVersion, 64)
+}
+
+function validateConsentRevoke(value) {
+  return hasStrictShape(value, ['purpose', 'revokedAt', 'clientVersion'])
+    && consentPurposes.has(value.purpose)
+    && timestamp(value.revokedAt)
     && nonEmptyString(value.clientVersion, 64)
 }
 
@@ -532,11 +540,23 @@ function validateStoredLegacyReceipt(value) {
 }
 
 function validateGenerationPreferences(value) {
-  if (!hasStrictShape(value, ['outputType', 'models', 'generation'])
+  if (!hasStrictShape(
+    value,
+    ['outputType', 'models', 'generation'],
+    ['knowledgeBaseIds', 'knowledgeMode'],
+  )
     || !['auto', 'text', 'image', 'audio', 'video'].includes(value.outputType)
     || !hasStrictShape(value.models, [], ['text', 'image', 'audio', 'video'])
     || !Object.values(value.models).every((model) => nonEmptyString(model))
-    || !hasStrictShape(value.generation, ['image', 'audio', 'video'])) return false
+    || !hasStrictShape(value.generation, ['image', 'audio', 'video'])
+    || ((value.knowledgeBaseIds === undefined) !== (value.knowledgeMode === undefined))
+    || (value.knowledgeBaseIds !== undefined && (
+      !Array.isArray(value.knowledgeBaseIds)
+      || value.knowledgeBaseIds.length > 32
+      || !value.knowledgeBaseIds.every(identifier)
+      || new Set(value.knowledgeBaseIds).size !== value.knowledgeBaseIds.length
+      || !['mixed', 'strict'].includes(value.knowledgeMode)
+    ))) return false
   const { image, audio, video } = value.generation
   return hasStrictShape(image, ['count', 'resolution', 'aspectRatio', 'format'])
     && image.count === 1
@@ -614,6 +634,8 @@ function validateMutationPayload(kind, payload) {
       return validateLegacyConfirm(payload)
     case 'privacy.consent':
       return validateConsent(payload)
+    case 'privacy.consent.revoke':
+      return validateConsentRevoke(payload)
     case 'preferences.update':
       return validatePreferences(payload)
     case 'usage.record':
@@ -627,6 +649,7 @@ function mutationEntityMatches(kind, entityId, payload) {
   if (['message.append', 'usage.record'].includes(kind)) return entityId === payload.id
   if (kind === 'legacy.import') return entityId === payload.batchId
   if (kind === 'privacy.consent') return entityId === payload.documentVersion
+  if (kind === 'privacy.consent.revoke') return entityId === payload.purpose
   return true
 }
 
@@ -1128,7 +1151,9 @@ function createUserDataHandler({ rpc }) {
         if (!protocolIsCurrent(event)) return upgradeRequired()
         if (!identifier(event.deviceId)
           || !validateMutation(event.mutation)
-          || event.mutation.kind !== 'privacy.consent') return invalid()
+          || !['privacy.consent', 'privacy.consent.revoke'].includes(event.mutation.kind)) {
+          return invalid()
+        }
         return { ok: true, data: await rpc('autoforge_sync_push', {
           p_caller_user_id: uid,
           p_protocol_version: event.protocolVersion,

@@ -1,6 +1,7 @@
 import {
   toSafeAppError,
   type AppErrorCode,
+  type PrivacyConsentState,
   type SyncMutation,
   type SyncMutationResult,
 } from '@autoforge/shared'
@@ -41,6 +42,9 @@ interface SyncEngineDependencies {
   jitter: (delay: number, attempt: number) => number
   onConversationChanged: (conversationIds: readonly string[]) => void
   onWarningChanged: (binding: UserDataBindingToken, warningSince?: number) => void
+  onConsentChanged: (
+    binding: UserDataBindingToken, state: PrivacyConsentState | undefined,
+  ) => void
 }
 
 interface ActiveBinding {
@@ -76,6 +80,7 @@ const defaultDependencies: SyncEngineDependencies = {
   jitter: (delay) => Math.round(delay * (0.75 + Math.random() * 0.5)),
   onConversationChanged: () => undefined,
   onWarningChanged: () => undefined,
+  onConsentChanged: () => undefined,
 }
 
 function affectedConversationIds(
@@ -342,6 +347,7 @@ export class UserDataSyncEngine {
     this.#clearTimer()
     this.#status = { state: 'running' }
     let quarantineCode: AppErrorCode | undefined
+    let authoritativePullCompleted = false
 
     while (this.#isCurrent(binding)) {
       const ready = binding.store.outbox.listReady(this.#dependencies.now(), BATCH_LIMIT)
@@ -432,6 +438,7 @@ export class UserDataSyncEngine {
       try {
         binding.store.outbox.acknowledgePushResults(mutations, data.results)
         this.#pruneSyncing(binding)
+        this.#notifyConsent(binding, mutations)
         this.#notify(binding, conversationIds)
       } catch {
         for (const id of ids) {
@@ -446,18 +453,43 @@ export class UserDataSyncEngine {
       }
 
       let terminalResultCode: AppErrorCode | undefined
+      const consentConflicts: Array<Extract<
+        SyncMutation,
+        { kind: 'privacy.consent' | 'privacy.consent.revoke' }
+      >> = []
       for (const result of data.results) {
         if (result.status === 'conflict') {
           const code = result.errorCode === 'SYNC_CONFLICT' ? result.errorCode : 'SYNC_CONFLICT'
           binding.store.outbox.markFailed(result.id, code)
           this.#untrackSyncing(binding, [result.id])
-          terminalResultCode ??= code
+          const mutation = mutations.find(({ id }) => id === result.id)
+          if (mutation?.kind === 'privacy.consent'
+            || mutation?.kind === 'privacy.consent.revoke') {
+            consentConflicts.push(mutation)
+          } else {
+            terminalResultCode ??= code
+          }
         } else if (result.status === 'rejected') {
           const code = result.errorCode ?? 'INVALID_INPUT'
           binding.store.outbox.markFailed(result.id, code)
           this.#untrackSyncing(binding, [result.id])
           terminalResultCode ??= code
         }
+      }
+      if (consentConflicts.length > 0) {
+        const pullOutcome = await this.#pull(binding)
+        if (!this.#isCurrent(binding)) return
+        const converged = pullOutcome === 'success' && consentConflicts.every((mutation) => (
+          (binding.store.account.getConsentState(mutation.payload.purpose)?.revision ?? 0)
+            > mutation.baseRevision
+        ))
+        if (!converged) {
+          this.#quarantine('SYNC_CONFLICT')
+          return
+        }
+        for (const mutation of consentConflicts) binding.store.outbox.delete(mutation.id)
+        this.#notifyConsent(binding, consentConflicts)
+        authoritativePullCompleted = true
       }
       if (terminalResultCode) {
         this.#notify(binding, conversationIds)
@@ -468,7 +500,7 @@ export class UserDataSyncEngine {
 
     if (!this.#isCurrent(binding)) return
     this.#pullRequested = false
-    const pullOutcome = await this.#pull(binding)
+    const pullOutcome = authoritativePullCompleted ? 'success' : await this.#pull(binding)
     if (!this.#isCurrent(binding)) return
     if (quarantineCode) {
       this.#quarantine(quarantineCode)
@@ -534,6 +566,7 @@ export class UserDataSyncEngine {
           cursor: data.cursor,
         }, this.#dependencies.now())
         this.#pruneSyncing(binding)
+        this.#notifyConsent(binding, data.mutations)
         this.#notify(binding, affectedConversationIds(data.mutations))
       } catch {
         this.#quarantine('INTERNAL_ERROR')
@@ -641,6 +674,33 @@ export class UserDataSyncEngine {
     try {
       this.#dependencies.onConversationChanged([...new Set(conversationIds)])
     } catch { /* Projection notifications are observational. */ }
+  }
+
+  #notifyConsent(
+    binding: ActiveBinding,
+    mutations: readonly { kind: string; payload?: unknown }[],
+  ): void {
+    if (!this.#isCurrent(binding)) return
+    const purposes = new Set<'cloud_sync' | 'legacy_unowned_import'>()
+    for (const mutation of mutations) {
+      if (mutation.kind !== 'privacy.consent'
+        && mutation.kind !== 'privacy.consent.revoke') continue
+      const payload = mutation.payload
+      if (typeof payload !== 'object' || payload === null || !('purpose' in payload)) {
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }
+      const purpose = payload.purpose
+      if (purpose !== 'cloud_sync' && purpose !== 'legacy_unowned_import') {
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }
+      purposes.add(purpose)
+    }
+    for (const purpose of purposes) {
+      this.#dependencies.onConsentChanged(
+        { userId: binding.userId, generation: binding.generation },
+        binding.store.account.getConsentState(purpose),
+      )
+    }
   }
 
   #refreshWarning(binding: ActiveBinding): void {

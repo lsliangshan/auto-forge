@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { ipcChannels, toSafeAppError, type AppSettings } from '@autoforge/shared'
 import { pathToFileURL } from 'node:url'
+import { createLocalKnowledgeService } from '../knowledge/knowledge-service.js'
+import { memoryKnowledgeStore, parsedText } from '../knowledge/knowledge-test-support.js'
+import type { CloudKnowledgeRemote } from '../knowledge/sync-service.js'
 import {
   registerDesktopIpc,
   type DesktopIpcServices,
@@ -104,9 +107,19 @@ function services(): DesktopIpcServices {
       validateProviderCredential: vi.fn(async (provider) => ({ provider, configured: false, validation: 'unchecked' as const })),
       listProviderModels: vi.fn(async () => []),
       getTokenUsage: vi.fn().mockResolvedValue(emptyUsageSnapshot()),
-      clearLocalData: vi.fn(),
-      clearBrowserData: vi.fn(),
+      captureDataClearToken: vi.fn().mockResolvedValue('a'.repeat(64)),
+      clearLocalData: vi.fn().mockResolvedValue('applied'),
+      clearBrowserData: vi.fn().mockResolvedValue('applied'),
       recordPrivacyConsent: vi.fn().mockResolvedValue(undefined),
+      getCloudSyncConsentState: vi.fn().mockResolvedValue({
+        purpose: 'cloud_sync', state: 'accepted', revision: 1,
+        documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      }),
+      revokeCloudSyncConsent: vi.fn().mockResolvedValue({
+        purpose: 'cloud_sync', state: 'revoked', revision: 2,
+        revokedAt: '2026-08-25T01:00:00.000Z', clientVersion: '0.1.0',
+      }),
       previewLegacyImport: vi.fn().mockResolvedValue({
         ownedCount: 1, unownedCount: 1, requiresUnownedConfirmation: true,
       }),
@@ -119,6 +132,43 @@ function services(): DesktopIpcServices {
         pendingCount: 0, byokEstimatedCostUsd: '0', byokEstimatedCount: 0,
         byokUnavailableCount: 0, timezone: 'UTC', displayCurrency: 'USD',
       }),
+    },
+    knowledge: {
+      list: vi.fn().mockResolvedValue([]),
+      create: vi.fn().mockResolvedValue({
+        id: 'base_1', name: 'Policies', kind: 'local', status: 'ready', searchable: true,
+        documentCount: 0, updatedAt: '2026-08-26T00:00:00.000Z',
+      }),
+      listDocuments: vi.fn().mockResolvedValue([]),
+      listVersions: vi.fn().mockResolvedValue([]),
+      pickImportFiles: vi.fn().mockResolvedValue([{
+        id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
+      }]),
+      importDocument: vi.fn().mockResolvedValue({
+        id: 'document_1', baseId: 'base_1', name: 'policy.txt', mimeType: 'text/plain',
+        status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
+      }),
+      replaceDocument: vi.fn(), recycleDocument: vi.fn(), purgeDocument: vi.fn(),
+      restoreDocument: vi.fn(), recycleBase: vi.fn(), restoreBase: vi.fn(), purgeBase: vi.fn(), exportBase: vi.fn(),
+      getSelection: vi.fn().mockResolvedValue({ baseIds: [], mode: 'mixed' }),
+      updateSelection: vi.fn().mockResolvedValue({ baseIds: [], mode: 'mixed' }),
+      search: vi.fn().mockResolvedValue({ kind: 'results', strategy: 'bounded-instr', evidence: [] }),
+      getAvailability: vi.fn().mockResolvedValue({
+        encryption: { available: true }, parser: { available: false, reason: 'parser_unavailable' },
+        cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+        embedding: { available: false, reason: 'embedding_unavailable' },
+        entitlement: { available: false, reason: 'entitlement_unavailable' },
+        beta: { available: false, reason: 'beta_disabled' }, cloud: { available: false, reason: 'cloud_disabled' },
+      }),
+      getEntitlement: vi.fn().mockResolvedValue({ tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false }),
+      retainFreeAllowance: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+        retainedBaseId: 'base_1', retainedDocumentId: 'document_1',
+      }),
+      getConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
+      setConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'granted' }),
+      revokeConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
+      getSourcePreview: vi.fn().mockResolvedValue({ kind: 'unavailable' }),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }
@@ -157,6 +207,61 @@ function harness(
 }
 
 describe('registerDesktopIpc', () => {
+  it('waits for real cloud deletion before acknowledging a synced base purge', async () => {
+    const memory = memoryKnowledgeStore()
+    const deleteKnowledgeBase = vi.fn().mockResolvedValue({ deletionJobId: 'delete_ipc_1' })
+    const remote: CloudKnowledgeRemote = {
+      beginSync: vi.fn().mockResolvedValue({
+        knowledgeBaseId: 'unused', generationId: 'unused', status: 'staging',
+      }),
+      pushMutation: vi.fn().mockResolvedValue({
+        mutationId: 'unused', status: 'applied', sequence: 1, revision: 'unused',
+      }),
+      pullChanges: vi.fn().mockResolvedValue({
+        kind: 'incremental', nextSequence: 0, hasMore: false, changes: [],
+      }),
+      fullResync: vi.fn().mockResolvedValue({ kind: 'snapshot', nextSequence: 0, changes: [] }),
+      publishGeneration: vi.fn().mockResolvedValue({
+        generationId: 'unused', previousGenerationId: null, sequence: 1,
+      }),
+      deleteKnowledgeBase,
+      getJob: vi.fn().mockResolvedValue({
+        jobId: 'delete_ipc_1', state: 'completed', errorCode: null,
+      }),
+      cancelJob: vi.fn().mockResolvedValue(undefined),
+      cleanupOrphans: vi.fn().mockResolvedValue({ removed: 0 }),
+    }
+    const knowledge = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      verifyEntitlement: () => { throw new Error('signed path unused') },
+    })
+    knowledge.configureCloudRemote!(remote)
+    await knowledge.bind(authSession.user.id)
+    const base = await knowledge.create({ userId: authSession.user.id }, '同步库')
+    memory.database.prepare(`
+      INSERT INTO cloud_sync_states(knowledge_base_id, mode, published_generation_id, epoch, updated_at)
+      VALUES (?, 'synced', 'generation_1', 1, 1)
+    `).run(base.id)
+    await knowledge.refreshEntitlement!(authSession.user.id, undefined, true)
+    await knowledge.recycleBase({ userId: authSession.user.id }, base.id)
+    const app = harness()
+    app.dependencies.knowledge = knowledge
+
+    await expect(app.invoke(ipcChannels.knowledgePurgeBase, { baseId: base.id }))
+      .resolves.toBeUndefined()
+
+    expect(deleteKnowledgeBase).toHaveBeenCalledOnce()
+    await expect(knowledge.list({ userId: authSession.user.id })).resolves.toEqual([])
+    expect(memory.database.prepare(`
+      SELECT deletion_job_id AS deletionJobId
+      FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual({ deletionJobId: 'delete_ipc_1' })
+  })
+
   it('validates owner-free cloud account methods before invoking Main services', async () => {
     const app = harness()
     const consent = {
@@ -164,6 +269,20 @@ describe('registerDesktopIpc', () => {
       consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
     }
     await expect(app.invoke(ipcChannels.settingsRecordPrivacyConsent, consent)).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.settingsGetCloudSyncConsentState)).resolves.toMatchObject({
+      purpose: 'cloud_sync', state: 'accepted', revision: 1,
+    })
+    await expect(app.invoke(
+      ipcChannels.settingsRevokeCloudSyncConsent, { confirmed: true },
+    )).resolves.toMatchObject({ state: 'revoked', revision: 2 })
+    for (const forged of [
+      {}, { confirmed: false }, { confirmed: true, ownerUserId: 'forged' },
+      { confirmed: true, revision: 1 }, { confirmed: true, purpose: 'cloud_sync' },
+    ]) {
+      await expect(app.invoke(ipcChannels.settingsRevokeCloudSyncConsent, forged))
+        .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    expect(app.dependencies.settings.revokeCloudSyncConsent).toHaveBeenCalledOnce()
     await expect(app.invoke(ipcChannels.settingsPreviewLegacyImport)).resolves.toMatchObject({ ownedCount: 1 })
     await expect(app.invoke(ipcChannels.settingsImportLegacyData, {
       includeUnowned: false, cloudSyncConsent: consent,
@@ -397,34 +516,88 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.chat.send).not.toHaveBeenCalled()
   })
 
+  it('derives knowledge ownership in Main and rejects paths, user IDs, and search limits before service admission', async () => {
+    // Catches a production change that trusts renderer identity, filesystem paths, or retrieval scope.
+    const app = harness()
+
+    await expect(app.invoke(ipcChannels.knowledgePickImportFiles)).resolves.toEqual([{
+      id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
+    }])
+    await expect(app.invoke(ipcChannels.knowledgeImportDocument, {
+      baseId: 'base_1', importHandleId: 'import_1',
+    })).resolves.toMatchObject({ id: 'document_1', baseId: 'base_1' })
+    vi.mocked(app.dependencies.knowledge.search)
+      .mockResolvedValueOnce({ kind: 'query-too-short' })
+      .mockResolvedValueOnce({ kind: 'results', strategy: 'bounded-instr', evidence: [] })
+    await expect(app.invoke(ipcChannels.knowledgeSearch, { query: '合' })).resolves.toEqual({
+      kind: 'query-too-short',
+    })
+    await expect(app.invoke(ipcChannels.knowledgeSearch, { query: '合同' })).resolves.toEqual({
+      kind: 'results', strategy: 'bounded-instr', evidence: [],
+    })
+    await expect(app.invoke(ipcChannels.knowledgeRestoreDocument, { documentId: 'document_1' })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.knowledgeRestoreBase, { baseId: 'base_1' })).resolves.toBeUndefined()
+
+    const owner = { userId: 'user_1' }
+    expect(app.dependencies.knowledge.pickImportFiles).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledWith(owner, 'base_1', 'import_1')
+    expect(app.dependencies.knowledge.search).toHaveBeenNthCalledWith(1, owner, '合')
+    expect(app.dependencies.knowledge.search).toHaveBeenNthCalledWith(2, owner, '合同')
+    expect(app.dependencies.knowledge.restoreDocument).toHaveBeenCalledWith(owner, 'document_1')
+    expect(app.dependencies.knowledge.restoreBase).toHaveBeenCalledWith(owner, 'base_1')
+
+    for (const [channel, input] of [
+      [ipcChannels.knowledgeList, { userId: 'forged' }],
+      [ipcChannels.knowledgeImportDocument, { baseId: 'base_1', importHandleId: 'import_1', path: '/private/source.txt' }],
+      [ipcChannels.knowledgeSearch, { query: '合同', topK: 99 }],
+    ] as const) {
+      await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    expect(app.dependencies.knowledge.list).not.toHaveBeenCalled()
+    expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledOnce()
+    expect(app.dependencies.knowledge.search).toHaveBeenCalledTimes(2)
+  })
+
   it('strictly validates authenticated browser takeover, audit, and data-clear requests', async () => {
     const app = harness()
+    const clearToken = 'a'.repeat(64)
 
     await app.invoke(ipcChannels.chatTakeOverBrowser, {
       requestId: 'request_1', bindingId: 'binding_1',
     })
     await app.invoke(ipcChannels.chatListBrowserAudit, { bindingId: 'binding_1' })
-    await app.invoke(ipcChannels.settingsClearBrowserData)
+    await expect(app.invoke(ipcChannels.settingsCaptureDataClearToken)).resolves.toBe(clearToken)
+    await expect(app.invoke(ipcChannels.settingsClearLocalData, {
+      scope: 'all', token: clearToken,
+    })).resolves.toBe('applied')
+    await expect(app.invoke(ipcChannels.settingsClearBrowserData, { token: clearToken }))
+      .resolves.toBe('applied')
 
     expect(app.dependencies.chat.takeOverBrowser).toHaveBeenCalledWith({
       requestId: 'request_1', bindingId: 'binding_1',
     })
     expect(app.dependencies.chat.listBrowserAudit).toHaveBeenCalledWith('binding_1')
-    expect(app.dependencies.settings.clearBrowserData).toHaveBeenCalledOnce()
-    expect(app.dependencies.auth.requireSession).toHaveBeenCalledTimes(3)
+    expect(app.dependencies.settings.captureDataClearToken).toHaveBeenCalledOnce()
+    expect(app.dependencies.settings.clearLocalData).toHaveBeenCalledWith('all', clearToken)
+    expect(app.dependencies.settings.clearBrowserData).toHaveBeenCalledWith(clearToken)
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalledTimes(5)
 
     for (const [channel, input] of [
       [ipcChannels.chatTakeOverBrowser, { requestId: '', bindingId: 'binding_1' }],
       [ipcChannels.chatTakeOverBrowser, { requestId: 'request_1', bindingId: 42 }],
       [ipcChannels.chatTakeOverBrowser, { requestId: 'request_1', bindingId: 'binding_1', extra: true }],
       [ipcChannels.chatListBrowserAudit, { bindingId: '' }],
-      [ipcChannels.settingsClearBrowserData, { userId: 'user_2' }],
+      [ipcChannels.settingsClearBrowserData, { token: clearToken, userId: 'user_2' }],
+      [ipcChannels.settingsClearBrowserData, { token: clearToken, owner: 'user_2' }],
+      [ipcChannels.settingsClearBrowserData, { token: clearToken, revision: 2 }],
+      [ipcChannels.settingsClearLocalData, { scope: 'all', token: clearToken, owner: 'user_2' }],
     ] as const) {
       await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     }
     expect(app.dependencies.chat.takeOverBrowser).toHaveBeenCalledTimes(1)
     expect(app.dependencies.chat.listBrowserAudit).toHaveBeenCalledTimes(1)
     expect(app.dependencies.settings.clearBrowserData).toHaveBeenCalledTimes(1)
+    expect(app.dependencies.settings.clearLocalData).toHaveBeenCalledTimes(1)
   })
 
   it('denies anonymous and ownership-failed browser requests without leaking service details', async () => {
@@ -445,7 +618,7 @@ describe('registerDesktopIpc', () => {
 
     vi.mocked(app.dependencies.auth.requireSession)
       .mockRejectedValueOnce(toSafeAppError({ code: 'AUTH_REQUIRED' }))
-    await expect(app.invoke(ipcChannels.settingsClearBrowserData))
+    await expect(app.invoke(ipcChannels.settingsClearBrowserData, { token: 'a'.repeat(64) }))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     expect(app.dependencies.settings.clearBrowserData).not.toHaveBeenCalled()
 

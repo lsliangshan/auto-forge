@@ -54,6 +54,39 @@ function extractFunction(sql: string, functionName: string): string {
   return match![0]
 }
 
+function extractKnowledgePreferenceGuard(sql: string): string {
+  const replacement = sql.match(
+    /\$new\$(OR NOT \(payload->'preferences'[\s\S]*?)\$new\$/,
+  )
+  expect(replacement, 'missing executable knowledge preference guard replacement').not.toBeNull()
+  return replacement![1]
+}
+
+function evaluateModeGuard(guard: string, mode: unknown): boolean {
+  const typeGuard = guard.match(
+    /jsonb_typeof\(payload->'preferences'->'knowledgeMode'\)\s+IS DISTINCT FROM\s+'string'/,
+  )
+  const allowedMatch = guard.match(
+    /payload->'preferences'->>'knowledgeMode'\s+NOT IN\s+\(([^)]+)\)/,
+  )
+  if (!typeGuard || !allowedMatch) return false
+  if (typeof mode !== 'string') return true
+  const allowed = [...allowedMatch[1].matchAll(/'([^']+)'/g)].map(match => match[1])
+  return !allowed.includes(mode)
+}
+
+function applyFunctionReplacements(definition: string, migration: string): string {
+  const replacements = [...migration.matchAll(
+    /\$old\$([\s\S]*?)\$old\$,\s*\$new\$([\s\S]*?)\$new\$/g,
+  )]
+  expect(replacements.length).toBeGreaterThan(0)
+  return replacements.reduce((current, replacement) => {
+    const next = current.replace(replacement[1], replacement[2])
+    expect(next, `replacement anchor was not found: ${replacement[1]}`).not.toBe(current)
+    return next
+  }, definition)
+}
+
 describe('CloudBase user data migration', () => {
   it('keeps the canonical and deployable migrations byte-identical', async () => {
     const [canonical, featureCopy] = await Promise.all([
@@ -399,6 +432,79 @@ describe('CloudBase user data migration', () => {
     expect(purge).toMatch(
       /mutation\.kind IN \([\s\S]+?'conversation\.preferences'[\s\S]+?\) AND mutation\.entity_id/,
     )
+  })
+
+  it('ships mirrored data-preserving knowledge preference migrations', async () => {
+    const numbered = await readFile(new URL(
+      '../../cloudbase/user-data/migrations/0002_conversation_knowledge_preferences.sql', import.meta.url,
+    ), 'utf8')
+    const canonicalKnowledge = await readFile(new URL(
+      '../../cloudbase/migrations/20260826220000_conversation_knowledge_preferences.sql', import.meta.url,
+    ), 'utf8')
+    const rollback = await readFile(new URL(
+      '../../cloudbase/user-data/migrations/0002_conversation_knowledge_preferences.rollback.sql', import.meta.url,
+    ), 'utf8')
+
+    expect(numbered).toBe(canonicalKnowledge)
+    const guard = extractKnowledgePreferenceGuard(numbered)
+    expect(guard).toMatch(
+      /jsonb_typeof\(payload->'preferences'->'knowledgeBaseIds'\)\s+IS DISTINCT FROM\s+'array'/,
+    )
+    expect(guard).toMatch(/jsonb_typeof\(base_id\)\s+IS DISTINCT FROM\s+'string'/)
+    for (const [mode, rejected] of [
+      [null, true], [7, true], [{}, true], [[], true],
+      ['mixed', false], ['strict', false], ['enterprise', true],
+    ] as const) {
+      expect(evaluateModeGuard(guard, mode), `mode ${JSON.stringify(mode)}`).toBe(rejected)
+    }
+    expect(rollback).not.toMatch(/DROP TABLE|TRUNCATE|DELETE FROM/i)
+    expect(rollback).not.toMatch(/^\+/m)
+  })
+
+  it('ships a mirrored additive consent-state migration with purpose OCC and data-preserving rollback', async () => {
+    const [foundation, knowledgePreferences, numbered, deployed, rollback] = await Promise.all([
+      readFile(featureUrl, 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/user-data/migrations/0002_conversation_knowledge_preferences.sql', import.meta.url,
+      ), 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.sql', import.meta.url,
+      ), 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/migrations/20260828230000_privacy_consent_revocation.sql', import.meta.url,
+      ), 'utf8'),
+      readFile(new URL(
+        '../../cloudbase/user-data/migrations/0003_privacy_consent_revocation.rollback.sql', import.meta.url,
+      ), 'utf8'),
+    ])
+
+    expect(numbered).toBe(deployed)
+    expect(numbered).toContain('CREATE TABLE IF NOT EXISTS app_privacy_consent_states')
+    expect(numbered).toContain('PRIMARY KEY (owner_user_id, purpose)')
+    expect(numbered).toContain("state varchar(16) NOT NULL CHECK (state IN ('accepted', 'revoked'))")
+    expect(numbered).toContain('revision bigint NOT NULL CHECK (revision > 0)')
+    expect(numbered).toContain('FROM app_privacy_consents')
+    expect(numbered).toContain("'privacy.consent.revoke'")
+    expect(numbered).toContain("p_owner_user_id::text || ':privacy-consent:' || consent_purpose")
+    expect(numbered).toContain('consent_state.revision <> p_base_revision')
+    expect(numbered).toContain('result_revision_value := base_revision_value + 1')
+    expect(numbered).toContain('PERFORM autoforge_record_consent')
+    expect(numbered).toContain('ALTER TABLE app_privacy_consent_states FORCE ROW LEVEL SECURITY')
+    expect(numbered).toContain(
+      'REVOKE ALL ON TABLE app_privacy_consent_states FROM PUBLIC, anon, authenticated, service_role',
+    )
+    expect(numbered).not.toMatch(/GRANT .* ON TABLE/i)
+    expect(rollback).not.toMatch(/DROP TABLE|TRUNCATE|DELETE FROM/i)
+
+    const originalSyncPush = extractFunction(foundation, 'autoforge_sync_push')
+    const preConsentSyncPush = applyFunctionReplacements(originalSyncPush, knowledgePreferences)
+    const forwardSyncPush = applyFunctionReplacements(preConsentSyncPush, numbered)
+    expect(forwardSyncPush).toContain("'privacy.consent.revoke'")
+    expect(forwardSyncPush).toContain('autoforge_apply_privacy_consent_mutation')
+    const rolledBackSyncPush = applyFunctionReplacements(forwardSyncPush, rollback)
+    expect(rolledBackSyncPush).toBe(preConsentSyncPush)
+    expect(rolledBackSyncPush).not.toContain("'privacy.consent.revoke'")
+    expect(rolledBackSyncPush).not.toContain('autoforge_apply_privacy_consent_mutation')
   })
 
   it('replays a post-purge stale conflict verbatim after a lost response', async () => {

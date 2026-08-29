@@ -1,6 +1,7 @@
 import {
   appErrorCodeSchema,
   authorizationSnapshotSchema,
+  signedKnowledgeEntitlementSnapshotSchema,
   toSafeAppError,
   userAdminListResponseSchema,
   userAdminUpdateRoleResponseSchema,
@@ -34,6 +35,7 @@ const errorEnvelopeSchema = z.object({
 
 const ensureRoleDataSchema = authorizationSnapshotSchema.omit({ confirmed: true }).extend({
   userId: z.string().trim().min(1),
+  knowledgeEntitlement: signedKnowledgeEntitlementSnapshotSchema.nullable().optional(),
 }).strict()
 
 function parseCloudData<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -83,6 +85,7 @@ export class CloudBaseRoleService implements BusinessRoleService {
       version: data.version,
       updatedAt: data.updatedAt,
       confirmed: true,
+      ...(data.knowledgeEntitlement ? { knowledgeEntitlement: data.knowledgeEntitlement } : {}),
     })
   }
 

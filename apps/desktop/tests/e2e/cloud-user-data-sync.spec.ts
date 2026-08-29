@@ -76,8 +76,10 @@ async function createNamedConversation(profile: LaunchedProfile, title: string):
   }
   const id = await command<string>(profile.app, 'selectedConversation')
   await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
-  await expect(profile.page.getByRole('button', { name: '新会话', exact: true })).toBeVisible()
+  const conversation = profile.page.getByRole('button', { name: '新会话', exact: true })
+  await expect(conversation).toBeVisible()
   await expect(profile.page.getByRole('status', { name: '同步完成' })).toHaveCount(0)
+  await conversation.hover()
   await profile.page.getByRole('button', { name: '重命名新会话' }).click()
   const dialog = profile.page.getByRole('dialog', { name: '重命名会话' })
   await dialog.getByRole('textbox').fill(title)
@@ -90,6 +92,9 @@ async function createNamedConversation(profile: LaunchedProfile, title: string):
 }
 
 async function deleteConversation(profile: LaunchedProfile, title: string): Promise<void> {
+  const conversation = profile.page.getByRole('button', { name: title, exact: true })
+  await expect(conversation).toBeVisible()
+  await conversation.hover()
   await profile.page.getByRole('button', { name: `删除${title}` }).click()
   const dialog = profile.page.getByRole('dialog', { name: '删除会话' })
   await dialog.getByRole('button', { name: '确认删除' }).click()
@@ -105,7 +110,7 @@ async function switchUser(profile: LaunchedProfile, user: 'alice' | 'bob'): Prom
 async function assertImportedTranscriptVisible(profile: LaunchedProfile): Promise<void> {
   await profile.page.goto(`file://${join(desktopRoot, 'out/renderer/index.html')}#/chat`)
   await profile.page.reload()
-  const conversation = profile.page.getByRole('button', { name: /^本机未归属历史 /u })
+  const conversation = profile.page.getByRole('button', { name: '本机未归属历史', exact: true })
   await expect(conversation).toBeVisible()
   await conversation.click()
 
@@ -161,6 +166,51 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     await switchUser(profile, 'alice')
     await expect(profile.page.getByText('Alice 私有会话')).toBeVisible()
     await expect(profile.page.getByText('Bob 私有会话')).toHaveCount(0)
+  })
+
+  test('uses the real window bridge to create, import, select, and reload a ready knowledge base', async () => {
+    const profile = await launchProfile(fixture)
+    profiles.push(profile)
+    await grantCloudSync(fixture, profile)
+    await profile.page.getByLabel('新建会话').click()
+    await expect(profile.page.getByText('新会话', { exact: true })).toBeVisible()
+    await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
+
+    await profile.page.getByRole('link', { name: '知识库' }).click()
+    await expect(profile.page.getByTestId('knowledge-workspace')).toBeVisible()
+    await profile.page.getByRole('button', { name: '新建', exact: true }).click()
+    await profile.page.getByRole('textbox', { name: '知识库名称' }).fill('个人资料')
+    await profile.page.getByRole('button', { name: '创建', exact: true }).click()
+    await expect(profile.page.getByText('个人资料', { exact: true })).toBeVisible()
+    await profile.page.getByRole('button', { name: '导入', exact: true }).click()
+    const documentPane = profile.page.getByTestId('knowledge-document-pane')
+    await expect(documentPane.getByText('e2e-guide.txt', { exact: true })).toBeVisible()
+    await expect(documentPane.getByText('可检索', { exact: true })).toBeVisible()
+
+    await profile.page.getByRole('link', { name: '聊天' }).click()
+    await profile.page.getByTestId('knowledge-selector').locator('summary').click()
+    await expect(profile.page.getByTestId(/knowledge-select-/)).not.toBeChecked()
+    await profile.page.getByTestId(/knowledge-select-/).check()
+    await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
+
+    await profile.page.reload()
+    await expect(profile.page.getByLabel('主导航')).toBeVisible()
+    await profile.page.getByTestId('knowledge-selector').locator('summary').click()
+    await expect(profile.page.getByTestId(/knowledge-select-/)).toBeChecked()
+    await profile.page.getByTestId('knowledge-selector').locator('summary').click()
+
+    await profile.page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
+    await profile.page.getByTestId('send-message').click()
+    await expect(profile.page.getByTestId('knowledge-status')).toContainText('需要授权后才能发送依据')
+    await profile.page.getByTestId('grant-knowledge-consent').click()
+    await expect(profile.page.getByText('已授权，请重新发送问题。')).toBeVisible()
+    await profile.page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
+    await profile.page.getByTestId('send-message').click()
+    await expect(profile.page.getByTestId('knowledge-status').last()).toContainText('已找到 1 条依据')
+    const citation = profile.page.getByTestId('knowledge-citation')
+    await expect(citation).toBeVisible()
+    await citation.getByTestId('toggle-knowledge-preview').click()
+    await expect(citation.getByTestId('knowledge-source-preview')).toContainText('AutoForge knowledge smoke')
   })
 
   test('converges Alice across two independent app profiles', async () => {

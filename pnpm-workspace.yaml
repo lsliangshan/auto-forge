@@ -4,6 +4,7 @@ packages:
   - examples/*
 allowBuilds:
   better-sqlite3: true
+  better-sqlite3-multiple-ciphers: true
   core-js-pure: false
   electron: true
   electron-winstaller: true
@@ -12,4 +13,5 @@ minimumReleaseAgeExclude:
   - happy-dom@20.11.0
 patchedDependencies:
   https-proxy-agent@9.1.0: patches/https-proxy-agent@9.1.0.patch
+  pdfjs-dist@6.2.108: patches/pdfjs-dist@6.2.108.patch
   socks@2.8.9: patches/socks@2.8.9.patch

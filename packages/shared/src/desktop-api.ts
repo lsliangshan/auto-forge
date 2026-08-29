@@ -6,10 +6,14 @@ import { appErrorCodeSchema } from './errors.js'
 import {
   chatBlockSchema,
   attachmentKindSchema,
+  knowledgeCoordinateSchema,
+  knowledgeEvidenceSchema,
   type ChatBlock,
   type ChatEvent,
   type ExecutionEvent,
   type ExecutionStatus,
+  type KnowledgeEvidence,
+  type KnowledgeEvent,
 } from './events.js'
 import {
   capabilitySchema,
@@ -20,9 +24,153 @@ import {
   type CapabilityScope,
 } from './worker-protocol.js'
 
-const identifierSchema = z.string().trim().min(1)
+const identifierSchema = z.string().trim().min(1).max(128)
 const timestampSchema = z.string().datetime()
 const nonEmptyStringSchema = z.string().trim().min(1)
+
+export const knowledgeBaseSummarySchema = z.object({
+  id: identifierSchema,
+  name: nonEmptyStringSchema.max(200),
+  kind: z.enum(['local', 'cloud']),
+  status: z.enum(['ready', 'processing', 'paused', 'failed', 'read_only', 'recycled']),
+  searchable: z.boolean(),
+  documentCount: z.number().int().nonnegative(),
+  updatedAt: timestampSchema,
+  readOnly: z.boolean().optional(),
+}).strict()
+export type KnowledgeBaseSummary = z.infer<typeof knowledgeBaseSummarySchema>
+
+export const knowledgeDocumentSummarySchema = z.object({
+  id: identifierSchema,
+  baseId: identifierSchema,
+  name: nonEmptyStringSchema.max(500),
+  mimeType: nonEmptyStringSchema.max(200),
+  status: z.enum(['queued', 'copying', 'parsing', 'indexing', 'ready', 'failed', 'paused', 'deleted']),
+  versionCount: z.number().int().nonnegative(),
+  updatedAt: timestampSchema,
+  readOnly: z.boolean().optional(),
+}).strict()
+export type KnowledgeDocumentSummary = z.infer<typeof knowledgeDocumentSummarySchema>
+
+export const knowledgeVersionSummarySchema = z.object({
+  id: identifierSchema,
+  documentId: identifierSchema,
+  number: z.number().int().positive(),
+  status: z.enum(['staging', 'ready', 'failed', 'retired']),
+  createdAt: timestampSchema,
+}).strict()
+export type KnowledgeVersionSummary = z.infer<typeof knowledgeVersionSummarySchema>
+
+export const knowledgeImportHandleSchema = z.object({
+  id: identifierSchema,
+  name: nonEmptyStringSchema.max(500),
+  mimeType: nonEmptyStringSchema.max(200),
+  byteSize: z.number().int().nonnegative(),
+}).strict()
+export type KnowledgeImportHandle = z.infer<typeof knowledgeImportHandleSchema>
+
+export const knowledgeSelectionSchema = z.object({
+  baseIds: z.array(identifierSchema).max(32).refine(
+    (ids) => new Set(ids).size === ids.length,
+    { message: 'Knowledge base IDs must be unique' },
+  ),
+  mode: z.enum(['mixed', 'strict']),
+}).strict()
+export type KnowledgeSelection = z.infer<typeof knowledgeSelectionSchema>
+
+export const knowledgeEntitlementStateSchema = z.object({
+  tier: z.enum(['free', 'member']),
+  status: z.enum(['active', 'offline_grace', 'expired', 'unavailable']),
+  localEnabled: z.boolean(),
+  cloudEnabled: z.boolean(),
+  betaEnabled: z.boolean().optional(),
+  expiresAt: timestampSchema.optional(),
+  graceEndsAt: timestampSchema.optional(),
+  retainedBaseId: identifierSchema.optional(),
+  retainedDocumentId: identifierSchema.optional(),
+  retentionConfirmed: z.boolean().optional(),
+}).strict().superRefine((value, context) => {
+  if (value.cloudEnabled && (value.tier !== 'member'
+    || !['active', 'offline_grace'].includes(value.status)
+    || value.betaEnabled !== true)) {
+    context.addIssue({ code: 'custom', path: ['cloudEnabled'], message: 'Cloud requires an admitted member beta entitlement' })
+  }
+  if (value.betaEnabled && value.tier !== 'member') {
+    context.addIssue({ code: 'custom', path: ['betaEnabled'], message: 'Beta requires membership' })
+  }
+  if ((value.status === 'expired' || value.status === 'unavailable') && value.cloudEnabled) {
+    context.addIssue({ code: 'custom', path: ['cloudEnabled'], message: 'Expired or unavailable entitlement must fail closed' })
+  }
+  if ((value.expiresAt === undefined) !== (value.graceEndsAt === undefined)
+    || (value.expiresAt && value.graceEndsAt
+      && Date.parse(value.graceEndsAt) < Date.parse(value.expiresAt))) {
+    context.addIssue({ code: 'custom', path: ['graceEndsAt'], message: 'Expiry and grace boundaries must be complete and ordered' })
+  }
+  if (value.retainedDocumentId && !value.retainedBaseId) {
+    context.addIssue({ code: 'custom', path: ['retainedDocumentId'], message: 'A retained document requires its retained base' })
+  }
+})
+export type KnowledgeEntitlementState = z.infer<typeof knowledgeEntitlementStateSchema>
+
+export const knowledgeRetentionSelectionSchema = z.object({
+  baseId: identifierSchema,
+  documentId: identifierSchema,
+}).strict()
+export type KnowledgeRetentionSelection = z.infer<typeof knowledgeRetentionSelectionSchema>
+
+export const knowledgeConsentStateSchema = z.object({
+  provider: z.enum(['openrouter', 'deepseek']),
+  status: z.enum(['unknown', 'granted', 'denied']),
+  updatedAt: timestampSchema.optional(),
+}).strict()
+export type KnowledgeConsentState = z.infer<typeof knowledgeConsentStateSchema>
+
+export const knowledgeSourcePreviewRequestSchema = z.object({
+  evidenceId: identifierSchema,
+  baseId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  coordinate: knowledgeCoordinateSchema,
+}).strict()
+export type KnowledgeSourcePreviewRequest = z.infer<typeof knowledgeSourcePreviewRequestSchema>
+export const knowledgeSourcePreviewSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('available'), preview: nonEmptyStringSchema.max(4_000) }).strict(),
+  z.object({ kind: z.literal('unavailable') }).strict(),
+])
+export type KnowledgeSourcePreview = z.infer<typeof knowledgeSourcePreviewSchema>
+
+function knowledgeGateSchema(reason: string) {
+  return z.object({
+    available: z.boolean(),
+    reason: z.literal(reason).optional(),
+  }).strict().superRefine((value, context) => {
+    if ((value.available && value.reason !== undefined) || (!value.available && value.reason === undefined)) {
+      context.addIssue({ code: 'custom', message: 'Knowledge availability gates must fail closed with their matching reason' })
+    }
+  })
+}
+
+export const knowledgeAvailabilitySchema = z.object({
+  encryption: knowledgeGateSchema('encryption_unavailable'),
+  parser: knowledgeGateSchema('parser_unavailable'),
+  cloudbase: knowledgeGateSchema('cloudbase_unavailable'),
+  embedding: knowledgeGateSchema('embedding_unavailable'),
+  entitlement: knowledgeGateSchema('entitlement_unavailable'),
+  beta: knowledgeGateSchema('beta_disabled'),
+  cloud: knowledgeGateSchema('cloud_disabled'),
+}).strict()
+export type KnowledgeAvailability = z.infer<typeof knowledgeAvailabilitySchema>
+export type { KnowledgeEvidence, KnowledgeEvent }
+
+export const knowledgeSearchResultSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('query-too-short') }).strict(),
+  z.object({
+    kind: z.literal('results'),
+    strategy: z.enum(['trigram', 'bounded-instr']),
+    evidence: z.array(knowledgeEvidenceSchema).max(8),
+  }).strict(),
+])
+export type KnowledgeSearchResult = z.infer<typeof knowledgeSearchResultSchema>
 
 const browserAuditOriginSchema = z.string().superRefine((value, context) => {
   try {
@@ -203,12 +351,19 @@ export type RoleId = z.infer<typeof roleIdSchema>
 export const businessCapabilitySchema = z.enum(['manage_users'])
 export type BusinessCapability = z.infer<typeof businessCapabilitySchema>
 
+export const signedKnowledgeEntitlementSnapshotSchema = z.object({
+  payload: z.string().regex(/^[A-Za-z0-9_-]+$/).max(8_192),
+  signature: z.string().regex(/^[A-Za-z0-9_-]+$/).max(256),
+}).strict()
+export type SignedKnowledgeEntitlementSnapshot = z.infer<typeof signedKnowledgeEntitlementSnapshotSchema>
+
 export const authorizationSnapshotSchema = z.object({
   role: roleIdSchema,
   capabilities: z.array(businessCapabilitySchema),
   version: z.number().int().nonnegative(),
   updatedAt: timestampSchema,
   confirmed: z.boolean(),
+  knowledgeEntitlement: signedKnowledgeEntitlementSnapshotSchema.optional(),
 }).strict()
 export type AuthorizationSnapshot = z.infer<typeof authorizationSnapshotSchema>
 
@@ -356,7 +511,17 @@ export const conversationGenerationPreferencesSchema = z.object({
     video: nonEmptyStringSchema.optional(),
   }).strict(),
   generation: generationOptionsSchema,
-}).strict()
+  knowledgeBaseIds: knowledgeSelectionSchema.shape.baseIds.optional(),
+  knowledgeMode: knowledgeSelectionSchema.shape.mode.optional(),
+}).strict().superRefine((preferences, context) => {
+  if ((preferences.knowledgeBaseIds === undefined) !== (preferences.knowledgeMode === undefined)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['knowledgeBaseIds'],
+      message: 'Knowledge selection fields must be supplied together',
+    })
+  }
+})
 export type ConversationGenerationPreferences = z.infer<typeof conversationGenerationPreferencesSchema>
 
 export const syncStateSchema = z.enum(['synced', 'pending', 'syncing', 'failed'])
@@ -458,6 +623,7 @@ export const syncMutationKindSchema = z.enum([
   'message.append',
   'legacy.import',
   'privacy.consent',
+  'privacy.consent.revoke',
   'preferences.update',
   'usage.record',
 ])
@@ -519,6 +685,32 @@ export const privacyConsentSchema = z.object({
   clientVersion: nonEmptyStringSchema.max(64),
 }).strict()
 export type PrivacyConsent = z.infer<typeof privacyConsentSchema>
+
+export const privacyConsentRevokeSchema = z.object({
+  purpose: privacyConsentPurposeSchema,
+  revokedAt: timestampSchema,
+  clientVersion: nonEmptyStringSchema.max(64),
+}).strict()
+export type PrivacyConsentRevoke = z.infer<typeof privacyConsentRevokeSchema>
+
+export const privacyConsentStateSchema = z.discriminatedUnion('state', [
+  privacyConsentSchema.extend({
+    state: z.literal('accepted'),
+    revision: z.number().int().positive(),
+  }).strict(),
+  privacyConsentRevokeSchema.extend({
+    state: z.literal('revoked'),
+    revision: z.number().int().positive(),
+  }).strict(),
+])
+export type PrivacyConsentState = z.infer<typeof privacyConsentStateSchema>
+
+export const cloudSyncConsentRevokeRequestSchema = z.object({
+  confirmed: z.literal(true),
+}).strict()
+export type CloudSyncConsentRevokeRequest = z.infer<
+  typeof cloudSyncConsentRevokeRequestSchema
+>
 
 export const legacyImportConfirmRequestSchema = z.object({
   batchId: identifierSchema,
@@ -1079,6 +1271,11 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...syncMutationBaseShape,
+    kind: z.literal('privacy.consent.revoke'),
+    payload: privacyConsentRevokeSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
     kind: z.literal('preferences.update'),
     payload: accountDataPreferencesSchema,
   }).strict(),
@@ -1099,6 +1296,9 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
       break
     case 'privacy.consent':
       payloadEntityId = mutation.payload.documentVersion
+      break
+    case 'privacy.consent.revoke':
+      payloadEntityId = mutation.payload.purpose
       break
   }
   if (payloadEntityId !== undefined && mutation.entityId !== payloadEntityId) {
@@ -1168,6 +1368,11 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...pulledMutationBaseShape,
+    kind: z.literal('privacy.consent.revoke'),
+    payload: privacyConsentRevokeSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
     kind: z.literal('preferences.update'),
     payload: accountDataPreferencesSchema,
   }).strict(),
@@ -1188,6 +1393,9 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
       break
     case 'privacy.consent':
       payloadEntityId = mutation.payload.documentVersion
+      break
+    case 'privacy.consent.revoke':
+      payloadEntityId = mutation.payload.purpose
       break
   }
   if (payloadEntityId !== undefined && mutation.entityId !== payloadEntityId) {
@@ -1459,13 +1667,41 @@ export const ipcChannels = {
   settingsListProviderModels: 'settings:list-provider-models',
   settingsGetTokenUsage: 'settings:get-token-usage',
   settingsRecordPrivacyConsent: 'settings:record-privacy-consent',
+  settingsGetCloudSyncConsentState: 'settings:get-cloud-sync-consent-state',
+  settingsRevokeCloudSyncConsent: 'settings:revoke-cloud-sync-consent',
   settingsPreviewLegacyImport: 'settings:preview-legacy-import',
   settingsImportLegacyData: 'settings:import-legacy-data',
   settingsGetAccountDataPreferences: 'settings:get-account-data-preferences',
   settingsUpdateAccountDataPreferences: 'settings:update-account-data-preferences',
   settingsGetRemoteUsage: 'settings:get-remote-usage',
+  settingsCaptureDataClearToken: 'settings:capture-data-clear-token',
   settingsClearLocalData: 'settings:clear-local-data',
   settingsClearBrowserData: 'settings:clear-browser-data',
+  knowledgeList: 'knowledge:list',
+  knowledgeCreateBase: 'knowledge:create-base',
+  knowledgeListDocuments: 'knowledge:list-documents',
+  knowledgeListVersions: 'knowledge:list-versions',
+  knowledgePickImportFiles: 'knowledge:pick-import-files',
+  knowledgeImportDocument: 'knowledge:import-document',
+  knowledgeReplaceDocument: 'knowledge:replace-document',
+  knowledgeRecycleDocument: 'knowledge:recycle-document',
+  knowledgeRestoreDocument: 'knowledge:restore-document',
+  knowledgePurgeDocument: 'knowledge:purge-document',
+  knowledgeRecycleBase: 'knowledge:recycle-base',
+  knowledgeRestoreBase: 'knowledge:restore-base',
+  knowledgePurgeBase: 'knowledge:purge-base',
+  knowledgeExportBase: 'knowledge:export-base',
+  knowledgeGetSelection: 'knowledge:get-selection',
+  knowledgeUpdateSelection: 'knowledge:update-selection',
+  knowledgeSearch: 'knowledge:search',
+  knowledgeGetAvailability: 'knowledge:get-availability',
+  knowledgeGetEntitlement: 'knowledge:get-entitlement',
+  knowledgeRetainFreeAllowance: 'knowledge:retain-free-allowance',
+  knowledgeGetConsent: 'knowledge:get-consent',
+  knowledgeSetConsent: 'knowledge:set-consent',
+  knowledgeRevokeConsent: 'knowledge:revoke-consent',
+  knowledgeGetSourcePreview: 'knowledge:get-source-preview',
+  knowledgeEvent: 'knowledge:event',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
 } as const
@@ -1549,8 +1785,36 @@ export const saveProviderApiKeyRequestSchema = providerRequestSchema.extend({ ap
 export const listProviderModelsRequestSchema = providerRequestSchema.extend({
   refresh: z.boolean().optional().default(false),
 }).strict()
+export const dataClearTokenSchema = z.string().regex(/^[a-f0-9]{64}$/)
+export type DataClearToken = z.infer<typeof dataClearTokenSchema>
+export const dataClearResultSchema = z.enum(['applied', 'stale'])
+export type DataClearResult = z.infer<typeof dataClearResultSchema>
 export const clearLocalDataRequestSchema = z.object({
   scope: z.enum(['conversations', 'executions', 'all']),
+  token: dataClearTokenSchema,
+}).strict()
+export const clearBrowserDataRequestSchema = z.object({ token: dataClearTokenSchema }).strict()
+export const knowledgeListRequestSchema = z.undefined()
+export const knowledgeBaseRequestSchema = z.object({ baseId: identifierSchema }).strict()
+export const knowledgeDocumentRequestSchema = z.object({ documentId: identifierSchema }).strict()
+export const knowledgeCreateBaseRequestSchema = z.object({ name: nonEmptyStringSchema.max(200) }).strict()
+export const knowledgeImportRequestSchema = z.object({
+  baseId: identifierSchema,
+  importHandleId: identifierSchema,
+}).strict()
+export const knowledgeReplaceRequestSchema = z.object({
+  documentId: identifierSchema,
+  importHandleId: identifierSchema,
+}).strict()
+export const knowledgeSelectionRequestSchema = z.object({ conversationId: identifierSchema }).strict()
+export const knowledgeUpdateSelectionRequestSchema = knowledgeSelectionRequestSchema.extend({
+  selection: knowledgeSelectionSchema,
+}).strict()
+export const knowledgeSearchRequestSchema = z.object({ query: nonEmptyStringSchema.max(1_000) }).strict()
+export const knowledgeRetentionSelectionRequestSchema = knowledgeRetentionSelectionSchema
+export const knowledgeConsentRequestSchema = z.object({ provider: modelProviderIdSchema }).strict()
+export const knowledgeSetConsentRequestSchema = knowledgeConsentRequestSchema.extend({
+  status: z.enum(['granted', 'denied']),
 }).strict()
 export const openExternalRequestSchema = z.object({
   url: z.string().superRefine((value, context) => {
@@ -1632,13 +1896,40 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsListProviderModels]: listProviderModelsRequestSchema,
   [ipcChannels.settingsGetTokenUsage]: z.undefined(),
   [ipcChannels.settingsRecordPrivacyConsent]: privacyConsentSchema,
+  [ipcChannels.settingsGetCloudSyncConsentState]: z.undefined(),
+  [ipcChannels.settingsRevokeCloudSyncConsent]: cloudSyncConsentRevokeRequestSchema,
   [ipcChannels.settingsPreviewLegacyImport]: z.undefined(),
   [ipcChannels.settingsImportLegacyData]: legacyImportRequestSchema,
   [ipcChannels.settingsGetAccountDataPreferences]: z.undefined(),
   [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
   [ipcChannels.settingsGetRemoteUsage]: z.undefined(),
+  [ipcChannels.settingsCaptureDataClearToken]: z.undefined(),
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
-  [ipcChannels.settingsClearBrowserData]: z.undefined(),
+  [ipcChannels.settingsClearBrowserData]: clearBrowserDataRequestSchema,
+  [ipcChannels.knowledgeList]: knowledgeListRequestSchema,
+  [ipcChannels.knowledgeCreateBase]: knowledgeCreateBaseRequestSchema,
+  [ipcChannels.knowledgeListDocuments]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeListVersions]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgePickImportFiles]: z.undefined(),
+  [ipcChannels.knowledgeImportDocument]: knowledgeImportRequestSchema,
+  [ipcChannels.knowledgeReplaceDocument]: knowledgeReplaceRequestSchema,
+  [ipcChannels.knowledgeRecycleDocument]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgeRestoreDocument]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgePurgeDocument]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgeRecycleBase]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeRestoreBase]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgePurgeBase]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeExportBase]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeGetSelection]: knowledgeSelectionRequestSchema,
+  [ipcChannels.knowledgeUpdateSelection]: knowledgeUpdateSelectionRequestSchema,
+  [ipcChannels.knowledgeSearch]: knowledgeSearchRequestSchema,
+  [ipcChannels.knowledgeGetAvailability]: z.undefined(),
+  [ipcChannels.knowledgeGetEntitlement]: z.undefined(),
+  [ipcChannels.knowledgeRetainFreeAllowance]: knowledgeRetentionSelectionRequestSchema,
+  [ipcChannels.knowledgeGetConsent]: knowledgeConsentRequestSchema.optional(),
+  [ipcChannels.knowledgeSetConsent]: knowledgeSetConsentRequestSchema,
+  [ipcChannels.knowledgeRevokeConsent]: knowledgeConsentRequestSchema,
+  [ipcChannels.knowledgeGetSourcePreview]: knowledgeSourcePreviewRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
 } as const
@@ -1709,13 +2000,40 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsListProviderModels]: z.array(modelInfoSchema),
   [ipcChannels.settingsGetTokenUsage]: tokenUsageSnapshotSchema,
   [ipcChannels.settingsRecordPrivacyConsent]: voidResponseSchema,
+  [ipcChannels.settingsGetCloudSyncConsentState]: privacyConsentStateSchema.nullable(),
+  [ipcChannels.settingsRevokeCloudSyncConsent]: privacyConsentStateSchema,
   [ipcChannels.settingsPreviewLegacyImport]: legacyImportPreviewSchema,
   [ipcChannels.settingsImportLegacyData]: z.array(legacyImportResultSchema),
   [ipcChannels.settingsGetAccountDataPreferences]: accountDataPreferencesSchema,
   [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
   [ipcChannels.settingsGetRemoteUsage]: remoteUsageSnapshotSchema,
-  [ipcChannels.settingsClearLocalData]: voidResponseSchema,
-  [ipcChannels.settingsClearBrowserData]: voidResponseSchema,
+  [ipcChannels.settingsCaptureDataClearToken]: dataClearTokenSchema,
+  [ipcChannels.settingsClearLocalData]: dataClearResultSchema,
+  [ipcChannels.settingsClearBrowserData]: dataClearResultSchema,
+  [ipcChannels.knowledgeList]: z.array(knowledgeBaseSummarySchema),
+  [ipcChannels.knowledgeCreateBase]: knowledgeBaseSummarySchema,
+  [ipcChannels.knowledgeListDocuments]: z.array(knowledgeDocumentSummarySchema),
+  [ipcChannels.knowledgeListVersions]: z.array(knowledgeVersionSummarySchema),
+  [ipcChannels.knowledgePickImportFiles]: z.array(knowledgeImportHandleSchema),
+  [ipcChannels.knowledgeImportDocument]: knowledgeDocumentSummarySchema.optional(),
+  [ipcChannels.knowledgeReplaceDocument]: knowledgeDocumentSummarySchema.optional(),
+  [ipcChannels.knowledgeRecycleDocument]: voidResponseSchema,
+  [ipcChannels.knowledgeRestoreDocument]: voidResponseSchema,
+  [ipcChannels.knowledgePurgeDocument]: voidResponseSchema,
+  [ipcChannels.knowledgeRecycleBase]: voidResponseSchema,
+  [ipcChannels.knowledgeRestoreBase]: voidResponseSchema,
+  [ipcChannels.knowledgePurgeBase]: voidResponseSchema,
+  [ipcChannels.knowledgeExportBase]: voidResponseSchema,
+  [ipcChannels.knowledgeGetSelection]: knowledgeSelectionSchema,
+  [ipcChannels.knowledgeUpdateSelection]: knowledgeSelectionSchema,
+  [ipcChannels.knowledgeSearch]: knowledgeSearchResultSchema,
+  [ipcChannels.knowledgeGetAvailability]: knowledgeAvailabilitySchema,
+  [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
+  [ipcChannels.knowledgeRetainFreeAllowance]: knowledgeEntitlementStateSchema,
+  [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeSetConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeRevokeConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeGetSourcePreview]: knowledgeSourcePreviewSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
 } as const
@@ -1807,13 +2125,43 @@ export interface DesktopAPI {
     listProviderModels(provider: ModelProviderId, refresh?: boolean): Promise<ModelInfo[]>
     getTokenUsage(): Promise<TokenUsageSnapshot>
     recordPrivacyConsent(input: PrivacyConsent): Promise<void>
+    getCloudSyncConsentState(): Promise<PrivacyConsentState | null>
+    revokeCloudSyncConsent(input: CloudSyncConsentRevokeRequest): Promise<PrivacyConsentState>
     previewLegacyImport(): Promise<LegacyImportPreview>
     importLegacyData(input: LegacyImportRequest): Promise<LegacyImportResult[]>
     getAccountDataPreferences(): Promise<AccountDataPreferences>
     updateAccountDataPreferences(input: AccountDataPreferences): Promise<AccountDataPreferences>
     getRemoteUsage(): Promise<RemoteUsageSnapshot>
-    clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
-    clearBrowserData(): Promise<void>
+    captureDataClearToken(): Promise<DataClearToken>
+    clearLocalData(scope: 'conversations' | 'executions' | 'all', token: DataClearToken): Promise<DataClearResult>
+    clearBrowserData(token: DataClearToken): Promise<DataClearResult>
+  }
+  knowledge: {
+    list(): Promise<KnowledgeBaseSummary[]>
+    create(name: string): Promise<KnowledgeBaseSummary>
+    listDocuments(baseId: string): Promise<KnowledgeDocumentSummary[]>
+    listVersions(documentId: string): Promise<KnowledgeVersionSummary[]>
+    pickImportFiles(): Promise<KnowledgeImportHandle[]>
+    importDocument(baseId: string, importHandleId: string): Promise<KnowledgeDocumentSummary | undefined>
+    replaceDocument(documentId: string, importHandleId: string): Promise<KnowledgeDocumentSummary | undefined>
+    recycleDocument(documentId: string): Promise<void>
+    restoreDocument(documentId: string): Promise<void>
+    purgeDocument(documentId: string): Promise<void>
+    recycleBase(baseId: string): Promise<void>
+    restoreBase(baseId: string): Promise<void>
+    purgeBase(baseId: string): Promise<void>
+    exportBase(baseId: string): Promise<void>
+    getSelection(conversationId: string): Promise<KnowledgeSelection>
+    updateSelection(conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
+    search(query: string): Promise<KnowledgeSearchResult>
+    getAvailability(): Promise<KnowledgeAvailability>
+    getEntitlement(): Promise<KnowledgeEntitlementState>
+    retainFreeAllowance(input: KnowledgeRetentionSelection): Promise<KnowledgeEntitlementState>
+    getConsent(provider?: ModelProviderId): Promise<KnowledgeConsentState>
+    setConsent(provider: ModelProviderId, status: 'granted' | 'denied'): Promise<KnowledgeConsentState>
+    revokeConsent(provider: ModelProviderId): Promise<KnowledgeConsentState>
+    getSourcePreview(input: KnowledgeSourcePreviewRequest): Promise<KnowledgeSourcePreview>
+    onEvent(listener: (event: KnowledgeEvent) => void): () => void
   }
   system: {
     openExternal(url: string): Promise<void>

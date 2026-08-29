@@ -18,6 +18,7 @@ import {
   chatSendInputSchema,
   byokUsageEventSchema,
   conversationPageSchema,
+  conversationGenerationPreferencesSchema,
   conversationSummarySchema,
   executionEventSchema,
   generationOptionsSchema,
@@ -30,6 +31,12 @@ import {
   legacyImportPreviewSchema,
   listConversationsRequestSchema,
   listMessagesRequestSchema,
+  knowledgeAvailabilitySchema,
+  knowledgeImportRequestSchema,
+  knowledgeListRequestSchema,
+  knowledgeSelectionSchema,
+  knowledgeSearchRequestSchema,
+  knowledgeSearchResultSchema,
   logoutRequestSchema,
   logoutResultSchema,
   retryConversationSyncRequestSchema,
@@ -43,6 +50,8 @@ import {
   parseProxyBypassText,
   permissionGrantSchema,
   privacyConsentSchema,
+  privacyConsentRevokeSchema,
+  privacyConsentStateSchema,
   remoteUsageSnapshotSchema,
   providerUsageModalitySchema,
   providerCredentialStatusSchema,
@@ -538,6 +547,72 @@ describe('cross-process contracts', () => {
     }).success).toBe(false)
   })
 
+  it('models privacy consent acceptance and revocation as one purpose-scoped revision chain', () => {
+    const accepted = {
+      purpose: 'cloud_sync' as const,
+      state: 'accepted' as const,
+      revision: 1,
+      documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-28T00:00:00.000Z',
+      clientVersion: '0.1.0',
+    }
+    const revoke = {
+      purpose: 'cloud_sync' as const,
+      revokedAt: '2026-08-28T01:00:00.000Z',
+      clientVersion: '0.1.0',
+    }
+    const revoked = { ...revoke, state: 'revoked' as const, revision: 2 }
+    expect(privacyConsentStateSchema.parse(accepted)).toEqual(accepted)
+    expect(privacyConsentRevokeSchema.parse(revoke)).toEqual(revoke)
+    expect(privacyConsentStateSchema.parse(revoked)).toEqual(revoked)
+
+    const revokeMutation = {
+      id: 'consent_revoke_1', kind: 'privacy.consent.revoke' as const,
+      entityId: 'cloud_sync', baseRevision: 1,
+      occurredAt: revoke.revokedAt, payload: revoke,
+    }
+    expect(syncMutationSchema.parse(revokeMutation)).toEqual(revokeMutation)
+    expect(pulledMutationSchema.parse({
+      id: revokeMutation.id, kind: revokeMutation.kind,
+      entityId: revokeMutation.entityId, baseRevision: revokeMutation.baseRevision,
+      payload: revokeMutation.payload, resultRevision: 2, receivedAt: revoke.revokedAt,
+    })).toMatchObject({ kind: 'privacy.consent.revoke', resultRevision: 2 })
+    for (const invalid of [
+      { ...revoke, ownerUserId: 'forged' },
+      { ...revoke, revision: 1 },
+      { ...revokeMutation, entityId: 'cloud-sync-2026-08' },
+      { ...revokeMutation, payload: { ...revoke, purpose: 'other' } },
+      { ...revoked, state: 'accepted', documentVersion: undefined, consentedAt: undefined },
+    ]) {
+      const schema = 'kind' in invalid ? syncMutationSchema
+        : 'state' in invalid ? privacyConsentStateSchema : privacyConsentRevokeSchema
+      expect(schema.safeParse(invalid).success).toBe(false)
+    }
+  })
+
+  it('keeps the cloud-sync Settings revoke IPC owner- and revision-free', () => {
+    const revoked = {
+      purpose: 'cloud_sync' as const, state: 'revoked' as const, revision: 2,
+      revokedAt: '2026-08-28T01:00:00.000Z', clientVersion: '0.1.0',
+    }
+    expect(ipcRequestSchemas[ipcChannels.settingsGetCloudSyncConsentState]
+      .parse(undefined)).toBeUndefined()
+    expect(ipcRequestSchemas[ipcChannels.settingsRevokeCloudSyncConsent]
+      .parse({ confirmed: true })).toEqual({ confirmed: true })
+    expect(ipcResponseSchemas[ipcChannels.settingsGetCloudSyncConsentState]
+      .parse(null)).toBeNull()
+    expect(ipcResponseSchemas[ipcChannels.settingsRevokeCloudSyncConsent]
+      .parse(revoked)).toEqual(revoked)
+    for (const forged of [
+      {}, { confirmed: false }, { confirmed: true, userId: 'forged' },
+      { confirmed: true, purpose: 'cloud_sync' }, { confirmed: true, revision: 1 },
+      { confirmed: true, knowledgeEpoch: 7 },
+    ]) {
+      expect(ipcRequestSchemas[ipcChannels.settingsRevokeCloudSyncConsent]
+        .safeParse(forged).success).toBe(false)
+    }
+  })
+
   it('defines strict account preferences and safe BYOK usage events', () => {
     expect(accountDataPreferencesSchema.parse({})).toEqual({
       timezone: 'Asia/Shanghai',
@@ -688,6 +763,16 @@ describe('cross-process contracts', () => {
         role: 'user', capabilities: [], version: 0, updatedAt: '2026-08-21T00:00:00.000Z', confirmed: true,
       },
     }).authorization.role).toBe('user')
+    expect(authorizationSnapshotSchema.parse({
+      role: 'user', capabilities: [], version: 4,
+      updatedAt: '2026-08-28T00:00:00.000Z', confirmed: true,
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA' },
+    }).knowledgeEntitlement).toEqual({ payload: 'eA', signature: 'eA' })
+    expect(authorizationSnapshotSchema.safeParse({
+      role: 'user', capabilities: [], version: 4,
+      updatedAt: '2026-08-28T00:00:00.000Z', confirmed: true,
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA', ownerId: 'forged' },
+    }).success).toBe(false)
   })
 
   it('validates strict paged user administration requests and optimistic role updates', () => {
@@ -1229,7 +1314,20 @@ describe('cross-process contracts', () => {
       .toEqual({ requestId: 'request_1', bindingId: 'binding_1' })
     expect(ipcRequestSchemas[ipcChannels.chatListBrowserAudit].parse({ bindingId: 'binding_1' }))
       .toEqual({ bindingId: 'binding_1' })
-    expect(ipcRequestSchemas[ipcChannels.settingsClearBrowserData].parse(undefined)).toBeUndefined()
+    const clearToken = 'a'.repeat(64)
+    expect(ipcChannels.settingsCaptureDataClearToken).toBe('settings:capture-data-clear-token')
+    expect(ipcRequestSchemas[ipcChannels.settingsCaptureDataClearToken].parse(undefined)).toBeUndefined()
+    expect(ipcResponseSchemas[ipcChannels.settingsCaptureDataClearToken].parse(clearToken)).toBe(clearToken)
+    expect(ipcRequestSchemas[ipcChannels.settingsClearLocalData].parse({
+      scope: 'all', token: clearToken,
+    })).toEqual({ scope: 'all', token: clearToken })
+    expect(ipcRequestSchemas[ipcChannels.settingsClearBrowserData].parse({ token: clearToken }))
+      .toEqual({ token: clearToken })
+    expect(ipcResponseSchemas[ipcChannels.settingsClearLocalData].parse('applied')).toBe('applied')
+    expect(ipcResponseSchemas[ipcChannels.settingsClearBrowserData].parse('stale')).toBe('stale')
+    expect(ipcRequestSchemas[ipcChannels.settingsClearBrowserData].safeParse({
+      token: clearToken, owner: 'user_1', revision: 3,
+    }).success).toBe(false)
     expect(ipcResponseSchemas[ipcChannels.chatListBrowserAudit].parse([{
       id: 'audit_1', bindingId: 'binding_1', sequence: 1, origin: 'https://fw.bjrcgz.gov.cn',
       action: 'inspect', targetSummary: '工作居住证信息', risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
@@ -1824,6 +1922,136 @@ describe('cross-process contracts', () => {
       workflowName: '百度搜索', source: 'installed', actionSummary: '打开百度首页', permissionIndex: 0,
       capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] }, scopeHash: 'a'.repeat(64),
     })).toThrow()
+  })
+
+  it('rejects renderer-controlled knowledge authority and path inputs before Main admission', () => {
+    // Catches a production change that lets Renderer widen a knowledge search or select a local file path.
+    expect(knowledgeSearchRequestSchema.parse({ query: '合同' })).toEqual({ query: '合同' })
+    expect(knowledgeSearchRequestSchema.safeParse({ query: '合同', topK: 99 }).success).toBe(false)
+    expect(knowledgeSearchResultSchema.parse({ kind: 'query-too-short' })).toEqual({ kind: 'query-too-short' })
+    expect(knowledgeSearchResultSchema.parse({
+      kind: 'results', strategy: 'bounded-instr', evidence: [],
+    })).toEqual({ kind: 'results', strategy: 'bounded-instr', evidence: [] })
+    expect(knowledgeSearchResultSchema.safeParse({
+      kind: 'results', strategy: 'bounded-instr', evidence: [], topK: 8,
+    }).success).toBe(false)
+    expect(knowledgeListRequestSchema.safeParse({ userId: 'forged' }).success).toBe(false)
+    expect(knowledgeImportRequestSchema.parse({ baseId: 'base_1', importHandleId: 'import_1' }))
+      .toEqual({ baseId: 'base_1', importHandleId: 'import_1' })
+    expect(knowledgeImportRequestSchema.safeParse({ baseId: 'base_1', importHandleId: 'import_1', path: '/tmp/secret' }).success)
+      .toBe(false)
+    expect(ipcChannels.knowledgeRestoreDocument).toBe('knowledge:restore-document')
+    expect(ipcChannels.knowledgeRestoreBase).toBe('knowledge:restore-base')
+    expect(ipcRequestSchemas[ipcChannels.knowledgeRestoreDocument].parse({ documentId: 'document_1' }))
+      .toEqual({ documentId: 'document_1' })
+    expect(ipcRequestSchemas[ipcChannels.knowledgeRestoreBase].parse({ baseId: 'base_1' }))
+      .toEqual({ baseId: 'base_1' })
+  })
+
+  it('keeps knowledge selections strict and owner-free', () => {
+    // Catches a production change that accepts foreign base scope or renderer-supplied index metadata.
+    expect(knowledgeSelectionSchema.parse({ baseIds: [], mode: 'mixed' })).toEqual({ baseIds: [], mode: 'mixed' })
+    expect(knowledgeSelectionSchema.safeParse({ baseIds: ['base_1', 'base_1'], mode: 'strict' }).success).toBe(false)
+    expect(knowledgeSelectionSchema.safeParse({ baseIds: ['base_1'], mode: 'mixed', generationId: 'foreign' }).success).toBe(false)
+    expect(knowledgeSelectionSchema.safeParse({ baseIds: ['a'.repeat(128)], mode: 'mixed' }).success).toBe(true)
+    expect(knowledgeSelectionSchema.safeParse({ baseIds: ['a'.repeat(129)], mode: 'mixed' }).success).toBe(false)
+  })
+
+  it('keeps live and persisted knowledge grounding blocks path-free and bounded', () => {
+    const status = {
+      type: 'knowledge_status', blockId: 'knowledge_status_1', status: 'found',
+      searchIndex: 1, searchLimit: 3, evidenceCount: 2,
+    }
+    const citation = {
+      type: 'knowledge_citation', blockId: 'knowledge_citation_1', evidenceId: 'evidence:1',
+      baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
+      coordinate: { kind: 'text', line: 2, startOffset: 0, endOffset: 6 },
+    }
+    expect(chatBlockSchema.parse(status)).toEqual(status)
+    expect(chatBlockSchema.parse(citation)).toEqual(citation)
+    expect(chatBlockSchema.safeParse({ ...citation, path: '/tmp/private' }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...citation, preview: '合同在签字后生效。' }).success).toBe(false)
+    expect(chatBlockSchema.parse({
+      type: 'knowledge_citation', blockId: 'legacy_citation_1', evidenceId: 'evidence:legacy',
+      documentId: 'document_legacy', versionId: 'version_legacy',
+      coordinate: { kind: 'text', line: 3, startOffset: 0, endOffset: 6 },
+      preview: '/etc/private 旧摇要不得重新披露', sourceAvailable: true,
+    })).toEqual({
+      type: 'knowledge_citation', blockId: 'legacy_citation_1', evidenceId: 'evidence:legacy',
+      baseId: 'legacy_unavailable', documentId: 'document_legacy', versionId: 'version_legacy',
+      coordinate: { kind: 'text', line: 3, startOffset: 0, endOffset: 6 }, legacyUnavailable: true,
+    })
+    expect(chatEventSchema.parse({
+      type: 'block_update', conversationId: 'conversation_1', messageId: 'message_1',
+      blockId: status.blockId, block: { ...status, status: 'insufficient', evidenceCount: 0 },
+    })).toMatchObject({ type: 'block_update', blockId: status.blockId })
+    expect(ipcRequestSchemas[ipcChannels.knowledgeGetSourcePreview].safeParse({
+      evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
+      coordinate: { kind: 'text', line: 2, startOffset: 0, endOffset: 6 },
+    }).success).toBe(true)
+    expect(ipcRequestSchemas[ipcChannels.knowledgeGetSourcePreview].safeParse({
+      evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
+      coordinate: { kind: 'text', line: 2, startOffset: 0, endOffset: 6 }, ownerId: 'forged',
+    }).success).toBe(false)
+  })
+
+  it('keeps knowledge selection inside strict conversation preferences', () => {
+    const parsed = conversationGenerationPreferencesSchema.parse({
+      outputType: 'auto',
+      models: {},
+      generation: {
+        image: { count: 1 },
+        audio: {},
+        video: {},
+      },
+      knowledgeBaseIds: ['base_1'],
+      knowledgeMode: 'strict',
+    })
+    expect(parsed).toMatchObject({ knowledgeBaseIds: ['base_1'], knowledgeMode: 'strict' })
+    expect(conversationGenerationPreferencesSchema.safeParse({
+      ...parsed,
+      knowledgeBaseIds: ['base_1', 'base_1'],
+    }).success).toBe(false)
+    expect(conversationGenerationPreferencesSchema.safeParse({
+      ...parsed,
+      knowledgeMode: 'owner-controlled',
+    }).success).toBe(false)
+  })
+
+  it('keeps downgrade retention owner-free and returns only advisory opaque IDs', () => {
+    expect(ipcRequestSchemas[ipcChannels.knowledgeRetainFreeAllowance].parse({
+      baseId: 'base_1', documentId: 'document_1',
+    })).toEqual({ baseId: 'base_1', documentId: 'document_1' })
+    expect(ipcRequestSchemas[ipcChannels.knowledgeRetainFreeAllowance].safeParse({
+      baseId: 'base_1', documentId: 'document_1', ownerId: 'forged',
+    }).success).toBe(false)
+    expect(ipcResponseSchemas[ipcChannels.knowledgeRetainFreeAllowance].parse({
+      tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+      retainedBaseId: 'base_1', retainedDocumentId: 'document_1',
+    })).toMatchObject({ retainedBaseId: 'base_1', retainedDocumentId: 'document_1' })
+  })
+
+  it('reports each knowledge gate separately and fails closed with its matching reason', () => {
+    // Catches a production change that conflates encryption, parser, cloud, or commercial gates.
+    const availability = {
+      encryption: { available: true },
+      parser: { available: false, reason: 'parser_unavailable' },
+      cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+      embedding: { available: false, reason: 'embedding_unavailable' },
+      entitlement: { available: false, reason: 'entitlement_unavailable' },
+      beta: { available: false, reason: 'beta_disabled' },
+      cloud: { available: false, reason: 'cloud_disabled' },
+    }
+
+    expect(knowledgeAvailabilitySchema.parse(availability)).toEqual(availability)
+    expect(knowledgeAvailabilitySchema.safeParse({
+      ...availability,
+      encryption: { available: false },
+    }).success).toBe(false)
+    expect(knowledgeAvailabilitySchema.safeParse({
+      ...availability,
+      parser: { available: false, reason: 'cloudbase_unavailable' },
+    }).success).toBe(false)
   })
 
   it('requires bound approval context fields', () => {

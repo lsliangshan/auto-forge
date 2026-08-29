@@ -5,12 +5,16 @@ import type {
   AppSettingsPatch,
   AccountDataPreferences,
   LegacyImportPreview,
+  LegacyImportRequest,
   ModelInfo,
   ModelProviderId,
   PermissionGrant,
+  PrivacyConsent,
+  PrivacyConsentState,
   ProviderCredentialStatus,
   TokenUsageSnapshot,
   RemoteUsageSnapshot,
+  DataClearToken,
 } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
@@ -19,6 +23,14 @@ import { useWorkflowStore } from './workflow'
 
 const updateQueues = new WeakMap<object, Promise<AppSettings | undefined>>()
 type ModelOutput = 'text' | 'image' | 'audio' | 'video'
+declare const accountGenerationBrand: unique symbol
+export type AccountGenerationToken = number & { readonly [accountGenerationBrand]: true }
+declare const accountOperationAttemptBrand: unique symbol
+export type AccountOperationAttemptToken = number & {
+  readonly [accountOperationAttemptBrand]: true
+}
+export type AccountMutationResult = 'applied' | 'stale'
+export type AccountRecoveryResult = 'success' | 'failure' | 'stale'
 
 function supportsOutput(model: ModelInfo, output: ModelOutput): boolean {
   return model.inputModalities.includes('text')
@@ -64,6 +76,7 @@ export const useSettingsStore = defineStore('settings', {
     remoteUsage: undefined as RemoteUsageSnapshot | undefined,
     accountDataPreferences: undefined as AccountDataPreferences | undefined,
     legacyImportPreview: undefined as LegacyImportPreview | undefined,
+    cloudSyncConsentState: undefined as PrivacyConsentState | null | undefined,
     loading: false,
     modelsLoading: false,
     tokenUsageLoading: false,
@@ -72,6 +85,14 @@ export const useSettingsStore = defineStore('settings', {
     tokenUsageError: '',
     remoteUsageError: '',
     cloudDataError: '',
+    _cloudDataOwnerId: undefined as string | undefined,
+    _accountGeneration: 0,
+    _accountOperationAdmissionOpen: false,
+    _cloudDataReadVersion: 0,
+    _cloudConsentMutationVersion: 0,
+    _cloudConsentMutationPending: false,
+    _accountMaintenanceVersion: 0,
+    _accountMaintenancePending: false,
     _loadVersion: 0,
     _tokenUsageVersion: 0,
     _credentialVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
@@ -105,6 +126,64 @@ export const useSettingsStore = defineStore('settings', {
     },
   },
   actions: {
+    captureAccountGeneration(): AccountGenerationToken {
+      return this._accountGeneration as AccountGenerationToken
+    },
+    isAccountGenerationCurrent(token: AccountGenerationToken): boolean {
+      return this._accountOperationAdmissionOpen
+        && this._cloudDataOwnerId !== undefined
+        && token === this.captureAccountGeneration()
+    },
+    isAccountOperationAttemptCurrent(token: AccountOperationAttemptToken): boolean {
+      return !this._accountOperationAdmissionOpen
+        && token === (this._accountGeneration as AccountOperationAttemptToken)
+    },
+    suspendAccountOperationAdmission(): AccountOperationAttemptToken {
+      const consentMutationPending = this._cloudConsentMutationPending
+      const accountMaintenancePending = this._accountMaintenancePending
+      this._accountGeneration += 1
+      this._accountOperationAdmissionOpen = false
+      this._cloudDataReadVersion += 1
+      this._cloudConsentMutationVersion += 1
+      this._tokenUsageVersion += 1
+      this._accountMaintenanceVersion += 1
+      this._cloudConsentMutationPending = false
+      this._accountMaintenancePending = false
+      this.tokenUsageLoading = false
+      if (consentMutationPending || accountMaintenancePending) this.saving = false
+      return this._accountGeneration as AccountOperationAttemptToken
+    },
+    bindAccountOwner(
+      ownerId: string | undefined,
+      attempt: AccountOperationAttemptToken,
+    ): AccountMutationResult {
+      if (!this.isAccountOperationAttemptCurrent(attempt)) return 'stale'
+      const ownerChanged = ownerId !== this._cloudDataOwnerId
+      const consentMutationPending = this._cloudConsentMutationPending
+      this._accountGeneration += 1
+      this._accountOperationAdmissionOpen = ownerId !== undefined
+      this._cloudDataReadVersion += 1
+      this._cloudConsentMutationVersion += 1
+      this._cloudConsentMutationPending = false
+      if (consentMutationPending) this.saving = false
+      if (ownerChanged) this.saving = false
+      if (!ownerChanged) return 'applied'
+      this._cloudDataOwnerId = ownerId
+      this._tokenUsageVersion += 1
+      this.tokenUsage = undefined
+      this.remoteUsage = undefined
+      this.accountDataPreferences = undefined
+      this.legacyImportPreview = undefined
+      this.cloudSyncConsentState = undefined
+      this.tokenUsageError = ''
+      this.remoteUsageError = ''
+      this.cloudDataError = ''
+      return 'applied'
+    },
+    closeAccountOwner() {
+      const attempt = this.suspendAccountOperationAdmission()
+      return this.bindAccountOwner(undefined, attempt)
+    },
     async refreshGrants() {
       this.error = ''
       try {
@@ -114,28 +193,50 @@ export const useSettingsStore = defineStore('settings', {
       }
     },
     async loadTokenUsage() {
+      const accountGeneration = this.captureAccountGeneration()
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return
       const version = ++this._tokenUsageVersion
       this.tokenUsageLoading = true
       this.tokenUsageError = ''
       try {
         const usage = await getDesktopApi().settings.getTokenUsage()
-        if (version === this._tokenUsageVersion) this.tokenUsage = usage
+        if (version === this._tokenUsageVersion
+          && this.isAccountGenerationCurrent(accountGeneration)) this.tokenUsage = usage
       } catch (error) {
-        if (version === this._tokenUsageVersion) {
+        if (version === this._tokenUsageVersion
+          && this.isAccountGenerationCurrent(accountGeneration)) {
           this.tokenUsageError = displayError(error, 'Token 用量加载失败')
         }
       } finally {
-        if (version === this._tokenUsageVersion) this.tokenUsageLoading = false
+        if (version === this._tokenUsageVersion
+          && this.isAccountGenerationCurrent(accountGeneration)) this.tokenUsageLoading = false
       }
     },
-    async loadCloudData() {
+    async loadCloudData(
+      recoveryAttempt?: AccountOperationAttemptToken,
+    ): Promise<AccountRecoveryResult> {
+      const ownerId = this._cloudDataOwnerId
+      const accountGeneration = this._accountGeneration
+      const admissionIsCurrent = () => recoveryAttempt === undefined
+        ? this._accountOperationAdmissionOpen && accountGeneration === this._accountGeneration
+        : this.isAccountOperationAttemptCurrent(recoveryAttempt)
+          && accountGeneration === this._accountGeneration
+      if (!ownerId || !admissionIsCurrent()) return 'stale'
+      const readVersion = ++this._cloudDataReadVersion
+      const consentMutationVersion = this._cloudConsentMutationVersion
+      const consentMutationWasPending = this._cloudConsentMutationPending
       this.cloudDataError = ''
       this.remoteUsageError = ''
-      const [remoteUsage, accountDataPreferences, legacyImportPreview] = await Promise.allSettled([
+      const [remoteUsage, accountDataPreferences, legacyImportPreview, cloudSyncConsentState]
+        = await Promise.allSettled([
         Promise.resolve().then(() => getDesktopApi().settings.getRemoteUsage()),
         Promise.resolve().then(() => getDesktopApi().settings.getAccountDataPreferences()),
         Promise.resolve().then(() => getDesktopApi().settings.previewLegacyImport()),
+        Promise.resolve().then(() => getDesktopApi().settings.getCloudSyncConsentState()),
       ])
+      if (ownerId !== this._cloudDataOwnerId
+        || readVersion !== this._cloudDataReadVersion
+        || !admissionIsCurrent()) return 'stale'
       if (remoteUsage.status === 'fulfilled') {
         this.remoteUsage = remoteUsage.value
       } else {
@@ -151,15 +252,131 @@ export const useSettingsStore = defineStore('settings', {
       } else if (!this.cloudDataError) {
         this.cloudDataError = displayError(legacyImportPreview.reason, '历史会话迁移信息加载失败')
       }
+      if (!consentMutationWasPending
+        && consentMutationVersion === this._cloudConsentMutationVersion) {
+        if (cloudSyncConsentState.status === 'fulfilled') {
+          this.cloudSyncConsentState = cloudSyncConsentState.value
+          return 'success'
+        } else {
+          this.cloudSyncConsentState = undefined
+          if (!this.cloudDataError) {
+            this.cloudDataError = displayError(
+              cloudSyncConsentState.reason,
+              '云同步授权状态加载失败',
+            )
+          }
+        }
+      }
+      return cloudSyncConsentState.status === 'rejected' ? 'failure' : 'stale'
+    },
+    async recoverAccountOperationAdmission(
+      ownerId: string | undefined,
+      attempt: AccountOperationAttemptToken,
+    ): Promise<AccountRecoveryResult> {
+      if (!this.isAccountOperationAttemptCurrent(attempt)) return 'stale'
+      if (ownerId !== this._cloudDataOwnerId) {
+        this._cloudDataOwnerId = ownerId
+        this._tokenUsageVersion += 1
+        this.tokenUsage = undefined
+        this.remoteUsage = undefined
+        this.accountDataPreferences = undefined
+        this.legacyImportPreview = undefined
+        this.cloudSyncConsentState = undefined
+        this.tokenUsageError = ''
+        this.remoteUsageError = ''
+        this.cloudDataError = ''
+      }
+      if (!ownerId) {
+        this.cloudSyncConsentState = undefined
+        return 'success'
+      }
+      const result = await this.loadCloudData(attempt)
+      if (result === 'stale'
+        || ownerId !== this._cloudDataOwnerId
+        || !this.isAccountOperationAttemptCurrent(attempt)) return 'stale'
+      if (result === 'failure') this.cloudSyncConsentState = undefined
+      return result
     },
     async updateAccountDataPreferences(input: AccountDataPreferences) {
+      const accountGeneration = this.captureAccountGeneration()
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return
       this.cloudDataError = ''
       try {
-        this.accountDataPreferences = await getDesktopApi().settings
+        const updated = await getDesktopApi().settings
           .updateAccountDataPreferences(input)
+        if (!this.isAccountGenerationCurrent(accountGeneration)) return
+        this.accountDataPreferences = updated
         await this.loadCloudData()
       } catch (error) {
-        this.cloudDataError = displayError(error, '账户数据偏好保存失败')
+        if (this.isAccountGenerationCurrent(accountGeneration)) {
+          this.cloudDataError = displayError(error, '账户数据偏好保存失败')
+        }
+      }
+    },
+    async importLegacyData(
+      input: LegacyImportRequest,
+      accountGeneration?: AccountGenerationToken,
+    ): Promise<AccountMutationResult> {
+      const capturedGeneration = accountGeneration ?? this.captureAccountGeneration()
+      if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
+      this.cloudDataError = ''
+      try {
+        const consentResult = await this.recordPrivacyConsent(
+          input.cloudSyncConsent,
+          capturedGeneration,
+        )
+        if (consentResult !== 'applied') return 'stale'
+        await getDesktopApi().settings.importLegacyData(input)
+        if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
+        return 'applied'
+      } catch (error) {
+        if (!this.isAccountGenerationCurrent(capturedGeneration)) return 'stale'
+        this.cloudDataError = `历史会话迁移失败：${displayError(error)}`
+        throw error
+      }
+    },
+    async recordPrivacyConsent(
+      input: PrivacyConsent,
+      accountGeneration: AccountGenerationToken,
+    ): Promise<AccountMutationResult> {
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
+      try {
+        await getDesktopApi().settings.recordPrivacyConsent(input)
+        return this.isAccountGenerationCurrent(accountGeneration) ? 'applied' : 'stale'
+      } catch (error) {
+        if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
+        throw error
+      }
+    },
+    async revokeCloudSyncConsent(
+      accountGeneration?: AccountGenerationToken,
+    ): Promise<AccountMutationResult> {
+      const capturedGeneration = accountGeneration ?? this.captureAccountGeneration()
+      if (!this.isAccountGenerationCurrent(capturedGeneration)
+        || this.cloudSyncConsentState?.state !== 'accepted') return 'stale'
+      const mutationVersion = ++this._cloudConsentMutationVersion
+      this._cloudDataReadVersion += 1
+      this._cloudConsentMutationPending = true
+      this.saving = true
+      this.cloudDataError = ''
+      try {
+        const revoked = await getDesktopApi().settings
+          .revokeCloudSyncConsent({ confirmed: true })
+        if (!this.isAccountGenerationCurrent(capturedGeneration)
+          || mutationVersion !== this._cloudConsentMutationVersion) return 'stale'
+        this.cloudSyncConsentState = revoked
+        return 'applied'
+      } catch (error) {
+        if (!this.isAccountGenerationCurrent(capturedGeneration)
+          || mutationVersion !== this._cloudConsentMutationVersion) return 'stale'
+        this.cloudDataError = displayError(error, '云同步授权撤回失败')
+        throw error
+      } finally {
+        if (this.isAccountGenerationCurrent(capturedGeneration)
+          && mutationVersion === this._cloudConsentMutationVersion) {
+          this._cloudConsentMutationPending = false
+          this.saving = false
+        }
       }
     },
     async load() {
@@ -321,11 +538,29 @@ export const useSettingsStore = defineStore('settings', {
         return { defaultModels }
       })
     },
-    async clearLocalData(scope: 'conversations' | 'executions' | 'all') {
+    async captureDataClearToken(
+      accountGeneration: AccountGenerationToken,
+    ): Promise<DataClearToken | undefined> {
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return undefined
+      const token = await getDesktopApi().settings.captureDataClearToken()
+      return this.isAccountGenerationCurrent(accountGeneration) ? token : undefined
+    },
+    async clearLocalData(
+      scope: 'conversations' | 'executions' | 'all',
+      accountGeneration: AccountGenerationToken,
+      clearToken: DataClearToken,
+    ): Promise<AccountMutationResult> {
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
+      const mutationVersion = ++this._accountMaintenanceVersion
+      const mutationIsCurrent = () => mutationVersion === this._accountMaintenanceVersion
+        && this.isAccountGenerationCurrent(accountGeneration)
+      this._accountMaintenancePending = true
       this.saving = true
       this.error = ''
       try {
-        await getDesktopApi().settings.clearLocalData(scope)
+        const result = await getDesktopApi().settings.clearLocalData(scope, clearToken)
+        if (result !== 'applied') return 'stale'
+        if (!mutationIsCurrent()) return 'stale'
         if (scope === 'conversations' || scope === 'all') useChatStore().resetLocalData()
         if (scope === 'executions' || scope === 'all') useExecutionStore().resetLocalData()
         if (scope === 'all') {
@@ -333,23 +568,41 @@ export const useSettingsStore = defineStore('settings', {
         } else if (scope === 'conversations') {
           await this.loadTokenUsage()
         }
+        return mutationIsCurrent() ? 'applied' : 'stale'
       } catch (error) {
+        if (!mutationIsCurrent()) return 'stale'
         this.error = displayError(error, '本地数据清理失败')
         throw error
       } finally {
-        this.saving = false
+        if (mutationIsCurrent()) {
+          this._accountMaintenancePending = false
+          this.saving = false
+        }
       }
     },
-    async clearBrowserData() {
+    async clearBrowserData(
+      accountGeneration: AccountGenerationToken,
+      clearToken: DataClearToken,
+    ): Promise<AccountMutationResult> {
+      if (!this.isAccountGenerationCurrent(accountGeneration)) return 'stale'
+      const mutationVersion = ++this._accountMaintenanceVersion
+      const mutationIsCurrent = () => mutationVersion === this._accountMaintenanceVersion
+        && this.isAccountGenerationCurrent(accountGeneration)
+      this._accountMaintenancePending = true
       this.saving = true
       this.error = ''
       try {
-        await getDesktopApi().settings.clearBrowserData()
+        const result = await getDesktopApi().settings.clearBrowserData(clearToken)
+        return result === 'applied' && mutationIsCurrent() ? 'applied' : 'stale'
       } catch (error) {
+        if (!mutationIsCurrent()) return 'stale'
         this.error = displayError(error, '浏览器数据清除失败')
         throw error
       } finally {
-        this.saving = false
+        if (mutationIsCurrent()) {
+          this._accountMaintenancePending = false
+          this.saving = false
+        }
       }
     },
   },

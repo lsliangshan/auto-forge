@@ -217,6 +217,7 @@ export async function resolveBrowserVisualEvidence(
   try {
     for await (const event of trackProviderStream({
       operationKey: `agent:${input.requestId}:browser-visual-evidence:${input.evidenceRevision}`,
+      purpose: 'browser_visual_evidence',
       attribution: {
         userId: input.userId,
         requestId: input.requestId,

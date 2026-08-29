@@ -34,6 +34,7 @@ export interface CloudBaseFunctionPort {
   callFunction(options: {
     name: string
     data: Record<string, unknown>
+    signal?: AbortSignal
   }): Promise<unknown>
 }
 
@@ -53,9 +54,28 @@ const cloudBaseFactory: CloudBaseFactory = {
     const app = cloudbase.init(config)
     return {
       auth: app.auth,
-      callFunction: (options) => app.callFunction(options),
+      callFunction: ({ signal, ...options }) => abortableCallFunction(
+        () => app.callFunction(options), signal,
+      ),
     }
   },
+}
+
+function abortableCallFunction(
+  invoke: () => Promise<unknown>,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  if (!signal) return invoke()
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(new Error('CloudBase function call aborted'))
+    if (signal.aborted) {
+      aborted()
+      return
+    }
+    const pending = invoke()
+    signal.addEventListener('abort', aborted, { once: true })
+    pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted))
+  })
 }
 
 export function readCloudBaseAuthConfig(env: NodeJS.ProcessEnv): CloudBaseAuthConfig {
@@ -88,7 +108,13 @@ export function createCloudBaseClientPorts(
   })
   return {
     auth: app.auth,
-    functions: { callFunction: app.callFunction.bind(app) },
+    functions: {
+      callFunction: ({ signal, ...options }: {
+        name: string
+        data: Record<string, unknown>
+        signal?: AbortSignal
+      }) => abortableCallFunction(() => app.callFunction(options), signal),
+    },
   }
 }
 

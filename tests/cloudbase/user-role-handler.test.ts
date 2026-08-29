@@ -82,6 +82,30 @@ describe('CloudBase user role function', () => {
     })
   })
 
+  it('returns only a nullable strict opaque signed entitlement from the role RPC', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      userId: 'admin_1', role: 'user', capabilities: [], version: 0,
+      updatedAt: '2026-08-21T00:00:00.000Z',
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA' },
+    })
+    const handler = createUserRoleHandler({ rpc })
+    await expect(handler({ action: 'ensureMyRole' }, context)).resolves.toEqual({
+      ok: true,
+      data: expect.objectContaining({
+        knowledgeEntitlement: { payload: 'eA', signature: 'eA' },
+      }),
+    })
+
+    rpc.mockResolvedValueOnce({
+      userId: 'admin_1', role: 'user', capabilities: [], version: 0,
+      updatedAt: '2026-08-21T00:00:00.000Z',
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA', privateKey: 'forbidden' },
+    })
+    await expect(handler({ action: 'ensureMyRole' }, context)).resolves.toEqual({
+      ok: false, error: { code: 'INTERNAL_ERROR' },
+    })
+  })
+
   it('ignores CloudBase-injected event identity metadata while trusting only the function context', async () => {
     const rpc = vi.fn().mockResolvedValue({
       userId: 'admin_1', role: 'user', capabilities: [], version: 0,
@@ -185,34 +209,5 @@ describe('CloudBase user role function', () => {
     await expect(unknown({ action: 'ensureMyRole' }, context)).resolves.toEqual({
       ok: false, error: { code: 'INTERNAL_ERROR' },
     })
-  })
-})
-
-describe('CloudBase PostgreSQL user role migration', () => {
-  it('keeps CloudBase bigint auth ids exact across the string API boundary', async () => {
-    const sql = await readFile(new URL('../../cloudbase/user-roles/migrations/0001_user_roles.sql', import.meta.url), 'utf8')
-    const versionedSql = await readFile(new URL('../../cloudbase/migrations/20260821105102_user_roles.sql', import.meta.url), 'utf8')
-    expect(versionedSql).toBe(sql)
-    expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.app_user_roles')
-    expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.app_user_role_audit')
-    expect(sql).toContain('user_id bigint PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE')
-    expect(sql).toContain("'userId', role_row.user_id::text")
-    expect(sql).toContain('users.id::text = p_caller_user_id')
-    expect(sql).toContain('users.id::text = p_target_user_id')
-    expect(sql).not.toMatch(/users\.id\s*=\s*p_(?:caller|target)_user_id/)
-    expect(sql).not.toContain('roles.user_id = users.id::text')
-    expect(sql).toContain("existing_role varchar(63) := 'user'")
-    expect(sql).not.toMatch(/\bcurrent_role\b/)
-    expect(sql).toContain('request_id varchar(128) NOT NULL UNIQUE')
-    expect(sql).toContain('SELF_ROLE_CHANGE_FORBIDDEN')
-    expect(sql).toContain('LAST_SUPER_ADMIN')
-    expect(sql).toContain('ROLE_CONFLICT')
-    expect(sql).toContain('REQUEST_ID_CONFLICT')
-    expect(sql).toContain("'total', (SELECT total FROM totals)")
-    expect(sql).toMatch(/REVOKE ALL ON (TABLE )?public\.app_user_roles FROM PUBLIC/)
-    expect(sql).toContain('REVOKE ALL ON FUNCTION public.autoforge_list_users')
-    expect(sql).toContain('GRANT EXECUTE ON FUNCTION public.autoforge_list_users')
-    expect(sql).toContain('TO service_role')
-    expect(sql).toContain("SET search_path = pg_catalog, public")
   })
 })

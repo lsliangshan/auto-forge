@@ -1,0 +1,212 @@
+import { chmod, copyFile, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
+import type { SafeStoragePort } from '../security/secret-store.js'
+import { KnowledgeKeyStore } from './key-store.js'
+
+const roots: string[] = []
+const wrappingMask = Buffer.from('67f64f3eb4a85dedbce6132d63159fe1', 'hex')
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(release => { resolve = release })
+  return { promise, resolve }
+}
+
+async function temporaryRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-keys-'))
+  roots.push(root)
+  return root
+}
+
+function fakeSafeStorage(available = true): SafeStoragePort {
+  return {
+    isAvailable: async () => available,
+    encrypt: async (value) => Buffer.from(
+      Buffer.from(value, 'utf8').map((byte, index) => byte ^ wrappingMask[index % wrappingMask.length]!),
+    ),
+    decrypt: async (value) => ({
+      value: Buffer.from(
+        value.map((byte, index) => byte ^ wrappingMask[index % wrappingMask.length]!),
+      ).toString('utf8'),
+      shouldReEncrypt: false,
+    }),
+  }
+}
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
+})
+
+describe('KnowledgeKeyStore', () => {
+  it.runIf(process.platform !== 'win32')(
+    'tightens pre-existing root, owner, and key-record permissions before loading',
+    async () => {
+      const root = await temporaryRoot()
+      const store = new KnowledgeKeyStore(root, fakeSafeStorage())
+      const created = await store.loadOrCreate('owner-loose-key-paths')
+      created.active.fill(0)
+      created.objectKey.fill(0)
+      await chmod(root, 0o777)
+      await chmod(created.ownerRoot, 0o777)
+      await chmod(created.recordPath, 0o666)
+
+      const loaded = await store.loadExisting('owner-loose-key-paths')
+
+      expect(loaded).toBeDefined()
+      expect((await stat(root)).mode & 0o777).toBe(0o700)
+      expect((await stat(created.ownerRoot)).mode & 0o777).toBe(0o700)
+      expect((await stat(created.recordPath)).mode & 0o777).toBe(0o600)
+      loaded?.active.fill(0)
+      loaded?.objectKey.fill(0)
+    },
+  )
+
+  it('single-flights concurrent first use so every caller receives the committed key', async () => {
+    const root = await temporaryRoot()
+    const store = new KnowledgeKeyStore(root, fakeSafeStorage())
+
+    const materials = await Promise.all(
+      Array.from({ length: 8 }, () => store.loadOrCreate('owner-concurrent-create')),
+    )
+
+    expect(materials.every(material => material.active.equals(materials[0]!.active))).toBe(true)
+    expect(materials.every(material => material.objectKey.equals(materials[0]!.objectKey))).toBe(true)
+    for (const material of materials) {
+      material.active.fill(0)
+      material.objectKey.fill(0)
+    }
+  })
+
+  it('does not make one owner wait for another owner key operation', async () => {
+    const root = await temporaryRoot()
+    const firstEncryptionStarted = deferred()
+    const releaseFirstEncryption = deferred()
+    let encryptionCount = 0
+    const safeStorage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async (value) => {
+        encryptionCount += 1
+        if (encryptionCount === 1) {
+          firstEncryptionStarted.resolve()
+          await releaseFirstEncryption.promise
+        }
+        return Buffer.from(value, 'utf8')
+      },
+      decrypt: async value => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
+    }
+    const store = new KnowledgeKeyStore(root, safeStorage)
+    const first = store.loadOrCreate('owner-blocked-a')
+    await firstEncryptionStarted.promise
+
+    const second = store.loadOrCreate('owner-independent-b')
+    const secondFinishedEarly = await Promise.race([
+      second.then(() => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), 200)),
+    ])
+    releaseFirstEncryption.resolve()
+    const [firstMaterial, secondMaterial] = await Promise.all([first, second])
+
+    expect(secondFinishedEarly).toBe(true)
+    firstMaterial.active.fill(0)
+    firstMaterial.objectKey.fill(0)
+    secondMaterial.active.fill(0)
+    secondMaterial.objectKey.fill(0)
+  })
+
+  it('creates one owner-bound active key under a hashed per-user root', async () => {
+    const root = await temporaryRoot()
+    const store = new KnowledgeKeyStore(root, fakeSafeStorage())
+
+    const first = await store.loadOrCreate('user/alice@example.test')
+    const second = await store.loadOrCreate('user/alice@example.test')
+
+    expect(first.active.equals(second.active)).toBe(true)
+    expect(first.active).toHaveLength(32)
+    expect(first.ownerRoot).not.toContain('alice@example.test')
+    expect(first.recordPath).not.toContain('alice@example.test')
+    expect(JSON.parse(await readFile(first.recordPath, 'utf8'))).toMatchObject({ version: 1 })
+    if (process.platform !== 'win32') {
+      expect((await stat(first.ownerRoot)).mode & 0o777).toBe(0o700)
+      expect((await stat(first.recordPath)).mode & 0o777).toBe(0o600)
+    }
+    first.active.fill(0)
+    first.objectKey.fill(0)
+    second.active.fill(0)
+    second.objectKey.fill(0)
+  })
+
+  it('fails closed without secure storage and rejects a wrapped key copied across owners', async () => {
+    const root = await temporaryRoot()
+    await expect(new KnowledgeKeyStore(root, fakeSafeStorage(false)).loadOrCreate('owner-a'))
+      .rejects.toThrow(/secure storage.*unavailable/i)
+
+    const store = new KnowledgeKeyStore(root, fakeSafeStorage())
+    const alice = await store.loadOrCreate('owner-a')
+    const bob = await store.loadOrCreate('owner-b')
+    await copyFile(alice.recordPath, bob.recordPath)
+
+    await expect(store.loadOrCreate('owner-b')).rejects.toThrow(/owner.*binding/i)
+    alice.active.fill(0)
+    alice.objectKey.fill(0)
+    bob.active.fill(0)
+    bob.objectKey.fill(0)
+  })
+
+  it('durably stages, promotes, and discards a pending key slot', async () => {
+    const root = await temporaryRoot()
+    const store = new KnowledgeKeyStore(root, fakeSafeStorage())
+    const created = await store.loadOrCreate('owner-slots')
+    const pending = Buffer.alloc(32, 0xa7)
+
+    await store.stagePending('owner-slots', pending)
+    const staged = await store.loadExisting('owner-slots')
+    expect(staged?.active.equals(created.active)).toBe(true)
+    expect(staged?.pending?.equals(pending)).toBe(true)
+
+    await store.promotePending('owner-slots')
+    const promoted = await store.loadExisting('owner-slots')
+    expect(promoted?.active.equals(pending)).toBe(true)
+    expect(promoted?.pending).toBeUndefined()
+
+    await store.stagePending('owner-slots', Buffer.alloc(32, 0x4c))
+    await store.discardPending('owner-slots')
+    expect((await store.loadExisting('owner-slots'))?.pending).toBeUndefined()
+
+    created.active.fill(0)
+    created.objectKey.fill(0)
+    staged?.active.fill(0)
+    staged?.objectKey.fill(0)
+    staged?.pending?.fill(0)
+    promoted?.active.fill(0)
+    promoted?.objectKey.fill(0)
+    pending.fill(0)
+  })
+
+  it('atomically rewraps every key slot when secure storage requests migration', async () => {
+    const root = await temporaryRoot()
+    let encryptions = 0
+    const safeStorage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async (value) => {
+        encryptions += 1
+        return Buffer.from(value, 'utf8')
+      },
+      decrypt: async value => ({ value: value.toString('utf8'), shouldReEncrypt: true }),
+    }
+    const store = new KnowledgeKeyStore(root, safeStorage)
+    const created = await store.loadOrCreate('owner-rewrap')
+    expect(encryptions).toBe(2)
+
+    const loaded = await store.loadExisting('owner-rewrap')
+
+    expect(encryptions).toBe(4)
+    expect(loaded?.active.equals(created.active)).toBe(true)
+    expect(loaded?.objectKey.equals(created.objectKey)).toBe(true)
+    created.active.fill(0)
+    created.objectKey.fill(0)
+    loaded?.active.fill(0)
+    loaded?.objectKey.fill(0)
+  })
+})

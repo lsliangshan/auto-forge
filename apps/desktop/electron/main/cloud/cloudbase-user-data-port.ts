@@ -326,11 +326,13 @@ export class CloudBaseUserDataPort {
   private diagnose(
     input: unknown,
     stage: UserDataCallDiagnostic['stage'],
-    code: UserDataErrorCode,
+    code: AppError['code'],
     remoteStage?: UserDataCallDiagnostic['remoteStage'],
   ): void {
+    const parsedCode = userDataErrorCodeSchema.safeParse(code)
+    const diagnosticCode = parsedCode.success ? parsedCode.data : 'INTERNAL_ERROR'
     if (!isRecord(input)) {
-      this.onDiagnostic?.({ action: undefined, stage, code })
+      this.onDiagnostic?.({ action: undefined, stage, code: diagnosticCode })
       return
     }
     const action = typeof input.action === 'string' ? input.action : undefined
@@ -344,7 +346,7 @@ export class CloudBaseUserDataPort {
     this.onDiagnostic?.({
       action,
       stage,
-      code,
+      code: diagnosticCode,
       ...(bytes === undefined ? {} : { bytes }),
       ...(Array.isArray(input.conversations) ? { conversationCount: input.conversations.length } : {}),
       ...(Array.isArray(input.messages) ? { messageCount: input.messages.length } : {}),

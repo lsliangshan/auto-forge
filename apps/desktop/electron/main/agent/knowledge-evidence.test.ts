@@ -1,0 +1,841 @@
+import { describe, expect, it } from 'vitest'
+import type { KnowledgeEvidence } from '@autoforge/shared'
+import {
+  CurrentTurnKnowledgeEvidence,
+  formatValidatedKnowledgeAnswer,
+  parseKnowledgeSearchArguments,
+  validateKnowledgeAnswer,
+} from './knowledge-evidence.js'
+
+function evidence(index: number, overrides: Partial<KnowledgeEvidence> = {}): KnowledgeEvidence {
+  const id = `evidence:${index}`
+  return {
+    id,
+    baseId: 'base_selected',
+    documentId: `document_${index}`,
+    versionId: `version_${index}`,
+    snippet: `第 ${index} 条证据`,
+    score: 1,
+    citation: {
+      evidenceId: id,
+      documentId: `document_${index}`,
+      versionId: `version_${index}`,
+      coordinate: { kind: 'text', line: index + 1, startOffset: 0, endOffset: 8 },
+    },
+    ...overrides,
+  }
+}
+
+describe('CurrentTurnKnowledgeEvidence', () => {
+  it('caps an immutable current-turn registry at eight unique evidence items across searches', () => {
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    registry.add(Array.from({ length: 6 }, (_, index) => evidence(index)))
+    registry.add(Array.from({ length: 6 }, (_, index) => evidence(index + 4)))
+
+    const snapshot = registry.snapshot()
+    expect(snapshot).toHaveLength(8)
+    expect(snapshot.map(item => item.id)).toEqual(Array.from({ length: 8 }, (_, index) => `evidence:${index}`))
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(Object.isFrozen(snapshot[0])).toBe(true)
+  })
+
+  it('rejects retriever evidence outside the Main-captured base scope', () => {
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    expect(() => registry.add([evidence(0, { baseId: 'base_forged' })])).toThrow('Knowledge evidence escaped selected scope')
+    expect(registry.snapshot()).toEqual([])
+    expect(() => registry.add([evidence(1, {
+      id: `evidence:${'x'.repeat(600)}`,
+      citation: {
+        evidenceId: `evidence:${'x'.repeat(600)}`,
+        documentId: 'document_1', versionId: 'version_1',
+        coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 1 },
+      },
+    })])).toThrow('Knowledge evidence identity is invalid')
+  })
+
+  it('rejects a closing bracket in every admitted evidence identity', () => {
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    for (const identity of ['evidence:0]', 'document_0]', 'version_0]']) {
+      const current = evidence(0, {
+        id: identity.startsWith('evidence') ? identity : 'evidence:0',
+        documentId: identity.startsWith('document') ? identity : 'document_0',
+        versionId: identity.startsWith('version') ? identity : 'version_0',
+        citation: {
+          evidenceId: identity.startsWith('evidence') ? identity : 'evidence:0',
+          documentId: identity.startsWith('document') ? identity : 'document_0',
+          versionId: identity.startsWith('version') ? identity : 'version_0',
+          coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 1 },
+        },
+      })
+      expect(() => registry.add([current])).toThrow('Knowledge evidence identity is invalid')
+    }
+  })
+
+  it('rejects consecutive opening brackets in every admitted evidence identity', () => {
+    const identities = [
+      { id: 'evidence:[[0', documentId: 'document_0', versionId: 'version_0' },
+      { id: 'evidence:0', documentId: 'document_[[0', versionId: 'version_0' },
+      { id: 'evidence:0', documentId: 'document_0', versionId: 'version_[[0' },
+    ]
+    for (const identity of identities) {
+      const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+      const current = evidence(0, {
+        ...identity,
+        citation: {
+          evidenceId: identity.id, documentId: identity.documentId, versionId: identity.versionId,
+          coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 1 },
+        },
+      })
+      expect(() => registry.add([current])).toThrow('Knowledge evidence identity is invalid')
+      expect(registry.snapshot()).toEqual([])
+    }
+  })
+
+  it.each([
+    'evidence:\r0',
+    'evidence:\n0',
+    'e'.repeat(513),
+  ])('rejects marker-delimiter and length boundary violation %s', (id) => {
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    expect(() => registry.add([evidence(0, {
+      id,
+      citation: {
+        evidenceId: id, documentId: 'document_0', versionId: 'version_0',
+        coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 1 },
+      },
+    })])).toThrow('Knowledge evidence identity is invalid')
+  })
+
+  it('builds a bounded untrusted Provider envelope without owner, path, URL, or generation fields', () => {
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    registry.add([evidence(0, {
+      snippet: '正文 https://signed.example/object?token=private /Users/alice/private.txt 路径/etc/passwd 路径/secret,path=/opt/autoforge,source:/Users/bob/private \\\\server\\share\\secret.txt C:\\Users\\alice\\private.txt 比例 10/2 and/or docs/readme 章节/介绍 每秒/次',
+      citation: {
+        evidenceId: 'evidence:0', documentId: 'document_0', versionId: 'version_0',
+        coordinate: { kind: 'docx', headingPath: ['https://signed.example/title'], paragraph: 1 },
+      },
+    })])
+
+    const envelope = registry.providerEnvelope(registry.snapshot())
+    expect(envelope).toContain('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+    expect(envelope).toContain('evidence:0')
+    expect(envelope).toContain('正文')
+    expect(envelope).toContain('[REDACTED_LOCATION]')
+    expect(envelope).not.toContain('signed.example')
+    expect(envelope).not.toContain('/Users/alice')
+    expect(envelope).not.toContain('/etc/passwd')
+    expect(envelope).not.toContain('/opt/autoforge')
+    expect(envelope).not.toContain('server\\share')
+    expect(envelope).not.toContain('/Users/bob')
+    expect(envelope).not.toContain('/secret')
+    expect(envelope).toContain('比例 10/2 and/or docs/readme 章节/介绍 每秒/次')
+    expect(envelope).not.toContain('C:\\Users')
+    expect(envelope).not.toMatch(/owner|userId|https?:|generation/iu)
+    expect(new TextEncoder().encode(envelope).byteLength).toBeLessThanOrEqual(40 * 1024)
+    expect(envelope).toMatch(/END_UNTRUSTED_KNOWLEDGE_EVIDENCE$/u)
+  })
+})
+
+describe('knowledge tool and answer validation', () => {
+  it('accepts only bounded query and optional rewrite supplied by the model', () => {
+    expect(parseKnowledgeSearchArguments({ query: '合同条款', rewrite: '违约责任' })).toEqual({
+      query: '合同条款', rewrite: '违约责任',
+    })
+    for (const forbidden of ['baseIds', 'owner', 'topK', 'sql', 'path', 'generationId', 'tools']) {
+      expect(() => parseKnowledgeSearchArguments({ query: '合同条款', [forbidden]: 'forged' })).toThrow()
+    }
+  })
+
+  it('validates citations only against current-turn evidence and allows exactly one repair decision', () => {
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    registry.add([evidence(0, { snippet: '结论来自当前证据。' }), evidence(1)])
+
+    expect(validateKnowledgeAnswer('结论 [[kb:evidence:0]]', registry.snapshot(), 'strict', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false, text: '结论',
+    })
+    expect(validateKnowledgeAnswer('伪造 [[kb:evidence:999]]', registry.snapshot(), 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['evidence:999'],
+    })
+    expect(validateKnowledgeAnswer('仍然伪造 [[kb:evidence:999]]', registry.snapshot(), 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'invalid-citation',
+    })
+  })
+
+  it.each([
+    { name: 'one opening bracket', id: 'evidence:[0' },
+    { name: 'non-consecutive opening brackets', id: 'evidence:[part[0' },
+    { name: '512-code-unit boundary', id: 'e'.repeat(512) },
+  ])('accepts canonical strict and mixed citations at $name', ({ id }) => {
+    const current = evidence(0, {
+      id,
+      snippet: '合同生效。',
+      citation: {
+        evidenceId: id, documentId: 'document_0', versionId: 'version_0',
+        coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 5 },
+      },
+    })
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    registry.add([current])
+    const marker = `[[kb:${id}]]`
+
+    expect(validateKnowledgeAnswer(`合同生效。${marker}`, registry.snapshot(), 'strict', 1)).toEqual({
+      kind: 'valid', citedEvidenceIds: [id], generalKnowledge: false, text: '合同生效。',
+    })
+    expect(validateKnowledgeAnswer(`合同生效。${marker}`, registry.snapshot(), 'mixed', 1)).toEqual({
+      kind: 'valid', citedEvidenceIds: [id], generalKnowledge: false, text: '【知识库依据】合同生效。',
+    })
+  })
+
+  it('does not admit or preserve an injected nested-marker identity and trailing payload', () => {
+    const id = 'evidence:[[0'
+    const current = evidence(0, {
+      id,
+      snippet: '合同生效payload',
+      citation: {
+        evidenceId: id, documentId: 'document_0', versionId: 'version_0',
+        coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 5 },
+      },
+    })
+    const answer = `合同生效[[kb:${id}]]payload]]`
+    expect({
+      strict: validateKnowledgeAnswer(answer, [current], 'strict', 1),
+      mixed: validateKnowledgeAnswer(answer, [current], 'mixed', 1),
+    }).toEqual({
+      strict: { kind: 'insufficient', reason: 'invalid-citation' },
+      mixed: {
+        kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '【一般信息】合同生效',
+      },
+    })
+
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    expect(() => registry.add([current])).toThrow('Knowledge evidence identity is invalid')
+  })
+
+  it('fails strict answers closed and labels uncited mixed answers as general knowledge', () => {
+    expect(validateKnowledgeAnswer('没有证据的结论', [], 'strict', 0)).toEqual({
+      kind: 'insufficient', reason: 'no-evidence',
+    })
+    expect(validateKnowledgeAnswer('一般信息', [], 'mixed', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '【一般信息】一般信息',
+    })
+    expect(validateKnowledgeAnswer(
+      '第 0 条证据 [[kb:evidence:0]]\n\n未由依据支持的补充', [evidence(0)], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['uncited-material'] })
+    expect(validateKnowledgeAnswer(
+      '第 0 条证据 [[kb:evidence:0]]\n\n一般补充', [evidence(0)], 'mixed', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
+      text: '【知识库依据】第 0 条证据\n【一般信息】一般补充',
+    })
+  })
+
+  it('rejects unrelated cited claims and downgrades their whole mixed sentence group', () => {
+    const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
+    expect(validateKnowledgeAnswer(
+      '月球由奶酪构成。[[kb:evidence:0]]', [contract], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+    expect(validateKnowledgeAnswer(
+      '月球由奶酪构成。[[kb:evidence:0]]', [contract], 'strict', 1,
+    )).toEqual({ kind: 'insufficient', reason: 'unsupported-claim' })
+
+    expect(validateKnowledgeAnswer(
+      '合同经双方签字后生效[[kb:evidence:0]]，但月球由奶酪构成[[kb:evidence:0]]。',
+      [contract], 'mixed', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: '【一般信息】合同经双方签字后生效\n【一般信息】但月球由奶酪构成。',
+    })
+  })
+
+  it('propagates sentence-final markers and rejects polarity or modality contradictions', () => {
+    const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
+    expect(validateKnowledgeAnswer(
+      '合同经双方签字后生效，并且月球由奶酪构成。[[kb:evidence:0]]',
+      [contract], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+
+    const permission = evidence(1, { snippet: '合同允许提前解除。' })
+    expect(validateKnowledgeAnswer(
+      '合同不得提前解除。[[kb:evidence:1]]', [permission], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+
+    const optionalSeal = evidence(2, { snippet: '合同不需要盖章即可生效。' })
+    expect(validateKnowledgeAnswer(
+      '合同需要盖章即可生效。[[kb:evidence:2]]', [optionalSeal], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+    expect(validateKnowledgeAnswer(
+      '合同需要盖章即可生效。[[kb:evidence:2]]', [optionalSeal], 'strict', 1,
+    )).toEqual({ kind: 'insufficient', reason: 'unsupported-claim' })
+
+    const payer = evidence(3, { snippet: '甲方应在 7 日内付款。' })
+    expect(validateKnowledgeAnswer(
+      '乙方应在 7 日内付款。[[kb:evidence:3]]', [payer], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+  })
+
+  it('accepts a bounded true synonym match with the same polarity and entities', () => {
+    const contract = evidence(0, { snippet: '协议由双方签署之日起生效。' })
+    expect(validateKnowledgeAnswer(
+      '双方签订协议后，协议即开始起效。[[kb:evidence:0]]', [contract], 'strict', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: '双方签订协议后\n协议即开始起效。',
+    })
+  })
+
+  it.each([
+    {
+      name: 'English cross-subject publication timing',
+      snippet: 'project a starts after launch, project b report is published before launch.',
+      answer: 'after project a starts, project a report is published.[[kb:evidence:0]]',
+    },
+    {
+      name: 'Chinese cross-subject effective condition',
+      snippet: '甲协议由甲方签署之日起生效，乙协议由乙方签署之日起生效。',
+      answer: '甲方签署后，乙协议即开始生效。[[kb:evidence:0]]',
+    },
+  ])('rejects temporal reordering that borrows across independent facts: $name', ({ snippet, answer }) => {
+    expect(validateKnowledgeAnswer(answer, [evidence(0, { snippet })], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [evidence(0, { snippet })], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it('accepts an English temporal reorder only when one evidence fact supports the full tuple', () => {
+    expect(validateKnowledgeAnswer(
+      'after project a starts, project a report is published.[[kb:evidence:0]]',
+      [evidence(0, { snippet: 'project a report is published after project a starts.' })],
+      'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it('accepts bounded English paraphrases only after canonical terms still meet high coverage', () => {
+    const contract = evidence(0, { snippet: 'The agreement takes effect when both parties sign it.' })
+    expect(validateKnowledgeAnswer(
+      'The contract becomes effective when both parties sign it. [[kb:evidence:0]]',
+      [contract], 'strict', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: 'The contract becomes effective when both parties sign it.',
+    })
+  })
+
+  it.each([
+    '会议时间为 12:30。',
+    '服务费为 100.50 美元。',
+    '注册资本为 1,000 美元。',
+    '合同于 2026-08-01 生效。',
+  ])('keeps numeric punctuation inside one supported material claim: %s', (text) => {
+    expect(validateKnowledgeAnswer(`${text}[[kb:evidence:0]]`, [evidence(0, { snippet: text })], 'strict', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false, text,
+    })
+  })
+
+  it.each([
+    {
+      name: '完整公司名称替换',
+      snippet: '供应商为北京星火科技有限公司。',
+      answer: '供应商为上海星火科技有限公司。[[kb:evidence:0]]',
+    },
+    {
+      name: '其他中文组织名称一处替换',
+      snippet: '报告由华南创新研究院发布。',
+      answer: '报告由华北创新研究院发布。[[kb:evidence:0]]',
+    },
+    {
+      name: '中文地名一处替换不能被长句稀释',
+      snippet: '该重点示范项目的主要实施地点位于杭州市西湖区并持续运营。',
+      answer: '该重点示范项目的主要实施地点位于杭州市西湖县并持续运营。[[kb:evidence:0]]',
+    },
+    {
+      name: '连续高信息片段替换不能被长句稀释',
+      snippet: '该项目的核心交付成果必须采用红色标准格式并保持长期稳定。',
+      answer: '该项目的核心交付成果必须采用蓝色标准格式并保持长期稳定。[[kb:evidence:0]]',
+    },
+  ])('rejects $name', ({ snippet, answer }) => {
+    const current = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it.each([
+    {
+      name: '不能把乙方的蓝色拼到甲方关系上',
+      snippet: '甲方设备颜色为红色。乙方设备颜色为蓝色。',
+      answer: '甲方设备颜色为蓝色。[[kb:evidence:0]]',
+    },
+    {
+      name: '不能跨项目拼接实施地点',
+      snippet: '晨光项目位于杭州市西湖区。星河项目位于上海市浦东新区。',
+      answer: '晨光项目地点是上海市浦东新区。[[kb:evidence:0]]',
+    },
+    {
+      name: '不能跨产品拼接交付版本',
+      snippet: '甲产品为基础版本。乙产品为企业版本。',
+      answer: '甲产品是企业版本。[[kb:evidence:0]]',
+    },
+    {
+      name: '不能跨主体拼接发布机构',
+      snippet: '甲报告由华南创新研究院发布。乙报告由华北创新研究院发布。',
+      answer: '甲报告由华北创新研究院发布。[[kb:evidence:0]]',
+    },
+  ])('requires one anchored evidence clause: $name', ({ snippet, answer }) => {
+    expect(validateKnowledgeAnswer(answer, [evidence(0, { snippet })], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it.each([
+    '甲方设备颜色：蓝色。[[kb:evidence:0]]',
+    '甲方设备颜色，蓝色。[[kb:evidence:0]]',
+    '甲方设备颜色并且是蓝色。[[kb:evidence:0]]',
+  ])('does not let one model sentence combine material fragments from different evidence clauses: %s', (answer) => {
+    const splitFacts = evidence(0, { snippet: '甲方设备颜色为红色。乙方设备颜色为蓝色。' })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it('does not label cross-clause fragments as grounded in mixed mode', () => {
+    const splitFacts = evidence(0, { snippet: '甲方设备颜色为红色。乙方设备颜色为蓝色。' })
+    expect(validateKnowledgeAnswer(
+      '甲方设备颜色：蓝色。[[kb:evidence:0]]', [splitFacts], 'mixed', 1,
+    )).toMatchObject({
+      kind: 'valid',
+      generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it('accepts a material field/list when one evidence clause supports every model fragment', () => {
+    const list = evidence(0, { snippet: '甲方设备可用颜色包括红色、蓝色、绿色。' })
+    expect(validateKnowledgeAnswer(
+      '甲方设备可用颜色：红色、蓝色、绿色。[[kb:evidence:0]]',
+      [list], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
+    '甲方设备颜色为红色且乙方设备颜色为蓝色。',
+    '甲方设备颜色为红色并且乙方设备颜色为蓝色。',
+    '甲方设备颜色为红色以及乙方设备颜色为蓝色。',
+    '甲方设备颜色为红色同时乙方设备颜色为蓝色。',
+    '甲方设备颜色为红色、乙方设备颜色为蓝色。',
+  ])('anchors field:value to one fact tuple across evidence connectors: %s', (snippet) => {
+    const splitFacts = evidence(0, { snippet })
+    const answer = '甲方设备颜色：蓝色。[[kb:evidence:0]]'
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it('anchors an English field:value claim across independent facts joined by and', () => {
+    const splitFacts = evidence(0, {
+      snippet: 'Device A color is red and Device B color is blue.',
+    })
+    expect(validateKnowledgeAnswer(
+      'Device A color: blue. [[kb:evidence:0]]', [splitFacts], 'strict', 1,
+    )).toEqual({ kind: 'insufficient', reason: 'unsupported-claim' })
+  })
+
+  it.each([
+    {
+      name: 'English Device A comma field',
+      snippet: 'Device A color is red and Device B color is blue.',
+      answer: 'Device A color, blue. [[kb:evidence:0]]',
+    },
+    {
+      name: '中文一字母设备逗号字段',
+      snippet: 'A设备颜色为红色且B设备颜色为蓝色。',
+      answer: 'A设备颜色，蓝色。[[kb:evidence:0]]',
+    },
+  ])('anchors $name to one subject, relation, and value tuple', ({ snippet, answer }) => {
+    const splitFacts = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it.each([
+    {
+      name: 'arbitrary Chinese material field',
+      snippet: 'A设备材质为钢制且B设备材质为铝制。',
+      answer: 'A设备材质，铝制。[[kb:evidence:0]]',
+    },
+    {
+      name: 'arbitrary Chinese weight field',
+      snippet: 'A设备重量为100千克且B设备重量为200千克。',
+      answer: 'A设备重量，200千克。[[kb:evidence:0]]',
+    },
+    {
+      name: 'arbitrary English material field',
+      snippet: 'Device A material is steel and Device B material is aluminum.',
+      answer: 'Device A material, aluminum. [[kb:evidence:0]]',
+    },
+  ])('fails $name closed without extending a field-name allowlist', ({ snippet, answer }) => {
+    const splitFacts = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it.each([
+    {
+      name: 'Chinese project hours borrowed from another subject',
+      snippet: 'A项目工时100小时，B项目工时200小时。',
+      answer: 'A项目工时，200小时。[[kb:evidence:0]]',
+    },
+    {
+      name: 'English project hours borrowed from another subject',
+      snippet: 'Project A effort 100 hours, Project B effort 200 hours.',
+      answer: 'Project A effort, 200 hours. [[kb:evidence:0]]',
+    },
+    {
+      name: 'same value attached to a different Chinese subject',
+      snippet: 'B项目工时100小时。',
+      answer: 'A项目工时，100小时。[[kb:evidence:0]]',
+    },
+    {
+      name: 'same value attached to a different English subject',
+      snippet: 'Project B effort 100 hours.',
+      answer: 'Project A effort, 100 hours. [[kb:evidence:0]]',
+    },
+  ])('fails structurally field-like comma claims closed: $name', ({ snippet, answer }) => {
+    const current = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it.each([
+    {
+      name: 'status field with a clause-like value',
+      snippet: 'A项目系统状态异常，B项目当前运行稳定。',
+      answer: 'A项目系统状态，当前运行稳定。[[kb:evidence:0]]',
+    },
+    {
+      name: 'material field with a clause-like value',
+      snippet: 'A项目材料钢材，B项目默认采用铝材。',
+      answer: 'A项目材料，默认采用铝材。[[kb:evidence:0]]',
+    },
+    {
+      name: 'owner field with a clause-like value',
+      snippet: 'A项目负责人张三，B项目验收工作由李四负责。',
+      answer: 'A项目负责人，验收工作由李四负责。[[kb:evidence:0]]',
+    },
+    {
+      name: 'English start-time field with a finite clause value',
+      snippet: 'project a start time pending, project b work will start tomorrow.',
+      answer: 'project a start time, work will start tomorrow. [[kb:evidence:0]]',
+    },
+    {
+      name: 'hours field with a planned-duration value',
+      snippet: 'A项目工时100小时，B项目计划持续200小时。',
+      answer: 'A项目工时，计划持续200小时。[[kb:evidence:0]]',
+    },
+  ])('does not let a clause-like field value bypass tuple grounding: $name', ({ snippet, answer }) => {
+    const current = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+  })
+
+  it.each([
+    {
+      name: 'standalone number from another party field',
+      snippet: '乙方编号为 7。',
+      answer: '7。[[kb:evidence:0]]',
+    },
+    {
+      name: 'report publication date comma field',
+      snippet: 'A报告发布日期为2026-01-01且B报告发布日期为2026-02-02。',
+      answer: 'A报告发布日期，2026-02-02。[[kb:evidence:0]]',
+    },
+    {
+      name: 'contract effective date comma field',
+      snippet: 'A合同生效日期为2026-01-01且B合同生效日期为2026-02-02。',
+      answer: 'A合同生效日期，2026-02-02。[[kb:evidence:0]]',
+    },
+    {
+      name: 'party payment amount comma field',
+      snippet: 'A方支付金额为100且B方支付金额为200。',
+      answer: 'A方支付金额，200。[[kb:evidence:0]]',
+    },
+  ])('rejects $name instead of borrowing a numeric value from cited evidence', ({ snippet, answer }) => {
+    const splitFacts = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: expect.not.stringContaining('【知识库依据】'),
+    })
+    expect(validateKnowledgeAnswer(answer, [splitFacts], 'mixed', 1)).toMatchObject({
+      text: expect.not.stringContaining('[[kb:'),
+    })
+  })
+
+  it.each([
+    ['会议时间为 12:30。', '会议时间：12:30。'],
+    ['会议时间是 12:30。', '会议时间：12:30。'],
+    ['Meeting time is 12:30.', 'Meeting time: 12:30.'],
+  ])('accepts a time field paraphrase without treating the value colon as a field separator: %s', (snippet, claim) => {
+    expect(validateKnowledgeAnswer(
+      `${claim}[[kb:evidence:0]]`, [evidence(0, { snippet })], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it('keeps one-subject value lists as one supported fact tuple', () => {
+    expect(validateKnowledgeAnswer(
+      '甲方支持红色、蓝色。[[kb:evidence:0]]',
+      [evidence(0, { snippet: '甲方支持红色、蓝色。' })],
+      'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
+    ['完成导入后，系统生成摘要。', '完成导入后，系统生成摘要。'],
+    ['系统运行稳定，日志记录完整。', '系统运行稳定，日志记录完整。'],
+  ])('keeps an ordinary or temporal comma sentence supported: %s', (snippet, claim) => {
+    expect(validateKnowledgeAnswer(
+      `${claim}[[kb:evidence:0]]`, [evidence(0, { snippet })], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
+    ['一般结论 [[kb:evidence:forged]]', '【一般信息】一般结论'],
+    ['一般结论 [[kb:evidence:forged', '【一般信息】一般结论'],
+    ['一般结论 [[kb:', '【一般信息】一般结论'],
+    ['一般结论 [[kb:\nforged]]', '【一般信息】一般结论'],
+    ['一般结论 [[ kb ： forged ]]', '【一般信息】一般结论'],
+    ['一般结论 [[\u200bkb：forged]]', '【一般信息】一般结论'],
+  ])('strips complete or malformed markers from mixed no-evidence output: %s', (answer, expected) => {
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: expected,
+    })
+  })
+
+  it.each([
+    '[[kb:evidence:forged]]',
+    '[[kb:evidence:forged',
+    '[[kb:',
+    '[[kb:\nforged]]',
+    '[[ kb ： forged ]]',
+    '[[\u200bkb：forged]]',
+    '[[kb:[[kb:forged]]payload]]',
+    '[[kb:outer [[level [[not-kb]] end]] payload]]',
+    '[[kb:outer [[not-kb]] payload',
+    '[[kb:first]][[ kb:second [[not-kb]] payload]]',
+  ])('fails mixed no-evidence output closed when marker cleanup leaves no answer: %s', (answer) => {
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'insufficient', reason: 'no-evidence',
+    })
+  })
+
+  it('removes a malformed marker tail while retaining an admitted mixed citation', () => {
+    expect(validateKnowledgeAnswer(
+      '合同生效。[[kb:evidence:0]][[kb:',
+      [evidence(0, { snippet: '合同生效。' })],
+      'mixed', 1,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: '【知识库依据】合同生效。',
+    })
+  })
+
+  it('removes a cross-line malformed marker while retaining an admitted mixed citation', () => {
+    expect(validateKnowledgeAnswer(
+      '合同生效。[[kb:evidence:0]] [[kb:\nforged]]',
+      [evidence(0, { snippet: '合同生效。' })],
+      'mixed', 1,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: '【知识库依据】合同生效。',
+    })
+  })
+
+  it('removes an entire nested suspicious marker while retaining an admitted mixed citation', () => {
+    expect(validateKnowledgeAnswer(
+      '合同生效。[[kb:evidence:0]] [[ kb:outer [[not-kb]] payload]]',
+      [evidence(0, { snippet: '合同生效。' })],
+      'mixed', 1,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: '【知识库依据】合同生效。',
+    })
+  })
+
+  it('bounds nested marker scanning to the existing 4,000-character answer boundary', () => {
+    const prefix = '一般说明'.padEnd(4_000, '甲')
+    expect(validateKnowledgeAnswer(`${prefix}[[kb:[[not-kb]]payload]]tail`, [], 'mixed', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: `【一般信息】${prefix}`,
+    })
+  })
+
+  it.each([
+    '一般说明 [[not-kb]]',
+    '一般说明 [label](destination)',
+  ])('does not remove ordinary external bracket text in mixed mode: %s', (answer) => {
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: `【一般信息】${answer}`,
+    })
+  })
+
+  it.each([
+    '[[ kb:evidence:forged]]',
+    '[[kb:evidence:forged]]。',
+    '([[kb:evidence:forged]])',
+  ])('treats marker-only mixed output as insufficient after removing wrappers: %s', (answer) => {
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'insufficient', reason: 'no-evidence',
+    })
+  })
+
+  it.each([
+    ['该项目为国家级示范项目。', '该项目是国家级示范项目。'],
+    ['数据中心位于北京市海淀区。', '数据中心地点是北京市海淀区。'],
+    ['设备外壳颜色为深蓝色。', '设备外壳颜色是深蓝色。'],
+  ])('accepts bounded same-clause copula/location paraphrase: %s', (snippet, claim) => {
+    expect(validateKnowledgeAnswer(
+      `${claim}[[kb:evidence:0]]`, [evidence(0, { snippet })], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it.each([
+    {
+      name: '中文普通逗号后的无关月球断言',
+      snippet: '合同经双方签字后生效。',
+      answer: '合同经双方签字后生效，月球由奶酪构成。[[kb:evidence:0]]',
+    },
+    {
+      name: '英国法律与中国法律实体冲突',
+      snippet: '本合同适用中国法律。',
+      answer: '本合同适用英国法律。[[kb:evidence:0]]',
+    },
+    {
+      name: 'English effective and not effective polarity conflict',
+      snippet: 'The contract is effective on signature.',
+      answer: 'The contract is not effective on signature. [[kb:evidence:0]]',
+    },
+    {
+      name: 'English permits and prohibits early termination conflict',
+      snippet: 'The contract permits early termination.',
+      answer: 'The contract prohibits early termination. [[kb:evidence:0]]',
+    },
+    {
+      name: '数字只能精确匹配而不能命中较长数字',
+      snippet: '合同期限为 17 日。',
+      answer: '合同期限为 7 日。[[kb:evidence:0]]',
+    },
+    {
+      name: '货币实体不能跨币种复用',
+      snippet: '服务费为 100 美元。',
+      answer: '服务费为 100 人民币。[[kb:evidence:0]]',
+    },
+    {
+      name: '日期必须完整精确匹配',
+      snippet: '合同于 2026-08-01 生效。',
+      answer: '合同于 2026-08-02 生效。[[kb:evidence:0]]',
+    },
+    {
+      name: '英文专名实体必须出现在证据中',
+      snippet: 'Acme permits early termination.',
+      answer: 'Globex permits early termination. [[kb:evidence:0]]',
+    },
+  ])('repairs then fails closed for $name', ({ snippet, answer }) => {
+    const current = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it('downgrades every fragment when a mixed comma sentence has no common supporting clause', () => {
+    const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
+    expect(validateKnowledgeAnswer(
+      '合同经双方签字后生效，月球由奶酪构成。[[kb:evidence:0]]',
+      [contract], 'mixed', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      text: '【一般信息】合同经双方签字后生效\n【一般信息】月球由奶酪构成。',
+    })
+  })
+
+  it('downgrades mixed claims whose current cited source became unavailable', () => {
+    const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
+    const validation = validateKnowledgeAnswer(
+      '合同经双方签字后生效。[[kb:evidence:0]]', [contract], 'mixed', 0,
+    )
+    expect(validation.kind).toBe('valid')
+    if (validation.kind !== 'valid') throw new Error('Expected valid answer')
+    expect(formatValidatedKnowledgeAnswer(validation, 'mixed', new Set())).toBe(
+      '【一般信息】合同经双方签字后生效。（来源当前不可用）',
+    )
+  })
+
+  it('requires a citation on each strict factual sentence and bounds eight emoji snippets by UTF-8 bytes', () => {
+    expect(validateKnowledgeAnswer(
+      '第一句没有依据。第二句有依据。[[kb:evidence:0]]', [evidence(0)], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['uncited-material'] })
+
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    registry.add(Array.from({ length: 8 }, (_, index) => evidence(index, {
+      snippet: '😀'.repeat(2_000),
+      citation: {
+        evidenceId: `evidence:${index}`, documentId: `document_${index}`, versionId: `version_${index}`,
+        coordinate: { kind: 'docx', headingPath: ['😀'.repeat(500)], paragraph: index },
+      },
+    })))
+    const envelope = registry.providerEnvelope(registry.snapshot())
+    expect(new TextEncoder().encode(envelope).byteLength).toBeLessThanOrEqual(40 * 1024)
+    expect(envelope).toMatch(/END_UNTRUSTED_KNOWLEDGE_EVIDENCE$/u)
+  })
+})

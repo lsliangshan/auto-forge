@@ -13,6 +13,60 @@ const nonEmptyStringSchema = z.string().trim().min(1)
 const workflowSourceSchema = z.enum(['installed', 'development'])
 const buildHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 
+export const knowledgeCoordinateSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('pdf'), page: z.number().int().positive(),
+    startOffset: z.number().int().nonnegative(), endOffset: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    kind: z.literal('docx'), headingPath: z.array(nonEmptyStringSchema).max(32), paragraph: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    kind: z.literal('text'), line: z.number().int().positive(),
+    startOffset: z.number().int().nonnegative(), endOffset: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({ kind: z.literal('html'), structuralPath: nonEmptyStringSchema.max(500) }).strict(),
+])
+
+export const knowledgeCitationSchema = z.object({
+  evidenceId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  coordinate: knowledgeCoordinateSchema,
+}).strict()
+export type KnowledgeCitation = z.infer<typeof knowledgeCitationSchema>
+
+export const knowledgeEvidenceSchema = z.object({
+  id: identifierSchema,
+  baseId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  snippet: nonEmptyStringSchema.max(4_000),
+  score: z.number().finite().min(0).max(1),
+  citation: knowledgeCitationSchema,
+}).strict().superRefine(({ id, documentId, versionId, citation }, context) => {
+  if (citation.evidenceId !== id || citation.documentId !== documentId || citation.versionId !== versionId) {
+    context.addIssue({ code: 'custom', path: ['citation'], message: 'Knowledge citation must reference this evidence item' })
+  }
+})
+export type KnowledgeEvidence = z.infer<typeof knowledgeEvidenceSchema>
+
+const knowledgeDocumentEventSummarySchema = z.object({
+  id: identifierSchema,
+  baseId: identifierSchema,
+  name: nonEmptyStringSchema.max(500),
+  mimeType: nonEmptyStringSchema.max(200),
+  status: z.enum(['queued', 'copying', 'parsing', 'indexing', 'ready', 'failed', 'paused', 'deleted']),
+  versionCount: z.number().int().nonnegative(),
+  updatedAt: timestampSchema,
+}).strict()
+
+export const knowledgeEventSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('document_updated'), document: knowledgeDocumentEventSummarySchema }).strict(),
+  z.object({ type: z.literal('document_removed'), documentId: identifierSchema }).strict(),
+])
+export type KnowledgeEvent = z.infer<typeof knowledgeEventSchema>
+
 function opaqueKeyTokens(key: string): string[] {
   return key
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
@@ -155,7 +209,43 @@ export const browserStatusBlockSchema = z.object({
   errorCode: appErrorCodeSchema.optional(),
 }).strict()
 
-export const chatBlockSchema = z.discriminatedUnion('type', [
+export const knowledgeStatusBlockSchema = z.object({
+  type: z.literal('knowledge_status'),
+  blockId: identifierSchema,
+  status: z.enum([
+    'searching', 'found', 'consent_required', 'consent_denied',
+    'insufficient', 'source_unavailable', 'failed',
+  ]),
+  searchIndex: z.number().int().positive().max(3),
+  searchLimit: z.literal(3),
+  evidenceCount: z.number().int().nonnegative().max(8),
+  provider: z.enum(['openrouter', 'deepseek']).optional(),
+  errorCode: appErrorCodeSchema.optional(),
+}).strict().superRefine(({ status, evidenceCount, errorCode, provider }, context) => {
+  if ((status === 'searching' || status === 'found') && errorCode !== undefined) {
+    context.addIssue({ code: 'custom', path: ['errorCode'], message: 'Active knowledge status cannot contain an error' })
+  }
+  if (status === 'found' && evidenceCount === 0) {
+    context.addIssue({ code: 'custom', path: ['evidenceCount'], message: 'Found knowledge status requires evidence' })
+  }
+  const consentStatus = status === 'consent_required' || status === 'consent_denied'
+  if (consentStatus !== (provider !== undefined)) {
+    context.addIssue({ code: 'custom', path: ['provider'], message: 'Provider is required only for consent status' })
+  }
+})
+
+export const knowledgeCitationBlockSchema = z.object({
+  type: z.literal('knowledge_citation'),
+  blockId: identifierSchema,
+  evidenceId: identifierSchema,
+  baseId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  coordinate: knowledgeCoordinateSchema,
+  legacyUnavailable: z.literal(true).optional(),
+}).strict()
+
+const currentChatBlockSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string() }).strict(),
   z.object({ type: z.literal('reasoning_status'), label: z.string().trim().min(1) }).strict(),
   z.object({
@@ -245,9 +335,29 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     message: z.string().trim().min(1),
   }).strict(),
   browserStatusBlockSchema,
+  knowledgeStatusBlockSchema,
+  knowledgeCitationBlockSchema,
   mediaBlockSchema,
   mediaGenerationBlockSchema,
 ])
+
+function normalizeLegacyKnowledgeCitation(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || !('type' in value)
+    || value.type !== 'knowledge_citation' || 'baseId' in value) return value
+  const legacy = value as Record<string, unknown>
+  return {
+    type: 'knowledge_citation',
+    blockId: legacy.blockId,
+    evidenceId: legacy.evidenceId,
+    baseId: 'legacy_unavailable',
+    documentId: legacy.documentId,
+    versionId: legacy.versionId,
+    coordinate: legacy.coordinate,
+    legacyUnavailable: true,
+  }
+}
+
+export const chatBlockSchema = z.preprocess(normalizeLegacyKnowledgeCitation, currentChatBlockSchema)
 
 export type ChatBlock = z.infer<typeof chatBlockSchema>
 
@@ -286,7 +396,7 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     conversationId: identifierSchema,
     messageId: identifierSchema,
     blockId: identifierSchema,
-    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema]),
+    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema, knowledgeStatusBlockSchema]),
   }).strict(),
   z.object({
     type: z.literal('conversation_title_updated'),

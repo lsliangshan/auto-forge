@@ -127,14 +127,18 @@ describe('preload desktop bridge', () => {
     const importRequest = { includeUnowned: false, cloudSyncConsent }
 
     await app.api.settings.recordPrivacyConsent(cloudSyncConsent)
+    await app.api.settings.getCloudSyncConsentState()
+    await app.api.settings.revokeCloudSyncConsent({ confirmed: true })
     await app.api.settings.previewLegacyImport()
     await app.api.settings.importLegacyData(importRequest)
     await app.api.settings.getAccountDataPreferences()
     await app.api.settings.updateAccountDataPreferences({ timezone: 'UTC', displayCurrency: 'USD' })
     await app.api.settings.getRemoteUsage()
 
-    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-6)).toEqual([
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-8)).toEqual([
       [ipcChannels.settingsRecordPrivacyConsent, cloudSyncConsent],
+      [ipcChannels.settingsGetCloudSyncConsentState, undefined],
+      [ipcChannels.settingsRevokeCloudSyncConsent, { confirmed: true }],
       [ipcChannels.settingsPreviewLegacyImport, undefined],
       [ipcChannels.settingsImportLegacyData, importRequest],
       [ipcChannels.settingsGetAccountDataPreferences, undefined],
@@ -182,10 +186,13 @@ describe('preload desktop bridge', () => {
 
   it('maps browser continuation takeover, redacted audit, and explicit data clearing to fixed channels', async () => {
     const app = harness()
+    const clearToken = 'a'.repeat(64)
 
     await app.api.chat.takeOverBrowser({ requestId: 'request_1', bindingId: 'binding_1' })
     await app.api.chat.listBrowserAudit('binding_1')
-    await app.api.settings.clearBrowserData()
+    await app.api.settings.captureDataClearToken()
+    await app.api.settings.clearLocalData('all', clearToken)
+    await app.api.settings.clearBrowserData(clearToken)
 
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.chatTakeOverBrowser, {
       requestId: 'request_1', bindingId: 'binding_1',
@@ -193,7 +200,13 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.chatListBrowserAudit, {
       bindingId: 'binding_1',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.settingsClearBrowserData, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.settingsCaptureDataClearToken, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.settingsClearLocalData, {
+      scope: 'all', token: clearToken,
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(5, ipcChannels.settingsClearBrowserData, {
+      token: clearToken,
+    })
     expect(app.api.chat).not.toHaveProperty('invoke')
     expect(app.api.settings).not.toHaveProperty('clearStorageData')
   })
@@ -274,6 +287,80 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.chatUpdateGenerationPreferences, { conversationId: 'conversation_1', preferences })
     expect(app.api).not.toHaveProperty('invoke')
     expect(app.api).not.toHaveProperty('ipcRenderer')
+  })
+
+  it('uses fixed path-free knowledge channels and returns only opaque import handles', async () => {
+    // Catches a production change that exposes a generic filesystem bridge or forwards a local path.
+    const app = harness()
+    vi.mocked(app.ipcRenderer.invoke).mockResolvedValueOnce([{
+      id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
+    }])
+
+    await expect(app.api.knowledge.pickImportFiles()).resolves.toEqual([{
+      id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
+    }])
+    await app.api.knowledge.importDocument('base_1', 'import_1')
+    await app.api.knowledge.restoreDocument('document_1')
+    await app.api.knowledge.restoreBase('base_1')
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.knowledgePickImportFiles, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeImportDocument, {
+      baseId: 'base_1', importHandleId: 'import_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.knowledgeRestoreDocument, {
+      documentId: 'document_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.knowledgeRestoreBase, {
+      baseId: 'base_1',
+    })
+    expect(app.api).not.toHaveProperty('getPathForFile')
+    expect(JSON.stringify(app.api)).not.toContain('/private')
+  })
+
+  it('exposes only fixed Provider-consent and lazy source-preview knowledge calls', async () => {
+    const app = harness()
+    vi.mocked(app.ipcRenderer.invoke)
+      .mockResolvedValueOnce({ provider: 'deepseek', status: 'granted' })
+      .mockResolvedValueOnce({ provider: 'deepseek', status: 'unknown' })
+      .mockResolvedValueOnce({ kind: 'available', preview: '最小原文' })
+    await app.api.knowledge.setConsent('deepseek', 'granted')
+    await app.api.knowledge.revokeConsent('deepseek')
+    await app.api.knowledge.getSourcePreview({
+      evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
+      coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 4 },
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.knowledgeSetConsent, {
+      provider: 'deepseek', status: 'granted',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeRevokeConsent, {
+      provider: 'deepseek',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.knowledgeGetSourcePreview, {
+      evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
+      coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 4 },
+    })
+  })
+
+  it('forwards only strict owner-free knowledge events', () => {
+    // Catches a production change that forwards owner scope or local paths from Main events.
+    const app = harness()
+    const listener = vi.fn()
+    app.api.knowledge.onEvent(listener)
+    const wrapped = [...app.listeners.get(ipcChannels.knowledgeEvent)!][0]!
+    const event = {
+      type: 'document_updated',
+      document: {
+        id: 'document_1', baseId: 'base_1', name: 'policy.txt', mimeType: 'text/plain',
+        status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
+      },
+    }
+
+    wrapped({}, event)
+    wrapped({}, { ...event, ownerUserId: 'private-owner' })
+    wrapped({}, { ...event, path: '/private/policy.txt' })
+
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(event)
   })
 
   it('normalizes IPC errors without exposing resolved paths', async () => {

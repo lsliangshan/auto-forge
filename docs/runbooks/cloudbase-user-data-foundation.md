@@ -14,11 +14,12 @@ The following order is mandatory.
 
 ### 1. Apply schema
 
-Have an authorized database operator apply the reviewed user-data foundation migration to the target environment. Confirm the canonical and deployment migration artifacts are byte-identical before application. Record the migration checksum and database runtime version.
+Have an authorized database operator apply the reviewed user-data migrations in numeric order, including the additive consent-revocation migration. Confirm each canonical and deployment migration pair is byte-identical before application. Record every migration checksum and the database runtime version.
 
 Go criteria:
 
 - All tables, indexes, policies, and service-role RPCs are present at the expected version.
+- `app_privacy_consent_states` retains one monotonic owner/purpose revision while `app_privacy_consents` retains accepted history.
 - Direct client roles have no table access and no direct RPC grants.
 - The existing rollback artifact remains data-preserving.
 
@@ -55,12 +56,13 @@ Go criteria:
 
 ### 4. Enable shadow write
 
-Enable remote writes only for the internal rollout cohort while keeping local data authoritative and remote reads disabled. Exercise creates, renames, message appends, deletes, consent, preferences, legacy import, and BYOK usage records.
+Enable remote writes only for the internal rollout cohort while keeping local data authoritative and remote reads disabled. Exercise creates, renames, message appends, deletes, consent acceptance/revocation/re-acceptance, preferences, legacy import, and BYOK usage records.
 
 Go criteria:
 
 - Local behavior remains unchanged when the remote service is unavailable.
 - Accepted mutations are owner-scoped and ordered; retries do not create additional logical rows.
+- A stale acceptance conflicts after revocation, a stale revocation conflicts after re-acceptance, and neither changes the current consent revision.
 - Retry, quarantine, conflict, and response-size metrics remain within the approved thresholds.
 
 ### 5. Compare counts and deterministic hashes

@@ -1,0 +1,8 @@
+packages:
+  - .
+
+overrides:
+  '@xmldom/xmldom': 0.8.13
+
+patchedDependencies:
+  pdfjs-dist@6.2.108: patches/pdfjs-dist@6.2.108.patch
