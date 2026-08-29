@@ -5038,6 +5038,18 @@ describe('createApplicationRuntime', () => {
     '不要把图片做成 ICO，但请将它保存为 WebP',
     '支持转换成哪些格式？请把图片转成 PDF',
     'What formats are supported? Save it as WebP',
+    '转换这个附件',
+    '把图片保存为 ZIP',
+    '把附件另存一份',
+    '导出这个文档为 DOCX',
+    'transcode this audio',
+    'save this image as TIF',
+    'export this document as DOCX',
+    '用万象转换处理这个附件',
+    '不要解释，直接转换这个附件',
+    '转换这个附件后，告诉我它是什么格式',
+    '不要转换成 Word，而是 ZIP',
+    "don't convert to Word; DOCX instead",
   ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
@@ -5142,6 +5154,18 @@ describe('createApplicationRuntime', () => {
     '可以把图片转换成什么格式？',
     '请问能将这个文件转成哪些格式？',
     '万象转换支持什么格式？',
+    '不用转换这个附件',
+    '不需要把图片保存为 ZIP',
+    'no need to convert this file',
+    'no need to save this image as TIF',
+    '介绍一下万象转换',
+    '万象转换是什么？',
+    '万象转换支持哪些格式？',
+    '万象转换能转换哪些格式？',
+    '这个工具能把图片转成什么格式？',
+    '万象转换安全吗？',
+    '万象转换会上传文件吗？',
+    '如何使用万象转换？',
   ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
     directories.push(root)

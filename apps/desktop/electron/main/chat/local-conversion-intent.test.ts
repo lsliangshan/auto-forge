@@ -43,6 +43,26 @@ describe('local conversion intent', () => {
     'make this image into an ICO file',
     '支持转换成哪些格式？请把图片转成 PDF',
     'What formats are supported? Save it as WebP',
+    '转换这个附件',
+    '把图片制作一下',
+    '把图片保存为 ZIP',
+    '把附件另存一份',
+    '导出这个文档',
+    'transcode this audio',
+    'convert this file',
+    'save this image as TIF',
+    'export this document as DOCX',
+    'make this image a ZIP',
+    'turn it into TIF',
+    'change this file to DOCX',
+    '用万象转换处理这个附件',
+    '处理这个附件',
+    '不要解释，直接转换这个附件',
+    '不要说明安全性，把附件导出为 ZIP',
+    '转换这个附件后，告诉我它是什么格式',
+    'convert this file; what format is it afterward',
+    '不要转换成 Word，而是 ZIP',
+    "don't convert to Word; DOCX instead",
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -88,6 +108,20 @@ describe('local conversion intent', () => {
     ['不要把图片做成 ICO，也不要将它保存为 WebP', attachments],
     ['What formats are supported?', attachments],
     ['Which formats can it convert to?', attachments],
+    ['不用转换这个附件', attachments],
+    ['不需要把图片保存为 ZIP', attachments],
+    ['请不用万象转换处理这个附件', attachments],
+    ['no need to convert this file', attachments],
+    ['Please, no need to transcode this audio', attachments],
+    ['no need to save this image as TIF', attachments],
+    ['介绍一下万象转换', attachments],
+    ['万象转换是什么？', attachments],
+    ['万象转换支持哪些格式？', attachments],
+    ['万象转换能转换哪些格式？', attachments],
+    ['这个工具能把图片转成什么格式？', attachments],
+    ['万象转换安全吗？', attachments],
+    ['万象转换会上传文件吗？', attachments],
+    ['如何使用万象转换？', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)
@@ -100,6 +134,9 @@ describe('local conversion intent', () => {
     ['Please don’t', 'make this image an', 'ICO'],
     ["Please don't", 'save the file as', 'JPG'],
     ['Never', 'turn it into', '.WebP'],
+    ['不用', '转换', 'ZIP'],
+    ['不需要', '把附件保存为', 'TIF'],
+    ['no need to', 'export this file as', 'DOCX'],
   ] as const)('keeps a negated conversion non-local: %s %s %s', (modifier, action, target) => {
     expect(hasLocalConversionIntent(`${modifier} ${action} ${target}`, attachments)).toBe(false)
   })
@@ -109,6 +146,8 @@ describe('local conversion intent', () => {
     ['可以把图片转换成', '什么格式？'],
     ['请问能将这个文件转成', '哪些格式？'],
     ['万象转换支持', '什么格式？'],
+    ['万象转换能转换', '哪些格式？'],
+    ['这个工具能把图片转成', '什么格式？'],
   ] as const)('keeps a capability question non-local: %s%s', (prefix, targetQuestion) => {
     expect(hasLocalConversionIntent(`${prefix}${targetQuestion}`, attachments)).toBe(false)
   })
