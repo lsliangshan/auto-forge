@@ -46,6 +46,33 @@ The repository root contains unrelated pending migrations. Never run a root-wide
 for this launch. Copy only `migrations/0001_membership_control_plane.sql` to an empty `mktemp -d`
 workspace, run a dry-run there, verify its hash again, and then apply that single migration.
 
+### 2026-08-30 approved no-backup exception
+
+The operator explicitly authorized this dark launch to continue without the backup required above.
+This is a one-rollout exception, not a change to the production gate. The shared production database
+had no confirmed manual backup or PITR boundary, so recovery remains limited to the additive rollback
+described below and compensating membership mutations.
+
+- Environment `autoforge-d1gkhyfb419ba8455`, region `ap-shanghai`.
+- Migration SHA-256 `b3510a984a170fba22c78b331f3c6f1fd37b130b0569fe4f01419d1bbac0ad8b`;
+  CloudBase task `task-c1627200` submitted only the five already-applied migrations plus the one
+  membership migration, and the service executed only the latter. Seven unrelated root migrations
+  were not submitted.
+- `autoforge-membership` was deployed Active on Node.js 18.15 with key id
+  `membership-2026-08`. The Ed25519 private key was generated in process memory and injected through
+  child-process environment expansion; it was not printed or written to disk.
+- Canary fingerprint `3f289aeb40e1` and administrator fingerprint `98ad26b8c62a` use the first 12
+  hexadecimal characters of SHA-256 over the exact string user id. No raw user id is recorded here.
+- The single canary completed Free v0 -> Pro v1 -> extended Pro v2 -> revoked v3 -> corrected Free
+  v4. The revoke assertion initially expected Pro limits even though revoked memberships correctly
+  project Free limits; its fail-safe compensation performed the final correction. Read-only RPC and
+  rendered Electron verification then confirmed Free `1 / 1`, 64 MiB, and exactly four immutable
+  audit events in reverse order: `correct`, `revoke`, `extend`, `grant`.
+- Personal-knowledge cloud execution remained fail-closed throughout the rollout.
+
+Use `scripts/run-production-canary.mjs --verify` for a read-only repeat of the final membership and
+audit assertions. `--apply` creates a new four-event canary cycle and must not be used as a probe.
+
 ## Canary sequence
 
 1. Apply only the membership migration and verify Free plan defaults through the service-role RPC.

@@ -16,6 +16,14 @@ export const AUTOFORGE_KNOWLEDGE_ENTITLEMENT_PUBLIC_KEYS = Object.freeze({
 MCowBQYDK2VwAyEALldb4naB63qosvMo+P8W6Jyh7fia+uzNRFjSr2OlG9E=
 -----END PUBLIC KEY-----`,
     generation: 1,
+    status: 'retired' as const,
+    retiredAt: '2026-08-29T16:26:33.000Z',
+  }),
+  'membership-2026-08': Object.freeze({
+    publicKey: `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAj/gvU8DhRL/YnQ8LUCy7fy/eSWV0geIWkRWTYa0ud5c=
+-----END PUBLIC KEY-----`,
+    generation: 2,
     status: 'active' as const,
   }),
 })

@@ -1,6 +1,7 @@
 import { generateKeyPairSync, sign } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import {
+  AUTOFORGE_KNOWLEDGE_ENTITLEMENT_PUBLIC_KEYS,
   canonicalizeEntitlementPayload,
   canonicalizeMembershipEntitlementPayload,
   createKnowledgeEntitlementVerificationCallback,
@@ -37,6 +38,12 @@ function fixture() {
 }
 
 describe('KnowledgeEntitlementVerifier', () => {
+  it('constructs the production verifier with one active signing generation', () => {
+    expect(() => new KnowledgeEntitlementVerifier({
+      publicKeys: AUTOFORGE_KNOWLEDGE_ENTITLEMENT_PUBLIC_KEYS,
+    })).not.toThrow()
+  })
+
   it('accepts a canonical valid Ed25519 snapshot for the authenticated owner', () => {
     const { envelope, verifier } = fixture()
     expect(verifier().verify('alice', envelope())).toMatchObject({
