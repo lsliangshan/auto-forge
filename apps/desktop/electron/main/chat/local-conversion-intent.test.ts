@@ -26,6 +26,16 @@ describe('local conversion intent', () => {
     "don't convert to Word; PDF instead",
     '改为 PDF',
     'PDF instead',
+    '把图片做成 ico',
+    '把图片保存为 webp',
+    '将这张照片制作成 ICNS',
+    '保存这个文件为 xlsx',
+    '把附件存为 PDF',
+    'make this image an ICO',
+    'make the attachment into WebP',
+    'save this image as PNG',
+    'turn this photo into AVIF',
+    'change the file to GIF',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -38,6 +48,12 @@ describe('local conversion intent', () => {
     ["don't convert this attachment", attachments],
     ['不要把这个附件转换成 PDF', attachments],
     ["don't convert this file to PDF", attachments],
+    ['不要把图片做成 ICO', attachments],
+    ['请勿把图片保存为 WebP', attachments],
+    ["don't make this image an ICO", attachments],
+    ['never save this image as WebP', attachments],
+    ['帮我总结这张图片', attachments],
+    ['这张图片是什么格式？', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)

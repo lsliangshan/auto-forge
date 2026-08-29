@@ -7,13 +7,29 @@ export interface LocalAttachmentProjection {
   byteSize: number
 }
 
+const CONVERSION_TARGET_PATTERN = `(?:${CONVERSION_TARGET_FORMATS.join('|')})`
 const CONVERSION_REQUEST = /(?:转换|转成|转为|导出为|另存为|万象转换|\bconvert\b|\btranscode\b|\bexport\s+(?:as|to)\b|\bsave\s+as\b)/iu
+const CHINESE_TARGETED_CONVERSION_CLAUSE = `(?:做成|制作成|输出(?:成|为)|(?:保存|存)[^，,；;。.!！？?]{0,24}?(?:成|为))\\s*${CONVERSION_TARGET_PATTERN}(?=$|[^\\p{L}\\p{N}])`
+const ENGLISH_ATTACHMENT_NOUN = `(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:image|photo|picture|attachment|file|document|video|audio)`
+const ENGLISH_TARGETED_CONVERSION_CLAUSE = `(?:make\\s+${ENGLISH_ATTACHMENT_NOUN}\\s+(?:(?:into|as)\\s+|an?\\s+)?${CONVERSION_TARGET_PATTERN}|(?:save|export)\\s+${ENGLISH_ATTACHMENT_NOUN}\\s+(?:as|to)\\s+${CONVERSION_TARGET_PATTERN}|(?:turn|change)\\s+${ENGLISH_ATTACHMENT_NOUN}\\s+(?:into|to)\\s+${CONVERSION_TARGET_PATTERN})(?=$|[^\\p{L}\\p{N}])`
+const TARGETED_CONVERSION_REQUEST = new RegExp(
+  `(?:${CHINESE_TARGETED_CONVERSION_CLAUSE}|\\b${ENGLISH_TARGETED_CONVERSION_CLAUSE})`,
+  'iu',
+)
 const FULLY_NEGATED_CONVERSION_REQUESTS = [
   /^(?:请\s*)?(?:不要|无需|不必|别|禁止|请勿)\s*(?:把|将)?\s*(?:(?:这|这个|该|当前)\s*)?(?:附件|文件)?\s*(?:转换|转成|转为|导出为|另存为|万象转换)(?:\s*(?:(?:这|这个|该|当前)\s*)?(?:附件|文件))?(?:\s*(?:成|为|到)?\s*[\p{L}\p{N}._-]+)?\s*[。.!！]?$/iu,
   /^(?:please\s+)?(?:do\s+not|don't|never)\s+(?:(?:convert|transcode)(?:\s+(?:this|the|current))?(?:\s+(?:attachment|file))?(?:\s+(?:to|as)\s+[\p{L}\p{N}._-]+)?|(?:export\s+(?:as|to)|save\s+as)\s+[\p{L}\p{N}._-]+)\s*[.!]?$/iu,
+  new RegExp(
+    `^(?:请\\s*)?(?:不要|无需|不必|别|禁止|请勿)[^，,；;。.!！？?]{0,64}${CHINESE_TARGETED_CONVERSION_CLAUSE}\\s*[。.!！]?$`,
+    'iu',
+  ),
+  new RegExp(
+    `^(?:please\\s+)?(?:do\\s+not|don't|never)\\s+${ENGLISH_TARGETED_CONVERSION_CLAUSE}\\s*[.!]?$`,
+    'iu',
+  ),
 ]
 const CONVERSION_TARGET = new RegExp(
-  `(?:^|[^\\p{L}\\p{N}])(?:${CONVERSION_TARGET_FORMATS.join('|')})(?=$|[^\\p{L}\\p{N}])`,
+  `(?:^|[^\\p{L}\\p{N}])${CONVERSION_TARGET_PATTERN}(?=$|[^\\p{L}\\p{N}])`,
   'iu',
 )
 const CONTRASTIVE_ALTERNATIVE = /(?:而是|改成|改为|(?<!转)换成|(?<!转)换为|\binstead\b|\brather\b|\balternatively\b)/iu
@@ -51,6 +67,7 @@ export function hasLocalConversionIntent(
   const normalized = text.trim()
   const hasAlternative = CONTRASTIVE_ALTERNATIVE.test(normalized)
   const conversionLike = CONVERSION_REQUEST.test(normalized)
+    || TARGETED_CONVERSION_REQUEST.test(normalized)
     || (CONVERSION_TARGET.test(normalized) && hasAlternative)
   const fullyNegated = !hasAlternative
     && FULLY_NEGATED_CONVERSION_REQUESTS.some((pattern) => pattern.test(normalized))

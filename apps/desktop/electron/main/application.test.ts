@@ -5019,13 +5019,25 @@ describe('createApplicationRuntime', () => {
   it.each([
     '不要转换成 Word，而是 PDF',
     "don't convert to Word; PDF instead",
-  ])('keeps an implicit contrastive conversion private across chat and title calls: %s', async (content) => {
+    '把图片做成 ico',
+    '把图片保存为 webp',
+    '将这张照片制作成 ICNS',
+    '保存这个文件为 png',
+    'make this image an ICO',
+    'make the attachment into WebP',
+    'save this image as PNG',
+    'turn this photo into AVIF',
+  ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
-    const source = join(root, 'private-source.txt')
+    const source = join(root, 'private-source.png')
     const privateContent = 'IMPLICIT_CONVERSION_PRIVATE_CONTENT_MARKER'
+    const privateBytes = Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'),
+      Buffer.from(privateContent),
+    ])
     const assistantEchoMarker = 'ASSISTANT_ECHO_PRIVATE_MARKER'
-    await writeFile(source, privateContent)
+    await writeFile(source, privateBytes)
     const captured: ModelStreamRequest[] = []
     const chatEvents: ChatEvent[] = []
     const modelInput = vi.fn()
@@ -5037,7 +5049,7 @@ describe('createApplicationRuntime', () => {
       return { ...service, modelInput }
     })
     const provider = snapshotProvider('openrouter', {
-      listModels: async () => [modelInfo('openrouter/implicit-conversion', 'Implicit conversion')],
+      listModels: async () => [visionTextModelInfo('openrouter/implicit-conversion')],
       validateCredential: async () => ({ valid: true }),
       stream: async function* (request) {
         captured.push(request)
@@ -5048,9 +5060,9 @@ describe('createApplicationRuntime', () => {
             ? '附件格式转换'
             : [
                 assistantEchoMarker,
-                'private-source.txt',
-                'text/plain',
-                '42 bytes',
+                'private-source.png',
+                'image/png',
+                `${privateBytes.byteLength} bytes`,
                 attachmentSourceId,
                 privateContent,
               ].join(' '),
@@ -5093,17 +5105,17 @@ describe('createApplicationRuntime', () => {
     const providerPayload = JSON.stringify(captured)
     expect(providerPayload).not.toContain(privateContent)
     expect(providerPayload).not.toContain(assistantEchoMarker)
-    expect(providerPayload).not.toContain(Buffer.from(privateContent).toString('base64'))
+    expect(providerPayload).not.toContain(privateBytes.toString('base64'))
     expect(providerPayload).not.toContain(asset!.id)
     expect(providerPayload).not.toContain(source)
     expect(providerPayload).not.toMatch(/dataBase64|mediaAssetId|sourceId|absolutePath|relativePath|file:\/\//i)
     const agentPayload = JSON.stringify(agentRequests(captured)[0])
-    expect(agentPayload).toContain('[附件 0: private-source.txt, text/plain, 42 bytes]')
+    expect(agentPayload).toContain(`[附件 0: private-source.png, image/png, ${privateBytes.byteLength} bytes]`)
     const titleRequest = captured.find(isConversationTitleRequest)
     expect(titleRequest?.messages).toContainEqual({ role: 'user', content: `用户：${content}` })
     const titlePayload = JSON.stringify(titleRequest)
     expect(titlePayload).not.toContain('AI：')
-    expect(titlePayload).not.toMatch(/历史附件|private-source\.txt|text\/plain|42 bytes|mediaAssetId|sourceId|ASSISTANT_ECHO_PRIVATE_MARKER/i)
+    expect(titlePayload).not.toMatch(/历史附件|private-source\.png|image\/png|bytes|mediaAssetId|sourceId|ASSISTANT_ECHO_PRIVATE_MARKER/i)
     await runtime.close()
   })
 
