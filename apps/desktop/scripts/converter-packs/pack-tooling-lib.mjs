@@ -202,6 +202,10 @@ export function approvedTarget(platform, arch) {
     || (platform === 'win32' && arch === 'x64')
 }
 
+export function firstReleaseTarget(platform, arch) {
+  return platform === 'darwin' && (arch === 'arm64' || arch === 'x64')
+}
+
 function validVersion(value) {
   if (typeof value !== 'string' || value.length > 128) return false
   const match = semverPattern.exec(value)
@@ -278,7 +282,6 @@ export function validatePackDescriptor(value) {
 const productionCoordinates = new Set(PACK_NAMES.flatMap((name) => [
   `${name}\0darwin\0arm64`,
   `${name}\0darwin\0x64`,
-  `${name}\0win32\0x64`,
 ]))
 
 export function validateIndex(value, mode = 'test') {
@@ -311,7 +314,7 @@ export function validateIndex(value, mode = 'test') {
       value.packs.length !== productionCoordinates.size
       || inventory.size !== productionCoordinates.size
       || [...inventory].some((coordinate) => !productionCoordinates.has(coordinate))
-    ) fail('Production release must contain exactly four pack families for all three approved targets.')
+    ) fail('Production release must contain exactly four pack families for both first-release targets.')
   }
   return value
 }

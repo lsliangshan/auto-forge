@@ -383,7 +383,7 @@ describe('production conversion runtime', () => {
       {
         schemaVersion: 1, downloadsEnabled: false, indexUrl: null, rootPublicKeyFile: null,
         requiredPackFamilies: ['image-icon', 'document', 'pdf', 'media'],
-        supportedTargets: ['darwin-arm64', 'darwin-x64', 'win32-x64'],
+        supportedTargets: ['darwin-arm64', 'darwin-x64'],
       },
       {
         schemaVersion: 1, downloadsEnabled: true, indexUrl: 'http://packs.example.test/index.json',
@@ -427,7 +427,7 @@ describe('production conversion runtime', () => {
       schemaVersion: 1, downloadsEnabled: true,
       indexUrl: 'https://packs.example.test/releases/index.json', rootPublicKeyFile: 'root-public-key.pem',
       requiredPackFamilies: ['image-icon', 'document', 'pdf', 'media'],
-      supportedTargets: ['darwin-arm64', 'darwin-x64', 'win32-x64'],
+      supportedTargets: ['darwin-arm64', 'darwin-x64'],
     }))
     await writeFile(
       join(resourcesRoot, 'root-public-key.pem'),
@@ -479,7 +479,7 @@ describe('production conversion runtime', () => {
       schemaVersion: 1, downloadsEnabled: true,
       indexUrl: 'https://packs.example.test/releases/index.json', rootPublicKeyFile: 'root-public-key.pem',
       requiredPackFamilies: ['image-icon', 'document', 'pdf', 'media'],
-      supportedTargets: ['darwin-arm64', 'darwin-x64', 'win32-x64'],
+      supportedTargets: ['darwin-arm64', 'darwin-x64'],
     }))
     await writeFile(
       join(resourcesRoot, 'root-public-key.pem'),
@@ -539,7 +539,7 @@ describe('production conversion runtime', () => {
         schemaVersion: 1, downloadsEnabled: true,
         indexUrl: 'https://packs.example.test/releases/index.json', rootPublicKeyFile: 'root-public-key.pem',
         requiredPackFamilies: ['image-icon', 'document', 'pdf', 'media'],
-        supportedTargets: ['darwin-arm64', 'darwin-x64', 'win32-x64'],
+        supportedTargets: ['darwin-arm64', 'darwin-x64'],
       }))
       const trustedKey = await readFile(new URL('./fixtures/test-converter-root-public-key.pem', import.meta.url))
       const rootKeyPath = join(resourcesRoot, 'root-public-key.pem')
@@ -590,7 +590,7 @@ describe('production conversion runtime', () => {
     },
   )
 
-  it('fails closed on win32 when no Windows Job Object process tree is injected', async () => {
+  it('excludes win32 from the first-release matrix before reading release metadata or using the network', async () => {
     const app = await fixture({
       name: 'annual-report.pdf', mimeType: 'application/pdf', format: 'pdf', bytes: pdf(3),
     })
@@ -600,15 +600,22 @@ describe('production conversion runtime', () => {
       schemaVersion: 1, downloadsEnabled: true,
       indexUrl: 'https://packs.example.test/releases/index.json', rootPublicKeyFile: 'root-public-key.pem',
       requiredPackFamilies: ['image-icon', 'document', 'pdf', 'media'],
-      supportedTargets: ['darwin-arm64', 'darwin-x64', 'win32-x64'],
+      supportedTargets: ['darwin-arm64', 'darwin-x64'],
     }))
     await writeFile(
       join(resourcesRoot, 'root-public-key.pem'),
       await readFile(new URL('./fixtures/test-converter-root-public-key.pem', import.meta.url)),
     )
     const network = { fetch: vi.fn(), withTransportLease: vi.fn() }
+    const resourceFileOpen = vi.fn((path: string, flags: number) => open(path, flags))
     const create = createProductionConversionRuntimeFactory({
       resourcesRoot, network: network as never, platform: 'win32', arch: 'x64',
+      windowsJobObject: {
+        treeKind: 'windows-job-object',
+        spawn() { throw new Error('Windows conversion must remain unreachable in the first release') },
+        async terminateTree() {},
+      },
+      resourceFileOpen,
     })
     const binding = await create({
       ownerUserId: 'alice', dataRoot: app.dataRoot, packsRoot: join(app.dataRoot, 'win32-installed-packs'),
@@ -629,6 +636,7 @@ describe('production conversion runtime', () => {
       .rejects.toMatchObject({ code: 'CONVERSION_COMPONENT_UNAVAILABLE' })
     expect(network.fetch).not.toHaveBeenCalled()
     expect(network.withTransportLease).not.toHaveBeenCalled()
+    expect(resourceFileOpen).not.toHaveBeenCalled()
     app.database.close()
   })
 })

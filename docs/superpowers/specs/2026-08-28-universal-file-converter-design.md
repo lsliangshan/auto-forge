@@ -49,10 +49,14 @@ file is never overwritten.
 The first release supports:
 
 - macOS on Apple Silicon;
-- macOS on Intel;
-- Windows on x64.
+- macOS on Intel.
 
-Linux support and Linux packaging are outside this design.
+Windows and Linux conversion support and packaging are outside the first
+release. The production factory rejects Windows before reading release
+metadata or accessing the signed index/network. Cross-platform validation of
+signed Windows inventory, portable paths, reserved names, and active-content
+roles remains in place as security hardening; it does not advertise Windows
+release support.
 
 ## Scope
 
@@ -66,7 +70,7 @@ This design covers:
 - chat and developer-page presentation;
 - cancellation, timeout, restart recovery, and cleanup;
 - local privacy and security controls;
-- macOS and Windows packaging and release gates.
+- macOS arm64/x64 packaging and release gates.
 
 This design does not add:
 
@@ -688,8 +692,8 @@ converters to prove:
 
 ### Real Engine Tests
 
-On macOS arm64, macOS x64, and Windows x64, use licensed fixture files to cover
-at least one real route for every target family:
+On macOS arm64 and macOS x64, use licensed fixture files to cover at least one
+real route for every target family:
 
 - static image conversion;
 - animated GIF/WebP conversion;
@@ -727,12 +731,11 @@ Automated packaging must inspect the produced app and prove that:
 - platform and architecture selection is exact;
 - macOS components satisfy signing, hardened-runtime, quarantine, and
   notarization requirements;
-- Windows components and archives satisfy code-signing requirements;
 - all third-party license notices and source-offer obligations are met.
 
 The real hosted pack artifacts, production signature, macOS notarization,
-Windows signing, and CDN behavior are external release gates. Local fixtures or
-unsigned development packs must never be reported as release acceptance.
+and CDN behavior are external release gates. Local fixtures or unsigned
+development packs must never be reported as release acceptance.
 
 ## Implementation Boundaries
 
@@ -806,8 +809,9 @@ packaged root key through no-follow stable handles, accepts only an HTTPS index
 and sibling signature fetched under one controlled network lease with streamed
 byte caps, and never consults `PATH`. The checked-in bootstrap keeps downloads
 disabled and carries no key, so an unreleased build remains deterministically
-unavailable. Windows also remains unavailable unless Main receives a real Job
-Object process-tree port.
+unavailable. Windows is outside the first-release matrix and remains
+unconditionally unavailable even if a Job Object-shaped process-tree port is
+injected; rejection happens before release metadata or network/index access.
 
 Before adapter planning, the runtime copies the already-owned no-follow input
 handle into an exclusive private work directory, verifies size, hash, inode and
@@ -839,9 +843,9 @@ and rollback-leaf replacement. Normal reconciliation is idempotent; a detected
 conflict remains durably fail-closed until the user clears local data.
 
 This local Darwin arm64 fixture evidence is not release acceptance. Production
-signing keys and index, hosted packs and CDN behavior, all twelve production
+signing keys and index, hosted packs and CDN behavior, all eight production
 platform/architecture pack coordinates, third-party license review, real
-Darwin x64 and Windows x64 execution, code signing, hardened runtime,
+Darwin x64 execution, code signing, hardened runtime,
 notarization, quarantine behavior, production privacy review, and update or
 rollback drills remain external Task 13 gates. Real CloudBase/PostgreSQL sync,
 RLS, storage, and cross-device evidence remains an external Task 12 gate.

@@ -91,6 +91,29 @@ function stagePack(root: string, overrides: Partial<Record<string, unknown>> = {
   return stage
 }
 
+function stageWindowsPack(root: string): string {
+  const stage = stagePack(root)
+  const darwinPack = join(stage, 'packs', 'media-darwin-arm64')
+  const windowsPack = join(stage, 'packs', 'media-win32-x64')
+  renameSync(darwinPack, windowsPack)
+  renameSync(join(windowsPack, 'payload/bin/ffmpeg'), join(windowsPack, 'payload/bin/ffmpeg.exe'))
+  const manifestPath = join(windowsPack, 'pack.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    platform: string
+    arch: string
+    archiveUrl: string
+    files: Array<{ path: string; role: string }>
+  }
+  manifest.platform = 'win32'
+  manifest.arch = 'x64'
+  manifest.archiveUrl = 'https://packs.example.test/media-1.0.0-win32-x64.tar'
+  manifest.files = manifest.files.map((file) => (
+    file.path === 'bin/ffmpeg' ? { ...file, path: 'bin/ffmpeg.exe' } : file
+  ))
+  writeFileSync(manifestPath, JSON.stringify(manifest))
+  return stage
+}
+
 const targetExecutablePaths = {
   'image-icon': { darwin: ['bin/autoforge-image-converter'], win32: ['bin/autoforge-image-converter.exe'] },
   document: { darwin: ['program/soffice'], win32: ['program/soffice.exe'] },
@@ -106,7 +129,7 @@ function stageProduction(root: string): string {
     generatedAt: '2026-08-29T00:00:00.000Z',
     sequence: 13,
   }))
-  for (const [platform, arch] of [['darwin', 'arm64'], ['darwin', 'x64'], ['win32', 'x64']] as const) {
+  for (const [platform, arch] of [['darwin', 'arm64'], ['darwin', 'x64']] as const) {
     for (const name of ['image-icon', 'document', 'pdf', 'media'] as const) {
       const pack = join(stage, 'packs', `${name}-${platform}-${arch}`)
       const payload = join(pack, 'payload')
@@ -430,7 +453,7 @@ describe('converter pack release tooling', () => {
     }
   })
 
-  it('defaults to the exact 12-coordinate production inventory and accepts subsets only in explicit test mode', () => {
+  it('defaults to the exact 8-coordinate first-release inventory and accepts subsets only in explicit test mode', () => {
     const subsetRoot = temporaryRoot()
     const subsetStage = stagePack(subsetRoot)
     const defaultProduction = run(buildScript, [
@@ -455,7 +478,7 @@ describe('converter pack release tooling', () => {
     const productionKeys = keyPair(productionRoot)
     expect(run(buildScript, ['--input', productionStage, '--output', productionRelease]).status).toBe(0)
     const index = JSON.parse(readFileSync(join(productionRelease, 'index.json'), 'utf8')) as { packs: unknown[] }
-    expect(index.packs).toHaveLength(12)
+    expect(index.packs).toHaveLength(8)
     expect(run(signScript, ['--index', join(productionRelease, 'index.json'), '--private-key', productionKeys.privateKey]).status).toBe(0)
     expect(run(verifyScript, ['--root', productionRelease, '--public-key', productionKeys.publicKey]).status).toBe(0)
   })
@@ -603,19 +626,38 @@ describe('converter pack release tooling', () => {
     }
 
     const windowsRoot = temporaryRoot()
-    const production = stageProduction(windowsRoot)
-    chmodSync(join(production, 'packs/media-win32-x64/payload/bin/ffmpeg.exe'), 0o755)
-    chmodSync(join(production, 'packs/media-win32-x64/payload/LICENSES/media.txt'), 0o600)
-    expect(build(production, join(windowsRoot, 'release'), 'production').status).toBe(0)
+    const windows = stageWindowsPack(windowsRoot)
+    chmodSync(join(windows, 'packs/media-win32-x64/payload/bin/ffmpeg.exe'), 0o755)
+    chmodSync(join(windows, 'packs/media-win32-x64/payload/LICENSES/ffmpeg.txt'), 0o600)
+    expect(build(windows, join(windowsRoot, 'release'), 'test').status).toBe(0)
+
+    const unsafeWindowsRoot = temporaryRoot()
+    const unsafeWindows = stageWindowsPack(unsafeWindowsRoot)
+    writeFileSync(join(unsafeWindows, 'packs/media-win32-x64/payload/hidden.dll'), 'unsafe library')
+    const manifestPath = join(unsafeWindows, 'packs/media-win32-x64/pack.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { files: Array<{ path: string; role: string }> }
+    manifest.files.push({ path: 'hidden.dll', role: 'data' })
+    writeFileSync(manifestPath, JSON.stringify(manifest))
+    const unsafeWindowsResult = build(unsafeWindows, join(unsafeWindowsRoot, 'release'), 'test')
+    expect(unsafeWindowsResult.status).not.toBe(0)
+    expect(unsafeWindowsResult.stderr.toLowerCase()).toContain('code')
   })
 
   it('verifies canonical package metadata and recursively rejects engines, archives, signatures, tests, e2e, stale paths, or disguised private keys', () => {
-    for (const [platform, arch] of [['darwin', 'arm64'], ['darwin', 'x64'], ['win32', 'x64']] as const) {
+    for (const [platform, arch] of [['darwin', 'arm64'], ['darwin', 'x64']] as const) {
       const root = temporaryRoot()
       const fixture = packagedApp(root, platform)
       const result = run(verifyScript, ['--packaged-app', fixture.app, '--platform', platform, '--arch', arch])
       expect(result.status, `${platform}-${arch}: ${result.stderr}`).toBe(0)
     }
+
+    const excludedWindowsRoot = temporaryRoot()
+    const excludedWindows = packagedApp(excludedWindowsRoot, 'win32')
+    const excludedWindowsResult = run(verifyScript, [
+      '--packaged-app', excludedWindows.app, '--platform', 'win32', '--arch', 'x64',
+    ])
+    expect(excludedWindowsResult.status).not.toBe(0)
+    expect(excludedWindowsResult.stderr.toLowerCase()).toContain('first-release')
 
     const invalidTargetRoot = temporaryRoot()
     const invalidTarget = packagedApp(invalidTargetRoot, 'win32')

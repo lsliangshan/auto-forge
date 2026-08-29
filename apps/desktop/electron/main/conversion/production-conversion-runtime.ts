@@ -393,7 +393,7 @@ export function createProductionConversionJobRuntime(
 }
 
 const requiredPackFamilies = ['image-icon', 'document', 'pdf', 'media'] as const
-const supportedReleaseTargets = ['darwin-arm64', 'darwin-x64', 'win32-x64'] as const
+const supportedReleaseTargets = ['darwin-arm64', 'darwin-x64'] as const
 const maximumBootstrapBytes = 64 * 1024
 const maximumIndexBytes = 1024 * 1024
 const maximumSignatureBytes = 4 * 1024
@@ -645,6 +645,9 @@ export function createProductionConversionRuntimeFactory(
 ): ProductionConversionRuntimeFactory {
   const platform = options.platform ?? process.platform
   const arch = options.arch ?? process.arch
+  const releaseTargetSupported = supportedReleaseTargets.includes(
+    `${platform}-${arch}` as typeof supportedReleaseTargets[number],
+  )
   let releaseTask: Promise<ProductionReleaseConfig> | undefined
   const release = () => (releaseTask ??= loadProductionRelease(
     options.resourcesRoot,
@@ -654,13 +657,14 @@ export function createProductionConversionRuntimeFactory(
   ))
   let processRunner: ConversionProcessRunner | undefined
   try {
+    if (!releaseTargetSupported) throw failure('CONVERSION_COMPONENT_UNAVAILABLE')
     const processTree = options.processTree ?? createNodeConversionProcessTreePort({
       platform,
       ...(options.windowsJobObject === undefined ? {} : { windowsJobObject: options.windowsJobObject }),
     })
     processRunner = createConversionProcessRunner({ processTree })
   } catch {
-    // Windows remains fail-closed until a real Job Object port is injected.
+    // Targets outside the first-release matrix remain fail-closed before release metadata or network access.
   }
 
   return async (context) => {

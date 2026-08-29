@@ -73,11 +73,12 @@ The local Darwin arm64 engines are ImageMagick 7.1.1-47, LibreOfficeDev 26.8.0.0
 
 ## Pack supply-chain and packaging proof
 
-- `--mode production` is the default for build, sign, and verify. It requires exactly 12 unique coordinates: four pack families times Darwin arm64, Darwin x64, and Windows x64. No extras or duplicates are accepted. Fixture subsets require explicit `--mode test`.
+- `--mode production` is the default for build, sign, and verify. Following the approved first-release scope change, it requires exactly 8 unique coordinates: four pack families times Darwin arm64 and Darwin x64. No extras, Windows coordinates, or duplicates are accepted in production mode. Fixture subsets require explicit `--mode test`.
 - Staging uses an explicit file inventory with signed `executable`, `code`, `license`, or `data` roles. Executable identity must match the exact family/platform allowlist. `.exe`, `.com`, `.cmd`, `.bat`, `.ps1`, `.scr`, `.msi`, `.dll`, `.hta`, `.vbs`, `.vbe`, `.js`, `.jse`, `.wsf`, `.wsh`, `.cpl`, `.lnk`, `.reg`, `.url`, native/script/library extensions, shebang, MZ, ELF, and Mach-O signatures are classified; unclassified or disguised code fails.
 - All release inputs are canonical absolute paths. Release/pack JSON, payloads, licenses, executables, private/public keys, indexes, signatures, archives, ASAR, and pinned packaged metadata are opened with no-follow handles, require `nlink=1`, and verify `dev`, `ino`, and `size` before/after reads. Hardlink and path-swap attacks are covered.
 - All sorting that affects signed bytes uses UTF-8 `Buffer.compare`; `en_US.UTF-8` and `tr_TR.UTF-8` builds produce byte-identical indexes and archives.
-- Darwin sources require 0755 only for executables and 0644 otherwise. Windows source modes are not interpreted as Unix executable truth; the signed role and extension inventory remains mandatory. Windows drive-relative/rooted/device paths fail, canonical drive and UNC roots use `path.win32` containment, and the native/package verifiers select Darwin arm64/x64 or Win32 x64 structure. Cross-platform checks are explicitly structural; no Windows or Darwin x64 execution was fabricated.
+- Darwin sources require 0755 only for executables and 0644 otherwise. Windows source modes are not interpreted as Unix executable truth; the signed role and extension inventory remains mandatory. Windows drive-relative/rooted/device paths fail, canonical drive and UNC roots use `path.win32` containment, and generic native packaging retains structural Win32 validation. The converter packaged-release verifier accepts only first-release Darwin arm64/x64 targets. Cross-platform Windows inventory checks are security hardening only; no Windows or Darwin x64 execution was fabricated.
+- The production runtime rejects Win32 before opening bootstrap/root metadata or acquiring the network lease, including when a Job Object-shaped port is injected. Focused runtime and pack-tooling verification passed **36/36** after rebuilding the Darwin arm64 directory package; the package boundary confirmed the new two-target bootstrap.
 - The private key is supplied only by explicit absolute path, must be Ed25519 with restrictive Unix permissions, is never copied or logged, and repeated signing of identical canonical bytes is deterministic.
 - electron-builder now uses a positive `out` allowlist plus source-map and test/e2e/stale exclusions. Only exact canonical `bootstrap.json` and `index.schema.json` are packaged; the optional future root public key is absent while the kill switch is off.
 - The package verifier reads every ASAR payload and walks the complete physical application root. It rejects converter engines/packs, archives, signatures, private/trust material, and test/e2e/stale paths wherever placed. Regular files require no-follow, `nlink=1`, and stable identity; standard Electron framework symlinks are not traversed and must resolve inside the package root. Bounded small-file scans reject PEM/OpenSSH text and parseable DER PKCS8/PKCS1/SEC1 private keys regardless of filename.
@@ -153,8 +154,8 @@ Local signed-fixture GREEN does not authorize production distribution. Release r
 
 1. the production Ed25519 root public key and approved rotation/recovery procedure;
 2. the production HTTPS CDN and pinned signed canonical index;
-3. all four signed pack families for macOS arm64, macOS x64, and Windows x64;
+3. all four signed pack families for macOS arm64 and macOS x64;
 4. complete redistributable third-party licenses, notices, source offers, and provenance for every engine/dependency;
-5. real conversion-matrix runs on all three targets, platform signing, macOS notarization, packaged-content, privacy, update, and rollback acceptance.
+5. real conversion-matrix runs on both first-release targets, platform signing, macOS notarization, packaged-content, privacy, update, and rollback acceptance.
 
 If any item is absent, the production root stays unpinned and converter pack downloading stays disabled.

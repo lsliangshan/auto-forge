@@ -16,11 +16,11 @@ import { isAbsolute, join, relative, sep } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import {
-  approvedTarget,
   archiveFilename,
   canonicalBytes,
   compareUtf8,
   fail,
+  firstReleaseTarget,
   parseArguments,
   readStableRegularFile,
   releaseMode,
@@ -218,20 +218,19 @@ function validateBootstrap(root) {
     || bootstrap.indexUrl !== null
     || bootstrap.rootPublicKeyFile !== null
     || JSON.stringify(bootstrap.requiredPackFamilies) !== JSON.stringify(['image-icon', 'document', 'pdf', 'media'])
-    || JSON.stringify(bootstrap.supportedTargets) !== JSON.stringify(['darwin-arm64', 'darwin-x64', 'win32-x64'])
+    || JSON.stringify(bootstrap.supportedTargets) !== JSON.stringify(['darwin-arm64', 'darwin-x64'])
   ) fail('Packaged converter bootstrap must remain fail-closed.')
   if (names.includes('root-public-key.pem')) fail('Packaged root key is present while the converter download kill switch is disabled.')
 }
 
 function packagedResources(app, platform) {
   if (platform === 'darwin') return join(app, 'Contents', 'Resources')
-  if (platform === 'win32') return join(app, 'resources')
-  fail('Packaged converter verification supports macOS and Windows only.')
+  fail('Packaged converter verification supports first-release macOS targets only.')
 }
 
 export function verifyPackagedConverterBoundary(appPath, { platform = process.platform, arch = process.arch } = {}) {
   requireAbsolutePath(appPath, 'Packaged app path')
-  if (!approvedTarget(platform, arch)) fail('Packaged converter target is unsupported.')
+  if (!firstReleaseTarget(platform, arch)) fail('Packaged converter target is outside the first-release matrix.')
   requireStableDirectorySync(appPath, 'Packaged app path')
   const resources = packagedResources(appPath, platform)
   requireStableDirectorySync(resources, 'Packaged resources')
@@ -242,10 +241,8 @@ export function verifyPackagedConverterBoundary(appPath, { platform = process.pl
   const archive = decodeAsar(appAsar)
   scanCanonicalAsarEntries(archive)
 
-  const metadataRelative = platform === 'darwin'
-    ? 'Contents/Resources/converter-packs'
-    : 'resources/converter-packs'
-  const asarRelative = platform === 'darwin' ? 'Contents/Resources/app.asar' : 'resources/app.asar'
+  const metadataRelative = 'Contents/Resources/converter-packs'
+  const asarRelative = 'Contents/Resources/app.asar'
   const visit = (directory, prefix = '') => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => compareUtf8(a.name, b.name))) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name
@@ -316,8 +313,7 @@ export async function verifyConverterPackRelease({ root, publicKeyPath, mode = '
 function defaultPackagedApp() {
   if (process.platform === 'darwin' && process.arch === 'arm64') return join(desktopRoot, 'dist', 'mac-arm64', 'AutoForge.app')
   if (process.platform === 'darwin' && process.arch === 'x64') return join(desktopRoot, 'dist', 'mac', 'AutoForge.app')
-  if (process.platform === 'win32' && process.arch === 'x64') return join(desktopRoot, 'dist', 'win-unpacked')
-  fail('Packaged converter verification supports darwin arm64/x64 and win32 x64 only.')
+  fail('Packaged converter verification supports first-release darwin arm64/x64 only.')
 }
 
 const entry = process.argv[1]

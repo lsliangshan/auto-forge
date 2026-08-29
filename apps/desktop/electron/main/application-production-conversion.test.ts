@@ -91,7 +91,7 @@ describe.skipIf(!enabled)(`Application production conversion composition (${enab
       indexUrl: 'https://packs.example.test/release/index.json',
       rootPublicKeyFile: 'root-public-key.pem',
       requiredPackFamilies: ['image-icon', 'document', 'pdf', 'media'],
-      supportedTargets: ['darwin-arm64', 'darwin-x64', 'win32-x64'],
+      supportedTargets: ['darwin-arm64', 'darwin-x64'],
     }))
     await cp(join(bundleRoot, 'test-root-public-key.pem'), join(resourcesRoot, 'root-public-key.pem'))
     await cp(join(bundleRoot, 'installed'), join(root, 'converter-packs'), { recursive: true })
