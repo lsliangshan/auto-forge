@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "pretest": "pnpm --filter @autoforge/desktop prepare:native-electron",
     "typecheck": "pnpm -r --if-present typecheck",
-    "test": "node apps/desktop/scripts/run-vitest-electron.mjs run",
+    "test": "node apps/desktop/scripts/run-vitest-electron.mjs run && vitest run --config vitest.cloud-runtime.config.ts",
     "build": "pnpm -r --filter \"./packages/**\" build && pnpm --filter @autoforge/desktop build && pnpm build:e2e:cloud-user-data-sync && pnpm build:e2e:knowledge-smoke && pnpm build:e2e:knowledge-benchmark",
     "build:e2e:cloud-user-data-sync": "pnpm --filter @autoforge/desktop exec tsup electron/e2e/cloud-user-data-sync-main.ts --format esm --platform node --external electron --external better-sqlite3 --loader .sql=text --out-dir .e2e/main --clean false",
     "build:e2e:knowledge-smoke": "pnpm --filter @autoforge/desktop exec tsup electron/e2e/knowledge-smoke-main.ts --format esm --platform node --external electron --external better-sqlite3 --loader .sql=text --out-dir .e2e/main --clean false",

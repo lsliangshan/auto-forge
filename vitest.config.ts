@@ -18,7 +18,11 @@ export default defineConfig({
           name: 'root',
           environment: 'node',
           include: ['tests/**/*.test.ts'],
-          exclude: ['tests/e2e/**'],
+          exclude: [
+            'tests/e2e/**',
+            'tests/cloudbase/knowledge-worker.test.ts',
+            'tests/cloudbase/knowledge-package-smoke.test.ts',
+          ],
         },
       },
     ],
