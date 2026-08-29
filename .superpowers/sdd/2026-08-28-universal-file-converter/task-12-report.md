@@ -116,3 +116,55 @@ packages/shared/src/contracts.test.ts
 - Terminal mutations now participate in conversation pending/failed aggregation, owner-aware affected-conversation notification, and push acknowledgement. Applied receipts are promoted to durable receipt evidence and clear their outbox entry just like duplicate receipts, so they cannot remain stuck in `syncing` while waiting for an unnecessary pull.
 - RED/GREEN in this completion pass: **2 behavioral REDs** (terminal remote replay originally rejected its already-terminal block; an `applied` receipt left its outbox row syncing) followed by **2 fixes**. Focused GREEN: user-data store + sync engine **99/99**; Cloud handler + migration structure **50/50**; focused Application conversion lifecycle **8/8**; focused Agent conversion path **1/1**; shared build and `git diff --check` passed.
 - The migration test asserts the additive migration contains an executable replacement and that its extracted `autoforge_sync_push` body exactly equals the canonical foundation definition. The sync-engine test exercises terminal push, receipt clearing, revision advance, owner conversation notification, and payload privacy; the store test exercises pull/replay/mismatch quarantine behavior.
+
+## Fresh recovery cycle — durable coordinator and exhaustive sync closure
+
+### Requirement matrix
+
+- **A — closed.** A Main-owned coordinator now registers every active conversion in the exact persisted Agent snapshot, records the exact owner/conversation/message/block/execution binding, marks it finalized only after `finalizeWithMessage` commits the assistant append/outbox transaction, and reconstructs the finalized/execution-terminal/nonempty-all-jobs-terminal signals in any order. It emits zero terminal operations before the boundary and exactly one afterward; replay is a no-op. Real tests cover all three last-signal permutations, one then sequential foreground registrations, finalization failure, fast completion, normal background completion plus immediate sync push, restart/rebind, binding uniqueness, and duplicate/mismatched message blocks.
+- **B — closed.** Desktop result validation distinguishes applied `base + 1` from exact duplicate `base`; stored receipt replay accepts either exact result while preserving mutation identity. Pull rejects stale/future and active-at-base results, advances OCC on a next-revision terminal replay, requires one exact non-null conversion target, validates owner identity, derives the affected conversation through the database, and exhaustively recomputes pending/syncing/failed/warning state and notifications. The final user-data repository/sync-engine run is **129/129**.
+- **C — closed for local executable/structural evidence.** The handler accepts only strict unique `{ formats }` `file.convert` scopes and strict payload-free conversion messages/terminal mutations. Both foundation SQL files remain byte-identical; the additive migration reinstalls the full whitelist even when the old constraint is absent, widens `kind` to `varchar(64)`, uses supported JSON key counting, and installs the exact canonical push function. Exact active transition, duplicate-at-base, stored receipt replay, uniqueness, null-state, stale/future, and function-parity checks pass **63/63**. No real CloudBase or PostgreSQL environment was accessed.
+- **D — preserved.** The Task 12 store/UI/privacy behavior remains unchanged. Shared privacy contracts, component/store, context, IPC, and preload suites pass. The two deferred visual minors remain deferred, and no Task 13 packaging implementation was added.
+
+### RED / GREEN evidence
+
+- The real fast Agent/Application RED produced an active conversion and durable unfinalized binding but no terminal `block_update`; the finalization callback had been passed as an unused second `OpenRouterProvider` constructor argument instead of to `createAgentPersistence`. Moving it to the actual Agent persistence boundary made the same test GREEN and proved the binding stays unfinalized if assistant append fails.
+- Desktop sync RED tables exposed **7** repository failures, **1** owning-conversation retry failure, and **3** sync-engine failures across result revisions, exact receipt replay, pull OCC, affected-conversation lookup, pending/warning clearing, and notifications. The smallest repository changes made the combined final suite **129/129**.
+- Cloud RED added **1** handler failure and **2** migration failures for duplicate formats, absent-whitelist installation, exact block uniqueness, supported JSON key counting, and receipt/function parity. The final CloudBase suite is **63/63**; `node --check` also passes.
+- A direct conversion-repository RED found the durable-binding migration had advanced the real schema to 17 while final-schema tests still expected 16. Updating only those final-version assertions made database plus conversion repositories **120/120**.
+
+### Final local gates
+
+- Durable coordinator + full Agent: **202/202**; focused real Application lifecycle: **3/3**.
+- Full Application suite: **190/192**, with the two recorded baselines unchanged: the legacy-import log-directory `ENOTEMPTY` cleanup race and the context-summary `CONTEXT_LIMIT_EXCEEDED` budget failure.
+- User-data repositories + sync engine: **129/129**; database + conversion repositories: **120/120**.
+- Shared contracts: **103/103** and `@autoforge/shared` build passed.
+- Conversion component/store: **21/21**; context + IPC + preload/build-config: **102/102**.
+- Cloud handler/migrations: **63/63**; handler syntax check passed.
+- Scoped recovery TypeScript/ESLint is clean. Workspace typecheck still stops on the recorded **8 Main** diagnostics and the independently run Renderer typecheck still reports the recorded **3** diagnostics; no diagnostic names the new coordinator or recovery tests. The Cloud handler retains the pre-existing `_tcbContext` unused-variable lint diagnostic, reproduced from base before this recovery change.
+- Desktop production build and `git diff --check` pass.
+
+### Recovery files
+
+```text
+apps/desktop/electron/main/agent/agent-orchestrator.test.ts
+apps/desktop/electron/main/application.ts
+apps/desktop/electron/main/application.test.ts
+apps/desktop/electron/main/conversion/conversion-block-coordinator.ts
+apps/desktop/electron/main/conversion/conversion-block-coordinator.test.ts
+apps/desktop/electron/main/database/conversion-repositories.test.ts
+apps/desktop/electron/main/database/database.test.ts
+apps/desktop/electron/main/database/user-data-repositories.ts
+apps/desktop/electron/main/database/user-data-client.test.ts
+apps/desktop/electron/main/sync/user-data-sync-engine.test.ts
+cloudbase/migrations/20260824090000_user_data_foundation.sql
+cloudbase/migrations/20260829000000_conversion_block_terminal.sql
+cloudbase/user-data/function/user-data-handler.js
+cloudbase/user-data/migrations/0001_user_data_foundation.sql
+tests/cloudbase/user-data-handler.test.ts
+tests/cloudbase/user-data-migration.test.ts
+```
+
+### External gates
+
+- Real CloudBase deployment, live PostgreSQL execution/locks/concurrency/RLS, cross-device production convergence, signing, notarization, and packaged release acceptance remain external gates. The additive migration must be deployed before enabling the terminal mutation in a real environment.

@@ -160,6 +160,69 @@ describe('CloudBase user data migration', () => {
     expect(terminalBranch).toContain('UPDATE app_conversations SET revision = result_revision_value')
   })
 
+  it('keeps conversion terminal storage, key counting, and additive whitelist installation fail-closed', async () => {
+    const [canonical, featureCopy, additive] = await Promise.all([
+      readFile(canonicalUrl, 'utf8'),
+      readFile(featureUrl, 'utf8'),
+      readFile(conversionAdditiveUrl, 'utf8'),
+    ])
+
+    for (const sql of [canonical, featureCopy, additive]) {
+      expect(sql).not.toMatch(/jsonb?_object_length\s*\(/)
+      expect(sql).toContain('(SELECT count(*) FROM jsonb_object_keys(payload)) <> 4')
+    }
+
+    for (const foundation of [canonical, featureCopy]) {
+      const mutations = extractTable(foundation, 'app_sync_mutations')
+      const kindWidth = mutations.match(/\bkind varchar\((\d+)\) NOT NULL/)?.[1]
+      expect(Number(kindWidth)).toBeGreaterThanOrEqual(64)
+    }
+
+    const additiveSetup = additive.slice(0, additive.indexOf('CREATE OR REPLACE FUNCTION autoforge_sync_push('))
+    expect(additiveSetup).toContain('ALTER TABLE app_sync_mutations ALTER COLUMN kind TYPE varchar(64)')
+    expect(additiveSetup).toMatch(
+      /END \$\$;\s+ALTER TABLE app_sync_mutations ALTER COLUMN kind TYPE varchar\(64\);\s+ALTER TABLE app_sync_mutations DROP CONSTRAINT IF EXISTS app_sync_mutations_kind_check;\s+ALTER TABLE app_sync_mutations ADD CONSTRAINT app_sync_mutations_kind_check CHECK/,
+    )
+  })
+
+  it('enforces exact unique-block, null-state, base-revision, and receipt replay parity', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
+    const receiptReplay = syncPush.slice(
+      syncPush.indexOf('IF FOUND THEN'),
+      syncPush.indexOf("IF mutation_kind = 'conversation.create'"),
+    )
+    const terminalBranch = syncPush.slice(
+      syncPush.indexOf("ELSIF mutation_kind = 'message.conversion_block_terminal'"),
+      syncPush.indexOf("ELSIF mutation_kind = 'message.append'"),
+    )
+    const uniqueTargetCheck = terminalBranch.slice(
+      terminalBranch.indexOf('IF NOT FOUND OR (SELECT count(*)'),
+      terminalBranch.indexOf('THEN', terminalBranch.indexOf('IF NOT FOUND OR (SELECT count(*)')),
+    )
+
+    expect(receiptReplay).toMatch(
+      /WHEN existing_receipt\.kind = 'message\.conversion_block_terminal'\s+THEN existing_receipt\.status\s+WHEN existing_receipt\.status = 'applied' THEN 'duplicate'/,
+    )
+    expect(terminalBranch).toMatch(
+      /count\(\*\) FROM jsonb_array_elements\(existing_message\.blocks\) block\s+WHERE block->>'blockId' = payload->>'blockId'/,
+    )
+    expect(uniqueTargetCheck).not.toContain("block->>'type'")
+    expect(uniqueTargetCheck).not.toContain("block->>'executionId'")
+    expect(terminalBranch).toContain("existing_block->>'type' IS DISTINCT FROM 'conversion'")
+    expect(terminalBranch).toContain(
+      "existing_block->>'executionId' IS DISTINCT FROM payload->>'executionId'",
+    )
+    expect(terminalBranch).toContain("existing_block->>'state' IS DISTINCT FROM 'active'")
+    expect(terminalBranch).toContain("existing_block->>'state' IS DISTINCT FROM 'terminal'")
+    expect(terminalBranch).toMatch(
+      /conversation_row\.revision <> base_revision_value[\s\S]+?ELSIF existing_block->>'state' = 'terminal' THEN[\s\S]+?result_revision_value := base_revision_value;[\s\S]+?mutation_status := 'duplicate'/,
+    )
+    expect(terminalBranch).toContain('result_revision_value := base_revision_value + 1')
+    expect(terminalBranch.indexOf('conversation_row.revision <> base_revision_value'))
+      .toBeLessThan(terminalBranch.indexOf("existing_block->>'state' = 'terminal'"))
+  })
+
   it('rejects a duplicate message id unless every immutable field matches', async () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
     const syncPush = extractFunction(canonical, 'autoforge_sync_push')
@@ -435,9 +498,7 @@ describe('CloudBase user data migration', () => {
       syncPush.indexOf("IF mutation_kind = 'conversation.create'"),
     )
 
-    expect(receiptReplay).toMatch(
-      /'status', CASE\s+WHEN existing_receipt\.status = 'applied' THEN 'duplicate'\s+ELSE existing_receipt\.status\s+END/,
-    )
+    expect(receiptReplay).toContain("WHEN existing_receipt.status = 'applied' THEN 'duplicate'")
     expect(receiptReplay).toContain("'revision', existing_receipt.result_revision")
     expect(receiptReplay).toContain("'errorCode', existing_receipt.error_code")
     expect(receiptReplay).not.toContain("'status', 'duplicate'")

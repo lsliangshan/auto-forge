@@ -1559,6 +1559,44 @@ describe('AgentOrchestrator', () => {
     )
   })
 
+  it('marks assistant finalization only after the message append transaction commits', () => {
+    const committed: string[] = []
+    const finalized = vi.fn(() => { committed.push('binding-finalized') })
+    const persistence = createAgentPersistence({
+      messages: { get: vi.fn(() => ({ blocks: [] })) },
+      chatRuns: {
+        finalizeWithMessage: vi.fn(() => { committed.push('message-append-committed') }),
+      },
+    } as never, undefined, finalized)
+
+    persistence.finalize({
+      runId: 'run_finalize_boundary',
+      requestId: 'request_finalize_boundary',
+      messageId: 'message_finalize_boundary',
+      blocks: [],
+      status: 'completed',
+      endedAt: 12,
+    })
+
+    expect(committed).toEqual(['message-append-committed', 'binding-finalized'])
+    expect(finalized).toHaveBeenCalledWith('message_finalize_boundary', [])
+
+    const rejected = vi.fn()
+    const failedPersistence = createAgentPersistence({
+      messages: { get: vi.fn(() => ({ blocks: [] })) },
+      chatRuns: { finalizeWithMessage: vi.fn(() => { throw new Error('append failed') }) },
+    } as never, undefined, rejected)
+    expect(() => failedPersistence.finalize({
+      runId: 'run_finalize_failure',
+      requestId: 'request_finalize_failure',
+      messageId: 'message_finalize_failure',
+      blocks: [],
+      status: 'failed',
+      endedAt: 13,
+    })).toThrow('append failed')
+    expect(rejected).not.toHaveBeenCalled()
+  })
+
   it('skips workflow listing when tools are disabled', async () => {
     const dependencies = harness([[
       { type: 'text_delta', choiceIndex: 0, text: '视觉结果' },

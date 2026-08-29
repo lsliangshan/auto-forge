@@ -4,24 +4,25 @@
 DO $$
 DECLARE constraint_name text;
 BEGIN
-  SELECT conname INTO constraint_name
-  FROM pg_constraint
-  WHERE conrelid = 'app_sync_mutations'::regclass
-    AND contype = 'c'
-    AND pg_get_constraintdef(oid) LIKE '%message.append%'
-  LIMIT 1;
-  IF constraint_name IS NOT NULL THEN
+  FOR constraint_name IN
+    SELECT conname
+    FROM pg_constraint
+    WHERE conrelid = 'app_sync_mutations'::regclass
+      AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%message.append%'
+  LOOP
     EXECUTE format('ALTER TABLE app_sync_mutations DROP CONSTRAINT %I', constraint_name);
-    ALTER TABLE app_sync_mutations ADD CONSTRAINT app_sync_mutations_kind_check CHECK (kind IN (
-      'conversation.create', 'conversation.rename', 'conversation.preferences',
-      'conversation.delete', 'conversation.restore', 'message.append',
-      'message.conversion_block_terminal', 'legacy.import', 'privacy.consent',
-      'preferences.update', 'usage.record'
-    ));
-  END IF;
+  END LOOP;
 END $$;
 
 ALTER TABLE app_sync_mutations ALTER COLUMN kind TYPE varchar(64);
+ALTER TABLE app_sync_mutations DROP CONSTRAINT IF EXISTS app_sync_mutations_kind_check;
+ALTER TABLE app_sync_mutations ADD CONSTRAINT app_sync_mutations_kind_check CHECK (kind IN (
+  'conversation.create', 'conversation.rename', 'conversation.preferences',
+  'conversation.delete', 'conversation.restore', 'message.append',
+  'message.conversion_block_terminal', 'legacy.import', 'privacy.consent',
+  'preferences.update', 'usage.record'
+));
 
 -- Keep deployed databases on exactly the same strict protocol implementation
 -- as new installations. This replaces the production function atomically.
@@ -154,6 +155,8 @@ BEGIN
         results := results || jsonb_build_array(jsonb_strip_nulls(jsonb_build_object(
           'id', mutation_id,
           'status', CASE
+            WHEN existing_receipt.kind = 'message.conversion_block_terminal'
+              THEN existing_receipt.status
             WHEN existing_receipt.status = 'applied' THEN 'duplicate'
             ELSE existing_receipt.status
           END,
@@ -363,23 +366,16 @@ BEGIN
         WHERE message.owner_user_id = auth_user_id AND message.id = entity_id
         FOR UPDATE;
         IF NOT FOUND OR (SELECT count(*) FROM jsonb_array_elements(existing_message.blocks) block
-              WHERE block->>'type' = 'conversion'
-                AND block->>'blockId' = payload->>'blockId'
-                AND block->>'executionId' = payload->>'executionId') <> 1 THEN
+              WHERE block->>'blockId' = payload->>'blockId') <> 1 THEN
           mutation_status := 'rejected'; mutation_error := 'INVALID_INPUT';
         ELSE
           SELECT block INTO existing_block
           FROM jsonb_array_elements(existing_message.blocks) block
-          WHERE block->>'type' = 'conversion'
-            AND block->>'blockId' = payload->>'blockId'
-            AND block->>'executionId' = payload->>'executionId';
-          IF existing_block->>'state' = 'terminal' THEN
-            SELECT revision INTO result_revision_value
-            FROM app_conversations conversation
-            WHERE conversation.owner_user_id = auth_user_id
-              AND conversation.id = existing_message.conversation_id;
-            mutation_status := 'duplicate';
-          ELSIF existing_block->>'state' <> 'active' THEN
+          WHERE block->>'blockId' = payload->>'blockId';
+          IF existing_block->>'type' IS DISTINCT FROM 'conversion'
+            OR existing_block->>'executionId' IS DISTINCT FROM payload->>'executionId'
+            OR (existing_block->>'state' IS DISTINCT FROM 'active'
+              AND existing_block->>'state' IS DISTINCT FROM 'terminal') THEN
             mutation_status := 'rejected'; mutation_error := 'INVALID_INPUT';
           ELSE
             PERFORM pg_advisory_xact_lock(hashtextextended(
@@ -393,8 +389,11 @@ BEGIN
             IF NOT FOUND OR conversation_row.deleted_at IS NOT NULL
               OR conversation_row.revision <> base_revision_value THEN
               mutation_status := 'conflict'; mutation_error := 'SYNC_CONFLICT';
+            ELSIF existing_block->>'state' = 'terminal' THEN
+              result_revision_value := base_revision_value;
+              mutation_status := 'duplicate';
             ELSE
-              result_revision_value := conversation_row.revision + 1;
+              result_revision_value := base_revision_value + 1;
               UPDATE app_messages SET blocks = (SELECT jsonb_agg(CASE
                 WHEN block->>'type' = 'conversion' AND block->>'blockId' = payload->>'blockId'
                   AND block->>'executionId' = payload->>'executionId' AND block->>'state' = 'active'

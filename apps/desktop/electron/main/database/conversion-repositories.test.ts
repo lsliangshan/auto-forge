@@ -229,7 +229,7 @@ describe('conversion repositories', () => {
 
   it('applies the conversion migration with the owner queue index', () => {
     const { database, path } = openTestDatabase()
-    expect(database.schemaVersion()).toBe(16)
+    expect(database.schemaVersion()).toBe(17)
     database.close()
 
     const sqlite = new Database(path, { readonly: true })

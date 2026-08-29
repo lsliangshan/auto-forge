@@ -519,7 +519,10 @@ function canonicalMessagePayload(
   }
 }
 
-function requireValidRemoteResult(mutation: MutationReceipt): number {
+function requireValidRemoteResult(
+  mutation: MutationReceipt,
+  allowExactConversionDuplicate = false,
+): number {
   const result = requireRemoteRevision(mutation)
   const valid = (() => {
     switch (mutation.kind) {
@@ -532,8 +535,10 @@ function requireValidRemoteResult(mutation: MutationReceipt): number {
       case 'preferences.update':
         return result === mutation.baseRevision + 1
       case 'message.append':
-      case 'message.conversion_block_terminal':
         return result === mutation.baseRevision || result === mutation.baseRevision + 1
+      case 'message.conversion_block_terminal':
+        return result === mutation.baseRevision + 1
+          || (allowExactConversionDuplicate && result === mutation.baseRevision)
       case 'legacy.import':
       case 'privacy.consent':
       case 'usage.record':
@@ -560,7 +565,7 @@ function validateOutboxReceipt(
   if (row === undefined) return undefined
   const local = outboxFromRow(row)
   if (!sameMutationIdentity(local, mutation)) throw new UserDataConsistencyError()
-  if (validateRevision) requireValidRemoteResult(mutation)
+  if (validateRevision) requireValidRemoteResult(mutation, true)
   return local
 }
 
@@ -592,7 +597,7 @@ function validateReceiptEvidence(
   const local = findReceiptEvidence(database, mutation.id)
   if (local === undefined) return undefined
   if (!sameMutationIdentity(local, mutation)) throw new UserDataConsistencyError()
-  requireValidRemoteResult(mutation)
+  requireValidRemoteResult(mutation, true)
   return local
 }
 
@@ -693,7 +698,7 @@ function acknowledgeLocalMutation(
   remote: MutationReceipt,
   source: 'outbox' | 'evidence' = 'outbox',
 ): void {
-  const resultRevision = requireValidRemoteResult(remote)
+  const resultRevision = requireValidRemoteResult(remote, true)
   let conversationId: string | undefined
   switch (local.kind) {
     case 'conversation.create':
@@ -714,6 +719,8 @@ function acknowledgeLocalMutation(
     case 'message.conversion_block_terminal': {
       const message = storedMessage(database, local.payload.messageId)
       if (!message) throw new UserDataConsistencyError()
+      const target = requireConversionBlockTarget(message, local.payload)
+      if (target.state !== 'terminal') throw new UserDataConsistencyError()
       conversationId = message.conversationId
       requireOwnedConversation(database, ownerUserId, conversationId)
       break
@@ -776,6 +783,21 @@ function storedMessage(database: SqliteDatabase, id: string) {
   }))
 }
 
+function requireConversionBlockTarget(
+  message: NonNullable<ReturnType<typeof storedMessage>>,
+  payload: Extract<SyncMutation, { kind: 'message.conversion_block_terminal' }>['payload'],
+) {
+  const candidates = message.blocks.filter((block) => (
+    'blockId' in block && block.blockId === payload.blockId
+  ))
+  if (candidates.length !== 1) throw new UserDataConsistencyError()
+  const target = candidates[0]
+  if (target?.type !== 'conversion' || target.executionId !== payload.executionId) {
+    throw new UserDataConsistencyError()
+  }
+  return target
+}
+
 function sameMessageAppend(
   stored: NonNullable<ReturnType<typeof storedMessage>>,
   mutation: Extract<OrdinaryRemoteMutation, { kind: 'message.append' }>,
@@ -810,7 +832,9 @@ function applyRemoteMutation(
     applyCompactedRemoteMutation(database, ownerUserId, mutation)
     return
   }
-  const revision = requireValidRemoteResult(mutation)
+  const revision = mutation.kind === 'message.conversion_block_terminal'
+    ? requireRemoteRevision(mutation)
+    : requireValidRemoteResult(mutation)
   switch (mutation.kind) {
     case 'conversation.create': {
       const createdAt = timestamp(mutation.payload.createdAt)
@@ -1001,16 +1025,23 @@ function applyRemoteMutation(
     case 'message.conversion_block_terminal': {
       const existing = storedMessage(database, mutation.payload.messageId)
       if (!existing || existing.id !== mutation.entityId) throw new UserDataConsistencyError()
-      const matching = existing.blocks.filter((block) => block.type === 'conversion'
-        && block.blockId === mutation.payload.blockId
-        && block.executionId === mutation.payload.executionId)
-      if (matching.length !== 1) throw new UserDataConsistencyError()
-      const matched = matching[0]
-      if (!matched || matched.type !== 'conversion') throw new UserDataConsistencyError()
+      const matched = requireConversionBlockTarget(existing, mutation.payload)
       const conversation = remoteConversation(database, ownerUserId, existing.conversationId)
       if (!conversation) throw new UserDataConsistencyError()
-      if (matched.state === 'terminal' && conversation.revision >= revision) break
-      if (conversation.revision !== mutation.baseRevision) throw new UserDataConsistencyError()
+      const duplicateRevision = revision === mutation.baseRevision
+      const appliedRevision = revision === mutation.baseRevision + 1
+      if (!duplicateRevision && !appliedRevision) throw new UserDataConsistencyError()
+      if (matched.state === 'active' && (
+        !appliedRevision || conversation.revision !== mutation.baseRevision
+      )) throw new UserDataConsistencyError()
+      if (matched.state === 'terminal') {
+        if (duplicateRevision) {
+          if (conversation.revision !== mutation.baseRevision) throw new UserDataConsistencyError()
+          break
+        }
+        if (conversation.revision === revision) break
+        if (conversation.revision !== mutation.baseRevision) throw new UserDataConsistencyError()
+      }
       const blocks = existing.blocks.map((block) => {
         if (block.type !== 'conversion' || block.blockId !== mutation.payload.blockId
           || block.executionId !== mutation.payload.executionId) return block
@@ -1035,7 +1066,7 @@ function applyRemoteMutation(
     default:
       break
   }
-  const conversationId = affectedConversationId(mutation)
+  const conversationId = affectedConversationId(mutation, database)
   if (conversationId !== undefined) {
     recomputeConversationSyncState(database, ownerUserId, conversationId)
   }
@@ -1138,7 +1169,7 @@ function conversationSyncWarning(database: SqliteDatabase, conversationId: strin
   const result = database.prepare(`
     SELECT MIN(created_at) AS oldest
     FROM outbox_mutations
-    WHERE state IN ('pending', 'failed')
+    WHERE state IN ('pending', 'syncing', 'failed')
       AND (
         (kind LIKE 'conversation.%' AND entity_id = @conversationId)
         OR (kind = 'message.append' AND json_extract(payload_json, '$.conversationId') = @conversationId)
@@ -1334,7 +1365,14 @@ function acknowledgePushResults(
       const local = validateOutboxReceipt(database, receipt, false)
       if (local?.state !== 'syncing') throw new UserDataConsistencyError()
       if (result.status === 'applied' || result.status === 'duplicate') {
-        requireValidRemoteResult(receipt)
+        if (mutation.kind === 'message.conversion_block_terminal') {
+          const expectedRevision = result.status === 'applied'
+            ? mutation.baseRevision + 1
+            : mutation.baseRevision
+          if (result.revision !== expectedRevision) throw new UserDataConsistencyError()
+        } else {
+          requireValidRemoteResult(receipt)
+        }
         preserveReceiptEvidence(database, local)
         acknowledgeLocalMutation(database, ownerUserId, local, receipt)
       }
@@ -2202,7 +2240,7 @@ export function createUserDataRepositories(
           `).all() as Query[]).map(outboxFromRow).filter((mutation) => (
             validatedEntityId === undefined
               || mutation.entityId === validatedEntityId
-              || affectedConversationId(mutation) === validatedEntityId
+              || affectedConversationId(mutation, database) === validatedEntityId
           ))
           const update = database.prepare(`
             UPDATE outbox_mutations

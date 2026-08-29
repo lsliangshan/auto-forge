@@ -61,6 +61,54 @@ function approvalMutation(origin: string) {
   }])
 }
 
+function fileConvertApprovalMutation(
+  formats: string[],
+  extraScope: Record<string, unknown> = {},
+) {
+  return messageMutation([{
+    type: 'approval',
+    blockId: 'conversion_approval_1',
+    state: 'pending',
+    executionId: 'execution_1',
+    workflowId: 'file.convert.universal',
+    workflowName: '万象转换',
+    workflowVersion: '1.0.0',
+    source: 'installed',
+    actionSummary: '读取附件 1 并创建 PDF 结果',
+    permissionIndex: 0,
+    capability: 'file.convert',
+    scope: { formats, ...extraScope },
+    scopeHash: 'b'.repeat(64),
+  }])
+}
+
+function conversionBlockMutation(extraBlock: Record<string, unknown> = {}) {
+  return messageMutation([{
+    type: 'conversion',
+    blockId: 'conversion_block_1',
+    executionId: 'execution_1',
+    state: 'active',
+    ...extraBlock,
+  }])
+}
+
+function conversionTerminalMutation(extraPayload: Record<string, unknown> = {}) {
+  return {
+    id: 'conversion_terminal_mutation_1',
+    entityId: 'message_1',
+    baseRevision: 1,
+    occurredAt,
+    kind: 'message.conversion_block_terminal',
+    payload: {
+      messageId: 'message_1',
+      blockId: 'conversion_block_1',
+      executionId: 'execution_1',
+      state: 'terminal',
+      ...extraPayload,
+    },
+  }
+}
+
 function mockRpcResponse(
   value: unknown,
   options: {
@@ -388,6 +436,42 @@ describe('CloudBase user data function', () => {
       action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [invalid],
     }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
     expect(rpc).toHaveBeenCalledTimes(2)
+  })
+
+  it('accepts only canonical unique file-convert scopes and payload-free conversion blocks', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      results: [{ id: 'message_mutation_1', status: 'applied', revision: 1 }],
+    })
+    const handler = createUserDataHandler({ rpc })
+
+    for (const mutation of [
+      fileConvertApprovalMutation(['pdf', 'png']),
+      conversionBlockMutation(),
+      conversionTerminalMutation(),
+    ]) {
+      await expect(handler({
+        action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [mutation],
+      }, authenticatedContext)).resolves.toMatchObject({ ok: true })
+    }
+    expect(rpc).toHaveBeenCalledTimes(3)
+
+    const invalidMutations = [
+      fileConvertApprovalMutation([]),
+      fileConvertApprovalMutation(['pdf', 'pdf']),
+      fileConvertApprovalMutation(['docx']),
+      fileConvertApprovalMutation(['pdf'], { paths: ['/private/input.pdf'] }),
+      ...['bytes', 'path', 'sha256', 'artifactId', 'jobId'].map((key) => (
+        conversionBlockMutation({ [key]: 'private-local-value' })
+      )),
+      conversionTerminalMutation({ jobId: 'job_1' }),
+    ]
+
+    for (const mutation of invalidMutations) {
+      await expect(handler({
+        action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [mutation],
+      }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    }
+    expect(rpc).toHaveBeenCalledTimes(3)
   })
 
   it('rejects extra action and nested union keys before calling RPC', async () => {

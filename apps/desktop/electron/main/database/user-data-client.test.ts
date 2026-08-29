@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
-import type { PulledMutation, SyncMutation } from '@autoforge/shared'
+import type { PulledMutation, SyncMutation, SyncMutationResult } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
-import { UserDataStoreManager } from './user-data-client.js'
+import { UserDataStoreManager, type UserDataStore } from './user-data-client.js'
 
 const temporaryDirectories: string[] = []
 
@@ -53,6 +53,29 @@ function appendMessageMutation(
       role: 'user',
       blocks: [{ type: 'text', text: messageId }],
       createdAt: '2026-08-24T00:01:00.000Z',
+    },
+  }
+}
+
+function appendConversionMessageMutation(
+  id: string,
+  conversationId: string,
+  messageId: string,
+  state: 'active' | 'terminal' = 'active',
+): Extract<SyncMutation, { kind: 'message.append' }> {
+  const mutation = appendMessageMutation(id, conversationId, messageId)
+  return {
+    ...mutation,
+    payload: {
+      ...mutation.payload,
+      role: 'assistant',
+      executionId: 'conversion_execution',
+      blocks: [{
+        type: 'conversion',
+        blockId: 'conversion_block',
+        executionId: 'conversion_execution',
+        state,
+      }],
     },
   }
 }
@@ -121,6 +144,54 @@ function pulledMutation<T extends SyncMutation>(
   return { ...stored, resultRevision, receivedAt } as Omit<T, 'occurredAt'> & {
     resultRevision: number
     receivedAt: string
+  }
+}
+
+function createLocalTerminalOutbox(
+  store: UserDataStore,
+  prefix: string,
+): {
+  conversationId: string
+  messageId: string
+  mutation: Extract<SyncMutation, { kind: 'message.conversion_block_terminal' }>
+} {
+  const conversationId = `${prefix}_conversation`
+  const messageId = `${prefix}_message`
+  const create = createConversationMutation(`${prefix}_create`, conversationId)
+  const append = appendConversionMessageMutation(`${prefix}_append`, conversationId, messageId)
+  store.sync.applyRemotePage({
+    protocolVersion: 1,
+    cursor: `${prefix}_create_cursor`,
+    mutations: [pulledMutation(create, 1)],
+  }, 1)
+  store.sync.applyRemotePage({
+    protocolVersion: 1,
+    cursor: `${prefix}_append_cursor`,
+    mutations: [pulledMutation(append, 2)],
+  }, 2)
+  store.messages.replaceBlock(messageId, 'conversion_block', {
+    type: 'conversion',
+    blockId: 'conversion_block',
+    executionId: 'conversion_execution',
+    state: 'terminal',
+  })
+  const mutation = store.outbox.list(10).find((candidate) => (
+    candidate.kind === 'message.conversion_block_terminal'
+  ))
+  if (!mutation || mutation.kind !== 'message.conversion_block_terminal') {
+    throw new Error('Missing local conversion terminal mutation')
+  }
+  return {
+    conversationId,
+    messageId,
+    mutation: {
+      id: mutation.id,
+      kind: mutation.kind,
+      entityId: mutation.entityId,
+      baseRevision: mutation.baseRevision,
+      payload: mutation.payload,
+      occurredAt: mutation.occurredAt,
+    },
   }
 }
 
@@ -1598,6 +1669,293 @@ describe('UserDataStoreManager', () => {
       protocolVersion: 1, cursor: 'terminal_mismatch_cursor', mutations: [pulledMutation(mismatched, 4)],
     }, 4)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
     expect(store.sync.getCheckpoint()?.remoteCursor).toBe('terminal_replay_cursor')
+    manager.close()
+  })
+
+  it.each([
+    { label: 'applied base plus one', status: 'applied' as const, revisionDelta: 1, accepted: true },
+    { label: 'applied base', status: 'applied' as const, revisionDelta: 0, accepted: false },
+    { label: 'duplicate base', status: 'duplicate' as const, revisionDelta: 0, accepted: true },
+    { label: 'duplicate base plus one', status: 'duplicate' as const, revisionDelta: 1, accepted: false },
+    { label: 'duplicate stale revision', status: 'duplicate' as const, revisionDelta: -1, accepted: false },
+    { label: 'duplicate future revision', status: 'duplicate' as const, revisionDelta: 2, accepted: false },
+  ])('validates conversion terminal push acknowledgement: $label', ({
+    label, status, revisionDelta, accepted,
+  }) => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const seeded = createLocalTerminalOutbox(store, `terminal_ack_${label.replaceAll(' ', '_')}`)
+    store.outbox.markSyncing([seeded.mutation.id])
+    const result: SyncMutationResult = status === 'applied'
+      ? { id: seeded.mutation.id, status, revision: seeded.mutation.baseRevision + revisionDelta }
+      : { id: seeded.mutation.id, status, revision: seeded.mutation.baseRevision + revisionDelta }
+    const acknowledge = () => store.outbox.acknowledgePushResults([seeded.mutation], [result])
+
+    if (accepted) {
+      expect(acknowledge).not.toThrow()
+      expect(store.outbox.find(seeded.mutation.id)).toBeUndefined()
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        revision: seeded.mutation.baseRevision + 1,
+        syncState: 'synced',
+      })
+    } else {
+      expect(acknowledge).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+      expect(store.outbox.find(seeded.mutation.id)).toMatchObject({ state: 'syncing' })
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        revision: seeded.mutation.baseRevision + 1,
+        syncState: 'syncing',
+      })
+    }
+    manager.close()
+  })
+
+  it('allows a stale conversion duplicate only when an exact durable receipt satisfies it', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const seeded = createLocalTerminalOutbox(store, 'terminal_exact_receipt')
+    store.outbox.markSyncing([seeded.mutation.id])
+    store.outbox.acknowledgePushResults([seeded.mutation], [{
+      id: seeded.mutation.id,
+      status: 'duplicate',
+      revision: seeded.mutation.baseRevision,
+    }])
+    const checkpointBeforePull = store.sync.getCheckpoint()
+    const mismatched = {
+      ...seeded.mutation,
+      payload: { ...seeded.mutation.payload, executionId: 'other_execution' },
+    }
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'terminal_exact_receipt_mismatch',
+      mutations: [pulledMutation(mismatched, seeded.mutation.baseRevision)],
+    }, 4)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.sync.getCheckpoint()).toEqual(checkpointBeforePull)
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'terminal_exact_receipt_pull',
+      mutations: [pulledMutation(seeded.mutation, seeded.mutation.baseRevision)],
+    }, 5)).not.toThrow()
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('terminal_exact_receipt_pull')
+    expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+      revision: seeded.mutation.baseRevision + 1,
+      syncState: 'synced',
+    })
+    manager.close()
+  })
+
+  it.each([
+    { label: 'active next revision', localState: 'active' as const, baseRevision: 2, resultRevision: 3, accepted: true, expectedRevision: 3 },
+    { label: 'active duplicate revision', localState: 'active' as const, baseRevision: 2, resultRevision: 2, accepted: false, expectedRevision: 2 },
+    { label: 'active stale applied revision', localState: 'active' as const, baseRevision: 1, resultRevision: 2, accepted: false, expectedRevision: 2 },
+    { label: 'active future revision', localState: 'active' as const, baseRevision: 3, resultRevision: 4, accepted: false, expectedRevision: 2 },
+    { label: 'terminal next revision', localState: 'terminal' as const, baseRevision: 2, resultRevision: 3, accepted: true, expectedRevision: 3 },
+    { label: 'terminal exact duplicate revision', localState: 'terminal' as const, baseRevision: 2, resultRevision: 2, accepted: true, expectedRevision: 2 },
+    { label: 'terminal exact applied replay', localState: 'terminal' as const, baseRevision: 1, resultRevision: 2, accepted: true, expectedRevision: 2 },
+    { label: 'terminal stale revision', localState: 'terminal' as const, baseRevision: 0, resultRevision: 1, accepted: false, expectedRevision: 2 },
+    { label: 'terminal future revision', localState: 'terminal' as const, baseRevision: 3, resultRevision: 4, accepted: false, expectedRevision: 2 },
+  ])('validates pulled conversion terminal OCC: $label', ({
+    label, localState, baseRevision, resultRevision, accepted, expectedRevision,
+  }) => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const prefix = `terminal_pull_${label.replaceAll(' ', '_')}`
+    const conversationId = `${prefix}_conversation`
+    const messageId = `${prefix}_message`
+    const create = createConversationMutation(`${prefix}_create`, conversationId)
+    const append = appendConversionMessageMutation(
+      `${prefix}_append`, conversationId, messageId, localState,
+    )
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: `${prefix}_create_cursor`, mutations: [pulledMutation(create, 1)],
+    }, 1)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: `${prefix}_append_cursor`, mutations: [pulledMutation(append, 2)],
+    }, 2)
+    const checkpointBeforeTerminal = store.sync.getCheckpoint()
+    const terminal = conversionTerminalMutation(`${prefix}_terminal`, messageId, baseRevision)
+    const apply = () => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: `${prefix}_terminal_cursor`,
+      mutations: [pulledMutation(terminal, resultRevision)],
+    }, 3)
+
+    if (accepted) {
+      expect(apply).not.toThrow()
+      expect(store.sync.getCheckpoint()?.remoteCursor).toBe(`${prefix}_terminal_cursor`)
+      expect(store.messages.get(messageId)?.blocks).toEqual([{
+        type: 'conversion',
+        blockId: 'conversion_block',
+        executionId: 'conversion_execution',
+        state: 'terminal',
+      }])
+    } else {
+      expect(apply).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+      expect(store.sync.getCheckpoint()).toEqual(checkpointBeforeTerminal)
+      expect(store.messages.get(messageId)?.blocks).toEqual([{
+        type: 'conversion',
+        blockId: 'conversion_block',
+        executionId: 'conversion_execution',
+        state: localState,
+      }])
+    }
+    expect(store.conversations.getSummary(conversationId)?.revision).toBe(expectedRevision)
+    manager.close()
+  })
+
+  it.each([
+    {
+      label: 'duplicate exact conversion blocks',
+      blocks: [
+        { type: 'conversion', blockId: 'conversion_block', executionId: 'conversion_execution', state: 'active' },
+        { type: 'conversion', blockId: 'conversion_block', executionId: 'conversion_execution', state: 'active' },
+      ],
+    },
+    {
+      label: 'duplicate block id with another execution',
+      blocks: [
+        { type: 'conversion', blockId: 'conversion_block', executionId: 'conversion_execution', state: 'active' },
+        { type: 'conversion', blockId: 'conversion_block', executionId: 'other_execution', state: 'active' },
+      ],
+    },
+    {
+      label: 'duplicate block id with a non-conversion block',
+      blocks: [
+        { type: 'conversion', blockId: 'conversion_block', executionId: 'conversion_execution', state: 'active' },
+        { type: 'media_generation', blockId: 'conversion_block', jobId: 'media_job', kind: 'video', status: 'pending' },
+      ],
+    },
+    {
+      label: 'non-conversion target block',
+      blocks: [
+        { type: 'media_generation', blockId: 'conversion_block', jobId: 'media_job', kind: 'video', status: 'pending' },
+      ],
+    },
+    {
+      label: 'null conversion state',
+      blocks: [
+        { type: 'conversion', blockId: 'conversion_block', executionId: 'conversion_execution', state: null },
+      ],
+    },
+  ])('rejects malformed conversion block targets atomically: $label', ({ label, blocks }) => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const prefix = `terminal_blocks_${label.replaceAll(' ', '_')}`
+    const conversationId = `${prefix}_conversation`
+    const messageId = `${prefix}_message`
+    const create = createConversationMutation(`${prefix}_create`, conversationId)
+    const append = appendConversionMessageMutation(`${prefix}_append`, conversationId, messageId)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: `${prefix}_create_cursor`, mutations: [pulledMutation(create, 1)],
+    }, 1)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: `${prefix}_append_cursor`, mutations: [pulledMutation(append, 2)],
+    }, 2)
+    const raw = new Database(cachePath(root, 'cloud-alice'))
+    raw.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?').run(JSON.stringify(blocks), messageId)
+    raw.close()
+    const checkpointBeforeTerminal = store.sync.getCheckpoint()
+    const terminal = conversionTerminalMutation(`${prefix}_terminal`, messageId, 2)
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: `${prefix}_terminal_cursor`,
+      mutations: [pulledMutation(terminal, 3)],
+    }, 3)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.sync.getCheckpoint()).toEqual(checkpointBeforeTerminal)
+    const inspection = new Database(cachePath(root, 'cloud-alice'), { readonly: true })
+    expect(JSON.parse((inspection.prepare('SELECT blocks_json AS blocksJson FROM messages WHERE id = ?')
+      .get(messageId) as { blocksJson: string }).blocksJson)).toEqual(blocks)
+    expect(inspection.prepare('SELECT revision FROM conversations WHERE id = ?').get(conversationId))
+      .toEqual({ revision: 2 })
+    inspection.close()
+    manager.close()
+  })
+
+  it('rejects a conversion terminal pull when the message conversation owner changed', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const conversationId = 'terminal_owner_conversation'
+    const messageId = 'terminal_owner_message'
+    const create = createConversationMutation('terminal_owner_create', conversationId)
+    const append = appendConversionMessageMutation('terminal_owner_append', conversationId, messageId)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_owner_create_cursor', mutations: [pulledMutation(create, 1)],
+    }, 1)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_owner_append_cursor', mutations: [pulledMutation(append, 2)],
+    }, 2)
+    const raw = new Database(cachePath(root, 'cloud-alice'))
+    raw.prepare('UPDATE conversations SET user_id = ? WHERE id = ?').run('cloud-bob', conversationId)
+    raw.close()
+    const checkpointBeforeTerminal = store.sync.getCheckpoint()
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'terminal_owner_terminal_cursor',
+      mutations: [pulledMutation(conversionTerminalMutation(
+        'terminal_owner_terminal', messageId, 2,
+      ), 3)],
+    }, 3)).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(store.sync.getCheckpoint()).toEqual(checkpointBeforeTerminal)
+    const inspection = new Database(cachePath(root, 'cloud-alice'), { readonly: true })
+    expect(inspection.prepare('SELECT revision FROM conversations WHERE id = ?').get(conversationId))
+      .toEqual({ revision: 2 })
+    inspection.close()
+    manager.close()
+  })
+
+  it('aggregates conversion terminal pending states and warnings by owning conversation, then clears them', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    const manager = new UserDataStoreManager(temporaryRoot())
+    try {
+      const store = manager.open('cloud-alice')
+      const seeded = createLocalTerminalOutbox(store, 'terminal_aggregate')
+      now.mockReturnValue(1_000 + (24 * 60 * 60 * 1_000))
+
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        syncState: 'pending', syncWarningSince: '1970-01-01T00:00:01.000Z',
+      })
+      store.outbox.markSyncing([seeded.mutation.id])
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        syncState: 'syncing', syncWarningSince: '1970-01-01T00:00:01.000Z',
+      })
+      store.outbox.markFailed(seeded.mutation.id, 'SYNC_CONFLICT')
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        syncState: 'failed', syncWarningSince: '1970-01-01T00:00:01.000Z',
+      })
+      expect(store.outbox.retryFailed(seeded.conversationId)).toEqual([seeded.mutation.id])
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        syncState: 'pending', syncWarningSince: '1970-01-01T00:00:01.000Z',
+      })
+      store.outbox.markSyncing([seeded.mutation.id])
+      store.outbox.acknowledgePushResults([seeded.mutation], [{
+        id: seeded.mutation.id,
+        status: 'applied',
+        revision: seeded.mutation.baseRevision + 1,
+      }])
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        syncState: 'synced',
+      })
+      expect(store.conversations.getSummary(seeded.conversationId)?.syncWarningSince).toBeUndefined()
+    } finally {
+      manager.close()
+      now.mockRestore()
+    }
+  })
+
+  it('retries a failed conversion terminal mutation by its owning conversation ID', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const seeded = createLocalTerminalOutbox(store, 'terminal_retry_conversation')
+    store.outbox.markFailed(seeded.mutation.id, 'SYNC_CONFLICT')
+
+    expect(store.outbox.retryFailed(seeded.conversationId)).toEqual([seeded.mutation.id])
+    expect(store.outbox.find(seeded.mutation.id)).toMatchObject({ state: 'pending' })
+    expect(store.conversations.getSummary(seeded.conversationId)?.syncState).toBe('pending')
     manager.close()
   })
 

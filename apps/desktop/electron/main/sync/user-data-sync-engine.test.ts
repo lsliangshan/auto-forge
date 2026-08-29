@@ -28,6 +28,7 @@ type CreateMutation = Extract<SyncMutation, { kind: 'conversation.create' }>
 type PulledCreateMutation = Extract<RemoteSyncMutation, { kind: 'conversation.create' }>
 type RenameMutation = Extract<SyncMutation, { kind: 'conversation.rename' }>
 type MessageMutation = Extract<SyncMutation, { kind: 'message.append' }>
+type ConversionTerminalMutation = Extract<SyncMutation, { kind: 'message.conversion_block_terminal' }>
 
 function createMutation(index: number, prefix = 'alice'): CreateMutation {
   const suffix = String(index).padStart(3, '0')
@@ -114,6 +115,66 @@ function conversionMessageMutation(id: string, conversationId: string, baseRevis
     payload: {
       id: `${id}_message`, conversationId, role: 'assistant', createdAt: '2026-08-25T00:03:00.000Z',
       blocks: [{ type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal' }],
+    },
+  }
+}
+
+function conversionTerminalMutation(
+  id: string,
+  messageId: string,
+  baseRevision: number,
+): ConversionTerminalMutation {
+  return {
+    id,
+    kind: 'message.conversion_block_terminal',
+    entityId: messageId,
+    baseRevision,
+    payload: {
+      messageId,
+      blockId: 'conversion_block_1',
+      executionId: 'execution_1',
+      state: 'terminal',
+    },
+    occurredAt: '2026-08-25T00:04:00.000Z',
+  }
+}
+
+function createLocalTerminalOutbox(
+  store: UserDataStore,
+  index: number,
+): { conversationId: string; mutation: ConversionTerminalMutation } {
+  const create = createMutation(index)
+  const append = conversionMessageMutation(`terminal_ack_${index}`, create.entityId, 1)
+  append.payload = {
+    ...append.payload,
+    blocks: [{
+      type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'active',
+    }],
+  }
+  store.sync.applyRemotePage({
+    protocolVersion: 1, cursor: `terminal_ack_create_${index}`, mutations: [remoteReceipt(create, 1)],
+  }, 1)
+  store.sync.applyRemotePage({
+    protocolVersion: 1, cursor: `terminal_ack_append_${index}`, mutations: [remoteReceipt(append, 2)],
+  }, 2)
+  store.messages.replaceBlock(append.entityId, 'conversion_block_1', {
+    type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal',
+  })
+  const mutation = store.outbox.list(10).find((candidate) => (
+    candidate.kind === 'message.conversion_block_terminal'
+  ))
+  if (!mutation || mutation.kind !== 'message.conversion_block_terminal') {
+    throw new Error('Missing conversion terminal mutation')
+  }
+  return {
+    conversationId: create.entityId,
+    mutation: {
+      id: mutation.id,
+      kind: mutation.kind,
+      entityId: mutation.entityId,
+      baseRevision: mutation.baseRevision,
+      payload: mutation.payload,
+      occurredAt: mutation.occurredAt,
     },
   }
 }
@@ -289,6 +350,106 @@ describe('UserDataSyncEngine', () => {
     expect(store.outbox.find(pushed[0]!.id)).toBeUndefined()
     expect(store.conversations.getSummary(create.entityId)).toMatchObject({ revision: 3, syncState: 'synced' })
     expect(changes.flat()).toContain(create.entityId)
+  })
+
+  it.each([
+    { label: 'applied base plus one', status: 'applied' as const, revisionDelta: 1, accepted: true },
+    { label: 'duplicate base', status: 'duplicate' as const, revisionDelta: 0, accepted: true },
+    { label: 'applied base', status: 'applied' as const, revisionDelta: 0, accepted: false },
+    { label: 'duplicate base plus one', status: 'duplicate' as const, revisionDelta: 1, accepted: false },
+  ])('handles terminal push acknowledgement and notification: $label', async ({
+    label, status, revisionDelta, accepted,
+  }) => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const index = 50 + ['applied base plus one', 'duplicate base', 'applied base', 'duplicate base plus one']
+      .indexOf(label)
+    const seeded = createLocalTerminalOutbox(store, index)
+    const changes: string[][] = []
+    const { engine } = createEngine(manager, async (input) => input.action === 'syncPush'
+      ? success({
+          results: [{
+            id: seeded.mutation.id,
+            status,
+            revision: seeded.mutation.baseRevision + revisionDelta,
+          }],
+          cursor: `terminal_ack_push_${index}`,
+        })
+      : success({ mutations: [], cursor: `terminal_ack_pull_${index}` }),
+    new FakeClock(), (ids) => changes.push([...ids]))
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    if (accepted) {
+      expect(engine.status()).toEqual({ state: 'idle' })
+      expect(store.outbox.find(seeded.mutation.id)).toBeUndefined()
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        revision: seeded.mutation.baseRevision + 1,
+        syncState: 'synced',
+      })
+    } else {
+      expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'SYNC_FAILED' })
+      expect(store.outbox.find(seeded.mutation.id)).toMatchObject({
+        state: 'failed', lastErrorCode: 'SYNC_FAILED',
+      })
+      expect(store.conversations.getSummary(seeded.conversationId)?.syncState).toBe('failed')
+    }
+    expect(changes.flat()).toContain(seeded.conversationId)
+  })
+
+  it.each([
+    { label: 'terminal local content advances the next revision', localState: 'terminal' as const, resultRevision: 3, accepted: true },
+    { label: 'active local content rejects a duplicate revision', localState: 'active' as const, resultRevision: 2, accepted: false },
+  ])('handles terminal pull OCC, quarantine, and notification: $label', async ({
+    localState, resultRevision, accepted,
+  }) => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const index = localState === 'terminal' ? 60 : 61
+    const create = createMutation(index)
+    const append = conversionMessageMutation(`terminal_pull_${index}`, create.entityId, 1)
+    append.payload = {
+      ...append.payload,
+      blocks: [{
+        type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: localState,
+      }],
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: `terminal_pull_create_${index}`, mutations: [remoteReceipt(create, 1)],
+    }, 1)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: `terminal_pull_append_${index}`, mutations: [remoteReceipt(append, 2)],
+    }, 2)
+    const checkpointBeforePull = store.sync.getCheckpoint()
+    const terminal = conversionTerminalMutation(`terminal_pull_mutation_${index}`, append.entityId, 2)
+    const changes: string[][] = []
+    const { engine } = createEngine(manager, async (input) => input.action === 'syncPull'
+      ? success({
+          mutations: [remoteReceipt(terminal, resultRevision)],
+          cursor: `terminal_pull_cursor_${index}`,
+        })
+      : success({ results: [] }),
+    new FakeClock(), (ids) => changes.push([...ids]))
+
+    await engine.start('alice', 'device-a')
+    await engine.pull()
+
+    if (accepted) {
+      expect(engine.status()).toEqual({ state: 'idle' })
+      expect(store.sync.getCheckpoint()?.remoteCursor).toBe(`terminal_pull_cursor_${index}`)
+      expect(store.conversations.getSummary(create.entityId)?.revision).toBe(3)
+      expect(changes.flat()).toContain(create.entityId)
+    } else {
+      expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'INTERNAL_ERROR' })
+      expect(store.sync.getCheckpoint()).toEqual(checkpointBeforePull)
+      expect(store.conversations.getSummary(create.entityId)?.revision).toBe(2)
+      expect(changes).toEqual([])
+    }
+    expect(store.messages.get(append.entityId)?.blocks).toEqual([{
+      type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1',
+      state: accepted ? 'terminal' : localState,
+    }])
   })
 
   it('reports a 24-hour warning from durable outbox age and clears after recovery', async () => {

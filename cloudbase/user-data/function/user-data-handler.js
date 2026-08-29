@@ -338,6 +338,7 @@ function validateScope(capability, scope) {
     return hasStrictShape(scope, ['formats'])
       && Array.isArray(scope.formats)
       && scope.formats.length > 0
+      && new Set(scope.formats).size === scope.formats.length
       && scope.formats.every((format) => typeof format === 'string'
         && ['png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif', 'ico', 'icns', 'pdf', 'xlsx', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'mp4', 'webm', 'mov'].includes(format))
   }

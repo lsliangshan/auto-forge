@@ -9575,6 +9575,36 @@ describe('createApplicationRuntime', () => {
     await mkdir(dirname(inputPath), { recursive: true })
     await writeFile(inputPath, bytes)
     const emitChat = vi.fn()
+    const pushedMutations: SyncMutation[] = []
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+        if (input.action === 'syncPush') {
+          pushedMutations.push(...structuredClone(input.mutations))
+          return {
+            ok: true as const,
+            data: {
+              results: input.mutations.map((mutation) => ({
+                id: mutation.id,
+                status: 'applied' as const,
+                revision: mutation.kind === 'privacy.consent'
+                  || mutation.kind === 'usage.record'
+                  || mutation.kind === 'legacy.import'
+                  ? 0
+                  : mutation.baseRevision + 1,
+              })),
+              cursor: 'cursor_conversion_block_terminal',
+            },
+          }
+        }
+        if (input.action === 'syncPull') {
+          return {
+            ok: true as const,
+            data: { mutations: [], cursor: 'cursor_conversion_block_terminal' },
+          }
+        }
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }),
+    }
     const packEntered = deferred<void>()
     const releasePack = deferred<void>()
     const conversionRuntime: ConversionJobRuntime = {
@@ -9594,7 +9624,12 @@ describe('createApplicationRuntime', () => {
       }),
       convert: async () => { throw toSafeAppError({ code: 'CONVERSION_CANCELLED' }) },
     }
-    const runtime = createApplicationRuntime(options(root, { authService, conversionRuntime, emitChat }))
+    const runtime = createApplicationRuntime(options(root, {
+      authService,
+      conversionRuntime,
+      emitChat,
+      userDataSyncPort,
+    }))
     const conversionEvents: unknown[] = []
     runtime.services.conversion.onEvent((event) => { conversionEvents.push(event) })
     try {
@@ -9620,21 +9655,312 @@ describe('createApplicationRuntime', () => {
         type: 'conversion', blockId: 'block_conversion_terminal',
         executionId: 'execution_conversion_block_terminal', state: 'terminal',
       }])
-      expect(JSON.stringify({ events: emitChat.mock.calls, message })).not.toMatch(
+      const blockUpdateEvents = emitChat.mock.calls.filter(([event]) => event.type === 'block_update')
+      expect(JSON.stringify({ events: blockUpdateEvents, message })).not.toMatch(
         /bytes|path|sha256|artifactId|jobId|metadata/i,
       )
-      const outbox = new UserDataStoreManager(join(root, 'user-caches'))
-      const terminalMutation = outbox.open(session.user.id).outbox.list(100).find((mutation) => (
+      await vi.waitFor(() => expect(pushedMutations).toContainEqual(expect.objectContaining({
+        kind: 'message.conversion_block_terminal',
+        entityId: 'message_conversion_block_terminal',
+      })))
+      const terminalMutation = pushedMutations.find((mutation) => (
         mutation.kind === 'message.conversion_block_terminal'
         && mutation.entityId === 'message_conversion_block_terminal'
         && JSON.stringify(mutation.payload).includes('"state":"terminal"')
       ))
-      outbox.close()
       expect(terminalMutation).toBeDefined()
       expect(JSON.stringify(terminalMutation)).not.toMatch(/bytes|path|sha256|artifactId|jobId|metadata/i)
+      expect(withUserData(root, session.user.id, (userStore) => (
+        userStore.outbox.list(100).filter((mutation) => (
+          mutation.kind === 'message.conversion_block_terminal'
+        ))
+      ))).toHaveLength(0)
     } finally {
       releasePack.resolve()
       await runtime.close()
+    }
+  })
+
+  it('finalizes a fast conversion only after the assistant append commits and replays exactly once', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-block-fast-'))
+    directories.push(root)
+    const source = join(root, 'source.txt')
+    await writeFile(source, 'local conversion source')
+    const chatEvents: ChatEvent[] = []
+    const completion = deferred<Execution>()
+    const startReserved = vi.spyOn(ExecutionService.prototype, 'startReserved')
+      .mockImplementation(async (reservation, input) => {
+        const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+        try {
+          database.executions.insert({
+            id: reservation.executionId,
+            ownerUserId: input.userId,
+            workflowId: input.workflowId,
+            workflowVersion: input.workflowVersion,
+            ...(input.chatRunId === undefined ? {} : { chatRunId: input.chatRunId }),
+            status: 'completed',
+            input: input.input,
+          })
+          database.conversionJobs.create({
+            id: `job_${reservation.executionId}`,
+            ownerUserId: input.userId,
+            executionId: reservation.executionId,
+            sourceKind: 'media',
+            sourceId: 'local_source',
+            targetFormat: 'pdf',
+            status: 'completed',
+            progress: 100,
+          })
+        } finally {
+          database.close()
+        }
+        return { id: reservation.executionId, finished: completion.promise }
+      })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/conversion-block-fast', 'Conversion block fast'),
+        supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request: ModelStreamRequest) {
+        if (isConversationTitleRequest(request)) {
+          yield { type: 'text_delta' as const, choiceIndex: 0, text: '文件转换' }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+          return
+        }
+        if (request.messages.some((message) => message.role === 'tool')) {
+          yield { type: 'text_delta' as const, choiceIndex: 0, text: '转换任务已完成' }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+          return
+        }
+        const toolName = request.tools?.[0]?.function.name
+        if (!toolName) throw new Error('Expected the conversion workflow tool')
+        yield {
+          type: 'tool_call' as const,
+          choiceIndex: 0,
+          index: 0,
+          id: 'call_conversion_block_fast',
+          name: toolName,
+          arguments: { input: { files: [0], targetFormat: 'pdf' } },
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source],
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    let requestId: string | undefined
+    try {
+      const session = await authenticate(runtime, 'ConversionBlockFast')
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' },
+          openrouter: { text: 'openrouter/conversion-block-fast' },
+        },
+      })
+      await installConversionWorkflow(runtime)
+      const conversation = await runtime.services.chat.createConversation()
+      const [asset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id,
+        existingAssetIds: [],
+      })
+      const sent = await runtime.services.chat.send({
+        ...chatInput(conversation.id, '把附件转换成 PDF'),
+        assetIds: [asset!.id],
+        outputType: 'text',
+      })
+      requestId = sent.requestId
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({ type: 'approval', capability: 'file.convert' }),
+      })))
+      const approvalEvent = [...chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+        event.type === 'block' && event.block.type === 'approval'
+      ))!
+      const approval = approvalEvent.block as Extract<typeof approvalEvent.block, { type: 'approval' }>
+      const decision = runtime.services.executions.decide({
+        executionId: approval.executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: approval.scopeHash,
+        decision: 'once',
+      })
+      await vi.waitFor(() => expect(startReserved).toHaveBeenCalledTimes(1))
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block',
+        messageId: expect.any(String),
+        block: expect.objectContaining({
+          type: 'conversion', executionId: approval.executionId, state: 'active',
+        }),
+      })))
+      const conversionEvent = [...chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+        event.type === 'block' && event.block.type === 'conversion'
+      ))!
+      const conversion = conversionEvent.block as Extract<typeof conversionEvent.block, { type: 'conversion' }>
+      const before = openAppDatabase(join(root, 'autoforge.sqlite'))
+      expect(before.conversionBlockBindings.get(session.user.id, approval.executionId)).toMatchObject({
+        conversationId: conversation.id,
+        messageId: conversionEvent.messageId,
+        blockId: conversion.blockId,
+        executionId: approval.executionId,
+        finalizedAt: undefined,
+      })
+      before.close()
+      expect(withUserData(root, session.user.id, (store) => store.outbox.list(100)
+        .filter((mutation) => mutation.kind === 'message.conversion_block_terminal'))).toHaveLength(0)
+
+      completion.resolve({
+        id: approval.executionId,
+        workflowId: 'file.convert.test',
+        workflowVersion: '1.0.0',
+        status: 'completed',
+        input: { files: [0], targetFormat: 'pdf' },
+        result: { ok: true },
+        createdAt: 1,
+        startedAt: 1,
+        endedAt: 2,
+      })
+      await expect(decision).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block_update',
+        messageId: conversionEvent.messageId,
+        blockId: conversion.blockId,
+        block: expect.objectContaining({
+          type: 'conversion', executionId: approval.executionId, state: 'terminal',
+        }),
+      })))
+      const after = openAppDatabase(join(root, 'autoforge.sqlite'))
+      expect(after.conversionBlockBindings.get(session.user.id, approval.executionId)?.finalizedAt)
+        .toEqual(expect.any(Number))
+      after.close()
+      const mutations = withUserData(root, session.user.id, (store) => store.outbox.list(100))
+      expect(mutations.filter((mutation) => (
+        mutation.kind === 'message.append' && mutation.entityId === conversionEvent.messageId
+      ))).toHaveLength(1)
+      expect(mutations.filter((mutation) => (
+        mutation.kind === 'message.conversion_block_terminal'
+          && mutation.entityId === conversionEvent.messageId
+      ))).toHaveLength(1)
+      expect(JSON.stringify(mutations.filter((mutation) => (
+        mutation.kind === 'message.conversion_block_terminal'
+      )))).not.toMatch(/jobId|artifactId|bytes|path|sha256|metadata/i)
+    } finally {
+      completion.resolve({
+        id: 'unused', workflowId: 'file.convert.test', workflowVersion: '1.0.0',
+        status: 'cancelled', input: {}, createdAt: 1,
+      })
+      if (requestId) await runtime.services.chat.cancel(requestId).catch(() => undefined)
+      await runtime.close()
+    }
+
+    const restarted = createApplicationRuntime(options(root))
+    try {
+      const session = await authenticate(restarted, 'ConversionBlockFast')
+      await restarted.recover()
+      const terminalMutations = withUserData(root, session.user.id, (store) => store.outbox.list(100)
+        .filter((mutation) => mutation.kind === 'message.conversion_block_terminal'))
+      expect(terminalMutations).toHaveLength(1)
+    } finally {
+      await restarted.close()
+    }
+  })
+
+  it('rebinds and reconciles a persisted finalized active conversion after restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-block-rebind-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const bootstrap = createApplicationRuntime(options(root, { authService }))
+    const session = await authenticate(bootstrap, 'ConversionBlockRebind')
+    const conversation = await bootstrap.services.chat.createConversation()
+    await bootstrap.close()
+
+    withUserData(root, session.user.id, (store) => {
+      store.chatRuns.insert({
+        id: 'run_conversion_block_rebind',
+        conversationId: conversation.id,
+        requestId: 'request_conversion_block_rebind',
+        userId: session.user.id,
+        provider: 'openrouter',
+        model: 'openrouter/test',
+        status: 'completed',
+        startedAt: 1,
+        endedAt: 2,
+      })
+      store.messages.insert({
+        id: 'message_conversion_block_rebind',
+        conversationId: conversation.id,
+        role: 'assistant',
+        blocks: [{
+          type: 'conversion',
+          blockId: 'block_conversion_block_rebind',
+          executionId: 'execution_conversion_block_rebind',
+          state: 'active',
+        }],
+        createdAt: 2,
+      })
+    })
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.executions.insert({
+      id: 'execution_conversion_block_rebind',
+      ownerUserId: session.user.id,
+      workflowId: 'file.convert.universal',
+      workflowVersion: '0.1.0',
+      chatRunId: 'run_conversion_block_rebind',
+      status: 'completed',
+      input: {},
+    })
+    database.conversionJobs.create({
+      id: 'job_conversion_block_rebind',
+      ownerUserId: session.user.id,
+      executionId: 'execution_conversion_block_rebind',
+      sourceKind: 'media',
+      sourceId: 'source_conversion_block_rebind',
+      targetFormat: 'pdf',
+      status: 'completed',
+      progress: 100,
+    })
+    database.conversionBlockBindings.create({
+      ownerUserId: session.user.id,
+      conversationId: conversation.id,
+      messageId: 'message_conversion_block_rebind',
+      blockId: 'block_conversion_block_rebind',
+      executionId: 'execution_conversion_block_rebind',
+    })
+    database.conversionBlockBindings.finalize(
+      session.user.id,
+      'execution_conversion_block_rebind',
+      3,
+    )
+    database.close()
+
+    const emitChat = vi.fn()
+    const restarted = createApplicationRuntime(options(root, { authService, emitChat }))
+    try {
+      await restarted.services.auth.getSession()
+      await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'block_update',
+        conversationId: conversation.id,
+        messageId: 'message_conversion_block_rebind',
+        blockId: 'block_conversion_block_rebind',
+        block: {
+          type: 'conversion',
+          blockId: 'block_conversion_block_rebind',
+          executionId: 'execution_conversion_block_rebind',
+          state: 'terminal',
+        },
+      })))
+      expect(withUserData(root, session.user.id, (store) => store.outbox.list(100).filter((mutation) => (
+        mutation.kind === 'message.conversion_block_terminal'
+      )))).toHaveLength(1)
+      await restarted.services.auth.getSession()
+      expect(withUserData(root, session.user.id, (store) => store.outbox.list(100).filter((mutation) => (
+        mutation.kind === 'message.conversion_block_terminal'
+      )))).toHaveLength(1)
+    } finally {
+      await restarted.close()
     }
   })
 

@@ -118,6 +118,11 @@ import { MediaLifecycle } from './media/media-lifecycle.js'
 import { resolveUserConversionRoot, resolveUserMediaRoot } from './media/user-media-root.js'
 import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pinned-media-transport.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
+import {
+  finalizeConversionBlockBindings,
+  reconcileConversionBlockBinding,
+  registerConversionBlockBindings,
+} from './conversion/conversion-block-coordinator.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import { createTokenUsageSnapshot } from './token-usage.js'
@@ -756,9 +761,6 @@ function executionSummary(execution: Execution): ExecutionSummary {
 const terminalConversionStatuses = new Set<ConversionJob['status']>([
   'completed', 'failed', 'cancelled', 'interrupted',
 ])
-const terminalExecutionStatuses = new Set<Execution['status']>([
-  'completed', 'failed', 'cancelled', 'interrupted',
-])
 const retryableConversionStatuses = new Set<ConversionJob['status']>([
   'failed', 'cancelled', 'interrupted',
 ])
@@ -1289,16 +1291,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       credential: secretStore,
       fetch: options.networkProxy.fetch.bind(options.networkProxy) as typeof globalThis.fetch,
       diagnostic: providerDiagnostics.forProvider('openrouter'),
-    }, (messageId, blocks) => {
-      const ownerUserId = auth.currentUserId()
-      if (!ownerUserId) return
-      for (const block of blocks) {
-        if (block.type !== 'conversion') continue
-        const binding = database.conversionBlockBindings.get(ownerUserId, block.executionId)
-        if (!binding || binding.messageId !== messageId || binding.blockId !== block.blockId) continue
-        database.conversionBlockBindings.finalize(ownerUserId, block.executionId, Date.now())
-        if (boundConversion?.ownerUserId === ownerUserId) reconcileConversionBlocks(boundConversion, block.executionId)
-      }
     }),
     deepseek: options.modelProviders?.deepseek ?? new DeepSeekProvider({
       credential: secretStore,
@@ -1537,28 +1529,20 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
   }
   const reconcileConversionBlocks = (lifecycle: BoundConversionLifecycle, executionId: string): void => {
-    const binding = database.conversionBlockBindings.get(lifecycle.ownerUserId, executionId)
-    if (!binding?.finalizedAt) return
-    const execution = database.executions.getForUser(executionId, lifecycle.ownerUserId)
-    if (!execution?.chatRunId || !terminalExecutionStatuses.has(execution.status)) return
-    const jobs = database.conversionJobs.listForExecution(executionId, lifecycle.ownerUserId)
-    if (jobs.length === 0 || !jobs.every((candidate) => terminalConversionStatuses.has(candidate.status))) return
-    if (binding.conversationId !== chatDatabase.chatRuns.get(execution.chatRunId)?.conversationId) return
-    const activeConversion = (candidate: unknown): candidate is Extract<ChatBlock, { type: 'conversion' }> => (
-      typeof candidate === 'object' && candidate !== null
-      && (candidate as { type?: unknown }).type === 'conversion'
-      && (candidate as { executionId?: unknown }).executionId === executionId
-      && (candidate as { state?: unknown }).state === 'active'
-    )
-    const message = chatDatabase.messages.get(binding.messageId)
-    const block = message?.blocks.find((candidate): candidate is Extract<ChatBlock, { type: 'conversion' }> => (
-      activeConversion(candidate) && (candidate as Extract<ChatBlock, { type: 'conversion' }>).blockId === binding.blockId
-    ))
-    if (!message || !block || message.conversationId !== binding.conversationId) return
-    const replacement = { ...block, state: 'terminal' as const }
-    chatDatabase.messages.replaceBlock(message.id, block.blockId, replacement)
+    const transition = reconcileConversionBlockBinding({
+      repositories: { durable: database, chat: chatDatabase },
+      ownerUserId: lifecycle.ownerUserId,
+      executionId,
+    })
+    if (!transition) return
     queueUserDataFlush()
-    options.emitChat({ type: 'block_update', conversationId: binding.conversationId, messageId: message.id, blockId: replacement.blockId, block: replacement })
+    options.emitChat({
+      type: 'block_update',
+      conversationId: transition.conversationId,
+      messageId: transition.messageId,
+      blockId: transition.block.blockId,
+      block: transition.block,
+    })
   }
   const emitConversionJob = (lifecycle: BoundConversionLifecycle, job: ConversionJob): void => {
     if (boundConversion !== lifecycle
@@ -2200,16 +2184,27 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const agent = new AgentOrchestrator({
     workflows: registry,
     persistence: createAgentPersistence(chatDatabase, (messageId, blocks) => {
-      const conversion = blocks.find((block): block is Extract<ChatBlock, { type: 'conversion' }> => block.type === 'conversion' && block.state === 'active')
-      const message = chatDatabase.messages.get(messageId)
       const ownerUserId = auth.currentUserId()
-      if (!conversion || !message || !ownerUserId) return
-      const existing = database.conversionBlockBindings.get(ownerUserId, conversion.executionId)
-      if (existing) {
-        if (existing.messageId !== messageId || existing.blockId !== conversion.blockId) throw failure('CONFLICT')
-        return
-      }
-      database.conversionBlockBindings.create({ ownerUserId, conversationId: message.conversationId, messageId, blockId: conversion.blockId, executionId: conversion.executionId })
+      if (!ownerUserId) return
+      registerConversionBlockBindings({
+        repositories: { durable: database, chat: chatDatabase },
+        ownerUserId,
+        messageId,
+        blocks,
+      })
+    }, (messageId, blocks) => {
+      const ownerUserId = auth.currentUserId()
+      if (!ownerUserId) return
+      const executionIds = finalizeConversionBlockBindings({
+        repositories: { durable: database, chat: chatDatabase },
+        ownerUserId,
+        messageId,
+        blocks,
+        finalizedAt: Date.now(),
+      })
+      const lifecycle = boundConversion
+      if (!lifecycle || lifecycle.ownerUserId !== ownerUserId) return
+      for (const executionId of executionIds) reconcileConversionBlocks(lifecycle, executionId)
     }),
     history: conversationContext,
     policy,
