@@ -10,42 +10,76 @@ export interface LocalAttachmentProjection {
 const CHINESE_ATTACHMENT_REFERENCE = `(?:(?:(?:这|这个|该|当前|那|那个)?(?:张|个|份)?(?:附件|文件|图片|图像|照片|文档|视频|音频))|它们?)`
 const ENGLISH_ATTACHMENT_REFERENCE = `(?:(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:attachment|file|image|photo|picture|document|video|audio)|it|them)`
 const ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE = `(?:(?:this|the|that|current|my|your|an?)\\s+(?:attachment|file|image|photo|picture|document|video|audio)|it|them)`
-const CONVERSION_ACTION = new RegExp([
-  `(?<!万象)(?:转换|转成|转为)`,
-  `(?:做成|制作|保存|存为|另存|导出|输出(?:成|为)|改成|改为|换成|换为)`,
+const STRONG_CONVERSION_ACTION = [
+  `(?<!万象)(?:转换|转成|转为)(?!率|器)`,
+  `(?:另存(?:为)?|(?:保存|存|导出|输出|改|换)(?:成|为))`,
   `万象转换\\s*(?:来\\s*)?处理`,
-  `处理\\s*${CHINESE_ATTACHMENT_REFERENCE}`,
-  `\\b(?:transcode|convert|export)\\b`,
-  `\\bsave(?:\\s+${ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE})?(?:\\s+as)?\\b`,
+  `\\b(?:convert|transcode)\\b`,
+  `\\b(?:save|export)(?:\\s+${ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE})?\\s+as\\b`,
   `\\b(?:make|turn|change)\\s+${ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE}\\b`,
-].join('|'), 'iu')
-const CHINESE_NEGATED_ACTION_PREFIX = new RegExp(
-  `(?:请\\s*)?(?:千万\\s*)?(?:不要|不用|不需要|无需|不必|别|禁止|请勿)\\s*(?:(?:再|直接|继续|尝试)\\s*)?(?:把|将|用)?\\s*(?:${CHINESE_ATTACHMENT_REFERENCE}\\s*)?$`,
+].join('|')
+const WEAK_CONVERSION_ACTION = [
+  `(?:做成|制作|保存|导出|输出|处理)`,
+  `\\b(?:save|export|process)\\b`,
+].join('|')
+const CONVERSION_ACTION = new RegExp(
+  `(?<strong>${STRONG_CONVERSION_ACTION})|(?<weak>${WEAK_CONVERSION_ACTION})`,
+  'giu',
+)
+const ATTACHMENT_REFERENCE = new RegExp(
+  `(?:${CHINESE_ATTACHMENT_REFERENCE}|${ENGLISH_ATTACHMENT_REFERENCE})`,
   'iu',
 )
-const ENGLISH_NEGATED_ACTION_PREFIX = new RegExp(
-  `(?:please\\s+)?(?:you\\s+)?(?:do\\s+not|don't|never|no\\s+need\\s+to|do\\s+not\\s+need\\s+to|don't\\s+need\\s+to|need\\s+not|needn't)\\s*(?:ever\\s+)?(?:${ENGLISH_ATTACHMENT_REFERENCE}\\s*)?$`,
-  'iu',
-)
-const CHINESE_INFORMATION_PREFIX = /(?:支持|是否|能否|可否|能不能|可以|能够|请问|如何|怎么|介绍|说明|了解|安全|隐私|万象转换能|这个工具能|它能|你能)/iu
-const ENGLISH_INFORMATION_PREFIX = /\b(?:what|which|how|whether|can|could|would|does|is|tell|describe|explain)\b/iu
+const CONVERSION_NEGATION = /(?:不要|不用|不需要|无需|不必|别|禁止|请勿)|\b(?:do\s+not|don't|never|no\s+need\s+to|do\s+not\s+need\s+to|don't\s+need\s+to|need\s+not|needn't)\b/giu
+const OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION = /(?:解释|询问|问|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:explain|ask|summari[sz]e|describe|discuss|analy[sz]e|review|check|read|tell)\b/iu
+const OPEN_INFORMATION_QUESTION = /(?:(?:(?:请问)?(?:万象转换|这个工具|它|你)?(?:支持|能否|能不能|能|可以|能够))[^，,；;。.!！？?]{0,32}(?:哪些|什么|何种)\s*格式|(?:哪些|什么|何种)\s*格式|(?:介绍|说明|了解)[^，,；;。.!！？?]{0,24}(?:万象转换|转换)|(?:万象转换|转换)[^，,；;。.!！？?]{0,24}(?:是什么|什么意思|含义|安全|隐私|上传|能做什么|如何工作|怎么用)|\b(?:what|which)\s+formats?\b|\b(?:what\s+is|what\s+does|how\s+does|tell\s+me\s+about|describe|explain)[^,;.!?]{0,32}(?:conversion|converter|it)\b|\b(?:conversion|converter|it)\b[^,;.!?]{0,24}\b(?:safe|privacy|upload|mean)\b)/iu
 const BARE_TARGET_PATTERN = `(?:${[
   ...CONVERSION_TARGET_FORMATS,
-  'jpg', 'zip', 'tif', 'docx', 'word', 'heic', 'svg', 'csv', 'txt',
+  'jpg', 'zip', 'tif', 'docx', 'word', 'heic', 'svg', 'csv', 'txt', 'rar', '7z', 'cur',
 ].join('|')})`
+const FORMAT_LIKE_REFERENCE = new RegExp(
+  `(?:^|[^\\p{L}\\p{N}])\\.?${BARE_TARGET_PATTERN}(?=$|[^\\p{L}\\p{N}])`,
+  'iu',
+)
 const BARE_CONVERSION_TARGET = new RegExp(
   `^(?:(?:一(?:个|份|张)|an?)\\s+)?\\.?${BARE_TARGET_PATTERN}(?:(?:\\s*(?:格式|文件))|(?:\\s+(?:formats?|files?)))?(?:\\s+(?:instead|rather))?$`,
   'iu',
 )
 const UPPERCASE_BARE_CONVERSION_TARGET = /^(?:(?:an?)\s+)?\.?[A-Z0-9]{2,10}(?:\s+(?:FORMAT|FILE))?(?:\s+(?:instead|rather))?$/u
 const CONTRASTIVE_TARGET = /\b(?:instead|rather)\b/iu
-const CLAUSE_CONNECTOR = /(?:而是|但是|然后|并且|但)|\b(?:and\s+then|and|but|however|then)\b/giu
+const FORMAT_SHORTHAND = `\\.?[A-Za-z0-9]{2,5}`
+const CHINESE_CONTRASTIVE_SHORTHAND = new RegExp(
+  `(?:不要|不用|别)\\s*${FORMAT_SHORTHAND}\\s*(?:，|,|；|;)?\\s*(?:而是|改成|改为|换成|换为)\\s*${FORMAT_SHORTHAND}`,
+  'iu',
+)
+const ENGLISH_CONTRASTIVE_SHORTHAND = new RegExp(
+  `(?:not|do\\s+not\\s+use|don't\\s+use)\\s+${FORMAT_SHORTHAND}\\s*[,;.]\\s*(?:an?\\s+)?${FORMAT_SHORTHAND}\\s+instead`,
+  'iu',
+)
+const CLAUSE_CONNECTOR = /(?:而是|但是|然后|并且|但)|\b(?:and\s+then|but|however|then)\b/giu
 const CLAUSE_SEPARATOR = new RegExp(
   `[，,；;。!！？?]|…+|\\.(?![A-Za-z0-9]{2,10}\\b)`,
   'giu',
 )
+const UPPERCASE_FORMAT_REFERENCE = /(?:^|[^\p{L}\p{N}])\.?[A-Z0-9]{2,10}(?=$|[^\p{L}\p{N}])/u
 const RESERVED_SUMMARY_LABEL = /(?:附\s*件|目\s*标\s*格\s*式)/iu
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
+
+function conversionActionIsNegated(clause: string, start: number, actionIndex: number): boolean {
+  const prefix = clause.slice(start, actionIndex)
+  const negations = [...prefix.matchAll(CONVERSION_NEGATION)]
+  const negation = negations.at(-1)
+  if (!negation || negation.index === undefined) return false
+  const bridge = prefix.slice(negation.index + negation[0].length)
+  return !OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION.test(bridge)
+}
+
+function weakActionHasConversionContext(clause: string): boolean {
+  return ATTACHMENT_REFERENCE.test(clause)
+    || FORMAT_LIKE_REFERENCE.test(clause)
+    || UPPERCASE_FORMAT_REFERENCE.test(clause)
+    || /万象转换/u.test(clause)
+}
 
 export function sanitizeDisplayName(value: string, index = 0): string {
   const fallback = `文件-${index + 1}`
@@ -76,6 +110,8 @@ export function hasLocalConversionIntent(
 ): boolean {
   if (attachments.length === 0 || !text.trim()) return false
   const normalized = text.trim().normalize('NFKC').replace(/[‘’]/gu, "'")
+  if (CHINESE_CONTRASTIVE_SHORTHAND.test(normalized)
+    || ENGLISH_CONTRASTIVE_SHORTHAND.test(normalized)) return true
   const clauses = normalized
     .replace(CLAUSE_CONNECTOR, ',')
     .split(CLAUSE_SEPARATOR)
@@ -83,15 +119,21 @@ export function hasLocalConversionIntent(
     .filter(Boolean)
   let sawNegatedConversion = false
   for (const clause of clauses) {
-    const action = CONVERSION_ACTION.exec(clause)
-    if (action) {
-      const prefix = clause.slice(0, action.index)
-      const negated = CHINESE_NEGATED_ACTION_PREFIX.test(prefix)
-        || ENGLISH_NEGATED_ACTION_PREFIX.test(prefix)
-      if (negated) sawNegatedConversion = true
-      const informational = CHINESE_INFORMATION_PREFIX.test(prefix)
-        || ENGLISH_INFORMATION_PREFIX.test(prefix)
-      if (!negated && !informational) return true
+    const information = OPEN_INFORMATION_QUESTION.exec(clause)
+    let previousActionEnd = 0
+    for (const action of clause.matchAll(CONVERSION_ACTION)) {
+      const actionIndex = action.index
+      const negated = conversionActionIsNegated(clause, previousActionEnd, actionIndex)
+      previousActionEnd = actionIndex + action[0].length
+      const strong = action.groups?.strong !== undefined
+      if (!strong && !weakActionHasConversionContext(clause)) continue
+      if (negated) {
+        sawNegatedConversion = true
+        continue
+      }
+      const informational = information?.index !== undefined
+        && information.index < actionIndex
+      if (!informational) return true
     }
     const bareTarget = BARE_CONVERSION_TARGET.test(clause)
       || UPPERCASE_BARE_CONVERSION_TARGET.test(clause)

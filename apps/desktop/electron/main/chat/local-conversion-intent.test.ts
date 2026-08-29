@@ -63,6 +63,23 @@ describe('local conversion intent', () => {
     'convert this file; what format is it afterward',
     '不要转换成 Word，而是 ZIP',
     "don't convert to Word; DOCX instead",
+    'Can you convert this file to RAR?',
+    'Could you convert this attachment?',
+    'Would you save this image as 7z?',
+    '你能把图片转成 CUR 吗？',
+    '可以转换这个附件吗？',
+    '请问能不能导出为 RAR？',
+    "don't convert this image, save it as WebP",
+    "don't convert this image then save it as CUR",
+    "don't convert this image save it as WebP",
+    '不要把图片转成 PNG，保存为 CUR',
+    '不要把图片转成 PNG 然后另存为 rar',
+    '不要转换这个附件随后保存为 CUR',
+    "don't explain then convert this file",
+    '不要 png，而是 rar',
+    '不要 7z，而是 cur',
+    'not png; rar instead',
+    'not 7z, cur instead',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -122,6 +139,13 @@ describe('local conversion intent', () => {
     ['万象转换安全吗？', attachments],
     ['万象转换会上传文件吗？', attachments],
     ['如何使用万象转换？', attachments],
+    ['不要非常快速地把这个附件转换成 ZIP', attachments],
+    ["Please don't ever quickly convert this file to RAR", attachments],
+    ['制作一张海报', attachments],
+    ['save this conversation', attachments],
+    ['export chat history', attachments],
+    ['解释一下转换率', attachments],
+    ['process the conversation', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)
@@ -137,6 +161,8 @@ describe('local conversion intent', () => {
     ['不用', '转换', 'ZIP'],
     ['不需要', '把附件保存为', 'TIF'],
     ['no need to', 'export this file as', 'DOCX'],
+    ['千万不要', '非常快速地把附件转换成', 'RAR'],
+    ["Please don't", 'ever very quickly convert this file to', '7z'],
   ] as const)('keeps a negated conversion non-local: %s %s %s', (modifier, action, target) => {
     expect(hasLocalConversionIntent(`${modifier} ${action} ${target}`, attachments)).toBe(false)
   })

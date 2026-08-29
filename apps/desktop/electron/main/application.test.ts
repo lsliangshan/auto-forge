@@ -5050,6 +5050,17 @@ describe('createApplicationRuntime', () => {
     '转换这个附件后，告诉我它是什么格式',
     '不要转换成 Word，而是 ZIP',
     "don't convert to Word; DOCX instead",
+    'Can you convert this file to RAR?',
+    'Could you convert this attachment?',
+    'Would you save this image as 7z?',
+    '你能把图片转成 CUR 吗？',
+    '可以转换这个附件吗？',
+    '请问能不能导出为 RAR？',
+    "don't convert this image, save it as WebP",
+    "don't convert this image save it as WebP",
+    '不要把图片转成 PNG 然后另存为 rar',
+    '不要 png，而是 rar',
+    'not 7z, cur instead',
   ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
@@ -5166,6 +5177,13 @@ describe('createApplicationRuntime', () => {
     '万象转换安全吗？',
     '万象转换会上传文件吗？',
     '如何使用万象转换？',
+    '不要非常快速地把这个附件转换成 ZIP',
+    "Please don't ever quickly convert this file to RAR",
+    '制作一张海报',
+    'save this conversation',
+    'export chat history',
+    '解释一下转换率',
+    'process the conversation',
   ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
     directories.push(root)
