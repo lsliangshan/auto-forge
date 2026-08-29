@@ -42,7 +42,9 @@ const OPEN_INFORMATION_QUESTION = /(?:(?:(?:请问)?(?:万象转换|这个工具
 const ENGLISH_OPEN_FORMAT_QUESTION = /\b(?:what|which)\s+formats?\b(?:(?!\b(?:and|or|but|then|while)\b|[,;.!?])[\s\S]){0,48}/giu
 const ENGLISH_NO_MATTER_CAPABILITY = /^\s*no\s+matter\s+what\s+(?:this\s+(?:tool|converter)|it)\s+(?:can|could|does|will|would)\b[^,;.!?]{0,64}/giu
 const ENGLISH_HOW_TO_QUESTION = /^\s*how\s+(?:do|can|could|would|should)\s+(?:i|we|you)\b[^,;.!?]{0,96}/giu
+const CHINESE_HOW_TO_QUESTION = /^\s*(?:如何|怎么)[^，,；;。.!！？?]{0,96}/giu
 const ENGLISH_ACTION_MOOD = /(?<capability>\b(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b)|(?<executable>\b(?:can|could|would)\s+you\b|\bi\s+(?:would|want|need)\b|\b(?:just|please|otherwise)\b)/giu
+const CHINESE_COMMAND_MOOD = /(?:然后|但是|但|请|直接|立即|马上)/gu
 const BARE_TARGET_PATTERN = `(?:${[
   ...CONVERSION_TARGET_FORMATS,
   'jpg', 'zip', 'tif', 'docx', 'word', 'heic', 'svg', 'csv', 'txt', 'rar', '7z', 'cur',
@@ -119,12 +121,31 @@ function actionHasInformationalCapabilityMood(
   previousActionEnd: number,
   actionIndex: number,
 ): boolean {
-  const actionBridge = clause.slice(previousActionEnd, actionIndex)
-  if (previousActionEnd > 0 && /(?:或|否则)|\b(?:or|otherwise|just|please)\b/iu.test(actionBridge)) {
-    return false
-  }
   const moods = [...clause.slice(previousActionEnd, actionIndex).matchAll(ENGLISH_ACTION_MOOD)]
   return moods.at(-1)?.groups?.capability !== undefined
+}
+
+function actionHasExplicitCommandMood(
+  clause: string,
+  previousActionEnd: number,
+  actionIndex: number,
+  hasAttachmentObject: boolean,
+): boolean {
+  if (!hasAttachmentObject) return false
+  const prefix = clause.slice(previousActionEnd, actionIndex)
+  const english = [...prefix.matchAll(ENGLISH_ACTION_MOOD)]
+    .filter((mood) => mood.groups?.executable !== undefined)
+    .at(-1)
+  const chinese = [...prefix.matchAll(CHINESE_COMMAND_MOOD)].at(-1)
+  const mood = english === undefined
+    ? chinese
+    : chinese === undefined || english.index >= chinese.index
+      ? english
+      : chinese
+  if (mood?.index === undefined) return false
+  const bridge = prefix.slice(mood.index + mood[0].length)
+  return !OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION.test(bridge)
+    && !HOW_TO_SCOPE.test(bridge)
 }
 
 function formatTokenLike(value: string): boolean {
@@ -156,6 +177,12 @@ function hasChineseContrastiveCommand(text: string): boolean {
 
 type ExplicitObjectKind = 'attachment' | 'nonattachment'
 
+interface ExplicitObjectSummary {
+  kinds: Set<ExplicitObjectKind>
+  hasExplicitAttachment: boolean
+  lastKind?: ExplicitObjectKind
+}
+
 interface ActionOperandContext {
   text: string
   actionStart: number
@@ -163,7 +190,10 @@ interface ActionOperandContext {
 }
 
 function shieldFilenameEntities(value: string): string {
-  return value.replace(FILENAME_REFERENCE, '__autoforge_filename__')
+  return value.replace(FILENAME_REFERENCE, (filename) => {
+    const relation = /^(?:关于|围绕|包含|带有|来自)/u.exec(filename)?.[0] ?? ''
+    return `${relation}__autoforge_filename__`
+  })
 }
 
 function directObjectSpan(context: ActionOperandContext): string {
@@ -189,17 +219,42 @@ function directObjectSpan(context: ActionOperandContext): string {
   return boundary < 0 ? candidate : candidate.slice(0, boundary)
 }
 
-function explicitObjectKind(
+function explicitObjectSummary(
   span: string,
   previous: ExplicitObjectKind | undefined,
-): ExplicitObjectKind | undefined {
-  let kind: ExplicitObjectKind | undefined
-  for (const entity of shieldFilenameEntities(span).matchAll(DIRECT_OBJECT_ENTITY)) {
-    if (entity.groups?.attachment !== undefined) kind = 'attachment'
-    else if (entity.groups?.nonattachment !== undefined) kind = 'nonattachment'
-    else if (entity.groups?.pronoun !== undefined) kind = previous ?? 'attachment'
+): ExplicitObjectSummary {
+  const shielded = shieldFilenameEntities(span)
+  const entities = [...shielded.matchAll(DIRECT_OBJECT_ENTITY)]
+  const summary: ExplicitObjectSummary = { kinds: new Set(), hasExplicitAttachment: false }
+  for (const [index, entity] of entities.entries()) {
+    let kind: ExplicitObjectKind | undefined
+    if (entity.groups?.attachment !== undefined) {
+      const next = entities[index + 1]
+      const prefix = shielded.slice(index === 0
+        ? 0
+        : (entities[index - 1]!.index ?? 0) + entities[index - 1]![0].length, entity.index)
+      const bridge = next?.index === undefined
+        ? ''
+        : shielded.slice((entity.index ?? 0) + entity[0].length, next.index)
+      const conversationModifier = next?.groups?.nonattachment !== undefined
+        && /(?:关于|围绕|包含|带有|来自)\s*$/u.test(prefix)
+        && /^\s*的?\s*$/u.test(bridge)
+      if (!conversationModifier) {
+        kind = 'attachment'
+        summary.hasExplicitAttachment ||= entity[0] === '__autoforge_filename__'
+          || /^(?:(?:这|这个|该|当前|那|那个)|(?:this|the|that|current|my|your)\b)/iu.test(entity[0])
+      }
+    } else if (entity.groups?.nonattachment !== undefined) {
+      kind = 'nonattachment'
+    } else if (entity.groups?.pronoun !== undefined) {
+      kind = summary.lastKind ?? previous ?? 'attachment'
+    }
+    if (kind !== undefined) {
+      summary.kinds.add(kind)
+      summary.lastKind = kind
+    }
   }
-  return kind
+  return summary
 }
 
 function actionOperandContext(
@@ -306,26 +361,49 @@ export function hasLocalConversionIntent(
     const informationRanges = [
       ...clause.matchAll(OPEN_INFORMATION_QUESTION),
       ...clause.matchAll(ENGLISH_HOW_TO_QUESTION),
+      ...clause.matchAll(CHINESE_HOW_TO_QUESTION),
       ...restartableInformationRanges,
     ]
     let previousActionEnd = 0
     let previousActionWasNegated = false
     let previousActionWasEmbedded = false
+    let previousActionWasInformational = false
     let sawAction = false
     for (const action of clause.matchAll(CONVERSION_ACTION)) {
       sawAction = true
       const actionIndex = action.index
+      const actionEnd = actionIndex + action[0].length
       const actionBridge = clause.slice(previousActionEnd, actionIndex)
+      const operandContext = actionOperandContext(clause, actionIndex, actionEnd)
+      const objectSummary = explicitObjectSummary(
+        directObjectSpan(operandContext),
+        previousExplicitObject,
+      )
+      if (objectSummary.lastKind !== undefined) previousExplicitObject = objectSummary.lastKind
+      const hasAttachmentObject = objectSummary.kinds.has('attachment')
+      const explicitCommandMood = actionHasExplicitCommandMood(
+        clause,
+        previousActionEnd,
+        actionIndex,
+        hasAttachmentObject,
+      )
       const capabilityInformation = actionHasInformationalCapabilityMood(
         clause,
         previousActionEnd,
         actionIndex,
       )
-      const informational = capabilityInformation
+      const coordinatedInformation: boolean = previousActionWasInformational
+        && COORDINATED_ACTION_BRIDGE.test(actionBridge)
+      const explicitObjectRestart: boolean = coordinatedInformation
+        && objectSummary.hasExplicitAttachment
+      const informational: boolean = !explicitCommandMood && !explicitObjectRestart && (
+        capabilityInformation
+        || coordinatedInformation
         || actionFallsInsideInformationQuestion(actionIndex, informationRanges)
+      )
       const restartableInformation = capabilityInformation
         || actionFallsInsideInformationQuestion(actionIndex, restartableInformationRanges)
-      const embedded: boolean = !restartableInformation && (
+      const embedded: boolean = !explicitCommandMood && !restartableInformation && (
         actionIsEmbeddedInOtherIntent(clause, previousActionEnd, actionIndex)
         || (previousActionWasEmbedded && (
           EMBEDDED_ACTION_BRIDGE.test(actionBridge)
@@ -333,8 +411,9 @@ export function hasLocalConversionIntent(
         ))
       )
       previousActionWasEmbedded = embedded
+      previousActionWasInformational = informational || embedded
       if (embedded) {
-        previousActionEnd = actionIndex + action[0].length
+        previousActionEnd = actionEnd
         previousActionWasNegated = false
         continue
       }
@@ -344,12 +423,9 @@ export function hasLocalConversionIntent(
         actionIndex,
         previousActionWasNegated,
       )
-      previousActionEnd = actionIndex + action[0].length
+      previousActionEnd = actionEnd
       previousActionWasNegated = negated
-      const operandContext = actionOperandContext(clause, actionIndex, previousActionEnd)
-      const objectKind = explicitObjectKind(directObjectSpan(operandContext), previousExplicitObject)
-      if (objectKind !== undefined) previousExplicitObject = objectKind
-      if (objectKind === 'nonattachment') continue
+      if (!hasAttachmentObject && objectSummary.kinds.has('nonattachment')) continue
       const strong = action.groups?.strong !== undefined
       if (!strong && !weakActionHasConversionContext(operandContext.text)) continue
       if (negated) {
@@ -362,8 +438,8 @@ export function hasLocalConversionIntent(
       || UPPERCASE_BARE_CONVERSION_TARGET.test(clause)
     if (bareTarget && (sawNegatedConversion || CONTRASTIVE_TARGET.test(clause))) return true
     if (!sawAction) {
-      const clauseObject = explicitObjectKind(clauseAntecedentSpan(clause), previousExplicitObject)
-      if (clauseObject !== undefined) previousExplicitObject = clauseObject
+      const clauseObject = explicitObjectSummary(clauseAntecedentSpan(clause), previousExplicitObject)
+      if (clauseObject.lastKind !== undefined) previousExplicitObject = clauseObject.lastKind
     }
   }
   return false

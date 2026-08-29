@@ -121,6 +121,17 @@ describe('local conversion intent', () => {
     'Can this tool convert PNG or JPG or would you convert this attachment to PDF',
     'Can this tool convert PNG or JPG just convert this attachment to PDF',
     'Could it convert HEIC please convert this file to WebP',
+    'Convert this attachment and this conversation to PDF',
+    'Convert this image or this conversation to PDF',
+    'Convert this conversation or this image to PDF',
+    '把这个附件和这段对话转换为PDF',
+    '把这段对话和这个附件转换为PDF',
+    'No matter what this tool can convert just convert this attachment to PDF',
+    'No matter what it can convert please save this image as WebP',
+    'How do I convert PNG then I want you to convert this file to PDF',
+    'How can I save PNG or please convert this attachment to PDF',
+    '如何把图片转换为 PNG 然后请把这个附件转换为 PDF',
+    '怎么把图片保存为 PNG 然后直接把当前图片保存为 WebP',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -244,11 +255,21 @@ describe('local conversion intent', () => {
     ['将关于图片的对话保存为 archive.pdf', attachments],
     ['How do I convert this file to PDF?', attachments],
     ['How can I save this image as WebP?', attachments],
-    ['not foo but bar', attachments],
-    ['This image is not .dark but .vivid', attachments],
+    ['Can this tool convert PNG or convert JPG?', attachments],
+    ['Can this tool convert a PNG file or convert a JPG file?', attachments],
+    ['Could this converter save images as PNG or export documents as PDF?', attachments],
+    ['如何把这个文件转换为PDF？', attachments],
+    ['怎么把这个图片保存为WebP？', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)
+  })
+
+  it.each([
+    'not foo but bar',
+    'This image is not .dark but .vivid',
+  ])('keeps ambiguous unsupported bare shorthand non-local: %s', (text) => {
+    expect(hasLocalConversionIntent(text, attachments)).toBe(false)
   })
 
   it.each([

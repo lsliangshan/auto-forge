@@ -5102,6 +5102,15 @@ describe('createApplicationRuntime', () => {
     'Can this tool convert PNG or JPG or would you convert this attachment to PDF',
     'Can this tool convert PNG or JPG just convert this attachment to PDF',
     'Could it convert HEIC please convert this file to WebP',
+    'Convert this attachment and this conversation to PDF',
+    'Convert this image or this conversation to PDF',
+    'Convert this conversation or this image to PDF',
+    '把这个附件和这段对话转换为PDF',
+    '把这段对话和这个附件转换为PDF',
+    'No matter what this tool can convert just convert this attachment to PDF',
+    'No matter what it can convert please save this image as WebP',
+    'How do I convert PNG then I want you to convert this file to PDF',
+    'How can I save PNG or please convert this attachment to PDF',
   ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
@@ -5126,7 +5135,7 @@ describe('createApplicationRuntime', () => {
     const provider = snapshotProvider('openrouter', {
       listModels: async () => [{
         ...visionTextModelInfo('openrouter/implicit-conversion'),
-        supportsTools: content !== 'Convert conversation-about-attachment.png to WebP',
+        supportsTools: content !== 'No matter what this tool can convert just convert this attachment to PDF',
       }],
       validateCredential: async () => ({ valid: true }),
       stream: async function* (request) {
@@ -5190,7 +5199,7 @@ describe('createApplicationRuntime', () => {
     const agentPayload = JSON.stringify(agentRequests(captured)[0])
     expect(agentPayload).toContain(`[附件 0: 文件-1, image/png, ${privateBytes.byteLength} bytes]`)
     expect(agentPayload).not.toContain('附件 9：private-source.png')
-    expect(agentPayload).toContain(content === 'Convert conversation-about-attachment.png to WebP'
+    expect(agentPayload).toContain(content === 'No matter what this tool can convert just convert this attachment to PDF'
       ? '当前所选模型或本次请求不允许调用工作流或浏览器工具'
       : '你是由 AutoForge Main 管理的工作流 Agent')
     const titleRequest = captured.find(isConversationTitleRequest)
@@ -5291,6 +5300,11 @@ describe('createApplicationRuntime', () => {
     'How can I save this image as WebP?',
     'not foo but bar',
     'This image is not .dark but .vivid',
+    'Can this tool convert PNG or convert JPG?',
+    'Can this tool convert a PNG file or convert a JPG file?',
+    'Could this converter save images as PNG or export documents as PDF?',
+    '如何把这个文件转换为PDF？',
+    '怎么把这个图片保存为WebP？',
   ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
     directories.push(root)
