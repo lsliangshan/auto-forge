@@ -69,6 +69,17 @@ function services(): DesktopIpcServices {
         userId: 'user_2', role: 'super_admin', version: 2, updatedAt: '2026-08-21T00:00:00.000Z',
       }),
     },
+    membership: {
+      getCurrent: vi.fn().mockResolvedValue({
+        userId: 'user_1', planId: 'free', planVersion: 1, state: 'active',
+        effectiveStatus: 'active', grantKind: null, version: 0, termEndsAt: null,
+        limits: { knowledgeBases: 1, knowledgeDocuments: 1, knowledgeFileBytes: 67_108_864 },
+        cloudEligible: false, updatedAt: '2026-08-29T00:00:00.000Z',
+      }),
+      getTarget: vi.fn(),
+      mutate: vi.fn(),
+      listAudit: vi.fn(),
+    },
     profile: {
       get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),
       update: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice', displayName: 'Alice' }),

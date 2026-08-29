@@ -115,11 +115,11 @@ describe('personal knowledge workspace', () => {
 
     const importButton = wrapper.get('[data-testid="knowledge-import"]')
     expect(importButton.attributes()).toHaveProperty('disabled')
-    expect(importButton.attributes('title')).toBe('免费版仅支持 1 个有效文件，请使用“替换文件”更新现有文件')
+    expect(importButton.attributes('title')).toBe('当前会员版本的文件数量已达上限；回收站、处理失败和处理中条目也会计入，请永久删除后重试')
     await importButton.trigger('click')
     expect(client.knowledge.pickImportFiles).not.toHaveBeenCalled()
     await store.importDocuments()
-    expect(store.error).toBe('免费版仅支持 1 个有效文件，请使用“替换文件”更新现有文件')
+    expect(store.error).toBe('当前会员版本的文件数量已达上限；回收站、处理失败和处理中条目也会计入，请永久删除后重试')
     expect(client.knowledge.pickImportFiles).not.toHaveBeenCalled()
   })
 
@@ -425,7 +425,7 @@ describe('personal knowledge workspace', () => {
 
   it('uses the preload API for import and refreshes the selected base', async () => {
     const client = api({
-      list: vi.fn().mockResolvedValue([base('base_1')]),
+      list: vi.fn().mockResolvedValue([{ ...base('base_1'), documentCount: 0 }]),
       listDocuments: vi.fn()
         .mockResolvedValueOnce([])
         .mockResolvedValueOnce([document('doc_1', 'base_1', 'queued')]),

@@ -9,7 +9,8 @@
       <button
         type="button"
         data-testid="knowledge-create-toggle"
-        :disabled="store.busy || !store.localAvailable || (store.entitlement?.tier === 'free' && store.bases.length > 0)"
+        :disabled="store.busy || !store.localAvailable || store.baseLimitReached"
+        :title="store.baseLimitReached ? '当前会员版本的知识库数量已达上限' : undefined"
         @click="creating = !creating"
       >
         新建
@@ -28,7 +29,7 @@
       >
       <button
         type="submit"
-        :disabled="store.busy || !store.localAvailable || !name.trim() || (store.entitlement?.tier === 'free' && store.bases.length > 0)"
+        :disabled="store.busy || !store.localAvailable || !name.trim() || store.baseLimitReached"
       >
         创建
       </button>
@@ -87,7 +88,7 @@
       v-if="store.entitlement?.tier === 'free'"
       class="tier-note"
     >
-      免费版：1 个本地知识库 · 1 个有效文件
+      免费版：1 个本地知识库 · 1 个未永久删除的文件（含回收站）
     </p>
   </section>
 </template>

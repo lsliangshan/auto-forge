@@ -94,6 +94,26 @@
         </div>
       </section>
 
+      <section class="profile-section membership-section" data-testid="membership-card">
+        <header><h2>会员与用量</h2><p>会员状态由 AutoForge 服务端签名确认。</p></header>
+        <div v-if="membership.current" class="membership-summary">
+          <div><span>当前版本</span><strong>{{ planLabel }}</strong></div>
+          <div><span>状态</span><strong>{{ membershipStatusLabel }}</strong></div>
+          <div><span>到期时间</span><strong>{{ membershipExpiry }}</strong></div>
+          <div><span>知识库用量</span><strong>{{ knowledge.bases.length }} / {{ membership.current.limits.knowledgeBases }}</strong></div>
+          <div><span>文件用量</span><strong>{{ documentUsage }} / {{ membership.current.limits.knowledgeDocuments }}</strong></div>
+          <div><span>单文件上限</span><strong>{{ formatBytes(membership.current.limits.knowledgeFileBytes) }}</strong></div>
+        </div>
+        <p
+          v-else-if="membership.error"
+          class="membership-unavailable"
+          role="status"
+        >
+          {{ membership.error }}
+        </p>
+        <p v-else class="membership-loading">正在加载会员信息…</p>
+      </section>
+
       <p
         v-if="formError || profile.error"
         class="profile-error"
@@ -122,6 +142,8 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import type { ProfileGender, UserProfile, UserProfileUpdate } from '@autoforge/shared'
 import { useAuthStore } from '../stores/auth'
 import { useProfileStore } from '../stores/profile'
+import { useKnowledgeStore } from '../stores/knowledge'
+import { useMembershipStore } from '../stores/membership'
 
 interface ProfileDraft {
   avatarUrl: string
@@ -134,6 +156,8 @@ interface ProfileDraft {
 
 const auth = useAuthStore()
 const profile = useProfileStore()
+const knowledge = useKnowledgeStore()
+const membership = useMembershipStore()
 const formError = ref('')
 const draft = reactive<ProfileDraft>({
   avatarUrl: '', displayName: '', gender: '', birthDate: '', email: '', phone: '',
@@ -174,6 +198,18 @@ const today = computed(() => {
   const day = String(now.getDate()).padStart(2, '0')
   return `${year}-${month}-${day}`
 })
+const documentUsage = computed(() => knowledge.bases.reduce(
+  (total, base) => total + base.documentCount, 0,
+))
+const planLabel = computed(() => membership.current?.planId === 'pro' ? 'Pro 会员' : '免费版')
+const membershipStatusLabel = computed(() => ({
+  active: '有效', offline_grace: '离线宽限', expired: '已到期',
+  revoked: '已撤销', unavailable: '云端不可用',
+}[membership.current?.effectiveStatus ?? 'unavailable']))
+const membershipExpiry = computed(() => membership.current?.termEndsAt
+  ? new Date(membership.current.termEndsAt).toLocaleString('zh-CN', { hour12: false })
+  : '长期有效')
+const formatBytes = (bytes: number) => `${Math.round(bytes / 1024 / 1024)} MiB`
 
 function validDate(value: string): boolean {
   if (!value) return true
@@ -227,7 +263,12 @@ watch(() => profile.profile, (value) => {
 }, { immediate: true })
 
 onMounted(() => {
-  if (auth.session) void profile.load(auth.session.user.id)
+  if (auth.session) {
+    void profile.load(auth.session.user.id)
+    if (window.autoForge?.membership) void membership.loadCurrent()
+    else membership.error = '会员信息暂时不可用'
+    if (window.autoForge?.knowledge) void knowledge.bindOwner(auth.session.user.id)
+  }
 })
 </script>
 
@@ -247,6 +288,11 @@ onMounted(() => {
 .profile-grid input:focus, .profile-grid select:focus { border-color: var(--af-cobalt); outline: none; box-shadow: var(--af-focus); }
 .profile-grid input[readonly] { color: var(--af-text-muted); background: var(--af-surface-muted); }
 .profile-error { margin: 0 24px; border-left: 3px solid var(--af-danger); padding: 9px 11px; color: var(--af-danger); background: var(--af-danger-soft); font-size: 12px; }
+.membership-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.membership-summary div { display: grid; gap: 4px; border: 1px solid var(--af-border); border-radius: 8px; padding: 12px; background: var(--af-surface-muted); }
+.membership-summary span, .membership-loading { color: var(--af-text-muted); font-size: 12px; }
+.membership-unavailable { border-left: 3px solid var(--af-warning); padding: 9px 11px; color: var(--af-text); background: var(--af-warning-soft); }
+.membership-summary strong { color: var(--af-graphite); font-size: 14px; }
 .profile-actions { display: flex; justify-content: flex-end; border-top: 1px solid var(--af-border); padding: 16px 24px; }
-@media (max-width: 900px) { .profile-grid { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { .profile-grid, .membership-summary { grid-template-columns: 1fr; } }
 </style>

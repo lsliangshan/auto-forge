@@ -2225,14 +2225,49 @@ describe('local knowledge service', () => {
     await service.bind('alice')
 
     const base = await service.create({ userId: 'alice' }, '我的资料')
-    await expect(service.create({ userId: 'alice' }, '第二个')).rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(service.create({ userId: 'alice' }, '第二个'))
+      .rejects.toMatchObject({ code: 'KNOWLEDGE_BASE_LIMIT_EXCEEDED' })
     await expect(service.list({ userId: 'bob' })).rejects.toMatchObject({ code: 'FORBIDDEN' })
 
     const handles = await service.pickImportFiles({ userId: 'alice' })
     const acknowledged = await service.importDocument({ userId: 'alice' }, base.id, handles[0]!.id)
     expect(acknowledged).toMatchObject({ status: 'queued', versionCount: 1 })
     await expect(service.importDocument({ userId: 'alice' }, base.id, handles[1]!.id))
-      .rejects.toMatchObject({ code: 'CONFLICT' })
+      .rejects.toMatchObject({ code: 'KNOWLEDGE_DOCUMENT_LIMIT_EXCEEDED' })
+  })
+
+  it('enforces signed plan limits and counts recycled non-purged content', async () => {
+    const memory = memoryKnowledgeStore()
+    const selected = [
+      { name: '一.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('一') },
+      { name: '二.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('二') },
+      { name: '三.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('三') },
+    ]
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => selected.splice(0),
+      createParser: () => ({ parse: async () => parsedText('内容'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      entitlement: () => ({
+        tier: 'member', status: 'active', localEnabled: true, betaEnabled: true,
+        cloudEnabled: false, planId: 'pro', membershipVersion: 7,
+        limits: { knowledgeBases: 2, knowledgeDocuments: 2, knowledgeFileBytes: 67_108_864 },
+      }),
+    })
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    const first = await service.create(owner, '一库')
+    await service.create(owner, '二库')
+    await expect(service.create(owner, '三库'))
+      .rejects.toMatchObject({ code: 'KNOWLEDGE_BASE_LIMIT_EXCEEDED' })
+
+    const handles = await service.pickImportFiles(owner)
+    const firstDocument = (await service.importDocument(owner, first.id, handles[0]!.id))!
+    await service.importDocument(owner, first.id, handles[1]!.id)
+    await service.recycleDocument(owner, firstDocument.id)
+    await expect(service.importDocument(owner, first.id, handles[2]!.id))
+      .rejects.toMatchObject({ code: 'KNOWLEDGE_DOCUMENT_LIMIT_EXCEEDED' })
   })
 
   it('preserves query-too-short and bounded two-character search results through the service DTO', async () => {

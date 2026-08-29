@@ -1,6 +1,10 @@
 import { createPublicKey, KeyObject, verify, type KeyLike } from 'node:crypto'
 import { z } from 'zod'
-import { toSafeAppError } from '@autoforge/shared'
+import {
+  membershipSnapshotPayloadSchema,
+  toSafeAppError,
+  type MembershipSnapshotPayload,
+} from '@autoforge/shared'
 
 const GRACE_MS = 72 * 60 * 60 * 1_000
 const base64url = /^[A-Za-z0-9_-]+$/
@@ -51,15 +55,22 @@ export interface SignedKnowledgeEntitlement {
 
 export interface VerifiedKnowledgeEntitlement {
   readonly tier: 'free' | 'member'
-  readonly status: 'active' | 'offline_grace' | 'expired'
+  readonly status: 'active' | 'offline_grace' | 'expired' | 'unavailable'
   readonly localEnabled: true
   readonly betaEnabled: boolean
   readonly cloudEnabled: boolean
   readonly issuedAt: string
-  readonly expiresAt: string
-  readonly graceEndsAt: string
+  readonly expiresAt?: string
+  readonly graceEndsAt?: string
   readonly keyId: string
   readonly keyGeneration: number
+  readonly planId?: 'free' | 'pro'
+  readonly membershipVersion?: number
+  readonly limits?: {
+    readonly knowledgeBases: number
+    readonly knowledgeDocuments: number
+    readonly knowledgeFileBytes: number
+  }
 }
 
 export type KnowledgeEntitlementVerificationKey = Readonly<{
@@ -87,6 +98,33 @@ export function canonicalizeEntitlementPayload(input: {
     entitlements: parsed.entitlements,
     issuedAt: parsed.issuedAt,
     expiresAt: parsed.expiresAt,
+    keyId: parsed.keyId,
+  })
+}
+
+export function canonicalizeMembershipEntitlementPayload(
+  input: MembershipSnapshotPayload,
+): string {
+  const parsed = membershipSnapshotPayloadSchema.parse(input)
+  return JSON.stringify({
+    schemaVersion: parsed.schemaVersion,
+    userId: parsed.userId,
+    membershipVersion: parsed.membershipVersion,
+    planId: parsed.planId,
+    planVersion: parsed.planVersion,
+    state: parsed.state,
+    effectiveStatus: parsed.effectiveStatus,
+    grantKind: parsed.grantKind,
+    termEndsAt: parsed.termEndsAt,
+    issuedAt: parsed.issuedAt,
+    refreshAfter: parsed.refreshAfter,
+    offlineGraceEndsAt: parsed.offlineGraceEndsAt,
+    limits: {
+      knowledgeBases: parsed.limits.knowledgeBases,
+      knowledgeDocuments: parsed.limits.knowledgeDocuments,
+      knowledgeFileBytes: parsed.limits.knowledgeFileBytes,
+    },
+    cloudEligible: parsed.cloudEligible,
     keyId: parsed.keyId,
   })
 }
@@ -156,6 +194,50 @@ export class KnowledgeEntitlementVerifier {
       value = JSON.parse(payloadBytes.toString('utf8'))
     } catch {
       fail('INVALID_INPUT')
+    }
+    const membership = membershipSnapshotPayloadSchema.safeParse(value)
+    if (membership.success) {
+      const canonical = canonicalizeMembershipEntitlementPayload(membership.data)
+      if (!payloadBytes.equals(Buffer.from(canonical, 'utf8'))) fail('INVALID_INPUT')
+      const configuredKey = this.publicKeys.get(membership.data.keyId)
+      if (!configuredKey
+        || !verify(null, payloadBytes, configuredKey.publicKey, signature)) fail('FORBIDDEN')
+      if (membership.data.userId !== ownerId) fail('FORBIDDEN')
+      const issuedAt = Date.parse(membership.data.issuedAt)
+      if (issuedAt > observedAt) fail('FORBIDDEN')
+      if (configuredKey.retiredAt !== undefined && issuedAt > configuredKey.retiredAt) fail('FORBIDDEN')
+
+      let status: VerifiedKnowledgeEntitlement['status'] = membership.data.effectiveStatus === 'revoked'
+        ? 'expired'
+        : membership.data.effectiveStatus
+      if (status === 'active' && membership.data.planId === 'pro'
+        && membership.data.termEndsAt !== null
+        && observedAt > Date.parse(membership.data.termEndsAt)) {
+        status = observedAt <= Date.parse(membership.data.offlineGraceEndsAt)
+          ? 'offline_grace'
+          : 'expired'
+      }
+      if (observedAt > Date.parse(membership.data.offlineGraceEndsAt)
+        && status === 'offline_grace') status = 'expired'
+      const member = membership.data.planId === 'pro'
+        && (status === 'active' || status === 'offline_grace')
+      return Object.freeze({
+        tier: member ? 'member' : 'free',
+        status,
+        localEnabled: true,
+        betaEnabled: member,
+        cloudEnabled: member && membership.data.cloudEligible,
+        planId: membership.data.planId,
+        membershipVersion: membership.data.membershipVersion,
+        limits: Object.freeze({ ...membership.data.limits }),
+        issuedAt: membership.data.issuedAt,
+        ...(membership.data.termEndsAt !== null ? {
+          expiresAt: membership.data.termEndsAt,
+          graceEndsAt: membership.data.offlineGraceEndsAt,
+        } : {}),
+        keyId: membership.data.keyId,
+        keyGeneration: configuredKey.generation,
+      })
     }
     const parsed = payloadSchema.safeParse(value)
     if (!parsed.success) fail('INVALID_INPUT')

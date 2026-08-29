@@ -11,7 +11,8 @@ export class DesktopBridgeUnavailableError extends Error {
 
 export function getDesktopApi(): DesktopAPI {
   const api = window.autoForge
-  if (!api?.auth || !api?.profile || !api?.chat || !api?.workflows || !api?.executions || !api?.settings) {
+  if (!api?.auth || !api?.profile || !api?.chat
+    || !api?.workflows || !api?.executions || !api?.settings) {
     throw new DesktopBridgeUnavailableError()
   }
   return api
@@ -29,6 +30,10 @@ const messages: Partial<Record<AppError['code'], string>> = {
   USER_NOT_FOUND: '用户不存在或已被删除',
   ROLE_CONFLICT: '用户角色已被其他管理员更新，请刷新后重试',
   SELF_ROLE_CHANGE_FORBIDDEN: '不能修改自己的角色',
+  MEMBERSHIP_CONFLICT: '会员状态已被其他管理员更新，请刷新后重试',
+  SELF_MEMBERSHIP_CHANGE_FORBIDDEN: '不能修改自己的会员状态',
+  KNOWLEDGE_BASE_LIMIT_EXCEEDED: '当前会员版本的知识库数量已达上限',
+  KNOWLEDGE_DOCUMENT_LIMIT_EXCEEDED: '当前会员版本的文件数量已达上限；回收站、处理失败和处理中条目也会计入，请永久删除后重试',
   LAST_SUPER_ADMIN: '不能降级最后一个可用的超级管理员',
   REQUEST_ID_CONFLICT: '本次角色修改请求与已完成请求冲突',
   SERVICE_UNAVAILABLE: '用户角色服务暂时不可用，请稍后重试',

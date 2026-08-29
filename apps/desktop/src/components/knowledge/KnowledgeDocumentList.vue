@@ -9,8 +9,8 @@
       <button
         type="button"
         data-testid="knowledge-import"
-        :disabled="!store.selectedBaseId || store.busy || !store.localAvailable || store.selectedBase?.readOnly === true || store.freeDocumentLimitReached"
-        :title="store.freeDocumentLimitReached ? FREE_DOCUMENT_LIMIT_MESSAGE : undefined"
+        :disabled="!store.selectedBaseId || store.busy || !store.localAvailable || store.selectedBase?.readOnly === true || store.documentLimitReached"
+        :title="store.documentLimitReached ? KNOWLEDGE_DOCUMENT_LIMIT_MESSAGE : undefined"
         @click="store.importDocuments"
       >
         导入
@@ -41,7 +41,7 @@
 
 <script setup lang="ts">
 import type { KnowledgeDocumentSummary } from '@autoforge/shared'
-import { FREE_DOCUMENT_LIMIT_MESSAGE, useKnowledgeStore } from '../../stores/knowledge'
+import { KNOWLEDGE_DOCUMENT_LIMIT_MESSAGE, useKnowledgeStore } from '../../stores/knowledge'
 
 const store = useKnowledgeStore()
 const labels: Record<KnowledgeDocumentSummary['status'], string> = {

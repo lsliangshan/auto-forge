@@ -169,6 +169,11 @@ interface EntitlementProjectionRow {
   status: KnowledgeEntitlementState['status']
   betaEnabled: number
   cloudEnabled: number
+  membershipVersion: number
+  planId: 'free' | 'pro'
+  knowledgeBaseLimit: number
+  knowledgeDocumentLimit: number
+  knowledgeFileBytes: number
   expiresAt: number | null
   graceEndsAt: number | null
   epoch: number
@@ -760,6 +765,10 @@ export function createLocalKnowledgeService(
   const readProjection = (active: Binding): EntitlementProjectionRow | undefined => (
     active.store.database.prepare(`
       SELECT tier, status, beta_enabled AS betaEnabled, cloud_enabled AS cloudEnabled,
+        membership_version AS membershipVersion, plan_id AS planId,
+        knowledge_base_limit AS knowledgeBaseLimit,
+        knowledge_document_limit AS knowledgeDocumentLimit,
+        knowledge_file_bytes AS knowledgeFileBytes,
         expires_at AS expiresAt, grace_ends_at AS graceEndsAt, epoch,
         accepted_issued_at AS acceptedIssuedAt, accepted_key_id AS acceptedKeyId,
         accepted_key_generation AS acceptedKeyGeneration,
@@ -785,15 +794,23 @@ export function createLocalKnowledgeService(
     const current = readProjection(active)
     const expiresAt = state.expiresAt ? Date.parse(state.expiresAt) : null
     const graceEndsAt = state.graceEndsAt ? Date.parse(state.graceEndsAt) : null
+    const limits = state.limits ?? (state.tier === 'member'
+      ? { knowledgeBases: 20, knowledgeDocuments: 500, knowledgeFileBytes: 67_108_864 }
+      : { knowledgeBases: 1, knowledgeDocuments: 1, knowledgeFileBytes: 67_108_864 })
     active.store.database.prepare(`
       INSERT INTO knowledge_entitlement_projection(
-        singleton, tier, status, beta_enabled, cloud_enabled, expires_at,
+        singleton, tier, status, beta_enabled, cloud_enabled, membership_version, plan_id,
+        knowledge_base_limit, knowledge_document_limit, knowledge_file_bytes, expires_at,
         grace_ends_at, epoch, updated_at, accepted_issued_at, accepted_key_id,
         accepted_key_generation, accepted_snapshot_digest, verified, explicit_free, max_observed_at
-      ) VALUES (1, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(singleton) DO UPDATE SET
         tier = excluded.tier, status = excluded.status,
         beta_enabled = excluded.beta_enabled, cloud_enabled = excluded.cloud_enabled,
+        membership_version = excluded.membership_version, plan_id = excluded.plan_id,
+        knowledge_base_limit = excluded.knowledge_base_limit,
+        knowledge_document_limit = excluded.knowledge_document_limit,
+        knowledge_file_bytes = excluded.knowledge_file_bytes,
         expires_at = excluded.expires_at, grace_ends_at = excluded.grace_ends_at,
         epoch = knowledge_entitlement_projection.epoch + 1, updated_at = excluded.updated_at,
         accepted_issued_at = excluded.accepted_issued_at,
@@ -804,6 +821,8 @@ export function createLocalKnowledgeService(
         max_observed_at = excluded.max_observed_at
     `).run(
       state.tier, state.status, Number(state.betaEnabled === true), Number(state.cloudEnabled),
+      state.membershipVersion ?? 0, state.planId ?? (state.tier === 'member' ? 'pro' : 'free'),
+      limits.knowledgeBases, limits.knowledgeDocuments, limits.knowledgeFileBytes,
       expiresAt, graceEndsAt, options.observedAt,
       options.acceptedIssuedAt ?? current?.acceptedIssuedAt ?? null,
       options.acceptedKeyId ?? current?.acceptedKeyId ?? null,
@@ -824,6 +843,13 @@ export function createLocalKnowledgeService(
           localEnabled: true as const,
           betaEnabled: current.betaEnabled === 1,
           cloudEnabled: current.cloudEnabled === 1,
+          planId: current.planId,
+          membershipVersion: current.membershipVersion,
+          limits: {
+            knowledgeBases: current.knowledgeBaseLimit,
+            knowledgeDocuments: current.knowledgeDocumentLimit,
+            knowledgeFileBytes: current.knowledgeFileBytes,
+          },
           ...(current.expiresAt !== null ? { expiresAt: timestamp(current.expiresAt) } : {}),
           ...(current.graceEndsAt !== null ? { graceEndsAt: timestamp(current.graceEndsAt) } : {}),
         }
@@ -840,7 +866,8 @@ export function createLocalKnowledgeService(
     const expiry = raw.expiresAt ? Date.parse(raw.expiresAt) : undefined
     const graceEnd = raw.graceEndsAt ? Date.parse(raw.graceEndsAt) : undefined
     const checkedAt = observedAt
-    const projected: KnowledgeEntitlementState = expiry !== undefined && graceEnd !== undefined
+    const projected: KnowledgeEntitlementState = (raw.status === 'active' || raw.status === 'offline_grace')
+      && expiry !== undefined && graceEnd !== undefined
       && Number.isFinite(expiry) && Number.isFinite(graceEnd)
       ? checkedAt <= expiry
         ? { ...raw, status: 'active' }
@@ -855,6 +882,13 @@ export function createLocalKnowledgeService(
       || current.tier !== projected.tier || current.status !== projected.status
       || current.betaEnabled !== Number(betaEnabled)
       || current.cloudEnabled !== Number(projected.cloudEnabled)
+      || current.membershipVersion !== (projected.membershipVersion ?? 0)
+      || current.planId !== (projected.planId ?? (projected.tier === 'member' ? 'pro' : 'free'))
+      || current.knowledgeBaseLimit !== (projected.limits?.knowledgeBases
+        ?? (projected.tier === 'member' ? 20 : 1))
+      || current.knowledgeDocumentLimit !== (projected.limits?.knowledgeDocuments
+        ?? (projected.tier === 'member' ? 500 : 1))
+      || current.knowledgeFileBytes !== (projected.limits?.knowledgeFileBytes ?? 67_108_864)
       || current.expiresAt !== expiresAt || current.graceEndsAt !== graceEndsAt
       || current.maxObservedAt !== observedAt
     if (changed) {
@@ -931,16 +965,25 @@ export function createLocalKnowledgeService(
     return state.tier === 'member' && state.status !== 'expired'
   }
 
+  const limits = (active: Binding) => {
+    const state = entitlement(active)
+    return state.limits ?? (state.tier === 'member'
+      ? { knowledgeBases: 20, knowledgeDocuments: 500, knowledgeFileBytes: 67_108_864 }
+      : { knowledgeBases: 1, knowledgeDocuments: 1, knowledgeFileBytes: 67_108_864 })
+  }
+
   const assertWritableBase = (active: Binding, baseId: string): void => {
     if (isMember(active)) return
     const kept = retention(active)
-    if (kept && kept.baseId !== baseId) fail('FORBIDDEN')
+    if (!kept || kept.baseId !== baseId || (!kept.confirmed && kept.documentId !== undefined)) {
+      fail('FORBIDDEN')
+    }
   }
 
   const assertWritableDocument = (active: Binding, documentId: string): void => {
     if (isMember(active)) return
     const kept = retention(active)
-    if (!kept?.documentId || kept.documentId !== documentId) fail('FORBIDDEN')
+    if (!kept?.confirmed || !kept.documentId || kept.documentId !== documentId) fail('FORBIDDEN')
   }
 
   const ordinaryCloudAllowed = (active: Binding): boolean => {
@@ -2219,10 +2262,10 @@ export function createLocalKnowledgeService(
       const name = rawName.trim()
       if (!name || name.length > 200) fail('INVALID_INPUT')
       const member = isMember(active)
-      if (!member) {
-        const count = active.store.database.prepare('SELECT count(*) AS count FROM knowledge_bases').get() as { count: number }
-        if (count.count >= 1) fail('CONFLICT')
-      }
+      const count = active.store.database.prepare(
+        'SELECT count(*) AS count FROM knowledge_bases',
+      ).get() as { count: number }
+      if (count.count >= limits(active).knowledgeBases) fail('KNOWLEDGE_BASE_LIMIT_EXCEEDED')
       const baseId = id()
       const createdAt = now()
       active.store.database.prepare(`
@@ -2337,12 +2380,10 @@ export function createLocalKnowledgeService(
         'SELECT id FROM knowledge_bases WHERE id = ? AND recycled_at IS NULL',
       ).get(baseId)
       if (!base) fail('NOT_FOUND')
-      if (!isMember(active)) {
-        const count = active.store.database.prepare(
-          'SELECT count(*) AS count FROM documents WHERE recycled_at IS NULL',
-        ).get() as { count: number }
-        if (count.count >= 1) fail('CONFLICT')
-      }
+      const count = active.store.database.prepare(
+        'SELECT count(*) AS count FROM documents',
+      ).get() as { count: number }
+      if (count.count >= limits(active).knowledgeDocuments) fail('KNOWLEDGE_DOCUMENT_LIMIT_EXCEEDED')
       const handle = consumeHandle(active, handleId)
       const documentId = id()
       const createdAt = now()
@@ -2355,7 +2396,7 @@ export function createLocalKnowledgeService(
         `).run(documentId, baseId, handle.name, handle.mimeType, createdAt, createdAt)
         enqueue(active, documentId, handle, 1, 1)
       })()
-      if (!isMember(active)) writeRetention(active, { baseId, documentId, confirmed: false })
+      if (!isMember(active)) writeRetention(active, { baseId, documentId, confirmed: true })
       const parsing = active.runner.runQueued()
       const cloudConsentEpoch = active.cloudConsentEpoch
       const cloud = serialCloudTask(active, baseId, async () => {

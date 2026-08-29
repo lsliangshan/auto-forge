@@ -40,6 +40,7 @@ export interface DesktopIpcServices {
     requireSession(): Promise<AuthSession>
   }
   userAdmin: DesktopAPI['userAdmin']
+  membership: DesktopAPI['membership']
   profile: DesktopAPI['profile']
   chat: Omit<DesktopAPI['chat'], 'onEvent'>
   media: {
@@ -170,6 +171,10 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.authLogout, (input) => options.services.auth.logout(input), { anonymous: true })
   register(ipcChannels.userAdminList, (input) => options.services.userAdmin.list(input))
   register(ipcChannels.userAdminUpdateRole, (input) => options.services.userAdmin.updateRole(input))
+  register(ipcChannels.membershipGetCurrent, () => options.services.membership.getCurrent())
+  register(ipcChannels.membershipGetTarget, (input) => options.services.membership.getTarget(input.targetUserId))
+  register(ipcChannels.membershipMutate, (input) => options.services.membership.mutate(input))
+  register(ipcChannels.membershipListAudit, (input) => options.services.membership.listAudit(input))
   register(ipcChannels.profileGet, () => options.services.profile.get())
   register(ipcChannels.profileUpdate, (input) => options.services.profile.update(input))
   register(ipcChannels.profilePickAndUploadAvatar, () => options.services.profile.pickAndUploadAvatar())

@@ -19,7 +19,7 @@ describe('CloudBaseRoleService', () => {
 
     await expect(service.ensureMyRole()).resolves.toEqual({
       role: 'super_admin',
-      capabilities: ['manage_users'],
+      capabilities: ['manage_users', 'manage_memberships'],
       version: 2,
       updatedAt: '2026-08-21T00:00:00.000Z',
       confirmed: true,

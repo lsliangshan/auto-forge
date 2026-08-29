@@ -108,6 +108,10 @@ import { ProfileService } from './profile/profile-service.js'
 import { QiniuFileUploader, readQiniuConfig } from './upload/qiniu-file-uploader.js'
 import { UserAdminService } from './user-admin/user-admin-service.js'
 import {
+  CloudBaseMembershipService,
+  type MembershipControlService,
+} from './membership/cloudbase-membership-service.js'
+import {
   ExecutionService,
   NodeWorkerFactory,
   type WorkflowExecutionSource,
@@ -249,6 +253,7 @@ export interface ApplicationRuntimeOptions {
   safeStorage: SafeStoragePort
   authService?: AuthService
   roleService?: BusinessRoleService
+  membershipService?: MembershipControlService
   cloudbaseEnv?: NodeJS.ProcessEnv
   userDataStores?: UserDataStoreManager
   userDataSyncPort?: Pick<CloudBaseUserDataPort, 'call'>
@@ -413,6 +418,9 @@ export function observeAuthService(
           confirmed: false,
           ...(currentAuthorization?.knowledgeEntitlement
             ? { knowledgeEntitlement: currentAuthorization.knowledgeEntitlement }
+            : {}),
+          ...(currentAuthorization?.membershipEntitlement
+            ? { membershipEntitlement: currentAuthorization.membershipEntitlement }
             : {}),
         }
         authenticated = true
@@ -763,6 +771,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     roleService,
   )
+  const membershipSource = options.membershipService
+    ?? (cloudBasePorts ? new CloudBaseMembershipService(auth, cloudBasePorts.functions) : undefined)
+  const memberships: MembershipControlService = membershipSource ?? {
+    refreshCurrent: async () => { throw failure('SERVICE_UNAVAILABLE') },
+    getCurrent: async () => { throw failure('SERVICE_UNAVAILABLE') },
+    getTarget: async () => { throw failure('SERVICE_UNAVAILABLE') },
+    mutate: async () => { throw failure('SERVICE_UNAVAILABLE') },
+    listAudit: async () => { throw failure('SERVICE_UNAVAILABLE') },
+  }
   const logLegacyImportDiagnostic = createLegacyImportDiagnosticLog(options.paths.logs)
   const userDataStores = options.userDataStores
     ?? new UserDataStoreManager(join(options.paths.data, 'user-caches'))
@@ -807,6 +824,62 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   knowledge?.configureCloudRemote?.(
     cloudBasePorts ? new CloudBaseKnowledgeClient(cloudBasePorts.functions) : undefined,
   )
+  let membershipRefreshTimer: ReturnType<typeof setTimeout> | undefined
+  let membershipRefreshDueAt = 0
+  let membershipRefreshGeneration = 0
+  const clearMembershipRefresh = (): void => {
+    membershipRefreshGeneration += 1
+    if (membershipRefreshTimer !== undefined) clearTimeout(membershipRefreshTimer)
+    membershipRefreshTimer = undefined
+    membershipRefreshDueAt = 0
+  }
+  const scheduleMembershipRefresh = (
+    ownerId: string,
+    generation = membershipRefreshGeneration,
+  ): void => {
+    if (!membershipSource || boundUserId !== ownerId
+      || generation !== membershipRefreshGeneration) return
+    if (membershipRefreshTimer !== undefined) clearTimeout(membershipRefreshTimer)
+    const delay = Math.max(1_000, membershipRefreshDueAt - Date.now())
+    membershipRefreshTimer = setTimeout(() => {
+      membershipRefreshTimer = undefined
+      void auth.getSession().then(async (session) => {
+        if (!session || session.user.id !== ownerId || boundUserId !== ownerId
+          || generation !== membershipRefreshGeneration) return
+        const refreshed = await membershipSource.refreshCurrent()
+        if (generation !== membershipRefreshGeneration || boundUserId !== ownerId) return
+        await knowledge?.refreshEntitlement?.(ownerId, refreshed.entitlement, true)
+        membershipRefreshDueAt = Date.now() + 5 * 60 * 1_000
+          + Math.floor((Math.random() - 0.5) * 30_000)
+      }).catch(async () => {
+        if (boundUserId === ownerId && generation === membershipRefreshGeneration) {
+          await knowledge?.refreshEntitlement?.(ownerId, undefined, false).catch(() => undefined)
+          membershipRefreshDueAt = Date.now() + 30_000
+        }
+      }).finally(() => scheduleMembershipRefresh(ownerId, generation))
+    }, delay)
+    membershipRefreshTimer.unref?.()
+  }
+  const refreshMembershipEntitlement = async (session: AuthSession): Promise<void> => {
+    if (!membershipSource) {
+      await knowledge?.refreshEntitlement?.(
+        session.user.id,
+        session.authorization?.knowledgeEntitlement,
+        session.authorization?.confirmed === true,
+      )
+      return
+    }
+    if (membershipRefreshDueAt > Date.now()) return
+    try {
+      const refreshed = await membershipSource.refreshCurrent()
+      await knowledge?.refreshEntitlement?.(session.user.id, refreshed.entitlement, true)
+      membershipRefreshDueAt = Date.now() + 5 * 60 * 1_000
+        + Math.floor((Math.random() - 0.5) * 30_000)
+    } catch {
+      await knowledge?.refreshEntitlement?.(session.user.id, undefined, false)
+      membershipRefreshDueAt = Date.now() + 30_000
+    }
+  }
   const currentCloudSyncConsentAccepted = (): boolean => (
     userDataStores.current()?.account.getConsent('cloud_sync')?.documentVersion
       === CLOUD_SYNC_DOCUMENT_VERSION
@@ -838,11 +911,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
         await knowledge?.bind(session.user.id, currentCloudSyncConsentAccepted())
-        await knowledge?.refreshEntitlement?.(
-          session.user.id,
-          session.authorization?.knowledgeEntitlement,
-          session.authorization?.confirmed === true,
-        )
+        await refreshMembershipEntitlement(session)
+        scheduleMembershipRefresh(session.user.id)
         await bindUserMedia(session)
         activateUserReconciliation(runtimeRecovered)
         await activateVideoJobs(runtimeRecovered)
@@ -850,13 +920,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }
       await userDataSync.start(session.user.id, deviceId)
       await knowledge?.bind(session.user.id, currentCloudSyncConsentAccepted())
-      await knowledge?.refreshEntitlement?.(
-        session.user.id,
-        session.authorization?.knowledgeEntitlement,
-        session.authorization?.confirmed === true,
-      )
+      await refreshMembershipEntitlement(session)
       await bindUserMedia(session)
       boundUserId = session.user.id
+      scheduleMembershipRefresh(session.user.id)
       const warningSince = userDataSync.status().warningSince
       if (warningSince !== undefined) {
         notifySyncWarning(userDataSync.captureBinding(session.user.id), warningSince)
@@ -869,6 +936,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return operation
   }
   const pauseUserData = (): Promise<void> => {
+    clearMembershipRefresh()
     knowledge?.invalidate()
     const operation = userDataLifecycleTail.then(async () => {
       await knowledge?.drain()
@@ -883,6 +951,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return operation
   }
   const prepareUserDataDiscard = (): Promise<void> => {
+    clearMembershipRefresh()
     knowledge?.invalidate()
     const operation = userDataLifecycleTail.then(async () => {
       await knowledge?.drain()
@@ -1837,6 +1906,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     userAdmin: {
       list: (input) => userAdmin.list(input),
       updateRole: (input) => userAdmin.updateRole(input),
+    },
+    membership: {
+      getCurrent: () => memberships.getCurrent(),
+      getTarget: (targetUserId) => memberships.getTarget(targetUserId),
+      mutate: (input) => memberships.mutate(input),
+      listAudit: (input) => memberships.listAudit(input),
     },
     profile: {
       get: () => profiles.get(),
@@ -2887,6 +2962,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       if (closePromise) return closePromise
       closePromise = (async () => {
         acceptingWork = false
+        clearMembershipRefresh()
         const capture = async (
           source: ApplicationFailureSource,
           operation: () => void | Promise<void>,

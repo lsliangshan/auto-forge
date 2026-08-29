@@ -79,13 +79,17 @@ export class CloudBaseRoleService implements BusinessRoleService {
 
   async ensureMyRole(): Promise<AuthorizationSnapshot> {
     const data = parseCloudData(ensureRoleDataSchema, await this.invoke('ensureMyRole'))
+    const capabilities = data.role === 'super_admin'
+      ? [...new Set([...data.capabilities, 'manage_memberships' as const])]
+      : data.capabilities
     return parseCloudData(authorizationSnapshotSchema, {
       role: data.role,
-      capabilities: data.capabilities,
+      capabilities,
       version: data.version,
       updatedAt: data.updatedAt,
       confirmed: true,
       ...(data.knowledgeEntitlement ? { knowledgeEntitlement: data.knowledgeEntitlement } : {}),
+      ...(data.membershipEntitlement ? { membershipEntitlement: data.membershipEntitlement } : {}),
     })
   }
 

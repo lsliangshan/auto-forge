@@ -2,6 +2,7 @@ import { generateKeyPairSync, sign } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import {
   canonicalizeEntitlementPayload,
+  canonicalizeMembershipEntitlementPayload,
   createKnowledgeEntitlementVerificationCallback,
   KnowledgeEntitlementVerifier,
   type SignedKnowledgeEntitlement,
@@ -155,6 +156,44 @@ describe('KnowledgeEntitlementVerifier', () => {
       .toMatchObject({ status: 'offline_grace', tier: 'member' })
     expect(verifier(Date.parse(expiresAt) + (72 * 60 * 60 * 1_000) + 1).verify('alice', snapshot))
       .toMatchObject({ status: 'expired', tier: 'free', cloudEnabled: false })
+  })
+
+  it('verifies versioned membership limits and treats online revoke as immediately free', () => {
+    const key = generateKeyPairSync('ed25519')
+    const verifier = new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        membership: { publicKey: key.publicKey, generation: 2, status: 'active' },
+      },
+      now: () => NOW,
+    })
+    const signed = (effectiveStatus: 'active' | 'revoked') => {
+      const canonical = canonicalizeMembershipEntitlementPayload({
+        schemaVersion: 2, userId: 'alice', membershipVersion: effectiveStatus === 'active' ? 3 : 4,
+        planId: 'pro', planVersion: 1, state: effectiveStatus === 'active' ? 'active' : 'revoked',
+        effectiveStatus, grantKind: 'manual_grant', termEndsAt: '2026-08-29T00:00:00.000Z',
+        issuedAt: '2026-08-28T00:00:00.000Z', refreshAfter: '2026-08-28T00:05:00.000Z',
+        offlineGraceEndsAt: '2026-09-01T00:00:00.000Z',
+        limits: {
+          knowledgeBases: effectiveStatus === 'active' ? 20 : 1,
+          knowledgeDocuments: effectiveStatus === 'active' ? 500 : 1,
+          knowledgeFileBytes: 67_108_864,
+        },
+        cloudEligible: effectiveStatus === 'active', keyId: 'membership',
+      })
+      return {
+        payload: Buffer.from(canonical).toString('base64url'),
+        signature: sign(null, Buffer.from(canonical), key.privateKey).toString('base64url'),
+      }
+    }
+
+    expect(verifier.verify('alice', signed('active'))).toMatchObject({
+      tier: 'member', status: 'active', planId: 'pro', membershipVersion: 3,
+      limits: { knowledgeBases: 20, knowledgeDocuments: 500 },
+    })
+    expect(verifier.verify('alice', signed('revoked'))).toMatchObject({
+      tier: 'free', status: 'expired', planId: 'pro', membershipVersion: 4,
+      cloudEnabled: false, limits: { knowledgeBases: 1, knowledgeDocuments: 1 },
+    })
   })
 
   it('fails closed for a snapshot whose expiry precedes issuance', () => {

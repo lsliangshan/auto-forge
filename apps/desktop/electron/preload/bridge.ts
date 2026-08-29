@@ -68,6 +68,14 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       list: (input) => invoke(ipcRenderer, ipcChannels.userAdminList, input),
       updateRole: (input) => invoke(ipcRenderer, ipcChannels.userAdminUpdateRole, input),
     },
+    membership: {
+      getCurrent: () => invoke(ipcRenderer, ipcChannels.membershipGetCurrent),
+      getTarget: (targetUserId) => invoke(
+        ipcRenderer, ipcChannels.membershipGetTarget, { targetUserId },
+      ),
+      mutate: (input) => invoke(ipcRenderer, ipcChannels.membershipMutate, input),
+      listAudit: (input) => invoke(ipcRenderer, ipcChannels.membershipListAudit, input),
+    },
     profile: {
       get: () => invoke(ipcRenderer, ipcChannels.profileGet),
       update: (input) => invoke(ipcRenderer, ipcChannels.profileUpdate, input),

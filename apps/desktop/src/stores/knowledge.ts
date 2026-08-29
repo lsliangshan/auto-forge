@@ -13,7 +13,7 @@ const releases = new WeakMap<object, () => void>()
 const timers = new WeakMap<object, ReturnType<typeof setTimeout>>()
 const disposeWrapped = new WeakSet<object>()
 const MAX_POLL_DELAY_MS = 15_000
-export const FREE_DOCUMENT_LIMIT_MESSAGE = '免费版仅支持 1 个有效文件，请使用“替换文件”更新现有文件'
+export const KNOWLEDGE_DOCUMENT_LIMIT_MESSAGE = '当前会员版本的文件数量已达上限；回收站、处理失败和处理中条目也会计入，请永久删除后重试'
 
 interface OwnerToken {
   readonly ownerId: string
@@ -60,9 +60,15 @@ export const useKnowledgeStore = defineStore('knowledge', {
         && state.availability?.encryption.available === true
         && state.availability?.parser.available === true
     },
-    freeDocumentLimitReached(state): boolean {
-      return state.entitlement?.tier === 'free'
-        && state.documents.some(document => document.status !== 'deleted')
+    baseLimitReached(state): boolean {
+      const limit = state.entitlement?.limits?.knowledgeBases
+        ?? (state.entitlement?.tier === 'member' ? 20 : 1)
+      return state.bases.length >= limit
+    },
+    documentLimitReached(state): boolean {
+      const limit = state.entitlement?.limits?.knowledgeDocuments
+        ?? (state.entitlement?.tier === 'member' ? 500 : 1)
+      return state.bases.reduce((total, base) => total + base.documentCount, 0) >= limit
     },
   },
   actions: {
@@ -255,8 +261,8 @@ export const useKnowledgeStore = defineStore('knowledge', {
     async importDocuments() {
       const baseId = this.selectedBaseId
       if (!baseId) return
-      if (this.freeDocumentLimitReached) {
-        this.error = FREE_DOCUMENT_LIMIT_MESSAGE
+      if (this.documentLimitReached) {
+        this.error = KNOWLEDGE_DOCUMENT_LIMIT_MESSAGE
         return
       }
       const operation = this.beginOperation()

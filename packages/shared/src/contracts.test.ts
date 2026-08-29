@@ -45,6 +45,12 @@ import {
   mediaAssetSchema,
   mediaBlockSchema,
   mediaGenerationBlockSchema,
+  membershipAuditListRequestSchema,
+  membershipAuditListResponseSchema,
+  membershipMutationRequestSchema,
+  membershipMutationResponseSchema,
+  membershipSnapshotPayloadSchema,
+  membershipSummarySchema,
   modelInfoSchema,
   normalizeProxySettings,
   parseProxyBypassText,
@@ -812,6 +818,56 @@ describe('cross-process contracts', () => {
     expect(userAdminUpdateRoleRequestSchema.safeParse({
       requestId: 'request_1', targetUserId: 'uid_1', newRole: 'support_operator', expectedVersion: 1,
     }).success).toBe(false)
+  })
+
+  it('keeps membership authority signed, versioned, owner-bound, and renderer-narrow', () => {
+    const summary = {
+      userId: 'uid_1', planId: 'pro', planVersion: 1, state: 'active',
+      effectiveStatus: 'active', grantKind: 'manual_grant', version: 3,
+      termEndsAt: '2027-08-29T00:00:00.000Z',
+      limits: { knowledgeBases: 20, knowledgeDocuments: 500, knowledgeFileBytes: 67_108_864 },
+      cloudEligible: true, updatedAt: '2026-08-29T00:00:00.000Z',
+    } as const
+    expect(membershipSummarySchema.parse(summary)).toEqual(summary)
+    expect(membershipSummarySchema.safeParse({ ...summary, privateKey: 'forbidden' }).success).toBe(false)
+
+    const payload = {
+      schemaVersion: 2, userId: 'uid_1', membershipVersion: 3,
+      planId: 'pro', planVersion: 1, state: 'active', effectiveStatus: 'active', grantKind: 'manual_grant',
+      termEndsAt: '2027-08-29T00:00:00.000Z', issuedAt: '2026-08-29T00:00:00.000Z',
+      refreshAfter: '2026-08-29T00:05:00.000Z', offlineGraceEndsAt: '2026-09-01T00:00:00.000Z',
+      limits: summary.limits, cloudEligible: true, keyId: 'membership-2026-02',
+    } as const
+    expect(membershipSnapshotPayloadSchema.parse(payload)).toEqual(payload)
+    expect(membershipSnapshotPayloadSchema.safeParse({ ...payload, userId: '' }).success).toBe(false)
+    expect(membershipSnapshotPayloadSchema.safeParse({
+      ...payload, refreshAfter: '2026-08-28T00:00:00.000Z',
+    }).success).toBe(false)
+
+    expect(authorizationSnapshotSchema.parse({
+      role: 'super_admin', capabilities: ['manage_users', 'manage_memberships'], version: 3,
+      updatedAt: '2026-08-29T00:00:00.000Z', confirmed: true,
+      membershipEntitlement: { payload: 'eA', signature: 'eA' },
+    }).membershipEntitlement).toEqual({ payload: 'eA', signature: 'eA' })
+
+    const mutation = {
+      action: 'grant', requestId: 'request_1', targetUserId: 'uid_1', expectedVersion: 0,
+      grantKind: 'manual_grant', termEndsAt: '2027-08-29T00:00:00.000Z',
+      reasonCode: 'manual_payment_confirmed', note: '工单 1001',
+    } as const
+    expect(membershipMutationRequestSchema.parse(mutation)).toEqual(mutation)
+    expect(membershipMutationRequestSchema.safeParse({ ...mutation, actorUserId: 'forged' }).success).toBe(false)
+    expect(membershipMutationResponseSchema.parse({ status: 'applied', membership: summary }))
+      .toMatchObject({ status: 'applied', membership: { version: 3 } })
+    expect(membershipAuditListRequestSchema.parse({ targetUserId: 'uid_1', page: 1, pageSize: 20 }))
+      .toEqual({ targetUserId: 'uid_1', page: 1, pageSize: 20 })
+    expect(membershipAuditListResponseSchema.parse({ items: [], page: 1, pageSize: 20, total: 0 }))
+      .toEqual({ items: [], page: 1, pageSize: 20, total: 0 })
+    expect(ipcChannels.membershipGetCurrent).toBe('membership:get-current')
+    expect(ipcChannels.membershipMutate).toBe('membership:mutate')
+    expect(ipcChannels.membershipListAudit).toBe('membership:list-audit')
+    expect(ipcRequestSchemas[ipcChannels.membershipMutate].parse(mutation)).toEqual(mutation)
+    expect(ipcResponseSchemas[ipcChannels.membershipGetCurrent].parse(summary)).toEqual(summary)
   })
 
   it.each([

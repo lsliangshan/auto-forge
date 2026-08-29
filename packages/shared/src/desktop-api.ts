@@ -84,6 +84,13 @@ export const knowledgeEntitlementStateSchema = z.object({
   localEnabled: z.boolean(),
   cloudEnabled: z.boolean(),
   betaEnabled: z.boolean().optional(),
+  planId: z.enum(['free', 'pro']).optional(),
+  membershipVersion: z.number().int().nonnegative().optional(),
+  limits: z.object({
+    knowledgeBases: z.number().int().positive().max(10_000),
+    knowledgeDocuments: z.number().int().positive().max(1_000_000),
+    knowledgeFileBytes: z.number().int().positive().max(1024 * 1024 * 1024),
+  }).strict().optional(),
   expiresAt: timestampSchema.optional(),
   graceEndsAt: timestampSchema.optional(),
   retainedBaseId: identifierSchema.optional(),
@@ -98,7 +105,7 @@ export const knowledgeEntitlementStateSchema = z.object({
   if (value.betaEnabled && value.tier !== 'member') {
     context.addIssue({ code: 'custom', path: ['betaEnabled'], message: 'Beta requires membership' })
   }
-  if ((value.status === 'expired' || value.status === 'unavailable') && value.cloudEnabled) {
+  if (['expired', 'unavailable'].includes(value.status) && value.cloudEnabled) {
     context.addIssue({ code: 'custom', path: ['cloudEnabled'], message: 'Expired or unavailable entitlement must fail closed' })
   }
   if ((value.expiresAt === undefined) !== (value.graceEndsAt === undefined)
@@ -348,7 +355,7 @@ export type AuthUser = z.infer<typeof authUserSchema>
 export const roleIdSchema = z.string().trim().regex(/^[a-z][a-z0-9_]{0,62}$/)
 export type RoleId = z.infer<typeof roleIdSchema>
 
-export const businessCapabilitySchema = z.enum(['manage_users'])
+export const businessCapabilitySchema = z.enum(['manage_users', 'manage_memberships'])
 export type BusinessCapability = z.infer<typeof businessCapabilitySchema>
 
 export const signedKnowledgeEntitlementSnapshotSchema = z.object({
@@ -357,6 +364,154 @@ export const signedKnowledgeEntitlementSnapshotSchema = z.object({
 }).strict()
 export type SignedKnowledgeEntitlementSnapshot = z.infer<typeof signedKnowledgeEntitlementSnapshotSchema>
 
+export const signedMembershipEntitlementSnapshotSchema = signedKnowledgeEntitlementSnapshotSchema
+export type SignedMembershipEntitlementSnapshot = z.infer<typeof signedMembershipEntitlementSnapshotSchema>
+
+export const membershipPlanIdSchema = z.enum(['free', 'pro'])
+export type MembershipPlanId = z.infer<typeof membershipPlanIdSchema>
+export const membershipStateSchema = z.enum(['active', 'revoked'])
+export type MembershipState = z.infer<typeof membershipStateSchema>
+export const membershipEffectiveStatusSchema = z.enum([
+  'active', 'offline_grace', 'expired', 'revoked', 'unavailable',
+])
+export type MembershipEffectiveStatus = z.infer<typeof membershipEffectiveStatusSchema>
+export const membershipGrantKindSchema = z.enum(['manual_trial', 'manual_grant', 'future_paid'])
+export type MembershipGrantKind = z.infer<typeof membershipGrantKindSchema>
+export const membershipReasonCodeSchema = z.enum([
+  'manual_payment_confirmed', 'internal_grant', 'customer_compensation', 'trial',
+  'renewal', 'refund_revocation', 'risk_revocation', 'operator_correction',
+])
+export type MembershipReasonCode = z.infer<typeof membershipReasonCodeSchema>
+export const membershipLimitsSchema = z.object({
+  knowledgeBases: z.number().int().positive().max(10_000),
+  knowledgeDocuments: z.number().int().positive().max(1_000_000),
+  knowledgeFileBytes: z.number().int().positive().max(1024 * 1024 * 1024),
+}).strict()
+export type MembershipLimits = z.infer<typeof membershipLimitsSchema>
+
+export const membershipSummarySchema = z.object({
+  userId: identifierSchema.max(64),
+  planId: membershipPlanIdSchema,
+  planVersion: z.number().int().positive(),
+  state: membershipStateSchema,
+  effectiveStatus: membershipEffectiveStatusSchema,
+  grantKind: membershipGrantKindSchema.nullable(),
+  version: z.number().int().nonnegative(),
+  termEndsAt: timestampSchema.nullable(),
+  limits: membershipLimitsSchema,
+  cloudEligible: z.boolean(),
+  updatedAt: timestampSchema,
+}).strict()
+export type MembershipSummary = z.infer<typeof membershipSummarySchema>
+
+export const membershipSnapshotPayloadSchema = z.object({
+  schemaVersion: z.literal(2),
+  userId: identifierSchema.max(64),
+  membershipVersion: z.number().int().nonnegative(),
+  planId: membershipPlanIdSchema,
+  planVersion: z.number().int().positive(),
+  state: membershipStateSchema,
+  effectiveStatus: membershipEffectiveStatusSchema,
+  grantKind: membershipGrantKindSchema.nullable(),
+  termEndsAt: timestampSchema.nullable(),
+  issuedAt: timestampSchema,
+  refreshAfter: timestampSchema,
+  offlineGraceEndsAt: timestampSchema,
+  limits: membershipLimitsSchema,
+  cloudEligible: z.boolean(),
+  keyId: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+}).strict().superRefine((value, context) => {
+  const issuedAt = Date.parse(value.issuedAt)
+  const refreshAfter = Date.parse(value.refreshAfter)
+  const graceEndsAt = Date.parse(value.offlineGraceEndsAt)
+  if (refreshAfter < issuedAt) {
+    context.addIssue({ code: 'custom', path: ['refreshAfter'], message: 'Refresh must not precede issuance' })
+  }
+  if (graceEndsAt < refreshAfter) {
+    context.addIssue({ code: 'custom', path: ['offlineGraceEndsAt'], message: 'Grace must not precede refresh' })
+  }
+  for (const field of ['issuedAt', 'refreshAfter', 'offlineGraceEndsAt'] as const) {
+    if (new Date(value[field]).toISOString() !== value[field]) {
+      context.addIssue({ code: 'custom', path: [field], message: 'Timestamp must be canonical UTC milliseconds' })
+    }
+  }
+  if (value.termEndsAt && new Date(value.termEndsAt).toISOString() !== value.termEndsAt) {
+    context.addIssue({ code: 'custom', path: ['termEndsAt'], message: 'Timestamp must be canonical UTC milliseconds' })
+  }
+  if (value.planId === 'free' && (value.grantKind !== null || value.termEndsAt !== null)) {
+    context.addIssue({ code: 'custom', path: ['planId'], message: 'Free membership cannot carry a paid term' })
+  }
+  if (value.planId === 'pro' && (value.grantKind === null || value.termEndsAt === null)) {
+    context.addIssue({ code: 'custom', path: ['planId'], message: 'Pro membership requires a grant and term' })
+  }
+  if ((value.state === 'revoked') !== (value.effectiveStatus === 'revoked')) {
+    context.addIssue({ code: 'custom', path: ['effectiveStatus'], message: 'Revocation state must be explicit' })
+  }
+})
+export type MembershipSnapshotPayload = z.infer<typeof membershipSnapshotPayloadSchema>
+
+const membershipMutationBase = z.object({
+  requestId: identifierSchema.max(128),
+  targetUserId: identifierSchema.max(64),
+  expectedVersion: z.number().int().nonnegative(),
+  reasonCode: membershipReasonCodeSchema,
+  note: z.string().trim().max(500).optional(),
+})
+export const membershipMutationRequestSchema = z.discriminatedUnion('action', [
+  membershipMutationBase.extend({
+    action: z.literal('grant'),
+    grantKind: membershipGrantKindSchema,
+    termEndsAt: timestampSchema,
+  }).strict(),
+  membershipMutationBase.extend({
+    action: z.literal('extend'),
+    termEndsAt: timestampSchema,
+  }).strict(),
+  membershipMutationBase.extend({
+    action: z.literal('set_expiry'),
+    termEndsAt: timestampSchema,
+  }).strict(),
+  membershipMutationBase.extend({ action: z.literal('revoke') }).strict(),
+  membershipMutationBase.extend({
+    action: z.literal('correct'),
+    planId: membershipPlanIdSchema,
+    state: membershipStateSchema,
+    grantKind: membershipGrantKindSchema.nullable(),
+    termEndsAt: timestampSchema.nullable(),
+  }).strict(),
+])
+export type MembershipMutationRequest = z.infer<typeof membershipMutationRequestSchema>
+export const membershipMutationResponseSchema = z.object({
+  status: z.enum(['applied', 'duplicate']),
+  membership: membershipSummarySchema,
+}).strict()
+export type MembershipMutationResponse = z.infer<typeof membershipMutationResponseSchema>
+
+export const membershipAuditEntrySchema = z.object({
+  id: identifierSchema,
+  targetUserId: identifierSchema.max(64),
+  actorUserId: identifierSchema.max(64),
+  action: z.enum(['grant', 'extend', 'set_expiry', 'revoke', 'correct']),
+  reasonCode: membershipReasonCodeSchema,
+  previousVersion: z.number().int().nonnegative(),
+  resultingVersion: z.number().int().positive(),
+  createdAt: timestampSchema,
+}).strict()
+export type MembershipAuditEntry = z.infer<typeof membershipAuditEntrySchema>
+export const membershipAuditListRequestSchema = z.object({
+  targetUserId: identifierSchema.max(64),
+  page: z.number().int().positive(),
+  pageSize: z.union([z.literal(20), z.literal(50)]),
+}).strict()
+export type MembershipAuditListRequest = z.infer<typeof membershipAuditListRequestSchema>
+export const membershipAuditListResponseSchema = z.object({
+  items: z.array(membershipAuditEntrySchema),
+  page: z.number().int().positive(),
+  pageSize: z.union([z.literal(20), z.literal(50)]),
+  total: z.number().int().nonnegative(),
+}).strict()
+export type MembershipAuditListResponse = z.infer<typeof membershipAuditListResponseSchema>
+
 export const authorizationSnapshotSchema = z.object({
   role: roleIdSchema,
   capabilities: z.array(businessCapabilitySchema),
@@ -364,6 +519,7 @@ export const authorizationSnapshotSchema = z.object({
   updatedAt: timestampSchema,
   confirmed: z.boolean(),
   knowledgeEntitlement: signedKnowledgeEntitlementSnapshotSchema.optional(),
+  membershipEntitlement: signedMembershipEntitlementSnapshotSchema.optional(),
 }).strict()
 export type AuthorizationSnapshot = z.infer<typeof authorizationSnapshotSchema>
 
@@ -1612,6 +1768,10 @@ export const ipcChannels = {
   authLogout: 'auth:logout',
   userAdminList: 'user-admin:list',
   userAdminUpdateRole: 'user-admin:update-role',
+  membershipGetCurrent: 'membership:get-current',
+  membershipGetTarget: 'membership:get-target',
+  membershipMutate: 'membership:mutate',
+  membershipListAudit: 'membership:list-audit',
   profileGet: 'profile:get',
   profileUpdate: 'profile:update',
   profilePickAndUploadAvatar: 'profile:pick-and-upload-avatar',
@@ -1843,6 +2003,10 @@ export const ipcRequestSchemas = {
   [ipcChannels.authLogout]: logoutRequestSchema,
   [ipcChannels.userAdminList]: userAdminListRequestSchema,
   [ipcChannels.userAdminUpdateRole]: userAdminUpdateRoleRequestSchema,
+  [ipcChannels.membershipGetCurrent]: z.undefined(),
+  [ipcChannels.membershipGetTarget]: z.object({ targetUserId: identifierSchema.max(64) }).strict(),
+  [ipcChannels.membershipMutate]: membershipMutationRequestSchema,
+  [ipcChannels.membershipListAudit]: membershipAuditListRequestSchema,
   [ipcChannels.profileGet]: z.undefined(),
   [ipcChannels.profileUpdate]: userProfileUpdateSchema,
   [ipcChannels.profilePickAndUploadAvatar]: z.undefined(),
@@ -1947,6 +2111,10 @@ export const ipcResponseSchemas = {
   [ipcChannels.authLogout]: logoutResultSchema,
   [ipcChannels.userAdminList]: userAdminListResponseSchema,
   [ipcChannels.userAdminUpdateRole]: userAdminUpdateRoleResponseSchema,
+  [ipcChannels.membershipGetCurrent]: membershipSummarySchema,
+  [ipcChannels.membershipGetTarget]: membershipSummarySchema,
+  [ipcChannels.membershipMutate]: membershipMutationResponseSchema,
+  [ipcChannels.membershipListAudit]: membershipAuditListResponseSchema,
   [ipcChannels.profileGet]: userProfileSchema,
   [ipcChannels.profileUpdate]: userProfileSchema,
   [ipcChannels.profilePickAndUploadAvatar]: profileAvatarUploadResultSchema.nullable(),
@@ -2056,6 +2224,12 @@ export interface DesktopAPI {
   userAdmin: {
     list(input: UserAdminListRequest): Promise<UserAdminListResponse>
     updateRole(input: UserAdminUpdateRoleRequest): Promise<UserAdminUpdateRoleResponse>
+  }
+  membership: {
+    getCurrent(): Promise<MembershipSummary>
+    getTarget(targetUserId: string): Promise<MembershipSummary>
+    mutate(input: MembershipMutationRequest): Promise<MembershipMutationResponse>
+    listAudit(input: MembershipAuditListRequest): Promise<MembershipAuditListResponse>
   }
   chat: {
     listConversations(input: ListConversationsRequest): Promise<ConversationPage>

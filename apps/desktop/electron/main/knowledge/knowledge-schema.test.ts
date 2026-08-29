@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v16', () => {
+describe('knowledge schema v17', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(16)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(17)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -74,7 +74,9 @@ describe('knowledge schema v16', () => {
       'SELECT name, mime_type, chunking_revision FROM document_versions LIMIT 0',
     ).all()).toEqual([])
     expect(database.prepare(
-      'SELECT accepted_key_generation FROM knowledge_entitlement_projection LIMIT 0',
+      `SELECT accepted_key_generation, membership_version, plan_id,
+        knowledge_base_limit, knowledge_document_limit, knowledge_file_bytes
+      FROM knowledge_entitlement_projection LIMIT 0`,
     ).all()).toEqual([])
     expect((database.prepare(
       'PRAGMA table_info(knowledge_cloud_deletion_receipts)',
@@ -192,6 +194,11 @@ describe('knowledge schema v16', () => {
     database.exec('DROP TABLE kb_chunk_embeddings')
     database.exec('ALTER TABLE cloud_pending_publications DROP COLUMN upload_retiring')
     database.exec('ALTER TABLE document_versions DROP COLUMN chunking_revision')
+    database.exec('ALTER TABLE knowledge_entitlement_projection DROP COLUMN membership_version')
+    database.exec('ALTER TABLE knowledge_entitlement_projection DROP COLUMN plan_id')
+    database.exec('ALTER TABLE knowledge_entitlement_projection DROP COLUMN knowledge_base_limit')
+    database.exec('ALTER TABLE knowledge_entitlement_projection DROP COLUMN knowledge_document_limit')
+    database.exec('ALTER TABLE knowledge_entitlement_projection DROP COLUMN knowledge_file_bytes')
 
     initializeKnowledgeSchema(database)
 
@@ -206,6 +213,9 @@ describe('knowledge schema v16', () => {
     expect(database.prepare(
       'SELECT version FROM knowledge_schema_migrations WHERE version = 16',
     ).get()).toEqual({ version: 16 })
+    expect(database.prepare(
+      'SELECT version FROM knowledge_schema_migrations WHERE version = 17',
+    ).get()).toEqual({ version: 17 })
   })
 
   it('keeps trigram FTS rows synchronized with external chunk content', () => {
