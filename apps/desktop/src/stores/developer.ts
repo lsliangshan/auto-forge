@@ -566,7 +566,8 @@ export const useDeveloperStore = defineStore('developer', {
         if (this.selectedProjectId === projectId) this.debugError = displayError(error, '文件移除失败')
       }
     },
-    async _clearDeveloperAttachments(projectId = this.selectedProjectId) {
+    async _clearDeveloperAttachments(projectId?: string) {
+      projectId ??= this.selectedProjectId
       if (!projectId) return
       const shouldReset = projectId === this.selectedProjectId
       try {
