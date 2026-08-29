@@ -111,6 +111,16 @@ describe('local conversion intent', () => {
     'No matter what this tool can convert, convert this attachment to PDF',
     '不要 .heif，而是 .jxl',
     '不要 HEIF，而是 JXL',
+    'Convert conversation-about-attachment.png to WebP',
+    '转换对话-包含-附件.png为WebP',
+    'convert chat-history-with-image.jpg to PNG',
+    'Review this attachment in the conversation, then convert it to PDF',
+    '查看当前图片所在的对话，然后把它转换为 WebP',
+    'Can this tool convert PNG or JPG or I would like you to convert this attachment to PDF',
+    'Could it convert HEIC or could you convert this file to WebP',
+    'Can this tool convert PNG or JPG or would you convert this attachment to PDF',
+    'Can this tool convert PNG or JPG just convert this attachment to PDF',
+    'Could it convert HEIC please convert this file to WebP',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -226,6 +236,16 @@ describe('local conversion intent', () => {
     ['将包含这个附件的聊天记录导出为 PDF', attachments],
     ['不要黑暗，而是鲜艳', attachments],
     ['不要苹果，而是香蕉', attachments],
+    ['Convert this conversation to transcript.pdf', attachments],
+    ['Save this conversation as archive.pdf', attachments],
+    ['Convert this conversation from attachment.txt to PDF', attachments],
+    ['把这段对话转换为 transcript.pdf', attachments],
+    ['把来自附件.txt的聊天记录导出为 PDF', attachments],
+    ['将关于图片的对话保存为 archive.pdf', attachments],
+    ['How do I convert this file to PDF?', attachments],
+    ['How can I save this image as WebP?', attachments],
+    ['not foo but bar', attachments],
+    ['This image is not .dark but .vivid', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)

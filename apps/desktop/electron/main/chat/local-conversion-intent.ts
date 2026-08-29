@@ -13,7 +13,6 @@ const ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE = `\\b(?:(?:this|the|that|current|my
 const CHINESE_NAMED_ATTACHMENT_REFERENCE = `(?:(?:这|这个|该|当前|那|那个)?(?:张|个|份)?(?:附件|文件|图片|图像|照片|文档|视频|音频))`
 const ENGLISH_NAMED_ATTACHMENT_REFERENCE = `\\b(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:attachment|file|image|photo|picture|document|video|audio)\\b`
 const FILENAME_REFERENCE_PATTERN = `[\\p{L}\\p{N}_+-][\\p{L}\\p{N}._+-]{0,63}\\.[A-Za-z0-9]{1,12}`
-const NAMED_ATTACHMENT_ENTITY_PATTERN = `(?:${CHINESE_NAMED_ATTACHMENT_REFERENCE}|${ENGLISH_NAMED_ATTACHMENT_REFERENCE}|${FILENAME_REFERENCE_PATTERN})`
 const STRONG_CONVERSION_ACTION = [
   `(?<!万象)(?:转换|转成|转为)(?!率|器)`,
   `(?:另存(?:为)?|(?:保存|存|导出|输出|改|换)(?:成|为))`,
@@ -41,8 +40,9 @@ const ACTION_PIVOT = /(?:直接|立即|马上|以及|并且|并|同时|然后|�
 const HOW_TO_SCOPE = /(?:如何|怎么)|\bhow\s+to\b/iu
 const OPEN_INFORMATION_QUESTION = /(?:(?:(?:请问)?(?:万象转换|这个工具|它|你)?(?:支持|能否|能不能|能|可以|能够))[^，,；;。.!！？?]{0,32}(?:哪些|什么|何种)\s*格式|(?:哪些|什么|何种)\s*格式|(?:介绍|说明|了解)[^，,；;。.!！？?]{0,24}(?:万象转换|转换)|(?:万象转换|转换)[^，,；;。.!！？?]{0,24}(?:是什么|什么意思|含义|安全|隐私|上传|能做什么|如何工作|怎么用)|\b(?:what\s+is|what\s+does|how\s+does|tell\s+me\s+about|describe|explain)[^,;.!?]{0,32}(?:conversion|converter|it)\b|\b(?:conversion|converter|it)\b[^,;.!?]{0,24}\b(?:safe|privacy|upload|mean)\b)/giu
 const ENGLISH_OPEN_FORMAT_QUESTION = /\b(?:what|which)\s+formats?\b(?:(?!\b(?:and|or|but|then|while)\b|[,;.!?])[\s\S]){0,48}/giu
-const ENGLISH_CAPABILITY_QUESTION = /^\s*(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b(?:(?!\b(?:otherwise|or\s+(?:i\s+(?:want|need)|please))\b|[,;.!?])[\s\S]){0,96}/giu
 const ENGLISH_NO_MATTER_CAPABILITY = /^\s*no\s+matter\s+what\s+(?:this\s+(?:tool|converter)|it)\s+(?:can|could|does|will|would)\b[^,;.!?]{0,64}/giu
+const ENGLISH_HOW_TO_QUESTION = /^\s*how\s+(?:do|can|could|would|should)\s+(?:i|we|you)\b[^,;.!?]{0,96}/giu
+const ENGLISH_ACTION_MOOD = /(?<capability>\b(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b)|(?<executable>\b(?:can|could|would)\s+you\b|\bi\s+(?:would|want|need)\b|\b(?:just|please|otherwise)\b)/giu
 const BARE_TARGET_PATTERN = `(?:${[
   ...CONVERSION_TARGET_FORMATS,
   'jpg', 'zip', 'tif', 'docx', 'word', 'heic', 'svg', 'csv', 'txt', 'rar', '7z', 'cur',
@@ -79,13 +79,10 @@ const UPPERCASE_FORMAT_REFERENCE = /(?:^|[^\p{L}\p{N}])\.?[A-Z0-9]{2,10}(?=$|[^\
 const COORDINATED_ACTION_BRIDGE = /(?:或|和|及|以及|并|并且)\s*$|\b(?:or|and|nor)\s*$/iu
 const EMBEDDED_ACTION_BRIDGE = /(?:或|和|及|以及|并|并且|然后)\s*$|\b(?:or|and|nor|then)\s*$/iu
 const WEAK_CONTEXT_BOUNDARY = /(?:而是|但是|然后|解释|询问|问|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:while|then|explain|ask|summari[sz]e|describe|discuss|analy[sz]e|review|check|read|tell)\b/giu
-const NON_ATTACHMENT_OBJECT = /(?:对话|聊天记录|聊天历史)|\b(?:conversation|chat\s+history)\b/iu
-const ATTACHED_FILE_REFERENCE = /\b(?:attached|uploaded)\s+[\p{L}\p{N}][\p{L}\p{N}._+-]{0,63}\.[A-Za-z0-9]{1,12}\b/iu
-const NAMED_ATTACHMENT_ENTITY = new RegExp(NAMED_ATTACHMENT_ENTITY_PATTERN, 'iu')
-const ATTACHMENT_PRONOUN = /(?:它们?)|\b(?:it|them)\b/iu
-const CONVERSATION_HEAD_ATTACHMENT_RELATION = new RegExp(
-  `(?:(?:对话|聊天记录|聊天历史)|\\b(?:conversation|chat\\s+history)\\b)[^，,；;。.!！？?]{0,32}(?:(?:关于|包含|带有)|\\b(?:about|with|containing|including)\\b)[^，,；;。.!！？?]{0,32}${NAMED_ATTACHMENT_ENTITY_PATTERN}|(?:(?:关于|围绕|包含|带有)[^，,；;。.!！？?]{0,24}${NAMED_ATTACHMENT_ENTITY_PATTERN}[^，,；;。.!！？?]{0,16}(?:的)?(?:对话|聊天记录|聊天历史))`,
-  'iu',
+const FILENAME_REFERENCE = new RegExp(FILENAME_REFERENCE_PATTERN, 'giu')
+const DIRECT_OBJECT_ENTITY = new RegExp(
+  `(?<attachment>${CHINESE_NAMED_ATTACHMENT_REFERENCE}|${ENGLISH_NAMED_ATTACHMENT_REFERENCE}|__autoforge_filename__)|(?<nonattachment>(?:对话|聊天记录|聊天历史)|\\b(?:conversation|chat\\s+history)\\b)|(?<pronoun>(?:它们?)|\\b(?:it|them)\\b)`,
+  'giu',
 )
 const RESERVED_SUMMARY_LABEL = /(?:附\s*件|目\s*标\s*格\s*式)/iu
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
@@ -117,6 +114,19 @@ function actionIsEmbeddedInOtherIntent(clause: string, start: number, actionInde
   return !ACTION_PIVOT.test(bridge)
 }
 
+function actionHasInformationalCapabilityMood(
+  clause: string,
+  previousActionEnd: number,
+  actionIndex: number,
+): boolean {
+  const actionBridge = clause.slice(previousActionEnd, actionIndex)
+  if (previousActionEnd > 0 && /(?:或|否则)|\b(?:or|otherwise|just|please)\b/iu.test(actionBridge)) {
+    return false
+  }
+  const moods = [...clause.slice(previousActionEnd, actionIndex).matchAll(ENGLISH_ACTION_MOOD)]
+  return moods.at(-1)?.groups?.capability !== undefined
+}
+
 function formatTokenLike(value: string): boolean {
   const normalized = value.replace(/^\./u, '')
   return value.startsWith('.')
@@ -146,20 +156,57 @@ function hasChineseContrastiveCommand(text: string): boolean {
 
 type ExplicitObjectKind = 'attachment' | 'nonattachment'
 
-function explicitObjectKind(
-  context: string,
-  previous: ExplicitObjectKind | undefined,
-): ExplicitObjectKind | undefined {
-  if (CONVERSATION_HEAD_ATTACHMENT_RELATION.test(context)) return 'nonattachment'
-  if (NAMED_ATTACHMENT_ENTITY.test(context) || ATTACHED_FILE_REFERENCE.test(context)) {
-    return 'attachment'
-  }
-  if (NON_ATTACHMENT_OBJECT.test(context)) return 'nonattachment'
-  if (ATTACHMENT_PRONOUN.test(context)) return previous ?? 'attachment'
-  return undefined
+interface ActionOperandContext {
+  text: string
+  actionStart: number
+  actionEnd: number
 }
 
-function actionOperandContext(clause: string, actionIndex: number, actionEnd: number): string {
+function shieldFilenameEntities(value: string): string {
+  return value.replace(FILENAME_REFERENCE, '__autoforge_filename__')
+}
+
+function directObjectSpan(context: ActionOperandContext): string {
+  const before = context.text.slice(0, context.actionStart)
+  const chineseMarkers = [...before.matchAll(/(?:把|将)/gu)]
+  const chineseMarker = chineseMarkers.at(-1)
+  if (chineseMarker?.index !== undefined) {
+    return before.slice(chineseMarker.index + chineseMarker[0].length)
+  }
+
+  const action = context.text.slice(context.actionStart, context.actionEnd)
+  if (/\b(?:convert|transcode|save|export|process|make|turn|change)\b/iu.test(action)) {
+    const candidate = shieldFilenameEntities(
+      context.text.slice(context.actionStart)
+        .replace(/^\s*(?:convert|transcode|save|export|process|make|turn|change)\b/iu, ''),
+    )
+    const boundary = candidate.search(/\b(?:to|into|as|from|about|with|containing|including|convert|transcode|save|export|process|make|turn|change)\b/iu)
+    return boundary < 0 ? candidate : candidate.slice(0, boundary)
+  }
+
+  const candidate = shieldFilenameEntities(context.text.slice(context.actionEnd))
+  const boundary = candidate.search(/(?:为|成)/u)
+  return boundary < 0 ? candidate : candidate.slice(0, boundary)
+}
+
+function explicitObjectKind(
+  span: string,
+  previous: ExplicitObjectKind | undefined,
+): ExplicitObjectKind | undefined {
+  let kind: ExplicitObjectKind | undefined
+  for (const entity of shieldFilenameEntities(span).matchAll(DIRECT_OBJECT_ENTITY)) {
+    if (entity.groups?.attachment !== undefined) kind = 'attachment'
+    else if (entity.groups?.nonattachment !== undefined) kind = 'nonattachment'
+    else if (entity.groups?.pronoun !== undefined) kind = previous ?? 'attachment'
+  }
+  return kind
+}
+
+function actionOperandContext(
+  clause: string,
+  actionIndex: number,
+  actionEnd: number,
+): ActionOperandContext {
   const prefixWindow = clause.slice(Math.max(0, actionIndex - 48), actionIndex)
   const prefixBoundaries = [...prefixWindow.matchAll(WEAK_CONTEXT_BOUNDARY)]
   const lastPrefixBoundary = prefixBoundaries.at(-1)
@@ -171,7 +218,28 @@ function actionOperandContext(clause: string, actionIndex: number, actionEnd: nu
   const suffix = suffixBoundary?.index === undefined
     ? suffixWindow
     : suffixWindow.slice(0, suffixBoundary.index)
-  return `${prefix}${clause.slice(actionIndex, actionEnd)}${suffix}`
+  const action = clause.slice(actionIndex, actionEnd)
+  return {
+    text: `${prefix}${action}${suffix}`,
+    actionStart: prefix.length,
+    actionEnd: prefix.length + action.length,
+  }
+}
+
+function clauseAntecedentSpan(clause: string): string {
+  const english = /\b(?:review|check|read|describe|summari[sz]e|explain)\b/iu.exec(clause)
+  if (english?.index !== undefined) {
+    const candidate = clause.slice(english.index + english[0].length)
+    const boundary = candidate.search(/\b(?:in|from|about|with|inside|within)\b/iu)
+    return boundary < 0 ? candidate : candidate.slice(0, boundary)
+  }
+  const chinese = /(?:查看|读取|描述|总结|概括|说明)/u.exec(clause)
+  if (chinese?.index !== undefined) {
+    const candidate = clause.slice(chinese.index + chinese[0].length)
+    const boundary = candidate.search(/(?:所在|位于)/u)
+    return boundary < 0 ? candidate : candidate.slice(0, boundary)
+  }
+  return clause
 }
 
 function weakActionHasConversionContext(context: string): boolean {
@@ -233,24 +301,30 @@ export function hasLocalConversionIntent(
   for (const clause of clauses) {
     const restartableInformationRanges = [
       ...clause.matchAll(ENGLISH_OPEN_FORMAT_QUESTION),
-      ...clause.matchAll(ENGLISH_CAPABILITY_QUESTION),
       ...clause.matchAll(ENGLISH_NO_MATTER_CAPABILITY),
     ]
     const informationRanges = [
       ...clause.matchAll(OPEN_INFORMATION_QUESTION),
+      ...clause.matchAll(ENGLISH_HOW_TO_QUESTION),
       ...restartableInformationRanges,
     ]
     let previousActionEnd = 0
     let previousActionWasNegated = false
     let previousActionWasEmbedded = false
+    let sawAction = false
     for (const action of clause.matchAll(CONVERSION_ACTION)) {
+      sawAction = true
       const actionIndex = action.index
       const actionBridge = clause.slice(previousActionEnd, actionIndex)
-      const informational = actionFallsInsideInformationQuestion(actionIndex, informationRanges)
-      const restartableInformation = actionFallsInsideInformationQuestion(
+      const capabilityInformation = actionHasInformationalCapabilityMood(
+        clause,
+        previousActionEnd,
         actionIndex,
-        restartableInformationRanges,
       )
+      const informational = capabilityInformation
+        || actionFallsInsideInformationQuestion(actionIndex, informationRanges)
+      const restartableInformation = capabilityInformation
+        || actionFallsInsideInformationQuestion(actionIndex, restartableInformationRanges)
       const embedded: boolean = !restartableInformation && (
         actionIsEmbeddedInOtherIntent(clause, previousActionEnd, actionIndex)
         || (previousActionWasEmbedded && (
@@ -273,11 +347,11 @@ export function hasLocalConversionIntent(
       previousActionEnd = actionIndex + action[0].length
       previousActionWasNegated = negated
       const operandContext = actionOperandContext(clause, actionIndex, previousActionEnd)
-      const objectKind = explicitObjectKind(operandContext, previousExplicitObject)
+      const objectKind = explicitObjectKind(directObjectSpan(operandContext), previousExplicitObject)
       if (objectKind !== undefined) previousExplicitObject = objectKind
       if (objectKind === 'nonattachment') continue
       const strong = action.groups?.strong !== undefined
-      if (!strong && !weakActionHasConversionContext(operandContext)) continue
+      if (!strong && !weakActionHasConversionContext(operandContext.text)) continue
       if (negated) {
         sawNegatedConversion = true
         continue
@@ -287,8 +361,10 @@ export function hasLocalConversionIntent(
     const bareTarget = BARE_CONVERSION_TARGET.test(clause)
       || UPPERCASE_BARE_CONVERSION_TARGET.test(clause)
     if (bareTarget && (sawNegatedConversion || CONTRASTIVE_TARGET.test(clause))) return true
-    const clauseObject = explicitObjectKind(clause, previousExplicitObject)
-    if (clauseObject !== undefined) previousExplicitObject = clauseObject
+    if (!sawAction) {
+      const clauseObject = explicitObjectKind(clauseAntecedentSpan(clause), previousExplicitObject)
+      if (clauseObject !== undefined) previousExplicitObject = clauseObject
+    }
   }
   return false
 }
