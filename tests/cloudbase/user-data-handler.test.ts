@@ -109,6 +109,20 @@ function conversionTerminalMutation(extraPayload: Record<string, unknown> = {}) 
   }
 }
 
+function fileInputMutation(extraBlock: Record<string, unknown> = {}) {
+  return messageMutation([{
+    type: 'media',
+    blockId: 'file_block_1',
+    assetId: 'file_asset_1',
+    kind: 'file',
+    purpose: 'input',
+    name: 'notes.txt',
+    mimeType: 'text/plain',
+    byteSize: 12,
+    ...extraBlock,
+  }])
+}
+
 function mockRpcResponse(
   value: unknown,
   options: {
@@ -446,6 +460,7 @@ describe('CloudBase user data function', () => {
 
     for (const mutation of [
       fileConvertApprovalMutation(['pdf', 'png']),
+      fileInputMutation(),
       conversionBlockMutation(),
       conversionTerminalMutation(),
     ]) {
@@ -453,13 +468,15 @@ describe('CloudBase user data function', () => {
         action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [mutation],
       }, authenticatedContext)).resolves.toMatchObject({ ok: true })
     }
-    expect(rpc).toHaveBeenCalledTimes(3)
+    expect(rpc).toHaveBeenCalledTimes(4)
 
     const invalidMutations = [
       fileConvertApprovalMutation([]),
       fileConvertApprovalMutation(['pdf', 'pdf']),
       fileConvertApprovalMutation(['docx']),
       fileConvertApprovalMutation(['pdf'], { paths: ['/private/input.pdf'] }),
+      fileInputMutation({ purpose: 'output' }),
+      conversionBlockMutation({ state: 'terminal' }),
       ...['bytes', 'path', 'sha256', 'artifactId', 'jobId'].map((key) => (
         conversionBlockMutation({ [key]: 'private-local-value' })
       )),
@@ -471,7 +488,7 @@ describe('CloudBase user data function', () => {
         action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [mutation],
       }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
     }
-    expect(rpc).toHaveBeenCalledTimes(3)
+    expect(rpc).toHaveBeenCalledTimes(4)
   })
 
   it('rejects extra action and nested union keys before calling RPC', async () => {
@@ -711,12 +728,18 @@ describe('CloudBase user data function', () => {
     expect(rpc).toHaveBeenCalledTimes(2)
   })
 
-  it('enforces protocol, identifier, batch, and request-size limits before RPC', async () => {
+  it('accepts v1/v2, rejects later protocols, and enforces identifiers, batches, and request size', async () => {
     const rpc = vi.fn()
     const handler = createUserDataHandler({ rpc })
 
     await expect(handler({
       action: 'syncPull', protocolVersion: 2, deviceId: 'dev_1',
+    }, authenticatedContext)).resolves.toEqual({ ok: true, data: undefined })
+    expect(rpc).toHaveBeenLastCalledWith('autoforge_sync_pull', expect.objectContaining({
+      p_protocol_version: 2,
+    }))
+    await expect(handler({
+      action: 'syncPull', protocolVersion: 3, deviceId: 'dev_1',
     }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'UPGRADE_REQUIRED' } })
     await expect(handler({
       action: 'syncPull', protocolVersion: 1, deviceId: ' dev_1',
@@ -752,7 +775,7 @@ describe('CloudBase user data function', () => {
         },
       }],
     }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
-    expect(rpc).not.toHaveBeenCalled()
+    expect(rpc).toHaveBeenCalledOnce()
   })
 
   it('rejects non-datetime date strings before RPC', async () => {
@@ -1072,6 +1095,42 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
     })
     await expect(forged('autoforge_sync_pull', {}))
       .rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+  })
+
+  it('accepts only strict remote-only compacted conversion terminal receipts', async () => {
+    const receipt = {
+      id: 'conversion_terminal_mutation_1',
+      kind: 'message.conversion_block_terminal',
+      entityId: 'message_1',
+      conversationId: 'conversation_1',
+      baseRevision: 1,
+      resultRevision: 2,
+      compacted: true,
+      receivedAt: occurredAt,
+    }
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({ mutations: [receipt], cursor: opaqueCursor })),
+    })
+    await expect(rpc('autoforge_sync_pull', {})).resolves.toEqual({
+      mutations: [receipt], cursor: opaqueCursor,
+    })
+
+    for (const forgedReceipt of [
+      { ...receipt, conversationId: undefined },
+      { ...receipt, payload: { state: 'terminal' } },
+    ]) {
+      const forged = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest',
+        serviceKey: 'server-secret',
+        fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({
+          mutations: [forgedReceipt], cursor: opaqueCursor,
+        })),
+      })
+      await expect(forged('autoforge_sync_pull', {}))
+        .rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+    }
   })
 
   it('rejects pulled mutations whose entity identity disagrees with the strict payload', async () => {

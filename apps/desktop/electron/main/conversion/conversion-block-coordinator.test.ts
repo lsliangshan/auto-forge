@@ -1,16 +1,15 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { ChatBlock } from '@autoforge/shared'
+import { createAgentPersistence } from '../agent/agent-orchestrator.js'
 import { openAppDatabase } from '../database/client.js'
 import { UserDataStoreManager, type UserDataStore } from '../database/user-data-client.js'
 import { UserDataConsistencyError } from '../database/user-data-repositories.js'
-import { createAgentPersistence } from '../agent/agent-orchestrator.js'
 import {
-  finalizeConversionBlockBindings,
   reconcileConversionBlockBinding,
-  registerConversionBlockBindings,
   type ConversionBlockCoordinatorRepositories,
 } from './conversion-block-coordinator.js'
 
@@ -36,7 +35,6 @@ async function seeded(input: {
   finalized: boolean
   executionTerminal: boolean
   jobsTerminal: boolean
-  binding?: boolean
 }) {
   const root = await mkdtemp(join(tmpdir(), 'autoforge-conversion-block-coordinator-'))
   roots.push(root)
@@ -62,9 +60,10 @@ async function seeded(input: {
     id: messageId,
     conversationId,
     role: 'assistant',
-    blocks: [activeBlock],
+    blocks: [],
     createdAt: 2,
   })
+  chat.messages.update(messageId, { blocks: [activeBlock] })
   durable.executions.insert({
     id: executionId,
     ownerUserId,
@@ -84,20 +83,25 @@ async function seeded(input: {
     status: input.jobsTerminal ? 'completed' : 'verifying',
     progress: input.jobsTerminal ? 100 : 90,
   })
-  if (input.binding !== false) {
-    durable.conversionBlockBindings.create({
-      ownerUserId,
-      conversationId,
-      messageId,
-      blockId: activeBlock.blockId,
-      executionId,
-    })
-    if (input.finalized) {
-      durable.conversionBlockBindings.finalize(ownerUserId, executionId, 3)
-    }
+  if (input.finalized) finalize(chat, 3)
+  const repositories: ConversionBlockCoordinatorRepositories = {
+    durable,
+    chat: {
+      messages: chat.messages,
+      chatRuns: chat.chatRuns,
+      conversionBlockBindings: chat.conversionBlockBindings,
+    },
   }
-  const repositories: ConversionBlockCoordinatorRepositories = { durable, chat }
   return { root, durable, stores, chat, repositories }
+}
+
+function finalize(chat: UserDataStore, endedAt: number, blocks: ChatBlock[] = [activeBlock]): void {
+  chat.chatRuns.finalizeWithMessage(
+    runId,
+    messageId,
+    'conversion_coordinator_request',
+    { blocks, status: 'completed', endedAt },
+  )
 }
 
 function terminalMutations(chat: UserDataStore) {
@@ -107,73 +111,68 @@ function terminalMutations(chat: UserDataStore) {
 }
 
 describe('conversion block coordinator', () => {
-  it.each([
-    'finalized',
-    'execution',
-    'jobs',
-  ] as const)('emits once when the %s signal arrives last', async (lastSignal) => {
-    const fixture = await seeded({
-      finalized: lastSignal !== 'finalized',
-      executionTerminal: lastSignal !== 'execution',
-      jobsTerminal: lastSignal !== 'jobs',
-    })
-    try {
-      expect(reconcileConversionBlockBinding({
-        repositories: fixture.repositories,
-        ownerUserId,
-        executionId,
-      })).toBeUndefined()
-      expect(terminalMutations(fixture.chat)).toHaveLength(0)
-
-      if (lastSignal === 'finalized') {
-        expect(fixture.durable.conversionBlockBindings.finalize(ownerUserId, executionId, 4)).toBe(true)
-      } else if (lastSignal === 'execution') {
-        expect(fixture.durable.executions.updateForUser(
-          executionId,
-          ownerUserId,
-          { status: 'completed', endedAt: 4 },
-        )).toMatchObject({ status: 'completed' })
-      } else {
-        expect(fixture.durable.conversionJobs.transition({
-          jobId,
-          ownerUserId,
-          expectedEpoch: 0,
-          expectedStatuses: ['verifying'],
-          patch: { status: 'completed', progress: 100, endedAt: 4 },
-        })).toBe(true)
-      }
-
-      expect(reconcileConversionBlockBinding({
-        repositories: fixture.repositories,
-        ownerUserId,
-        executionId,
-      })).toEqual({
-        conversationId,
-        messageId,
-        block: { ...activeBlock, state: 'terminal' },
+  it.each(['finalized', 'execution', 'jobs'] as const)(
+    'emits exactly once when the %s signal arrives last',
+    async (lastSignal) => {
+      const fixture = await seeded({
+        finalized: lastSignal !== 'finalized',
+        executionTerminal: lastSignal !== 'execution',
+        jobsTerminal: lastSignal !== 'jobs',
       })
-      expect(terminalMutations(fixture.chat)).toHaveLength(1)
-      expect(fixture.chat.messages.get(messageId)?.blocks).toEqual([{ ...activeBlock, state: 'terminal' }])
+      try {
+        expect(reconcileConversionBlockBinding({
+          repositories: fixture.repositories,
+          ownerUserId,
+          executionId,
+        })).toBeUndefined()
+        expect(terminalMutations(fixture.chat)).toHaveLength(0)
 
-      expect(reconcileConversionBlockBinding({
-        repositories: fixture.repositories,
-        ownerUserId,
-        executionId,
-      })).toBeUndefined()
-      expect(terminalMutations(fixture.chat)).toHaveLength(1)
-    } finally {
-      fixture.stores.close()
-      fixture.durable.close()
-    }
-  })
+        if (lastSignal === 'finalized') {
+          finalize(fixture.chat, 4)
+        } else if (lastSignal === 'execution') {
+          expect(fixture.durable.executions.updateForUser(
+            executionId,
+            ownerUserId,
+            { status: 'completed', endedAt: 4 },
+          )).toMatchObject({ status: 'completed' })
+        } else {
+          expect(fixture.durable.conversionJobs.transition({
+            jobId,
+            ownerUserId,
+            expectedEpoch: 0,
+            expectedStatuses: ['verifying'],
+            patch: { status: 'completed', progress: 100, endedAt: 4 },
+          })).toBe(true)
+        }
 
-  it('registers one and then sequential foreground conversion bindings from persisted snapshots', async () => {
-    const fixture = await seeded({
-      finalized: false,
-      executionTerminal: false,
-      jobsTerminal: false,
-      binding: false,
-    })
+        expect(reconcileConversionBlockBinding({
+          repositories: fixture.repositories,
+          ownerUserId,
+          executionId,
+        })).toEqual({
+          conversationId,
+          messageId,
+          block: { ...activeBlock, state: 'terminal' },
+        })
+        expect(terminalMutations(fixture.chat)).toHaveLength(1)
+        expect(fixture.chat.conversionBlockBindings.get(ownerUserId, executionId))
+          .toMatchObject({ consumedAt: expect.any(Number) })
+
+        expect(reconcileConversionBlockBinding({
+          repositories: fixture.repositories,
+          ownerUserId,
+          executionId,
+        })).toBeUndefined()
+        expect(terminalMutations(fixture.chat)).toHaveLength(1)
+      } finally {
+        fixture.stores.close()
+        fixture.durable.close()
+      }
+    },
+  )
+
+  it('handles two sequential foreground bindings without crossing exact identities', async () => {
+    const fixture = await seeded({ finalized: false, executionTerminal: true, jobsTerminal: true })
     const secondExecutionId = 'conversion_coordinator_execution_2'
     const second = {
       type: 'conversion' as const,
@@ -182,72 +181,44 @@ describe('conversion block coordinator', () => {
       state: 'active' as const,
     }
     try {
-      expect(registerConversionBlockBindings({
-        repositories: fixture.repositories,
-        ownerUserId,
-        messageId,
-        blocks: [activeBlock],
-      })).toEqual([executionId])
-      expect(fixture.durable.conversionBlockBindings.get(ownerUserId, executionId)).toMatchObject({
-        conversationId,
-        messageId,
-        blockId: activeBlock.blockId,
-        executionId,
-        finalizedAt: undefined,
+      fixture.durable.executions.insert({
+        id: secondExecutionId, ownerUserId, workflowId: 'file.convert.test', workflowVersion: '1.0.0',
+        chatRunId: runId, status: 'completed', input: {},
+      })
+      fixture.durable.conversionJobs.create({
+        id: 'conversion_coordinator_job_2', ownerUserId, executionId: secondExecutionId,
+        sourceKind: 'media', sourceId: 'conversion_coordinator_source_2', targetFormat: 'pdf',
+        status: 'completed', progress: 100,
       })
       fixture.chat.messages.update(messageId, { blocks: [activeBlock, second] })
-      expect(registerConversionBlockBindings({
-        repositories: fixture.repositories,
-        ownerUserId,
-        messageId,
-        blocks: [activeBlock, second],
-      })).toEqual([executionId, secondExecutionId])
-      expect(fixture.durable.conversionBlockBindings.get(ownerUserId, secondExecutionId)).toMatchObject({
-        conversationId,
-        messageId,
-        blockId: second.blockId,
-        executionId: secondExecutionId,
-        finalizedAt: undefined,
-      })
+      finalize(fixture.chat, 5, [activeBlock, second])
 
-      expect(finalizeConversionBlockBindings({
-        repositories: fixture.repositories,
-        ownerUserId,
-        messageId,
-        blocks: [activeBlock, second],
-        finalizedAt: 5,
-      })).toEqual([executionId, secondExecutionId])
-      expect(fixture.durable.conversionBlockBindings.get(ownerUserId, executionId)?.finalizedAt).toBe(5)
-      expect(fixture.durable.conversionBlockBindings.get(ownerUserId, secondExecutionId)?.finalizedAt).toBe(5)
+      for (const currentExecutionId of [executionId, secondExecutionId]) {
+        expect(reconcileConversionBlockBinding({
+          repositories: fixture.repositories,
+          ownerUserId,
+          executionId: currentExecutionId,
+        })).toMatchObject({ block: { executionId: currentExecutionId, state: 'terminal' } })
+      }
+      expect(terminalMutations(fixture.chat)).toHaveLength(2)
+      expect(fixture.chat.messages.get(messageId)?.blocks).toEqual([
+        { ...activeBlock, state: 'terminal' },
+        { ...second, state: 'terminal' },
+      ])
     } finally {
       fixture.stores.close()
       fixture.durable.close()
     }
   })
 
-  it('leaves the binding unfinalized and queues no terminal operation when message finalization fails', async () => {
+  it('leaves the binding unfinalized and queues no terminal operation when finalization fails', async () => {
     const fixture = await seeded({ finalized: false, executionTerminal: true, jobsTerminal: true })
     try {
       const persistence = createAgentPersistence({
         messages: fixture.chat.messages,
-        chatRuns: {
-          finalizeWithMessage: () => { throw new Error('assistant append failed') },
-        },
-      } as never, undefined, (finalizedMessageId, blocks) => {
-        const finalizedExecutionIds = finalizeConversionBlockBindings({
-          repositories: fixture.repositories,
-          ownerUserId,
-          messageId: finalizedMessageId,
-          blocks,
-          finalizedAt: 5,
-        })
-        for (const finalizedExecutionId of finalizedExecutionIds) {
-          reconcileConversionBlockBinding({
-            repositories: fixture.repositories,
-            ownerUserId,
-            executionId: finalizedExecutionId,
-          })
-        }
+        chatRuns: { finalizeWithMessage: () => { throw new Error('assistant append failed') } },
+      } as never, undefined, () => {
+        reconcileConversionBlockBinding({ repositories: fixture.repositories, ownerUserId, executionId })
       })
 
       expect(() => persistence.finalize({
@@ -258,9 +229,8 @@ describe('conversion block coordinator', () => {
         status: 'completed',
         endedAt: 5,
       })).toThrow('assistant append failed')
-      expect(fixture.durable.conversionBlockBindings.get(ownerUserId, executionId)?.finalizedAt)
-        .toBeUndefined()
-      expect(fixture.chat.messages.get(messageId)?.blocks).toEqual([activeBlock])
+      expect(fixture.chat.conversionBlockBindings.get(ownerUserId, executionId))
+        .not.toHaveProperty('finalizedAt')
       expect(terminalMutations(fixture.chat)).toHaveLength(0)
     } finally {
       fixture.stores.close()
@@ -268,29 +238,20 @@ describe('conversion block coordinator', () => {
     }
   })
 
-  it('rejects duplicate durable execution and message-block bindings', async () => {
-    const fixture = await seeded({ finalized: false, executionTerminal: false, jobsTerminal: false })
+  it('retires a finalized binding whose durable execution disappeared', async () => {
+    const fixture = await seeded({ finalized: true, executionTerminal: true, jobsTerminal: true })
     try {
-      expect(() => fixture.durable.conversionBlockBindings.create({
+      fixture.durable.clearLocalData('executions')
+      expect(reconcileConversionBlockBinding({
+        repositories: fixture.repositories,
         ownerUserId,
-        conversationId,
-        messageId,
-        blockId: 'conversion_coordinator_other_block',
         executionId,
-      })).toThrow()
-      expect(() => fixture.durable.conversionBlockBindings.create({
-        ownerUserId,
-        conversationId,
-        messageId,
-        blockId: activeBlock.blockId,
-        executionId: 'conversion_coordinator_other_execution',
-      })).toThrow()
-      expect(fixture.durable.conversionBlockBindings.get(ownerUserId, executionId)).toMatchObject({
-        conversationId,
-        messageId,
-        blockId: activeBlock.blockId,
-        executionId,
+      })).toBeUndefined()
+      expect(fixture.chat.conversionBlockBindings.get(ownerUserId, executionId)).toMatchObject({
+        retirementReason: 'missing_execution',
+        retiredAt: expect.any(Number),
       })
+      expect(fixture.chat.conversionBlockBindings.listRecoverable(ownerUserId)).toEqual([])
     } finally {
       fixture.stores.close()
       fixture.durable.close()
@@ -298,32 +259,36 @@ describe('conversion block coordinator', () => {
   })
 
   it.each([
+    { label: 'duplicate target block', blocks: [activeBlock, { ...activeBlock }] },
     {
-      label: 'duplicate target block',
-      blocks: [activeBlock, { ...activeBlock }],
-    },
-    {
-      label: 'duplicate execution under another block',
-      blocks: [activeBlock, { ...activeBlock, blockId: 'conversion_coordinator_other_block' }],
-    },
-    {
-      label: 'mismatched bound execution',
+      label: 'mismatched execution',
       blocks: [{ ...activeBlock, executionId: 'conversion_coordinator_wrong_execution' }],
     },
-  ] satisfies Array<{ label: string; blocks: ChatBlock[] }>)('fails closed for $label', async ({ blocks }) => {
-    const fixture = await seeded({ finalized: true, executionTerminal: true, jobsTerminal: true })
-    try {
-      fixture.chat.messages.update(messageId, { blocks })
-      expect(() => reconcileConversionBlockBinding({
-        repositories: fixture.repositories,
-        ownerUserId,
-        executionId,
-      })).toThrow(UserDataConsistencyError)
-      expect(terminalMutations(fixture.chat)).toHaveLength(0)
-      expect(fixture.chat.messages.get(messageId)?.blocks).toEqual(blocks)
-    } finally {
-      fixture.stores.close()
-      fixture.durable.close()
-    }
-  })
+  ] satisfies Array<{ label: string; blocks: ChatBlock[] }>)(
+    'fails closed and retires a persisted $label',
+    async ({ blocks }) => {
+      const fixture = await seeded({ finalized: true, executionTerminal: true, jobsTerminal: true })
+      try {
+        const [cacheFile] = (await readdir(join(fixture.root, 'user-caches')))
+          .filter((name) => name.endsWith('.sqlite'))
+        if (!cacheFile) throw new Error('missing user cache')
+        const tamper = new Database(join(fixture.root, 'user-caches', cacheFile))
+        tamper.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+          .run(JSON.stringify(blocks), messageId)
+        tamper.close()
+
+        expect(() => reconcileConversionBlockBinding({
+          repositories: fixture.repositories,
+          ownerUserId,
+          executionId,
+        })).toThrow(UserDataConsistencyError)
+        expect(terminalMutations(fixture.chat)).toHaveLength(0)
+        expect(fixture.chat.conversionBlockBindings.get(ownerUserId, executionId))
+          .toMatchObject({ retirementReason: 'invalid_binding' })
+      } finally {
+        fixture.stores.close()
+        fixture.durable.close()
+      }
+    },
+  )
 })

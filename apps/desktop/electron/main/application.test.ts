@@ -8376,6 +8376,75 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('pushes one crash-recovered ready outbox batch before one startup pull', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-ready-outbox-restart-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const bootstrap = createApplicationRuntime(options(root, { authService }))
+    const session = await authenticate(bootstrap, 'ReadyOutboxRestart', false)
+    await bootstrap.close()
+
+    const occurredAt = '2026-08-29T00:00:00.000Z'
+    withUserData(root, session.user.id, (store) => store.outbox.recordWithConversation({
+      id: 'ready_outbox_restart_mutation',
+      kind: 'conversation.create',
+      entityId: 'ready_outbox_restart_conversation',
+      baseRevision: 0,
+      occurredAt,
+      payload: {
+        title: 'Ready after restart',
+        titleState: 'pending',
+        createdAt: occurredAt,
+        lastActivityAt: occurredAt,
+        metadataUpdatedAt: occurredAt,
+      },
+    }))
+    const calls: CloudBaseUserDataCall[] = []
+    const restarted = createApplicationRuntime(options(root, {
+      authService,
+      userDataSyncPort: {
+        call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+          calls.push(structuredClone(input))
+          if (input.action === 'syncPush') {
+            return {
+              ok: true,
+              data: {
+                results: input.mutations.map((mutation) => ({
+                  id: mutation.id,
+                  status: 'applied' as const,
+                  revision: mutation.baseRevision + 1,
+                })),
+                cursor: 'ready_outbox_restart_push',
+              },
+            }
+          }
+          if (input.action === 'syncPull') {
+            return {
+              ok: true,
+              data: { mutations: [], cursor: 'ready_outbox_restart_pull' },
+            }
+          }
+          throw new Error(`Unexpected ${input.action}`)
+        }),
+      },
+    }))
+    try {
+      await restarted.services.auth.getSession()
+      expect(calls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
+      expect(calls.every((call) => (
+        call.action !== 'syncPush' && call.action !== 'syncPull'
+          ? true
+          : call.protocolVersion === 2
+      ))).toBe(true)
+      expect(withUserData(root, session.user.id, (store) => store.outbox.countPending())).toBe(0)
+
+      await restarted.services.auth.getSession()
+      expect(calls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
+    } finally {
+      await restarted.close()
+    }
+  })
+
   it('refuses ordinary logout with pending sync and deletes the cache only after explicit discard', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-logout-pending-'))
     directories.push(root)
@@ -9528,15 +9597,23 @@ describe('createApplicationRuntime', () => {
     store.chatRuns.insert({
       id: 'run_conversion_block_terminal', conversationId: conversation.id, userId: session.user.id,
       provider: 'openrouter', requestId: 'request_conversion_block_terminal', model: 'openrouter/test',
-      status: 'completed', startedAt: 1, endedAt: 2,
+      status: 'running', startedAt: 1,
     })
     store.messages.insert({
       id: 'message_conversion_block_terminal', conversationId: conversation.id, role: 'assistant',
-      blocks: [{
-        type: 'conversion', blockId: 'block_conversion_terminal',
-        executionId: 'execution_conversion_block_terminal', state: 'active',
-      }], createdAt: 2,
+      blocks: [], createdAt: 2,
     })
+    const activeConversionBlock = {
+      type: 'conversion', blockId: 'block_conversion_terminal',
+      executionId: 'execution_conversion_block_terminal', state: 'active' as const,
+    } as const
+    store.messages.update('message_conversion_block_terminal', { blocks: [activeConversionBlock] })
+    store.chatRuns.finalizeWithMessage(
+      'run_conversion_block_terminal',
+      'message_conversion_block_terminal',
+      'request_conversion_block_terminal',
+      { blocks: [activeConversionBlock], status: 'completed', endedAt: 2 },
+    )
     stores.close()
     const database = openAppDatabase(join(root, 'autoforge.sqlite'))
     database.executions.insert({
@@ -9544,12 +9621,6 @@ describe('createApplicationRuntime', () => {
       workflowId: 'file.convert.universal', workflowVersion: '0.1.0',
       chatRunId: 'run_conversion_block_terminal', status: 'completed', input: {},
     })
-    database.conversionBlockBindings.create({
-      ownerUserId: session.user.id, conversationId: conversation.id,
-      messageId: 'message_conversion_block_terminal', blockId: 'block_conversion_terminal',
-      executionId: 'execution_conversion_block_terminal',
-    })
-    database.conversionBlockBindings.finalize(session.user.id, 'execution_conversion_block_terminal', 2)
     database.conversionJobs.create({
       id: 'job_conversion_block_terminal', ownerUserId: session.user.id,
       executionId: 'execution_conversion_block_terminal', sourceKind: 'artifact',
@@ -9689,7 +9760,7 @@ describe('createApplicationRuntime', () => {
     const chatEvents: ChatEvent[] = []
     const completion = deferred<Execution>()
     const startReserved = vi.spyOn(ExecutionService.prototype, 'startReserved')
-      .mockImplementation(async (reservation, input) => {
+      .mockImplementation(async function (this: unknown, reservation, input) {
         const database = openAppDatabase(join(root, 'autoforge.sqlite'))
         try {
           database.executions.insert({
@@ -9701,15 +9772,28 @@ describe('createApplicationRuntime', () => {
             status: 'completed',
             input: input.input,
           })
-          database.conversionJobs.create({
-            id: `job_${reservation.executionId}`,
-            ownerUserId: input.userId,
+          const binding = input.attachmentBindings?.[0]
+          if (!binding) throw new Error('Expected one conversion attachment binding')
+          const conversion = (this as {
+            dependencies?: {
+              conversion?: {
+                submit(submission: {
+                  executionId: string
+                  sourceKind: 'media' | 'artifact'
+                  sourceId: string
+                  targetFormat: 'pdf'
+                }): unknown
+              }
+            }
+          }).dependencies?.conversion
+          if (!conversion) throw new Error('Expected the application conversion port')
+          conversion.submit({
             executionId: reservation.executionId,
-            sourceKind: 'media',
-            sourceId: 'local_source',
+            sourceKind: binding.source.kind,
+            sourceId: binding.source.kind === 'media'
+              ? binding.source.mediaAssetId
+              : binding.source.artifactId,
             targetFormat: 'pdf',
-            status: 'completed',
-            progress: 100,
           })
         } finally {
           database.close()
@@ -9800,15 +9884,16 @@ describe('createApplicationRuntime', () => {
         event.type === 'block' && event.block.type === 'conversion'
       ))!
       const conversion = conversionEvent.block as Extract<typeof conversionEvent.block, { type: 'conversion' }>
-      const before = openAppDatabase(join(root, 'autoforge.sqlite'))
-      expect(before.conversionBlockBindings.get(session.user.id, approval.executionId)).toMatchObject({
+      const activeBinding = withUserData(root, session.user.id, (store) => (
+        store.conversionBlockBindings.get(session.user.id, approval.executionId)
+      ))
+      expect(activeBinding).toMatchObject({
         conversationId: conversation.id,
         messageId: conversionEvent.messageId,
         blockId: conversion.blockId,
         executionId: approval.executionId,
-        finalizedAt: undefined,
       })
-      before.close()
+      expect(activeBinding).not.toHaveProperty('finalizedAt')
       expect(withUserData(root, session.user.id, (store) => store.outbox.list(100)
         .filter((mutation) => mutation.kind === 'message.conversion_block_terminal'))).toHaveLength(0)
 
@@ -9832,10 +9917,9 @@ describe('createApplicationRuntime', () => {
           type: 'conversion', executionId: approval.executionId, state: 'terminal',
         }),
       })))
-      const after = openAppDatabase(join(root, 'autoforge.sqlite'))
-      expect(after.conversionBlockBindings.get(session.user.id, approval.executionId)?.finalizedAt)
-        .toEqual(expect.any(Number))
-      after.close()
+      expect(withUserData(root, session.user.id, (store) => (
+        store.conversionBlockBindings.get(session.user.id, approval.executionId)
+      ))).toMatchObject({ finalizedAt: expect.any(Number), consumedAt: expect.any(Number) })
       const mutations = withUserData(root, session.user.id, (store) => store.outbox.list(100))
       expect(mutations.filter((mutation) => (
         mutation.kind === 'message.append' && mutation.entityId === conversionEvent.messageId
@@ -9885,22 +9969,29 @@ describe('createApplicationRuntime', () => {
         userId: session.user.id,
         provider: 'openrouter',
         model: 'openrouter/test',
-        status: 'completed',
+        status: 'running',
         startedAt: 1,
-        endedAt: 2,
       })
       store.messages.insert({
         id: 'message_conversion_block_rebind',
         conversationId: conversation.id,
         role: 'assistant',
-        blocks: [{
-          type: 'conversion',
-          blockId: 'block_conversion_block_rebind',
-          executionId: 'execution_conversion_block_rebind',
-          state: 'active',
-        }],
+        blocks: [],
         createdAt: 2,
       })
+      const active = {
+        type: 'conversion',
+        blockId: 'block_conversion_block_rebind',
+        executionId: 'execution_conversion_block_rebind',
+        state: 'active' as const,
+      } as const
+      store.messages.update('message_conversion_block_rebind', { blocks: [active] })
+      store.chatRuns.finalizeWithMessage(
+        'run_conversion_block_rebind',
+        'message_conversion_block_rebind',
+        'request_conversion_block_rebind',
+        { blocks: [active], status: 'completed', endedAt: 3 },
+      )
     })
     const database = openAppDatabase(join(root, 'autoforge.sqlite'))
     database.executions.insert({
@@ -9922,18 +10013,6 @@ describe('createApplicationRuntime', () => {
       status: 'completed',
       progress: 100,
     })
-    database.conversionBlockBindings.create({
-      ownerUserId: session.user.id,
-      conversationId: conversation.id,
-      messageId: 'message_conversion_block_rebind',
-      blockId: 'block_conversion_block_rebind',
-      executionId: 'execution_conversion_block_rebind',
-    })
-    database.conversionBlockBindings.finalize(
-      session.user.id,
-      'execution_conversion_block_rebind',
-      3,
-    )
     database.close()
 
     const emitChat = vi.fn()

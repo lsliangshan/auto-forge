@@ -28,6 +28,7 @@ import {
   type AccountDataPreferencesRecord,
   type PrivacyConsent,
   type PrivacyConsentPurpose,
+  type ChatBlock,
 } from '@autoforge/shared'
 import {
   createRepositories,
@@ -48,13 +49,13 @@ const outboxMetadataSchema = z.object({
 }).strict()
 
 const checkpointSchema = z.object({
-  protocolVersion: z.number().int().positive(),
+  protocolVersion: z.union([z.literal(1), z.literal(2)]),
   remoteCursor: opaqueCursorSchema.optional(),
   updatedAt: z.number().int().nonnegative(),
 }).strict()
 
 const remotePageEnvelopeSchema = z.object({
-  protocolVersion: z.number().int().positive(),
+  protocolVersion: z.union([z.literal(1), z.literal(2)]),
   cursor: opaqueCursorSchema.nullable(),
   mutations: z.array(pulledMutationSchema).max(100),
 }).strict()
@@ -83,6 +84,18 @@ const messageRowSchema = z.object({
   createdAt: z.number().int().nonnegative(),
 }).passthrough()
 
+const conversionBlockBindingRowSchema = z.object({
+  ownerUserId: z.string().min(1).max(512),
+  conversationId: z.string().trim().min(1).max(128),
+  messageId: z.string().trim().min(1).max(128),
+  blockId: z.string().trim().min(1).max(128),
+  executionId: z.string().trim().min(1).max(128),
+  finalizedAt: z.number().int().nonnegative().nullable(),
+  consumedAt: z.number().int().nonnegative().nullable(),
+  retiredAt: z.number().int().nonnegative().nullable(),
+  retirementReason: z.enum(['missing_execution', 'missing_message', 'invalid_binding']).nullable(),
+}).strict()
+
 export type OutboxMutationRecord = SyncMutation & {
   state: 'pending' | 'syncing' | 'failed'
   attempts: number
@@ -95,6 +108,22 @@ export interface SyncCheckpoint {
   protocolVersion: number
   remoteCursor?: string
   updatedAt: number
+}
+
+export interface ConversionBlockBindingRecord {
+  ownerUserId: string
+  conversationId: string
+  messageId: string
+  blockId: string
+  executionId: string
+  finalizedAt?: number
+  consumedAt?: number
+  retiredAt?: number
+  retirementReason?: 'missing_execution' | 'missing_message' | 'invalid_binding'
+}
+
+export interface PushAcknowledgementOutcome {
+  supersededIds: string[]
 }
 
 export type RemoteMutation = PulledMutation
@@ -118,6 +147,16 @@ export interface UserDataRepositories {
   mediaGenerationJobs: AppRepositories['mediaGenerationJobs']
   chatRuns: AppRepositories['chatRuns']
   providerUsage: AppRepositories['providerUsage']
+  conversionBlockBindings: {
+    get(ownerUserId: string, executionId: string): ConversionBlockBindingRecord | undefined
+    listRecoverable(ownerUserId: string): ConversionBlockBindingRecord[]
+    retire(
+      ownerUserId: string,
+      executionId: string,
+      reason: NonNullable<ConversionBlockBindingRecord['retirementReason']>,
+      retiredAt: number,
+    ): boolean
+  }
   account: {
     getConsent(purpose: PrivacyConsentPurpose): PrivacyConsent | undefined
     getPreferences(): AccountDataPreferencesRecord | undefined
@@ -152,7 +191,7 @@ export interface UserDataRepositories {
     acknowledgePushResults(
       sent: readonly SyncMutation[],
       results: readonly SyncMutationResult[],
-    ): void
+    ): PushAcknowledgementOutcome
     retryFailed(entityId?: string): string[]
     delete(id: string): void
   }
@@ -204,6 +243,178 @@ function assertOwner(actual: string | undefined, expected: string): void {
 
 function assertStoredOwner(actual: string | undefined, expected: string): void {
   if (actual !== expected) throw new UserDataOwnerMismatchError()
+}
+
+type ConversionBlock = Extract<ChatBlock, { type: 'conversion' }>
+
+function exactConversionBlocks(blocksInput: unknown): ConversionBlock[] {
+  const blocks = parsePersisted(() => chatBlockSchema.array().parse(blocksInput))
+  const blockIds = new Set<string>()
+  const executionIds = new Set<string>()
+  const conversions: ConversionBlock[] = []
+  for (const block of blocks) {
+    if ('blockId' in block) {
+      if (blockIds.has(block.blockId)) throw new UserDataConsistencyError()
+      blockIds.add(block.blockId)
+    }
+    if (block.type !== 'conversion') continue
+    if (executionIds.has(block.executionId)) throw new UserDataConsistencyError()
+    executionIds.add(block.executionId)
+    conversions.push(block)
+  }
+  return conversions
+}
+
+function conversionBlockBindingFromRow(row: Query): ConversionBlockBindingRecord {
+  const parsed = parsePersisted(() => conversionBlockBindingRowSchema.parse(row))
+  return {
+    ownerUserId: parsed.ownerUserId,
+    conversationId: parsed.conversationId,
+    messageId: parsed.messageId,
+    blockId: parsed.blockId,
+    executionId: parsed.executionId,
+    ...(parsed.finalizedAt === null ? {} : { finalizedAt: parsed.finalizedAt }),
+    ...(parsed.consumedAt === null ? {} : { consumedAt: parsed.consumedAt }),
+    ...(parsed.retiredAt === null ? {} : { retiredAt: parsed.retiredAt }),
+    ...(parsed.retirementReason === null ? {} : { retirementReason: parsed.retirementReason }),
+  }
+}
+
+function storedConversionBlockBinding(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  executionId: string,
+): ConversionBlockBindingRecord | undefined {
+  const row = database.prepare(`
+    SELECT owner_user_id AS ownerUserId, conversation_id AS conversationId,
+           message_id AS messageId, block_id AS blockId, execution_id AS executionId,
+           finalized_at AS finalizedAt, consumed_at AS consumedAt,
+           retired_at AS retiredAt, retirement_reason AS retirementReason
+    FROM conversion_block_bindings
+    WHERE owner_user_id = @ownerUserId AND execution_id = @executionId
+  `).get({ ownerUserId, executionId }) as Query | undefined
+  return row === undefined ? undefined : conversionBlockBindingFromRow(row)
+}
+
+function exactBindingForBlock(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  message: { id: string; conversationId: string },
+  block: ConversionBlock,
+): ConversionBlockBindingRecord | undefined {
+  const binding = storedConversionBlockBinding(database, ownerUserId, block.executionId)
+  if (binding === undefined) return undefined
+  if (binding.conversationId !== message.conversationId
+    || binding.messageId !== message.id
+    || binding.blockId !== block.blockId) throw new UserDataConsistencyError()
+  return binding
+}
+
+function registerActiveConversionBindings(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  message: { id: string; conversationId: string },
+  blocksInput: unknown,
+): void {
+  const conversions = exactConversionBlocks(blocksInput)
+  for (const block of conversions) {
+    if (block.state !== 'active') throw new UserDataConsistencyError()
+    const existing = exactBindingForBlock(database, ownerUserId, message, block)
+    if (existing !== undefined) {
+      if (existing.consumedAt !== undefined || existing.retiredAt !== undefined) {
+        throw new UserDataConsistencyError()
+      }
+      continue
+    }
+    database.prepare(`
+      INSERT INTO conversion_block_bindings(
+        owner_user_id, conversation_id, message_id, block_id, execution_id
+      ) VALUES (
+        @ownerUserId, @conversationId, @messageId, @blockId, @executionId
+      )
+    `).run({
+      ownerUserId,
+      conversationId: message.conversationId,
+      messageId: message.id,
+      blockId: block.blockId,
+      executionId: block.executionId,
+    })
+  }
+  const recoverable = database.prepare(`
+    SELECT owner_user_id AS ownerUserId, conversation_id AS conversationId,
+           message_id AS messageId, block_id AS blockId, execution_id AS executionId,
+           finalized_at AS finalizedAt, consumed_at AS consumedAt,
+           retired_at AS retiredAt, retirement_reason AS retirementReason
+    FROM conversion_block_bindings
+    WHERE owner_user_id = @ownerUserId AND message_id = @messageId
+      AND consumed_at IS NULL AND retired_at IS NULL
+  `).all({ ownerUserId, messageId: message.id }) as Query[]
+  for (const row of recoverable) {
+    const binding = conversionBlockBindingFromRow(row)
+    const exact = conversions.filter((block) => (
+      block.blockId === binding.blockId && block.executionId === binding.executionId
+    ))
+    if (exact.length !== 1) throw new UserDataConsistencyError()
+  }
+}
+
+function finalizeConversionBindings(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  message: { id: string; conversationId: string },
+  blocksInput: unknown,
+  finalizedAt: number,
+): void {
+  if (!Number.isSafeInteger(finalizedAt) || finalizedAt < 0) throw new UserDataConsistencyError()
+  const conversions = exactConversionBlocks(blocksInput)
+  for (const block of conversions) {
+    if (block.state !== 'active') throw new UserDataConsistencyError()
+    const binding = exactBindingForBlock(database, ownerUserId, message, block)
+    if (!binding || binding.consumedAt !== undefined || binding.retiredAt !== undefined) {
+      throw new UserDataConsistencyError()
+    }
+    if (binding.finalizedAt !== undefined && binding.finalizedAt !== finalizedAt) {
+      throw new UserDataConsistencyError()
+    }
+    database.prepare(`
+      UPDATE conversion_block_bindings
+      SET finalized_at = @finalizedAt
+      WHERE owner_user_id = @ownerUserId AND execution_id = @executionId
+        AND finalized_at IS NULL AND consumed_at IS NULL AND retired_at IS NULL
+    `).run({ ownerUserId, executionId: block.executionId, finalizedAt })
+  }
+  const unrepresented = database.prepare(`
+    SELECT execution_id AS executionId
+    FROM conversion_block_bindings
+    WHERE owner_user_id = @ownerUserId AND message_id = @messageId
+      AND consumed_at IS NULL AND retired_at IS NULL
+  `).all({ ownerUserId, messageId: message.id }) as Array<{ executionId: string }>
+  if (unrepresented.some(({ executionId }) => (
+    !conversions.some((block) => block.executionId === executionId)
+  ))) throw new UserDataConsistencyError()
+}
+
+function consumeConversionBinding(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  message: { id: string; conversationId: string },
+  block: ConversionBlock,
+  consumedAt: number,
+): void {
+  const binding = exactBindingForBlock(database, ownerUserId, message, block)
+  // Remote and pre-journal historical messages intentionally have no local execution binding.
+  if (!binding) return
+  if (binding.retiredAt !== undefined || binding.finalizedAt === undefined) {
+    throw new UserDataConsistencyError()
+  }
+  if (binding.consumedAt !== undefined) return
+  const changed = database.prepare(`
+    UPDATE conversion_block_bindings
+    SET consumed_at = @consumedAt
+    WHERE owner_user_id = @ownerUserId AND execution_id = @executionId
+      AND finalized_at IS NOT NULL AND consumed_at IS NULL AND retired_at IS NULL
+  `).run({ ownerUserId, executionId: block.executionId, consumedAt }).changes
+  if (changed !== 1) throw new UserDataConsistencyError()
 }
 
 function timestamp(value: string): number {
@@ -490,11 +701,19 @@ function requireOwnedConversation(
   assertStoredOwner(owner.userId ?? undefined, ownerUserId)
 }
 
-function sameMutationIdentity(local: SyncMutation, remote: MutationReceipt): boolean {
+function sameMutationIdentity(
+  local: SyncMutation,
+  remote: MutationReceipt,
+  database: SqliteDatabase,
+): boolean {
   const payloadsMatch = isCompactedReceipt(remote)
-    ? remote.kind !== 'message.append'
-      || (local.kind === 'message.append'
-        && local.payload.conversationId === remote.conversationId)
+    ? remote.kind === 'message.append'
+      ? local.kind === 'message.append'
+        && local.payload.conversationId === remote.conversationId
+      : remote.kind === 'message.conversion_block_terminal'
+        ? local.kind === 'message.conversion_block_terminal'
+          && affectedConversationId(local, database) === remote.conversationId
+        : true
     : local.kind === 'message.append' && remote.kind === 'message.append'
     ? isDeepStrictEqual(
         canonicalMessagePayload(local.payload),
@@ -564,7 +783,7 @@ function validateOutboxReceipt(
   `).get({ id: mutation.id }) as Query | undefined
   if (row === undefined) return undefined
   const local = outboxFromRow(row)
-  if (!sameMutationIdentity(local, mutation)) throw new UserDataConsistencyError()
+  if (!sameMutationIdentity(local, mutation, database)) throw new UserDataConsistencyError()
   if (validateRevision) requireValidRemoteResult(mutation, true)
   return local
 }
@@ -596,7 +815,7 @@ function validateReceiptEvidence(
 ): SyncMutation | undefined {
   const local = findReceiptEvidence(database, mutation.id)
   if (local === undefined) return undefined
-  if (!sameMutationIdentity(local, mutation)) throw new UserDataConsistencyError()
+  if (!sameMutationIdentity(local, mutation, database)) throw new UserDataConsistencyError()
   requireValidRemoteResult(mutation, true)
   return local
 }
@@ -1077,8 +1296,12 @@ function applyCompactedRemoteMutation(
   ownerUserId: string,
   mutation: Extract<RemoteMutation, { compacted: true }>,
 ): void {
-  const revision = requireValidRemoteResult(mutation)
+  const revision = requireValidRemoteResult(
+    mutation,
+    mutation.kind === 'message.conversion_block_terminal',
+  )
   const conversationId = mutation.kind === 'message.append'
+    || mutation.kind === 'message.conversion_block_terminal'
     ? mutation.conversationId
     : mutation.entityId
   const current = remoteConversation(database, ownerUserId, conversationId)
@@ -1278,6 +1501,7 @@ function affectedConversationId(
     case 'message.append':
       return 'compacted' in mutation ? mutation.conversationId : mutation.payload.conversationId
     case 'message.conversion_block_terminal':
+      if ('compacted' in mutation) return mutation.conversationId
       return database === undefined ? undefined : storedMessage(database, mutation.entityId)?.conversationId
     default:
       return undefined
@@ -1329,12 +1553,95 @@ function writeCheckpoint(database: SqliteDatabase, checkpoint: SyncCheckpoint): 
   `).run({ ...validated, remoteCursor: validated.remoteCursor ?? null })
 }
 
+function acknowledgeAuthoritativeConversionDuplicate(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  local: Extract<SyncMutation, { kind: 'message.conversion_block_terminal' }>,
+  remote: MutationReceipt,
+): string[] {
+  const resultRevision = requireValidRemoteResult(remote, true)
+  if (resultRevision !== local.baseRevision) throw new UserDataConsistencyError()
+  const message = storedMessage(database, local.payload.messageId)
+  if (!message || message.id !== local.entityId) throw new UserDataConsistencyError()
+  const target = requireConversionBlockTarget(message, local.payload)
+  if (target.state !== 'terminal') throw new UserDataConsistencyError()
+  requireOwnedConversation(database, ownerUserId, message.conversationId)
+  const anchor = database.prepare(`
+    SELECT enqueue_sequence AS enqueueSequence
+    FROM outbox_mutations
+    WHERE id = @id
+  `).get({ id: local.id }) as { enqueueSequence: number } | undefined
+  if (!anchor || !Number.isSafeInteger(anchor.enqueueSequence)) throw new UserDataConsistencyError()
+
+  const later = (database.prepare(`
+    SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
+           payload_json AS payloadJson, state, attempts,
+           next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
+           occurred_at AS occurredAt, created_at AS createdAt,
+           enqueue_sequence AS enqueueSequence
+    FROM outbox_mutations
+    WHERE enqueue_sequence > @enqueueSequence
+      AND state IN ('pending', 'syncing')
+    ORDER BY enqueue_sequence
+  `).all({ enqueueSequence: anchor.enqueueSequence }) as Query[])
+    .map((row) => ({ mutation: outboxFromRow(row), enqueueSequence: row.enqueueSequence }))
+    .filter(({ mutation }) => affectedConversationId(mutation, database) === message.conversationId)
+
+  preserveReceiptEvidence(database, local)
+  const deleted = database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id: local.id })
+  if (deleted.changes !== 1) throw new UserDataConsistencyError()
+
+  let predictedRevision = resultRevision
+  const supersededIds: string[] = []
+  for (const { mutation, enqueueSequence } of later) {
+    if (!Number.isSafeInteger(enqueueSequence)) throw new UserDataConsistencyError()
+    const rebased = syncMutationSchema.parse({
+      id: randomUUID(),
+      kind: mutation.kind,
+      entityId: mutation.entityId,
+      baseRevision: predictedRevision,
+      payload: mutation.payload,
+      occurredAt: mutation.occurredAt,
+    })
+    const changed = database.prepare(`
+      UPDATE outbox_mutations
+      SET id = @newId,
+          base_revision = @baseRevision,
+          state = 'pending',
+          attempts = 0,
+          next_attempt_at = NULL,
+          last_error_code = NULL
+      WHERE id = @oldId AND enqueue_sequence = @enqueueSequence
+    `).run({
+      oldId: mutation.id,
+      newId: rebased.id,
+      baseRevision: rebased.baseRevision,
+      enqueueSequence,
+    }).changes
+    if (changed !== 1) throw new UserDataConsistencyError()
+    supersededIds.push(mutation.id)
+    predictedRevision += 1
+  }
+  const updated = database.prepare(`
+    UPDATE conversations
+    SET revision = @predictedRevision
+    WHERE id = @conversationId AND user_id = @ownerUserId
+  `).run({
+    predictedRevision,
+    conversationId: message.conversationId,
+    ownerUserId,
+  })
+  if (updated.changes !== 1) throw new UserDataConsistencyError()
+  recomputeConversationSyncState(database, ownerUserId, message.conversationId)
+  return supersededIds
+}
+
 function acknowledgePushResults(
   database: SqliteDatabase,
   ownerUserId: string,
   sentInput: readonly SyncMutation[],
   resultInput: readonly SyncMutationResult[],
-): void {
+): PushAcknowledgementOutcome {
   const sent = parsePersisted(() => sentInput.map((mutation) => syncMutationSchema.parse(mutation)))
   const results = parsePersisted(() => resultInput.map((result) => syncMutationResultSchema.parse(result)))
   if (sent.length === 0 || sent.length > 100 || sent.length !== results.length) {
@@ -1346,10 +1653,17 @@ function acknowledgePushResults(
     throw new UserDataConsistencyError()
   }
 
-  transaction(database, () => {
+  return transaction(database, () => {
+    const supersededIds = new Set<string>()
     for (const [id, mutation] of sentById) {
       const result = resultById.get(id)
       if (!result) throw new UserDataConsistencyError()
+      if (supersededIds.has(id)) {
+        if (result.status !== 'conflict' && result.status !== 'rejected') {
+          throw new UserDataConsistencyError()
+        }
+        continue
+      }
       const resultRevision = result.status === 'applied' || result.status === 'duplicate'
         ? result.revision
         : null
@@ -1374,9 +1688,21 @@ function acknowledgePushResults(
           requireValidRemoteResult(receipt)
         }
         preserveReceiptEvidence(database, local)
-        acknowledgeLocalMutation(database, ownerUserId, local, receipt)
+        if (mutation.kind === 'message.conversion_block_terminal'
+          && result.status === 'duplicate'
+          && result.revision === mutation.baseRevision) {
+          for (const supersededId of acknowledgeAuthoritativeConversionDuplicate(
+            database,
+            ownerUserId,
+            mutation,
+            receipt,
+          )) supersededIds.add(supersededId)
+        } else {
+          acknowledgeLocalMutation(database, ownerUserId, local, receipt)
+        }
       }
     }
+    return { supersededIds: [...supersededIds] }
   })
 }
 
@@ -1609,8 +1935,16 @@ export function createUserDataRepositories(
       id: string,
       value: Parameters<AppRepositories['messages']['update']>[1],
     ) {
-      if (!getOwnedMessage(id)) return undefined
-      return repositories.messages.update(id, value)
+      const existing = getOwnedMessage(id)
+      if (!existing) return undefined
+      return transaction(database, () => {
+        const updated = repositories.messages.update(id, value)
+        if (!updated) return undefined
+        if (value.blocks !== undefined) {
+          registerActiveConversionBindings(database, ownerUserId, updated, updated.blocks)
+        }
+        return updated
+      })
     },
     replaceBlock(
       messageId: string,
@@ -1623,14 +1957,22 @@ export function createUserDataRepositories(
       if (parsed.type !== 'conversion' || parsed.state !== 'terminal') {
         return repositories.messages.replaceBlock(messageId, blockId, parsed)
       }
-      const currentRaw = existing.blocks.find((block) => (
-        typeof block === 'object' && block !== null && 'blockId' in block && block.blockId === blockId
-      ))
-      const current = chatBlockSchema.safeParse(currentRaw).data
-      if (current?.type !== 'conversion' || current.executionId !== parsed.executionId) {
+      const candidates = exactConversionBlocks(existing.blocks).filter((block) => block.blockId === blockId)
+      const current = candidates[0]
+      if (candidates.length !== 1 || parsed.blockId !== blockId
+        || current?.executionId !== parsed.executionId) {
         throw new UserDataConsistencyError()
       }
-      if (current.state === 'terminal') return existing
+      if (current.state === 'terminal') {
+        transaction(database, () => consumeConversionBinding(
+          database,
+          ownerUserId,
+          existing,
+          current,
+          Date.now(),
+        ))
+        return existing
+      }
       if (current.state !== 'active') throw new UserDataConsistencyError()
       const summary = conversationSummary(existing.conversationId)
       if (!summary) throw new UserDataConsistencyError()
@@ -1640,8 +1982,10 @@ export function createUserDataRepositories(
         payload: { messageId, blockId, executionId: parsed.executionId, state: 'terminal' },
       }
       let updated: ReturnType<AppRepositories['messages']['replaceBlock']> | undefined
+      const consumedAt = Date.now()
       recordMutation(mutation, () => {
         updated = repositories.messages.replaceBlock(messageId, blockId, parsed)
+        consumeConversionBinding(database, ownerUserId, existing, parsed, consumedAt)
         database.prepare(`
           UPDATE conversations
           SET revision = @revision,
@@ -1893,9 +2237,20 @@ export function createUserDataRepositories(
       if (!chatRuns.get(id)) throw new UserDataConsistencyError()
       const existing = messages.get(messageId)
       if (!existing) throw new UserDataConsistencyError()
-      const mutation = messageMutation({ ...existing, blocks: value.blocks })
+      const finalizedAt = value.endedAt
+      if (finalizedAt === undefined && exactConversionBlocks(value.blocks).length > 0) {
+        throw new UserDataConsistencyError()
+      }
+      const mutation = parsePersisted(() => messageMutation({ ...existing, blocks: value.blocks }))
       let finalized: ReturnType<AppRepositories['chatRuns']['finalizeWithMessage']> | undefined
       recordMutation(mutation, () => {
+        finalizeConversionBindings(
+          database,
+          ownerUserId,
+          existing,
+          value.blocks,
+          finalizedAt ?? 0,
+        )
         finalized = repositories.chatRuns.finalizeWithMessage(id, messageId, requestId, value)
         database.prepare(`
           UPDATE conversations
@@ -1976,11 +2331,45 @@ export function createUserDataRepositories(
       return repositories.providerUsage.summarize(input)
     },
   }
+  const conversionBlockBindings: UserDataRepositories['conversionBlockBindings'] = {
+    get(requestedOwnerUserId, executionId) {
+      assertStoredOwner(requestedOwnerUserId, ownerUserId)
+      const validatedExecutionId = parsePersisted(() => z.string().trim().min(1).max(128).parse(executionId))
+      return storedConversionBlockBinding(database, ownerUserId, validatedExecutionId)
+    },
+    listRecoverable(requestedOwnerUserId) {
+      assertStoredOwner(requestedOwnerUserId, ownerUserId)
+      return (database.prepare(`
+        SELECT owner_user_id AS ownerUserId, conversation_id AS conversationId,
+               message_id AS messageId, block_id AS blockId, execution_id AS executionId,
+               finalized_at AS finalizedAt, consumed_at AS consumedAt,
+               retired_at AS retiredAt, retirement_reason AS retirementReason
+        FROM conversion_block_bindings
+        WHERE owner_user_id = @ownerUserId
+          AND consumed_at IS NULL AND retired_at IS NULL
+        ORDER BY execution_id
+      `).all({ ownerUserId }) as Query[]).map(conversionBlockBindingFromRow)
+    },
+    retire(requestedOwnerUserId, executionId, reason, retiredAt) {
+      assertStoredOwner(requestedOwnerUserId, ownerUserId)
+      const validated = parsePersisted(() => z.object({
+        executionId: z.string().trim().min(1).max(128),
+        reason: z.enum(['missing_execution', 'missing_message', 'invalid_binding']),
+        retiredAt: z.number().int().nonnegative(),
+      }).strict().parse({ executionId, reason, retiredAt }))
+      return transaction(database, () => database.prepare(`
+        UPDATE conversion_block_bindings
+        SET retired_at = @retiredAt, retirement_reason = @reason
+        WHERE owner_user_id = @ownerUserId AND execution_id = @executionId
+          AND consumed_at IS NULL AND retired_at IS NULL
+      `).run({ ownerUserId, ...validated }).changes === 1)
+    },
+  }
   function recordMutation(
     mutationInput: SyncMutation,
     optimisticWrite?: (mutation: SyncMutation) => void,
   ): void {
-    const mutation = syncMutationSchema.parse(mutationInput)
+    const mutation = parsePersisted(() => syncMutationSchema.parse(mutationInput))
     transaction(database, () => {
       assertOutboxCapacity(database)
       optimisticWrite?.(mutation)
@@ -2010,6 +2399,7 @@ export function createUserDataRepositories(
     mediaGenerationJobs,
     chatRuns,
     providerUsage,
+    conversionBlockBindings,
     account: {
       getConsent: (purpose) => storedConsent(database, purpose),
       getPreferences: () => storedPreferences(database),
@@ -2222,7 +2612,7 @@ export function createUserDataRepositories(
         })
       },
       acknowledgePushResults(sent, results) {
-        acknowledgePushResults(database, ownerUserId, sent, results)
+        return acknowledgePushResults(database, ownerUserId, sent, results)
       },
       retryFailed(entityId) {
         const validatedEntityId = entityId === undefined

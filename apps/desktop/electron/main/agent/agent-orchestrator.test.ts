@@ -13,6 +13,7 @@ import type { ConversationHistoryPort } from '../chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from '../chat/model-provider.js'
 import {
   ProviderUsageConsistencyError,
+  type Execution,
   type ProviderUsageRepository,
 } from '../database/repositories.js'
 import { createWorkflowSourceSelectorVault } from '../workflows/workflow-source-selector.js'
@@ -2823,6 +2824,14 @@ describe('AgentOrchestrator', () => {
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = async () => [conversionWorkflow]
+    let finishExecution!: (execution: Execution) => void
+    dependencies.executions.startReserved = async (reservation, input) => {
+      dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
+      return {
+        id: reservation.executionId,
+        finished: new Promise<Execution>((resolve) => { finishExecution = resolve }),
+      }
+    }
     const orchestrator = new AgentOrchestrator(dependencies)
     const runInput = {
       ...textRunInput({
@@ -2856,12 +2865,30 @@ describe('AgentOrchestrator', () => {
     })).resolves.toMatchObject({ status: 'failed', error: { code: 'INVALID_INPUT' } })
     expect(dependencies.records.starts).toHaveLength(0)
 
-    const result = await orchestrator.resumeApproval({
+    const resultPromise = orchestrator.resumeApproval({
       executionId: pending.executionId!,
       permissionIndex: 0,
       scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
       decision: 'once',
     })
+
+    await vi.waitFor(() => expect(dependencies.records.starts).toHaveLength(1))
+    expect(dependencies.records.events.filter((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'conversion'
+    ))).toHaveLength(0)
+    expect(orchestrator.onConversionJobSubmitted('reserved_1')).toBe(true)
+    expect(orchestrator.onConversionJobSubmitted('reserved_1')).toBe(false)
+    finishExecution({
+      id: 'reserved_1',
+      workflowId: conversionWorkflow.id,
+      workflowVersion: conversionWorkflow.version,
+      status: 'completed',
+      input: { files: [0], targetFormat: 'pdf' },
+      result: { title: 'converted' },
+      createdAt: 1,
+    })
+    const result = await resultPromise
 
     expect(result).toMatchObject({ status: 'completed' })
     expect(dependencies.records.starts).toContainEqual(expect.objectContaining({
@@ -2884,6 +2911,57 @@ describe('AgentOrchestrator', () => {
     const providerPayload = JSON.stringify(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls)
     expect(providerPayload).not.toMatch(/media_private_0|b{32}|sourceFingerprint|attachmentBindings/)
   })
+
+  it.each(['failed', 'cancelled'] as const)(
+    'does not create a conversion block when a %s execution submits zero jobs',
+    async (status) => {
+      const dependencies = harness([[
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: `call_zero_job_${status}`,
+          name: 'workflow_1', arguments: { input: { files: [0], targetFormat: 'pdf' } },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ], [
+        { type: 'text_delta', choiceIndex: 0, text: '转换未提交' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ]])
+      dependencies.workflows.list = async () => [conversionWorkflow]
+      dependencies.executions.startReserved = async (reservation, input) => {
+        dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
+        return {
+          id: reservation.executionId,
+          finished: Promise.resolve({
+            id: reservation.executionId,
+            status,
+            ...(status === 'failed' ? { errorCode: 'INTERNAL_ERROR' as const } : {}),
+          }),
+        }
+      }
+      const orchestrator = new AgentOrchestrator(dependencies)
+      const pending = await orchestrator.run({
+        ...textRunInput({
+          conversationId: 'conversion_conversation', content: '将附件转换成 PDF',
+          provider: 'openrouter', model: 'model',
+        }),
+        modelContent: '将附件转换成 PDF\n[附件 0: report.pdf, application/pdf, 12 bytes]',
+        assetIds: ['media_private_0'],
+        attachmentBindings: currentConversionAttachments(),
+      })
+
+      await orchestrator.resumeApproval({
+        executionId: pending.executionId!,
+        permissionIndex: 0,
+        scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
+        decision: 'once',
+      })
+
+      expect(dependencies.records.events.filter((event) => (
+        typeof event === 'object' && event !== null && 'block' in event
+        && (event as { block?: { type?: string } }).block?.type === 'conversion'
+      ))).toHaveLength(0)
+      expect(JSON.stringify(dependencies.records.terminal)).not.toContain('"type":"conversion"')
+    },
+  )
 
   it('expires an approval at thirty minutes and pauses active time for a timely approval', async () => {
     let milliseconds = 0

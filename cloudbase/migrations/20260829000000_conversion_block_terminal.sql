@@ -62,11 +62,13 @@ DECLARE
   latest_cursor text;
   result_id text;
   receipt_ready boolean;
+  conversation_found boolean;
+  message_found boolean;
   results jsonb := '[]'::jsonb;
 BEGIN
   auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
   PERFORM autoforge_require_identifier(p_device_id, 128);
-  IF p_protocol_version IS DISTINCT FROM 1 THEN
+  IF p_protocol_version IS NULL OR p_protocol_version NOT IN (1, 2) THEN
     RAISE EXCEPTION USING MESSAGE = 'UPGRADE_REQUIRED', ERRCODE = 'P0001';
   END IF;
   IF p_mutations IS NULL OR jsonb_typeof(p_mutations) IS DISTINCT FROM 'array' THEN
@@ -358,50 +360,65 @@ BEGIN
         PERFORM autoforge_require_identifier(payload->>'messageId', 128);
         PERFORM autoforge_require_identifier(payload->>'blockId', 128);
         PERFORM autoforge_require_identifier(payload->>'executionId', 128);
-        PERFORM pg_advisory_xact_lock(hashtextextended(
-          auth_user_id::text || ':message:' || entity_id, 0
-        ));
-        SELECT * INTO existing_message
+        SELECT message.conversation_id INTO conversation_id
         FROM app_messages message
-        WHERE message.owner_user_id = auth_user_id AND message.id = entity_id
-        FOR UPDATE;
-        IF NOT FOUND OR (SELECT count(*) FROM jsonb_array_elements(existing_message.blocks) block
-              WHERE block->>'blockId' = payload->>'blockId') <> 1 THEN
+        WHERE message.owner_user_id = auth_user_id AND message.id = entity_id;
+        IF NOT FOUND THEN
           mutation_status := 'rejected'; mutation_error := 'INVALID_INPUT';
         ELSE
-          SELECT block INTO existing_block
-          FROM jsonb_array_elements(existing_message.blocks) block
-          WHERE block->>'blockId' = payload->>'blockId';
-          IF existing_block->>'type' IS DISTINCT FROM 'conversion'
-            OR existing_block->>'executionId' IS DISTINCT FROM payload->>'executionId'
-            OR (existing_block->>'state' IS DISTINCT FROM 'active'
-              AND existing_block->>'state' IS DISTINCT FROM 'terminal') THEN
+          PERFORM pg_advisory_xact_lock(hashtextextended(
+            auth_user_id::text || ':' || conversation_id, 0
+          ));
+          SELECT * INTO conversation_row
+          FROM app_conversations conversation
+          WHERE conversation.owner_user_id = auth_user_id
+            AND conversation.id = conversation_id
+          FOR UPDATE;
+          conversation_found := FOUND;
+
+          PERFORM pg_advisory_xact_lock(hashtextextended(
+            auth_user_id::text || ':message:' || entity_id, 0
+          ));
+          SELECT * INTO existing_message
+          FROM app_messages message
+          WHERE message.owner_user_id = auth_user_id AND message.id = entity_id
+          FOR UPDATE;
+          message_found := FOUND;
+
+          IF NOT message_found
+            OR existing_message.conversation_id IS DISTINCT FROM conversation_id THEN
+            mutation_status := 'rejected'; mutation_error := 'INVALID_INPUT';
+          ELSIF NOT conversation_found OR conversation_row.deleted_at IS NOT NULL
+            OR conversation_row.revision <> base_revision_value THEN
+            mutation_status := 'conflict'; mutation_error := 'SYNC_CONFLICT';
+          ELSIF (SELECT count(*) FROM jsonb_array_elements(existing_message.blocks) block
+                WHERE block->>'blockId' = payload->>'blockId') <> 1 THEN
             mutation_status := 'rejected'; mutation_error := 'INVALID_INPUT';
           ELSE
-            PERFORM pg_advisory_xact_lock(hashtextextended(
-              auth_user_id::text || ':' || existing_message.conversation_id, 0
-            ));
-            SELECT * INTO conversation_row
-            FROM app_conversations conversation
-            WHERE conversation.owner_user_id = auth_user_id
-              AND conversation.id = existing_message.conversation_id
-            FOR UPDATE;
-            IF NOT FOUND OR conversation_row.deleted_at IS NOT NULL
-              OR conversation_row.revision <> base_revision_value THEN
-              mutation_status := 'conflict'; mutation_error := 'SYNC_CONFLICT';
+            SELECT block INTO existing_block
+            FROM jsonb_array_elements(existing_message.blocks) block
+            WHERE block->>'blockId' = payload->>'blockId';
+            IF existing_block->>'type' IS DISTINCT FROM 'conversion'
+              OR existing_block->>'executionId' IS DISTINCT FROM payload->>'executionId'
+              OR (existing_block->>'state' IS DISTINCT FROM 'active'
+                AND existing_block->>'state' IS DISTINCT FROM 'terminal') THEN
+              mutation_status := 'rejected'; mutation_error := 'INVALID_INPUT';
             ELSIF existing_block->>'state' = 'terminal' THEN
               result_revision_value := base_revision_value;
               mutation_status := 'duplicate';
             ELSE
               result_revision_value := base_revision_value + 1;
               UPDATE app_messages SET blocks = (SELECT jsonb_agg(CASE
-                WHEN block->>'type' = 'conversion' AND block->>'blockId' = payload->>'blockId'
-                  AND block->>'executionId' = payload->>'executionId' AND block->>'state' = 'active'
-                THEN jsonb_set(block, '{state}', '"terminal"'::jsonb) ELSE block END)
-                FROM jsonb_array_elements(blocks) block)
+                WHEN item.block->>'type' = 'conversion'
+                  AND item.block->>'blockId' = payload->>'blockId'
+                  AND item.block->>'executionId' = payload->>'executionId'
+                  AND item.block->>'state' = 'active'
+                THEN jsonb_set(item.block, '{state}', '"terminal"'::jsonb)
+                ELSE item.block END ORDER BY item.ordinality)
+                FROM jsonb_array_elements(blocks) WITH ORDINALITY AS item(block, ordinality))
               WHERE owner_user_id = auth_user_id AND id = entity_id;
               UPDATE app_conversations SET revision = result_revision_value
-              WHERE owner_user_id = auth_user_id AND id = existing_message.conversation_id;
+              WHERE owner_user_id = auth_user_id AND id = conversation_id;
             END IF;
           END IF;
         END IF;
@@ -417,12 +434,24 @@ BEGIN
         mutation_error := 'INVALID_INPUT';
       ELSE
         PERFORM pg_advisory_xact_lock(hashtextextended(
+          auth_user_id::text || ':' || conversation_id, 0
+        ));
+        SELECT * INTO conversation_row
+        FROM app_conversations conversation
+        WHERE conversation.owner_user_id = auth_user_id AND conversation.id = conversation_id
+        FOR UPDATE;
+        conversation_found := FOUND;
+
+        PERFORM pg_advisory_xact_lock(hashtextextended(
           auth_user_id::text || ':message:' || entity_id, 0
         ));
         SELECT * INTO existing_message
         FROM app_messages message
-        WHERE message.owner_user_id = auth_user_id AND message.id = entity_id;
-        IF FOUND THEN
+        WHERE message.owner_user_id = auth_user_id AND message.id = entity_id
+        FOR UPDATE;
+        message_found := FOUND;
+
+        IF message_found THEN
           IF existing_message.conversation_id IS DISTINCT FROM conversation_id
             OR existing_message.role IS DISTINCT FROM payload->>'role'
             OR existing_message.blocks IS DISTINCT FROM payload->'blocks'
@@ -430,47 +459,40 @@ BEGIN
             OR existing_message.created_at IS DISTINCT FROM (payload->>'createdAt')::timestamptz THEN
             mutation_status := 'rejected';
             mutation_error := 'INVALID_INPUT';
+          ELSIF NOT conversation_found THEN
+            mutation_status := 'conflict';
+            mutation_error := 'SYNC_CONFLICT';
           ELSE
-            SELECT revision INTO result_revision_value
-            FROM app_conversations conversation
-            WHERE conversation.owner_user_id = auth_user_id
-              AND conversation.id = existing_message.conversation_id;
+            result_revision_value := conversation_row.revision;
             mutation_status := 'duplicate';
           END IF;
+        ELSIF NOT conversation_found THEN
+          mutation_status := 'conflict';
+          mutation_error := 'SYNC_CONFLICT';
+          mutation := jsonb_build_object(
+            'compacted', true,
+            'conversationId', conversation_id
+          );
+        ELSIF conversation_row.deleted_at IS NOT NULL
+          OR conversation_row.revision <> base_revision_value THEN
+          mutation_status := 'conflict';
+          mutation_error := 'SYNC_CONFLICT';
         ELSE
-          PERFORM pg_advisory_xact_lock(hashtextextended(auth_user_id::text || ':' || conversation_id, 0));
-          SELECT * INTO conversation_row
-          FROM app_conversations conversation
-          WHERE conversation.owner_user_id = auth_user_id AND conversation.id = conversation_id
-          FOR UPDATE;
-          IF NOT FOUND THEN
-            mutation_status := 'conflict';
-            mutation_error := 'SYNC_CONFLICT';
-            mutation := jsonb_build_object(
-              'compacted', true,
-              'conversationId', conversation_id
-            );
-          ELSIF conversation_row.deleted_at IS NOT NULL
-            OR conversation_row.revision <> base_revision_value THEN
-            mutation_status := 'conflict';
-            mutation_error := 'SYNC_CONFLICT';
-          ELSE
-            SELECT COALESCE(max(message.ordinal), 0) + 1 INTO assigned_ordinal
-            FROM app_messages message
-            WHERE message.owner_user_id = auth_user_id
-              AND message.conversation_id = conversation_id;
-            INSERT INTO app_messages(
-              id, owner_user_id, conversation_id, ordinal, role, blocks, execution_id, created_at
-            ) VALUES (
-              entity_id, auth_user_id, conversation_id, assigned_ordinal, payload->>'role',
-              payload->'blocks', NULLIF(payload->>'executionId', ''), (payload->>'createdAt')::timestamptz
-            );
-            result_revision_value := conversation_row.revision + 1;
-            UPDATE app_conversations SET
-              revision = result_revision_value,
-              last_activity_at = GREATEST(last_activity_at, (payload->>'createdAt')::timestamptz)
-            WHERE owner_user_id = auth_user_id AND id = conversation_id;
-          END IF;
+          SELECT COALESCE(max(message.ordinal), 0) + 1 INTO assigned_ordinal
+          FROM app_messages message
+          WHERE message.owner_user_id = auth_user_id
+            AND message.conversation_id = conversation_id;
+          INSERT INTO app_messages(
+            id, owner_user_id, conversation_id, ordinal, role, blocks, execution_id, created_at
+          ) VALUES (
+            entity_id, auth_user_id, conversation_id, assigned_ordinal, payload->>'role',
+            payload->'blocks', NULLIF(payload->>'executionId', ''), (payload->>'createdAt')::timestamptz
+          );
+          result_revision_value := conversation_row.revision + 1;
+          UPDATE app_conversations SET
+            revision = result_revision_value,
+            last_activity_at = GREATEST(last_activity_at, (payload->>'createdAt')::timestamptz)
+          WHERE owner_user_id = auth_user_id AND id = conversation_id;
         END IF;
       END IF;
 
@@ -626,5 +648,217 @@ EXCEPTION
     RAISE;
   WHEN OTHERS THEN
     RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001';
+END;
+$$;
+
+
+-- Reader-first protocol v2 and purge compaction must be installed with the writer.
+CREATE OR REPLACE FUNCTION autoforge_sync_pull(
+  p_caller_user_id varchar,
+  p_protocol_version integer,
+  p_device_id varchar,
+  p_cursor varchar DEFAULT NULL,
+  p_limit integer DEFAULT 100
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  auth_user_id bigint;
+  after_sequence bigint := 0;
+  next_cursor text := p_cursor;
+  result jsonb;
+BEGIN
+  auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
+  PERFORM autoforge_require_identifier(p_device_id, 128);
+  IF p_protocol_version IS NULL OR p_protocol_version NOT IN (1, 2) THEN
+    RAISE EXCEPTION USING MESSAGE = 'UPGRADE_REQUIRED', ERRCODE = 'P0001';
+  END IF;
+  IF p_limit IS NULL OR p_limit < 1 OR p_limit > 100 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM app_sync_devices device
+    WHERE device.owner_user_id = auth_user_id
+      AND device.device_id = p_device_id
+      AND device.revoked_at IS NULL
+  ) THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+
+  IF p_cursor IS NOT NULL THEN
+    SELECT mutation.server_sequence INTO after_sequence
+    FROM app_sync_mutations mutation
+    WHERE mutation.owner_user_id = auth_user_id
+      AND mutation.cursor_token::text = p_cursor;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+    END IF;
+  END IF;
+
+  WITH page AS (
+    SELECT mutation.*,
+           CASE WHEN mutation.kind = 'message.conversion_block_terminal' THEN COALESCE(
+             mutation.mutation_payload->>'conversationId',
+             (SELECT message.conversation_id
+              FROM app_messages message
+              WHERE message.owner_user_id = auth_user_id
+                AND message.id = mutation.entity_id)
+           ) ELSE NULL END AS terminal_conversation_id
+    FROM app_sync_mutations mutation
+    WHERE mutation.owner_user_id = auth_user_id
+      AND mutation.server_sequence > after_sequence
+      AND mutation.status IN ('applied', 'duplicate')
+    ORDER BY mutation.server_sequence
+    LIMIT p_limit
+  ), visible_page AS (
+    SELECT page.*
+    FROM page
+    WHERE p_protocol_version = 2
+      OR page.kind <> 'message.conversion_block_terminal'
+      OR (page.result_revision = page.base_revision + 1
+        AND page.terminal_conversation_id IS NOT NULL)
+  )
+  SELECT jsonb_build_object(
+    'mutations', COALESCE((SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+      'id', page.mutation_id,
+      'kind', CASE WHEN p_protocol_version = 1
+        AND page.kind = 'message.conversion_block_terminal'
+        THEN 'conversation.preferences' ELSE page.kind END,
+      'entityId', CASE WHEN p_protocol_version = 1
+        AND page.kind = 'message.conversion_block_terminal'
+        THEN page.terminal_conversation_id ELSE page.entity_id END,
+      'baseRevision', page.base_revision,
+      'resultRevision', page.result_revision,
+      'payload', CASE
+        WHEN p_protocol_version = 1
+          AND page.kind = 'message.conversion_block_terminal' THEN NULL
+        WHEN page.mutation_payload->>'compacted' = 'true' THEN NULL
+        WHEN p_protocol_version = 1 AND page.kind = 'message.append' THEN
+          jsonb_set(
+            page.mutation_payload->'payload',
+            '{blocks}',
+            COALESCE((SELECT jsonb_agg(block.value ORDER BY block.ordinality)
+              FROM jsonb_array_elements(page.mutation_payload->'payload'->'blocks')
+                WITH ORDINALITY AS block(value, ordinality)
+              WHERE block.value->>'type' <> 'conversion'), '[]'::jsonb)
+          )
+        ELSE page.mutation_payload->'payload'
+      END,
+      'compacted', CASE WHEN p_protocol_version = 1
+        AND page.kind = 'message.conversion_block_terminal'
+        THEN true
+        WHEN page.mutation_payload->>'compacted' = 'true' THEN true ELSE NULL END,
+      'conversationId', CASE WHEN NOT (p_protocol_version = 1
+        AND page.kind = 'message.conversion_block_terminal')
+        AND page.mutation_payload->>'compacted' = 'true'
+        AND page.kind IN ('message.append', 'message.conversion_block_terminal')
+        THEN page.mutation_payload->'conversationId' ELSE NULL END,
+      'receivedAt', autoforge_iso_timestamp(page.received_at)
+    )) ORDER BY page.server_sequence) FROM visible_page page), '[]'::jsonb),
+    'cursor', COALESCE((SELECT page.cursor_token::text
+      FROM page
+      ORDER BY page.server_sequence DESC
+      LIMIT 1), next_cursor)
+  ) INTO result;
+
+  UPDATE app_sync_devices SET last_pull_at = clock_timestamp()
+  WHERE owner_user_id = auth_user_id AND device_id = p_device_id;
+  RETURN result;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION autoforge_purge_expired_conversation_tombstones()
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  purged_count bigint;
+  purge_before timestamptz := clock_timestamp() - interval '30 days';
+  candidate_snapshot jsonb;
+  purge_candidates jsonb := '[]'::jsonb;
+  candidate record;
+  locked_deleted_at timestamptz;
+BEGIN
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'ownerUserId', conversation.owner_user_id,
+    'conversationId', conversation.id
+  ) ORDER BY conversation.owner_user_id, conversation.id), '[]'::jsonb)
+  INTO candidate_snapshot
+  FROM app_conversations conversation
+  WHERE conversation.deleted_at < purge_before;
+
+  FOR candidate IN
+    SELECT * FROM jsonb_to_recordset(candidate_snapshot)
+      AS item("ownerUserId" bigint, "conversationId" varchar)
+    ORDER BY "ownerUserId", "conversationId"
+  LOOP
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+      candidate."ownerUserId"::text || ':' || candidate."conversationId", 0
+    ));
+    SELECT conversation.deleted_at INTO locked_deleted_at
+    FROM app_conversations conversation
+    WHERE conversation.owner_user_id = candidate."ownerUserId"
+      AND conversation.id = candidate."conversationId"
+    FOR UPDATE;
+    IF FOUND AND locked_deleted_at < purge_before THEN
+      purge_candidates := purge_candidates || jsonb_build_array(jsonb_build_object(
+        'ownerUserId', candidate."ownerUserId",
+        'conversationId', candidate."conversationId"
+      ));
+    END IF;
+  END LOOP;
+
+  UPDATE app_usage_events usage
+  SET conversation_id = NULL
+  FROM jsonb_to_recordset(purge_candidates)
+    AS candidate("ownerUserId" bigint, "conversationId" varchar)
+  WHERE usage.owner_user_id = candidate."ownerUserId"
+    AND usage.conversation_id = candidate."conversationId";
+
+  WITH compacted AS (
+    SELECT mutation.server_sequence,
+           jsonb_strip_nulls(jsonb_build_object(
+             'compacted', true,
+             'conversationId', CASE WHEN mutation.kind IN (
+               'message.append', 'message.conversion_block_terminal'
+             ) THEN to_jsonb(candidate."conversationId") ELSE NULL END
+           )) AS mutation_payload
+    FROM app_sync_mutations mutation
+    JOIN jsonb_to_recordset(purge_candidates)
+      AS candidate("ownerUserId" bigint, "conversationId" varchar)
+      ON candidate."ownerUserId" = mutation.owner_user_id
+    LEFT JOIN app_messages message
+      ON message.owner_user_id = mutation.owner_user_id
+     AND message.id = mutation.entity_id
+     AND mutation.kind = 'message.conversion_block_terminal'
+    WHERE (
+       mutation.kind IN (
+         'conversation.create', 'conversation.rename', 'conversation.preferences',
+         'conversation.delete', 'conversation.restore'
+       ) AND mutation.entity_id = candidate."conversationId"
+       OR mutation.kind = 'message.append'
+         AND mutation.mutation_payload->'payload'->>'conversationId' = candidate."conversationId"
+       OR mutation.kind = 'message.conversion_block_terminal'
+         AND message.conversation_id = candidate."conversationId"
+     )
+  )
+  UPDATE app_sync_mutations mutation
+  SET mutation_payload = compacted.mutation_payload
+  FROM compacted
+  WHERE mutation.server_sequence = compacted.server_sequence;
+
+  DELETE FROM app_conversations conversation
+  USING jsonb_to_recordset(purge_candidates)
+    AS candidate("ownerUserId" bigint, "conversationId" varchar)
+  WHERE conversation.owner_user_id = candidate."ownerUserId"
+    AND conversation.id = candidate."conversationId";
+  GET DIAGNOSTICS purged_count = ROW_COUNT;
+  RETURN purged_count;
 END;
 $$;

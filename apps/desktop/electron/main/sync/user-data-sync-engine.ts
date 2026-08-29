@@ -18,7 +18,8 @@ import type {
   LegacyImportBatchResult,
 } from './legacy-user-data-import.js'
 
-const PROTOCOL_VERSION = 1 as const
+const SYNC_PROTOCOL_VERSION = 2 as const
+const LEGACY_IMPORT_PROTOCOL_VERSION = 1 as const
 const BATCH_LIMIT = 100
 const MAX_EVENT_BYTES = 1_048_576
 const MAX_RETRY_DELAY = 5 * 60 * 1_000
@@ -58,7 +59,7 @@ function legacyImportCall(
 ): LegacyImportCall {
   return {
     action: 'importLegacyBatch',
-    protocolVersion: PROTOCOL_VERSION,
+    protocolVersion: LEGACY_IMPORT_PROTOCOL_VERSION,
     deviceId: binding.deviceId,
     ...input,
   }
@@ -100,7 +101,8 @@ function affectedConversationIds(
       ids.add(mutation.payload.conversationId)
     }
     if (mutation.kind === 'message.conversion_block_terminal') {
-      const conversationId = store?.messages.get(mutation.entityId)?.conversationId
+      const conversationId = mutation.conversationId
+        ?? store?.messages.get(mutation.entityId)?.conversationId
       if (conversationId) ids.add(conversationId)
     }
   }
@@ -166,6 +168,21 @@ export class UserDataSyncEngine {
       this.#status = { state: 'idle' }
       this.#refreshWarning(this.#binding)
     })
+  }
+
+  /** Drains crash-recovered ready rows after an authenticated bind without an empty push. */
+  async drainReadyOutbox(): Promise<boolean> {
+    const binding = this.#binding
+    if (!binding || this.#status.state === 'paused' || this.#status.state === 'quarantined') {
+      return false
+    }
+    if (binding.store.outbox.listReady(this.#dependencies.now(), 1).length === 0) {
+      return false
+    }
+    this.#refreshWarning(binding)
+    this.#flushRequested = true
+    await this.#ensureDrain(binding)
+    return true
   }
 
   flush(): Promise<void> {
@@ -383,7 +400,7 @@ export class UserDataSyncEngine {
       try {
         response = await this.port.call({
           action: 'syncPush',
-          protocolVersion: PROTOCOL_VERSION,
+          protocolVersion: SYNC_PROTOCOL_VERSION,
           deviceId: binding.deviceId,
           mutations,
         })
@@ -435,9 +452,30 @@ export class UserDataSyncEngine {
       }
 
       try {
-        binding.store.outbox.acknowledgePushResults(mutations, data.results)
+        const acknowledgement = binding.store.outbox.acknowledgePushResults(mutations, data.results)
+        const supersededIds = new Set(acknowledgement.supersededIds)
         this.#pruneSyncing(binding)
         this.#notify(binding, conversationIds)
+        let terminalResultCode: AppErrorCode | undefined
+        for (const result of data.results) {
+          if (supersededIds.has(result.id)) continue
+          if (result.status === 'conflict') {
+            const code = result.errorCode === 'SYNC_CONFLICT' ? result.errorCode : 'SYNC_CONFLICT'
+            binding.store.outbox.markFailed(result.id, code)
+            this.#untrackSyncing(binding, [result.id])
+            terminalResultCode ??= code
+          } else if (result.status === 'rejected') {
+            const code = result.errorCode ?? 'INVALID_INPUT'
+            binding.store.outbox.markFailed(result.id, code)
+            this.#untrackSyncing(binding, [result.id])
+            terminalResultCode ??= code
+          }
+        }
+        if (terminalResultCode) {
+          this.#notify(binding, conversationIds)
+          this.#quarantine(terminalResultCode)
+          return
+        }
       } catch {
         for (const id of ids) {
           if (binding.store.outbox.find(id)?.state === 'syncing') {
@@ -447,26 +485,6 @@ export class UserDataSyncEngine {
         this.#untrackSyncing(binding, ids)
         this.#notify(binding, conversationIds)
         this.#quarantine('SYNC_FAILED')
-        return
-      }
-
-      let terminalResultCode: AppErrorCode | undefined
-      for (const result of data.results) {
-        if (result.status === 'conflict') {
-          const code = result.errorCode === 'SYNC_CONFLICT' ? result.errorCode : 'SYNC_CONFLICT'
-          binding.store.outbox.markFailed(result.id, code)
-          this.#untrackSyncing(binding, [result.id])
-          terminalResultCode ??= code
-        } else if (result.status === 'rejected') {
-          const code = result.errorCode ?? 'INVALID_INPUT'
-          binding.store.outbox.markFailed(result.id, code)
-          this.#untrackSyncing(binding, [result.id])
-          terminalResultCode ??= code
-        }
-      }
-      if (terminalResultCode) {
-        this.#notify(binding, conversationIds)
-        this.#quarantine(terminalResultCode)
         return
       }
     }
@@ -486,7 +504,7 @@ export class UserDataSyncEngine {
   #pushEventBytes(deviceId: string, mutations: readonly SyncMutation[]): number {
     return Buffer.byteLength(JSON.stringify({
       action: 'syncPush',
-      protocolVersion: PROTOCOL_VERSION,
+      protocolVersion: SYNC_PROTOCOL_VERSION,
       deviceId,
       mutations,
     }), 'utf8')
@@ -512,7 +530,7 @@ export class UserDataSyncEngine {
       try {
         response = await this.port.call({
           action: 'syncPull',
-          protocolVersion: PROTOCOL_VERSION,
+          protocolVersion: SYNC_PROTOCOL_VERSION,
           deviceId: binding.deviceId,
           ...(previousCursor === undefined ? {} : { cursor: previousCursor }),
           limit: BATCH_LIMIT,
@@ -534,7 +552,7 @@ export class UserDataSyncEngine {
       }
       try {
         binding.store.sync.applyRemotePage({
-          protocolVersion: PROTOCOL_VERSION,
+          protocolVersion: SYNC_PROTOCOL_VERSION,
           mutations: data.mutations,
           cursor: data.cursor,
         }, this.#dependencies.now())

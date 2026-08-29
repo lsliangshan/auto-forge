@@ -1360,6 +1360,74 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
+  it('keeps a v1 conversation writable across the terminal compatibility revision anchor', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const conversationId = 'v1_terminal_anchor_conversation'
+    const create = createConversationMutation('v1_terminal_anchor_create', conversationId)
+    const append = {
+      ...appendMessageMutation(
+        'v1_terminal_anchor_append',
+        conversationId,
+        'v1_terminal_anchor_message',
+      ),
+      payload: {
+        ...appendMessageMutation(
+          'v1_terminal_anchor_append',
+          conversationId,
+          'v1_terminal_anchor_message',
+        ).payload,
+        role: 'assistant' as const,
+        blocks: [{ type: 'text' as const, text: '转换已提交' }],
+      },
+    }
+    const rename = renameConversationMutation(
+      'v1_terminal_anchor_remote_rename',
+      conversationId,
+      3,
+      'Remote after terminal',
+    )
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'v1_terminal_anchor_cursor',
+      mutations: [
+        pulledMutation(create, 1),
+        pulledMutation(append, 2),
+        {
+          id: 'v1_terminal_anchor_compatibility',
+          kind: 'conversation.preferences',
+          entityId: conversationId,
+          baseRevision: 2,
+          resultRevision: 3,
+          compacted: true,
+          receivedAt: '2026-08-24T01:00:00.000Z',
+        },
+        pulledMutation(rename, 4),
+      ],
+    }, 1)
+
+    expect(projectedConversation(store, conversationId)).toMatchObject({
+      revision: 4,
+      title: 'Remote after terminal',
+      syncState: 'synced',
+    })
+    const localRename = renameConversationMutation(
+      'v1_terminal_anchor_local_rename',
+      conversationId,
+      4,
+      'Local after terminal',
+    )
+    store.outbox.recordWithConversation(localRename)
+    expect(store.outbox.find(localRename.id)).toMatchObject({ baseRevision: 4, state: 'pending' })
+    expect(projectedConversation(store, conversationId)).toMatchObject({
+      revision: 5,
+      title: 'Local after terminal',
+      syncState: 'pending',
+    })
+    manager.close()
+  })
+
   it('rejects corrupted persisted rows without advancing the checkpoint', () => {
     const root = temporaryRoot()
     const manager = new UserDataStoreManager(root)
@@ -1672,6 +1740,186 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
+  it('journals active conversion bindings with the message and finalizes them with the append outbox', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    store.conversations.insert({
+      id: 'binding_conversation', title: 'Binding', userId: 'cloud-alice', createdAt: 1, updatedAt: 1,
+    })
+    store.messages.insert({
+      id: 'binding_message', conversationId: 'binding_conversation', role: 'assistant',
+      blocks: [], createdAt: 2,
+    })
+    store.chatRuns.insert({
+      id: 'binding_run', conversationId: 'binding_conversation', requestId: 'binding_request',
+      userId: 'cloud-alice', provider: 'openrouter', model: 'model', status: 'running', startedAt: 2,
+    })
+    const active = {
+      type: 'conversion' as const,
+      blockId: 'binding_block',
+      executionId: 'binding_execution',
+      state: 'active' as const,
+    }
+
+    store.messages.update('binding_message', { blocks: [active] })
+    expect(store.conversionBlockBindings.get('cloud-alice', 'binding_execution')).toEqual({
+      ownerUserId: 'cloud-alice',
+      conversationId: 'binding_conversation',
+      messageId: 'binding_message',
+      blockId: 'binding_block',
+      executionId: 'binding_execution',
+    })
+
+    manager.close()
+    const reopened = manager.open('cloud-alice')
+    expect(reopened.conversionBlockBindings.listRecoverable('cloud-alice')).toEqual([
+      expect.objectContaining({ executionId: 'binding_execution' }),
+    ])
+    expect(reopened.conversionBlockBindings.listRecoverable('cloud-alice')[0])
+      .not.toHaveProperty('finalizedAt')
+
+    reopened.chatRuns.finalizeWithMessage(
+      'binding_run',
+      'binding_message',
+      'binding_request',
+      { blocks: [active], status: 'completed', endedAt: 3 },
+    )
+    expect(reopened.conversionBlockBindings.get('cloud-alice', 'binding_execution'))
+      .toMatchObject({ finalizedAt: 3 })
+    expect(reopened.outbox.list(10)).toEqual([
+      expect.objectContaining({
+        kind: 'message.append',
+        entityId: 'binding_message',
+        payload: expect.objectContaining({ blocks: [active] }),
+      }),
+    ])
+
+    reopened.messages.replaceBlock('binding_message', 'binding_block', {
+      ...active,
+      state: 'terminal',
+    })
+    expect(reopened.conversionBlockBindings.get('cloud-alice', 'binding_execution'))
+      .toMatchObject({ finalizedAt: 3, consumedAt: expect.any(Number) })
+    expect(reopened.conversionBlockBindings.listRecoverable('cloud-alice')).toEqual([])
+    expect(reopened.outbox.list(10).map(({ kind }) => kind)).toEqual([
+      'message.append',
+      'message.conversion_block_terminal',
+    ])
+    expect(() => reopened.messages.replaceBlock('binding_message', 'binding_block', {
+      ...active,
+      blockId: 'mismatched_replay_block',
+      state: 'terminal',
+    })).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+
+    manager.close()
+    const afterRestart = manager.open('cloud-alice')
+    expect(afterRestart.conversionBlockBindings.listRecoverable('cloud-alice')).toEqual([])
+    expect(afterRestart.outbox.countPending('message.conversion_block_terminal')).toBe(1)
+    afterRestart.conversations.delete('binding_conversation')
+    expect(afterRestart.conversionBlockBindings.get('cloud-alice', 'binding_execution'))
+      .toBeUndefined()
+    manager.close()
+  })
+
+  it('rolls back the active message or final append when exact binding invariants fail', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    store.conversations.insert({
+      id: 'binding_atomic_conversation', title: 'Atomic', userId: 'cloud-alice', createdAt: 1, updatedAt: 1,
+    })
+    for (const suffix of ['first', 'second']) {
+      store.messages.insert({
+        id: `binding_atomic_${suffix}`, conversationId: 'binding_atomic_conversation',
+        role: 'assistant', blocks: [], createdAt: suffix === 'first' ? 2 : 3,
+      })
+    }
+    store.chatRuns.insert({
+      id: 'binding_atomic_run', conversationId: 'binding_atomic_conversation',
+      requestId: 'binding_atomic_request', userId: 'cloud-alice', provider: 'openrouter',
+      model: 'model', status: 'running', startedAt: 2,
+    })
+    const active = {
+      type: 'conversion' as const,
+      blockId: 'binding_atomic_block',
+      executionId: 'binding_atomic_execution',
+      state: 'active' as const,
+    }
+    store.messages.update('binding_atomic_first', { blocks: [active] })
+
+    expect(() => store.messages.update('binding_atomic_first', { blocks: [{
+      ...active,
+      state: 'terminal',
+    }] })).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.messages.get('binding_atomic_first')?.blocks).toEqual([active])
+
+    expect(() => store.chatRuns.finalizeWithMessage(
+      'binding_atomic_run',
+      'binding_atomic_first',
+      'binding_atomic_request',
+      {
+        blocks: [{ ...active, state: 'terminal' }],
+        status: 'completed',
+        endedAt: 4,
+      },
+    )).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.chatRuns.get('binding_atomic_run')?.status).toBe('running')
+    expect(store.outbox.countPending()).toBe(0)
+
+    expect(() => store.messages.update('binding_atomic_second', { blocks: [{
+      ...active,
+      blockId: 'binding_atomic_second_block',
+    }] })).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.messages.get('binding_atomic_second')?.blocks).toEqual([])
+
+    expect(() => store.chatRuns.finalizeWithMessage(
+      'binding_atomic_run',
+      'binding_atomic_first',
+      'binding_atomic_request',
+      {
+        blocks: [active, { ...active }],
+        status: 'completed',
+        endedAt: 4,
+      },
+    )).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.messages.get('binding_atomic_first')?.blocks).toEqual([active])
+    expect(store.chatRuns.get('binding_atomic_run')?.status).toBe('running')
+    expect(store.conversionBlockBindings.get('cloud-alice', 'binding_atomic_execution'))
+      .not.toHaveProperty('finalizedAt')
+    expect(store.outbox.countPending()).toBe(0)
+    manager.close()
+  })
+
+  it('retires missing execution bindings without losing terminal outbox work', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    store.conversations.insert({
+      id: 'binding_retire_conversation', title: 'Retire', userId: 'cloud-alice', createdAt: 1, updatedAt: 1,
+    })
+    store.messages.insert({
+      id: 'binding_retire_message', conversationId: 'binding_retire_conversation', role: 'assistant',
+      blocks: [], createdAt: 2,
+    })
+    const active = {
+      type: 'conversion' as const,
+      blockId: 'binding_retire_block',
+      executionId: 'binding_retire_execution',
+      state: 'active' as const,
+    }
+    store.messages.update('binding_retire_message', { blocks: [active] })
+
+    expect(store.conversionBlockBindings.retire(
+      'cloud-alice', 'binding_retire_execution', 'missing_execution', 3,
+    )).toBe(true)
+    expect(store.conversionBlockBindings.retire(
+      'cloud-alice', 'binding_retire_execution', 'missing_execution', 4,
+    )).toBe(false)
+    expect(store.conversionBlockBindings.get('cloud-alice', 'binding_retire_execution'))
+      .toMatchObject({ retiredAt: 3, retirementReason: 'missing_execution' })
+    expect(store.conversionBlockBindings.listRecoverable('cloud-alice')).toEqual([])
+    manager.close()
+  })
+
   it.each([
     { label: 'applied base plus one', status: 'applied' as const, revisionDelta: 1, accepted: true },
     { label: 'applied base', status: 'applied' as const, revisionDelta: 0, accepted: false },
@@ -1695,7 +1943,9 @@ describe('UserDataStoreManager', () => {
       expect(acknowledge).not.toThrow()
       expect(store.outbox.find(seeded.mutation.id)).toBeUndefined()
       expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
-        revision: seeded.mutation.baseRevision + 1,
+        revision: status === 'duplicate'
+          ? seeded.mutation.baseRevision
+          : seeded.mutation.baseRevision + 1,
         syncState: 'synced',
       })
     } else {
@@ -1739,8 +1989,120 @@ describe('UserDataStoreManager', () => {
     }, 5)).not.toThrow()
     expect(store.sync.getCheckpoint()?.remoteCursor).toBe('terminal_exact_receipt_pull')
     expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
-      revision: seeded.mutation.baseRevision + 1,
+      revision: seeded.mutation.baseRevision,
       syncState: 'synced',
+    })
+    manager.close()
+  })
+
+  it('treats duplicate-at-base as authoritative and rebases every later conversation mutation', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const seeded = createLocalTerminalOutbox(store, 'terminal_authoritative_rebase')
+    const rename = renameConversationMutation(
+      'terminal_authoritative_later_rename',
+      seeded.conversationId,
+      seeded.mutation.baseRevision + 1,
+      'Rebased title',
+    )
+    const append = {
+      ...appendMessageMutation(
+        'terminal_authoritative_later_append',
+        seeded.conversationId,
+        'terminal_authoritative_later_message',
+      ),
+      baseRevision: seeded.mutation.baseRevision + 2,
+    }
+    const permanentlyFailed = {
+      ...appendMessageMutation(
+        'terminal_authoritative_failed_append',
+        seeded.conversationId,
+        'terminal_authoritative_failed_message',
+      ),
+      baseRevision: seeded.mutation.baseRevision + 3,
+    }
+    store.outbox.recordWithConversation(rename)
+    store.outbox.recordWithMessage(append)
+    store.outbox.recordWithMessage(permanentlyFailed)
+    store.outbox.markFailed(permanentlyFailed.id, 'INVALID_INPUT')
+    store.outbox.markSyncing([seeded.mutation.id, rename.id, append.id])
+
+    const outcome = store.outbox.acknowledgePushResults(
+      [seeded.mutation, rename, append],
+      [
+        { id: seeded.mutation.id, status: 'duplicate', revision: seeded.mutation.baseRevision },
+        { id: rename.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' },
+        { id: append.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' },
+      ],
+    )
+
+    expect(outcome.supersededIds).toEqual([rename.id, append.id])
+    expect(store.outbox.find(permanentlyFailed.id)).toMatchObject({
+      id: permanentlyFailed.id,
+      baseRevision: permanentlyFailed.baseRevision,
+      state: 'failed',
+      lastErrorCode: 'INVALID_INPUT',
+    })
+    const rebased = store.outbox.list(10).filter(({ id }) => id !== permanentlyFailed.id)
+    expect(rebased).toHaveLength(2)
+    expect(rebased.map(({ id }) => id)).not.toContain(rename.id)
+    expect(rebased.map(({ id }) => id)).not.toContain(append.id)
+    expect(rebased.map(({ baseRevision }) => baseRevision)).toEqual([
+      seeded.mutation.baseRevision,
+      seeded.mutation.baseRevision + 1,
+    ])
+    expect(rebased).toEqual(rebased.map(() => expect.objectContaining({
+      id: expect.not.stringMatching(/terminal_authoritative_later_(rename|append)/),
+      state: 'pending',
+      attempts: 0,
+    })))
+    for (const mutation of rebased) {
+      expect(mutation).not.toHaveProperty('nextAttemptAt')
+      expect(mutation).not.toHaveProperty('lastErrorCode')
+    }
+    expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+      title: 'Rebased title',
+      revision: seeded.mutation.baseRevision + 2,
+      syncState: 'failed',
+    })
+    manager.close()
+  })
+
+  it('applies a compacted terminal receipt by conversation without requiring its deleted message', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('compacted_terminal_create', 'compacted_terminal_conversation')
+    const rename = renameConversationMutation(
+      'compacted_terminal_rename', create.entityId, 1, 'Before compact terminal',
+    )
+    store.sync.applyRemotePage({
+      protocolVersion: 2,
+      cursor: 'compacted_terminal_setup',
+      mutations: [pulledMutation(create, 1), pulledMutation(rename, 2)],
+    }, 1)
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 2,
+      cursor: 'compacted_terminal_cursor',
+      mutations: [{
+        id: 'compacted_terminal_receipt',
+        kind: 'message.conversion_block_terminal',
+        entityId: 'purged_terminal_message',
+        conversationId: create.entityId,
+        baseRevision: 2,
+        resultRevision: 3,
+        compacted: true,
+        receivedAt: '2026-08-24T01:00:00.000Z',
+      }],
+    }, 2)).not.toThrow()
+    expect(store.messages.get('purged_terminal_message')).toBeUndefined()
+    expect(store.conversations.getSummary(create.entityId)).toMatchObject({
+      revision: 3,
+      syncState: 'synced',
+    })
+    expect(store.sync.getCheckpoint()).toMatchObject({
+      protocolVersion: 2,
+      remoteCursor: 'compacted_terminal_cursor',
     })
     manager.close()
   })
@@ -2469,10 +2831,12 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
+      .toBeDefined()
+    expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversion_block_bindings'").get())
       .toBeDefined()
     inspection.close()
   })
@@ -2553,7 +2917,7 @@ describe('UserDataStoreManager', () => {
 
     const inspection = new Database(path)
     expect(inspection.prepare('SELECT MAX(version) AS version FROM schema_migrations').get())
-      .toEqual({ version: 7 })
+      .toEqual({ version: 8 })
     expect(inspection.prepare(`
       SELECT revision, sync_state AS syncState, last_activity_at AS lastActivityAt,
              metadata_updated_at AS metadataUpdatedAt

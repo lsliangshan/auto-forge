@@ -138,16 +138,22 @@ describe('CloudBase user data migration', () => {
     expect(syncPush).toContain('#variable_conflict use_variable')
   })
 
-  it('ships an executable deployed-database replacement for the strict conversion terminal transition', async () => {
+  it('ships deployed replacements for conversion push, versioned pull, and terminal-safe purge', async () => {
     const [canonical, additive] = await Promise.all([
       readFile(canonicalUrl, 'utf8'),
       readFile(conversionAdditiveUrl, 'utf8'),
     ])
     const canonicalPush = extractFunction(canonical, 'autoforge_sync_push')
     const additivePush = extractFunction(additive, 'autoforge_sync_push')
+    const canonicalPull = extractFunction(canonical, 'autoforge_sync_pull')
+    const additivePull = extractFunction(additive, 'autoforge_sync_pull')
+    const canonicalPurge = extractFunction(canonical, 'autoforge_purge_expired_conversation_tombstones')
+    const additivePurge = extractFunction(additive, 'autoforge_purge_expired_conversation_tombstones')
 
     expect(additive).toContain('CREATE OR REPLACE FUNCTION autoforge_sync_push(')
     expect(additivePush).toBe(canonicalPush)
+    expect(additivePull).toBe(canonicalPull)
+    expect(additivePurge).toBe(canonicalPurge)
     const terminalBranch = additivePush.slice(
       additivePush.indexOf("ELSIF mutation_kind = 'message.conversion_block_terminal'"),
       additivePush.indexOf("ELSIF mutation_kind = 'message.append'"),
@@ -239,22 +245,25 @@ describe('CloudBase user data migration', () => {
     expect(duplicateBranch).toContain("mutation_status := 'rejected'")
     expect(duplicateBranch).toContain("mutation_error := 'INVALID_INPUT'")
     expect(duplicateBranch).toContain("auth_user_id::text || ':message:' || entity_id")
+    expect(duplicateBranch.indexOf("auth_user_id::text || ':' || conversation_id"))
+      .toBeLessThan(duplicateBranch.indexOf('SELECT * INTO conversation_row'))
+    expect(duplicateBranch.indexOf('SELECT * INTO conversation_row'))
+      .toBeLessThan(duplicateBranch.indexOf("auth_user_id::text || ':message:' || entity_id"))
     expect(duplicateBranch.indexOf("auth_user_id::text || ':message:' || entity_id"))
       .toBeLessThan(duplicateBranch.indexOf('SELECT * INTO existing_message'))
-    expect(duplicateBranch.indexOf('SELECT * INTO existing_message'))
-      .toBeLessThan(duplicateBranch.indexOf('SELECT * INTO conversation_row'))
   })
 
-  it('rejects null protocol versions and separates expected data failures from internal failures', async () => {
+  it('accepts sync protocol v1/v2 while keeping legacy import v1 and sanitizing failures', async () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
     const syncPush = extractFunction(canonical, 'autoforge_sync_push')
     const syncPull = extractFunction(canonical, 'autoforge_sync_pull')
     const legacyImport = extractFunction(canonical, 'autoforge_import_legacy_batch')
 
-    for (const rpc of [syncPush, syncPull, legacyImport]) {
-      expect(rpc).toContain('IF p_protocol_version IS DISTINCT FROM 1 THEN')
+    for (const rpc of [syncPush, syncPull]) {
+      expect(rpc).toContain('IF p_protocol_version IS NULL OR p_protocol_version NOT IN (1, 2) THEN')
       expect(rpc).toContain("MESSAGE = 'UPGRADE_REQUIRED'")
     }
+    expect(legacyImport).toContain('IF p_protocol_version IS DISTINCT FROM 1 THEN')
     expect(syncPush).toContain(
       "WHEN SQLSTATE 'P0001' OR data_exception OR integrity_constraint_violation THEN",
     )
@@ -427,7 +436,12 @@ describe('CloudBase user data migration', () => {
     expect(purge).not.toContain('[deleted conversation]')
     expect(purge).not.toContain("'blocks'")
     expect(purge).toContain("mutation.kind = 'message.append'")
-    expect(purge).toContain("mutation_payload->'payload'->'conversationId'")
+    expect(purge).toContain("mutation.kind = 'message.conversion_block_terminal'")
+    expect(purge).toContain('LEFT JOIN app_messages message')
+    expect(purge).toMatch(
+      /WHEN mutation\.kind IN \(\s*'message\.append', 'message\.conversion_block_terminal'\s*\)\s+THEN to_jsonb\(candidate\."conversationId"\)/,
+    )
+    expect(purge).toContain("mutation_payload->'payload'->>'conversationId'")
     expect(purge).not.toContain('request_hash =')
     expect(purge).toContain('DELETE FROM app_conversations')
     expect(canonical).toContain(
@@ -439,6 +453,223 @@ describe('CloudBase user data migration', () => {
     expect(canonical).not.toContain(
       'GRANT EXECUTE ON FUNCTION autoforge_purge_expired_conversation_tombstones() TO authenticated',
     )
+  })
+
+  it('locks each conversation before its message and revalidates exact terminal identity', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
+    const terminalBranch = syncPush.slice(
+      syncPush.indexOf("ELSIF mutation_kind = 'message.conversion_block_terminal'"),
+      syncPush.indexOf("ELSIF mutation_kind = 'message.append'"),
+    )
+    const conversationLookup = terminalBranch.indexOf('SELECT * INTO conversation_row')
+    const messageLock = terminalBranch.indexOf("auth_user_id::text || ':message:' || entity_id")
+    const lockedMessageLookup = terminalBranch.indexOf('SELECT * INTO existing_message', messageLock)
+
+    expect(terminalBranch).toContain('SELECT message.conversation_id INTO conversation_id')
+    expect(terminalBranch.indexOf("auth_user_id::text || ':' || conversation_id"))
+      .toBeLessThan(conversationLookup)
+    expect(conversationLookup).toBeLessThan(messageLock)
+    expect(messageLock).toBeLessThan(lockedMessageLookup)
+    expect(terminalBranch).toContain(
+      'existing_message.conversation_id IS DISTINCT FROM conversation_id',
+    )
+    expect(terminalBranch).toContain('conversation_row.revision <> base_revision_value')
+    expect(terminalBranch).toMatch(
+      /jsonb_agg\([\s\S]+?ORDER BY item\.ordinality\)[\s\S]+?FROM jsonb_array_elements\(blocks\) WITH ORDINALITY AS item\(block, ordinality\)/,
+    )
+  })
+
+  it('projects a v1-safe page while advancing the cursor across hidden v2 mutations', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPull = extractFunction(canonical, 'autoforge_sync_pull')
+
+    expect(syncPull).toMatch(
+      /p_protocol_version = 2\s+OR page\.kind <> 'message\.conversion_block_terminal'\s+OR \(page\.result_revision = page\.base_revision \+ 1/,
+    )
+    expect(syncPull).toContain("THEN 'conversation.preferences'")
+    expect(syncPull).toContain('THEN page.terminal_conversation_id')
+    expect(syncPull).toContain("mutation.mutation_payload->>'conversationId'")
+    expect(syncPull).toContain("message.conversation_id")
+    expect(syncPull).toMatch(
+      /page\.kind = 'message\.conversion_block_terminal'[\s\S]+?THEN true ELSE NULL END/,
+    )
+    expect(syncPull).toContain("block.value->>'type' <> 'conversion'")
+    expect(syncPull).toMatch(
+      /jsonb_array_elements\(page\.mutation_payload->'payload'->'blocks'\)\s+WITH ORDINALITY/,
+    )
+    expect(syncPull).toMatch(
+      /'cursor',[\s\S]+?SELECT page\.cursor_token::text[\s\S]+?FROM page[\s\S]+?ORDER BY page\.server_sequence DESC/,
+    )
+    expect(syncPull.indexOf('LIMIT p_limit')).toBeLessThan(
+      syncPull.indexOf("page.kind <> 'message.conversion_block_terminal'"),
+    )
+  })
+
+  it('keeps strict v1 readers OCC-continuous across an active append, hidden terminal, and later write', () => {
+    const isRecord = (value: unknown): value is Record<string, unknown> => (
+      typeof value === 'object' && value !== null && !Array.isArray(value)
+    )
+    const hasExactKeys = (value: Record<string, unknown>, expected: readonly string[]) => (
+      Object.keys(value).length === expected.length
+      && expected.every((key) => Object.hasOwn(value, key))
+    )
+    const oldV1ChatBlock = (value: unknown): boolean => {
+      if (!isRecord(value) || typeof value.type !== 'string') return false
+      if (value.type === 'text') {
+        return hasExactKeys(value, ['type', 'text']) && typeof value.text === 'string'
+      }
+      return value.type === 'error'
+        && hasExactKeys(value, ['type', 'code', 'message'])
+        && typeof value.code === 'string'
+        && typeof value.message === 'string'
+    }
+    const oldV1PulledMutation = (value: unknown): boolean => {
+      if (!isRecord(value)) return false
+      if (value.kind === 'conversation.preferences' && value.compacted === true) {
+        return hasExactKeys(value, [
+          'id', 'kind', 'entityId', 'baseRevision', 'resultRevision', 'compacted', 'receivedAt',
+        ])
+          && typeof value.id === 'string'
+          && typeof value.entityId === 'string'
+          && Number.isSafeInteger(value.baseRevision)
+          && Number.isSafeInteger(value.resultRevision)
+          && typeof value.receivedAt === 'string'
+      }
+      if (!hasExactKeys(value, [
+        'id', 'kind', 'entityId', 'baseRevision', 'resultRevision', 'payload', 'receivedAt',
+      ]) || !isRecord(value.payload)) return false
+      const payload = value.payload
+      if (value.kind === 'conversation.rename') {
+        return hasExactKeys(payload, ['title', 'titleState', 'metadataUpdatedAt'])
+          && typeof value.id === 'string'
+          && typeof value.entityId === 'string'
+          && Number.isSafeInteger(value.baseRevision)
+          && Number.isSafeInteger(value.resultRevision)
+          && typeof value.receivedAt === 'string'
+          && typeof payload.title === 'string'
+          && typeof payload.titleState === 'string'
+          && typeof payload.metadataUpdatedAt === 'string'
+      }
+      if (value.kind !== 'message.append') return false
+      return hasExactKeys(payload, ['id', 'conversationId', 'role', 'blocks', 'createdAt'])
+        && typeof value.id === 'string'
+        && typeof value.entityId === 'string'
+        && Number.isSafeInteger(value.baseRevision)
+        && Number.isSafeInteger(value.resultRevision)
+        && typeof value.receivedAt === 'string'
+        && typeof payload.id === 'string'
+        && typeof payload.conversationId === 'string'
+        && (payload.role === 'user' || payload.role === 'assistant')
+        && Array.isArray(payload.blocks)
+        && payload.blocks.every(oldV1ChatBlock)
+        && typeof payload.createdAt === 'string'
+    }
+    const receivedAt = '2026-08-29T00:00:00.000Z'
+    const v2Page = [{
+      id: 'append_with_conversion',
+      kind: 'message.append' as const,
+      entityId: 'assistant_message',
+      baseRevision: 1,
+      resultRevision: 2,
+      payload: {
+        id: 'assistant_message',
+        conversationId: 'conversation_1',
+        role: 'assistant' as const,
+        blocks: [
+          { type: 'text' as const, text: '转换已提交' },
+          {
+            type: 'conversion' as const,
+            blockId: 'conversion_block',
+            executionId: 'conversion_execution',
+            state: 'active' as const,
+          },
+        ],
+        createdAt: receivedAt,
+      },
+      receivedAt,
+      cursor: 'cursor_append',
+    }, {
+      id: 'terminal_hidden_from_v1',
+      kind: 'message.conversion_block_terminal' as const,
+      entityId: 'assistant_message',
+      baseRevision: 2,
+      resultRevision: 3,
+      payload: {
+        messageId: 'assistant_message',
+        blockId: 'conversion_block',
+        executionId: 'conversion_execution',
+        state: 'terminal' as const,
+      },
+      receivedAt,
+      cursor: 'cursor_terminal',
+    }, {
+      id: 'terminal_duplicate_hidden_from_v1',
+      kind: 'message.conversion_block_terminal' as const,
+      entityId: 'assistant_message',
+      baseRevision: 3,
+      resultRevision: 3,
+      payload: {
+        messageId: 'assistant_message',
+        blockId: 'conversion_block',
+        executionId: 'conversion_execution',
+        state: 'terminal' as const,
+      },
+      receivedAt,
+      cursor: 'cursor_terminal_duplicate',
+    }, {
+      id: 'rename_after_terminal',
+      kind: 'conversation.rename' as const,
+      entityId: 'conversation_1',
+      baseRevision: 3,
+      resultRevision: 4,
+      payload: {
+        title: '转换完成',
+        titleState: 'user_named',
+        metadataUpdatedAt: receivedAt,
+      },
+      receivedAt,
+      cursor: 'cursor_rename',
+    }]
+    const unprojected = v2Page.map(({ cursor, ...mutation }) => {
+      expect(cursor).toEqual(expect.stringMatching(/^cursor_/))
+      return mutation
+    })
+    expect(unprojected.map(oldV1PulledMutation)).toEqual([false, false, false, true])
+    const projected = unprojected
+      .flatMap((mutation) => {
+        if (mutation.kind === 'message.conversion_block_terminal') {
+          if (mutation.resultRevision !== mutation.baseRevision + 1) return []
+          return [{
+            id: mutation.id,
+            kind: 'conversation.preferences' as const,
+            entityId: 'conversation_1',
+            baseRevision: mutation.baseRevision,
+            resultRevision: mutation.resultRevision,
+            compacted: true as const,
+            receivedAt: mutation.receivedAt,
+          }]
+        }
+        return [mutation.kind === 'message.append'
+          ? {
+              ...mutation,
+              payload: {
+                ...mutation.payload,
+                blocks: mutation.payload.blocks.filter(({ type }) => type !== 'conversion'),
+              },
+            }
+          : mutation]
+      })
+
+    expect(projected.every(oldV1PulledMutation)).toBe(true)
+    let oldDeviceRevision = 1
+    for (const mutation of projected) {
+      expect(mutation.baseRevision).toBe(oldDeviceRevision)
+      oldDeviceRevision = mutation.resultRevision
+    }
+    const nextLocalWrite = { baseRevision: oldDeviceRevision }
+    expect(nextLocalWrite.baseRevision).toBe(4)
+    expect(v2Page.at(-1)?.cursor).toBe('cursor_rename')
   })
 
   it('compacts stale rename and message receipts that arrive after purge without changing the request hash', async () => {
@@ -457,7 +688,7 @@ describe('CloudBase user data migration', () => {
       /IF NOT FOUND THEN[\s\S]+?mutation_kind IN \('conversation\.rename', 'conversation\.preferences'\)[\s\S]+?'compacted', true/,
     )
     expect(messageBranch).toMatch(
-      /IF NOT FOUND[\s\S]+?mutation := jsonb_build_object\([\s\S]+?'compacted', true,[\s\S]+?'conversationId', conversation_id/,
+      /ELSIF NOT conversation_found THEN[\s\S]+?mutation := jsonb_build_object\([\s\S]+?'compacted', true,[\s\S]+?'conversationId', conversation_id/,
     )
     expect(renameBranch.indexOf("auth_user_id::text || ':' || entity_id"))
       .toBeLessThan(renameBranch.indexOf("mutation := jsonb_build_object('compacted', true)"))

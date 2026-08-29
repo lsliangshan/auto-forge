@@ -168,3 +168,77 @@ tests/cloudbase/user-data-migration.test.ts
 ### External gates
 
 - Real CloudBase deployment, live PostgreSQL execution/locks/concurrency/RLS, cross-device production convergence, signing, notarization, and packaged release acceptance remain external gates. The additive migration must be deployed before enabling the terminal mutation in a real environment.
+
+## Whole-task recovery round 1 — nine Important findings
+
+This round starts from clean partial-recovery HEAD `229bbdd5f18908b187b53ee46ed9d9646092446b` and addresses only the nine findings recorded by the fresh whole-task review. The previously delivered Task 12 card/store/privacy behavior is preserved; the two deferred visual minors and Task 13 remain out of scope.
+
+### Finding closure
+
+1. **First durable job boundary.** `AgentOrchestrator` no longer creates a conversion block from the declared `file.convert` capability. The Application conversion port first commits the job through `ConversionJobRunner.submit`, then notifies Agent. The first notification creates one active block; repeated job submissions do not duplicate it, and zero-job failed/cancelled executions create no block or binding.
+2. **User-store binding journal.** User-cache migration `0008_conversion_block_binding_journal.sql` adds exact owner/conversation/message/block/execution uniqueness, message/conversation cascade, and finalized/consumed/retired states. Active message update plus binding, final assistant `message.append` outbox plus `finalized_at`, and terminal mutation plus `consumed_at` each share one user-store transaction. The shipped app migration `0017` is left immutable; corrective app migration `0018` removes its obsolete cross-database journal. Startup enumerates exact recoverable bindings, while missing execution/message and invalid identities retire fail-closed.
+3. **Crash-ready outbox drain.** Authenticated bind now checks for a ready persisted outbox row. If present, it performs one bounded push followed by the normal trailing pull; otherwise it performs the ordinary pull. The real Application restart RED observed `syncPush, syncPull, syncPull`; the fix produces exactly `syncPush, syncPull`, and a repeated session bind emits neither again.
+4. **Cloud handler validation.** Current sync accepts shared-valid `media` file blocks only as `kind:file,purpose:input`, validates strict unique supported `file.convert` `{ formats }` scopes, accepts strict active conversion blocks, and rejects a newly appended terminal conversion block. Historical imports/list reads retain terminal compatibility; the dedicated terminal mutation remains the only creation transition.
+5. **Authoritative duplicate-at-base rebase.** A terminal `duplicate` at exact base is authoritative. In one SQLite transaction Desktop preserves receipt evidence, removes the acknowledged mutation, assigns new mutation IDs and base revisions to later pending/syncing conversation operations, clears their retry state, and restores the predicted local revision. Permanently failed later rows remain unchanged. The sync engine immediately sends the rebased chain and applies the subsequent pull.
+6. **Terminal receipt compaction.** Tombstone purge joins terminal receipts to their message before cascade deletion and rewrites them to strict payload-free `{ compacted:true, conversationId }`. Shared, Cloud response parsing, and Desktop apply/notification handling accept this remote-only shape, advance conversation OCC without a message lookup, and advance the pull cursor. Both foundation copies and the additive deployed migration install the same pull and purge functions.
+7. **Lock order and SQL parity.** Terminal push derives conversation identity without locking, then acquires the conversation advisory/row lock before the message advisory/row lock and fully revalidates both records and the unique exact block. Replacement aggregation uses `WITH ORDINALITY` plus ordered `jsonb_agg`. Both foundations are byte-identical; additive push/pull/purge bodies equal their canonical functions. Storage is `varchar(64)`, key counts use supported `jsonb_object_keys`, and the additive whitelist is reinstalled unconditionally.
+8. **Reader-first sync v2.** Desktop push/pull now send protocol v2; legacy import remains v1. Cloud accepts v1/v2. A v1 pull limits the raw page, strips conversion blocks from `message.append`, hides no-op terminal duplicates, and projects each revision-advancing terminal receipt as an old-v1-valid compacted `conversation.preferences` revision anchor. The raw-page cursor still advances across hidden/projected v2 receipts. A representative pre-conversion strict-v1 reader accepts the projection, advances append → compatibility anchor → later rename from revision 1 through 4, and can enqueue its next local write at base 4; the real SQLite apply path proves the same chain. Deployment order is a release gate: v1-safe/v2 Cloud first, then Desktop v2 writers.
+9. **Safe retirement and terminal flush.** Consumed bindings leave recovery enumeration, conversation/message deletion cascades journal rows, missing durable executions retire instead of blocking rebind, and malformed persisted identity retires then raises consistency failure. A late normal-background terminal event records one operation and immediately schedules authenticated sync without exposing owner paths or conversion job/artifact details.
+
+### RED / GREEN evidence
+
+- Agent RED showed an active block before any job existed; zero-job and first-submission tests now pass. Coordinator RED coverage includes all three last-signal permutations, sequential foreground executions, finalization failure, missing execution, duplicate target, and mismatched execution.
+- User-store/sync work began with **7/7 selected regressions failing**; four additional adversarial REDs covered terminal-via-update/finalize bypass, mismatched replay, missing-message compact notification, and failed-row revival. Final user-data repository plus sync-engine run is **137/137**.
+- Cloud handler REDs rejected the new valid file/v2/compact shapes, and SQL structure REDs exposed missing version projection, purge compaction, lock order, deterministic aggregation, and deployed-function parity. Final handler plus migration run is **57/57**.
+- Application restart RED was **1/1 failed** with `syncPush, syncPull, syncPull`; after the one-branch fix it is **1/1 passed** with one push and one pull.
+- Final whole-diff audit found one additional RED: filtering a revision-advancing terminal receipt left a strict v1 device at revision `N` while Cloud was at `N+1`. The SQL projection now emits an existing-schema compacted preference anchor only for `result = base + 1`, hides duplicate-at-base terminal receipts, and preserves the raw cursor. Structural parity, strict-v1 OCC simulation, and the real write-after-anchor SQLite lifecycle are GREEN.
+
+### Final local gates
+
+- Shared contracts **103/103** and `@autoforge/shared` build passed.
+- Cloud handler **34/34**, Cloud migration/parity/strict-v1 projection **23/23**, and handler `node --check` passed.
+- CloudBase Desktop port **24/24**.
+- User-data repositories plus sync engine **138/138**; app database plus conversion repositories **121/121**.
+- Coordinator plus full Agent **203/203**; real Application conversion/background/restart/rebind lifecycle **4/4**.
+- Full Agent plus Application is **386 passed / 2 recorded baseline failures** out of 388: the legacy-import temporary-root `ENOTEMPTY` cleanup race and the existing context-summary `CONTEXT_LIMIT_EXCEEDED` budget expectation. Agent itself is **195/195**; Application is **191/193**.
+- Conversion component/store, context, IPC, preload/build configuration, ExecutionService, and conversion runner are **231/231**.
+- Changed TypeScript/JavaScript files excluding the known Cloud wrapper line pass ESLint; `cloudbase/user-data/function/user-data-handler.js` still reports its pre-existing `_tcbContext` unused binding at line 159.
+- Node typecheck now reports only two unrelated baselines: the Cloud sync E2E browser stub lacks `capturePageScreenshot`, and browser visual-evidence tracking lacks `purpose`. Renderer typecheck retains the three recorded InspectorPanel/developer/Settings capability diagnostics. No new recovery file is named by either check.
+- Desktop production build and `git diff --check` pass.
+
+### Recovery files
+
+```text
+apps/desktop/electron/main/agent/agent-orchestrator.ts
+apps/desktop/electron/main/agent/agent-orchestrator.test.ts
+apps/desktop/electron/main/application.ts
+apps/desktop/electron/main/application.test.ts
+apps/desktop/electron/main/cloud/cloudbase-user-data-port.ts
+apps/desktop/electron/main/cloud/cloudbase-user-data-port.test.ts
+apps/desktop/electron/main/conversion/conversion-block-coordinator.ts
+apps/desktop/electron/main/conversion/conversion-block-coordinator.test.ts
+apps/desktop/electron/main/database/repositories.ts
+apps/desktop/electron/main/database/database.test.ts
+apps/desktop/electron/main/database/conversion-repositories.test.ts
+apps/desktop/electron/main/database/user-data-client.ts
+apps/desktop/electron/main/database/user-data-client.test.ts
+apps/desktop/electron/main/database/user-data-repositories.ts
+apps/desktop/electron/main/sync/user-data-sync-engine.ts
+apps/desktop/electron/main/sync/user-data-sync-engine.test.ts
+apps/desktop/resources/migrations/0018_retire_app_conversion_block_bindings.sql
+apps/desktop/resources/user-cache-migrations/0008_conversion_block_binding_journal.sql
+cloudbase/migrations/20260824090000_user_data_foundation.sql
+cloudbase/migrations/20260829000000_conversion_block_terminal.sql
+cloudbase/user-data/function/user-data-handler.js
+cloudbase/user-data/migrations/0001_user_data_foundation.sql
+packages/shared/src/contracts.test.ts
+packages/shared/src/desktop-api.ts
+tests/cloudbase/user-data-handler.test.ts
+tests/cloudbase/user-data-migration.test.ts
+```
+
+### External gates
+
+- Deploy the v1-safe/v2 Cloud handler and additive SQL migration before enabling Desktop v2 writers.
+- Execute the functions against staging PostgreSQL/CloudBase to verify syntax, grants, RLS, request-hash parity, real lock ordering/deadlock behavior, tombstone purge, and cross-device convergence. No real CloudBase environment was accessed or modified in this round.
+- Signing, notarization, packaged multi-platform acceptance, and formal release/corpus gates remain outside local Task 12 evidence.

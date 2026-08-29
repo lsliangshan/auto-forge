@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { SyncMutation } from '@autoforge/shared'
-import { CloudBaseUserDataPort } from './cloudbase-user-data-port.js'
+import {
+  CloudBaseUserDataPort,
+  type CloudBaseUserDataCall,
+} from './cloudbase-user-data-port.js'
 
 const mutation: SyncMutation = {
   id: 'mutation_1',
@@ -180,7 +183,49 @@ describe('CloudBaseUserDataPort', () => {
     const port = new CloudBaseUserDataPort({ callFunction })
 
     await expect(port.call({
-      action: 'syncPull', protocolVersion: 2, deviceId: 'device-a', limit: 100,
+      action: 'syncPull', protocolVersion: 3, deviceId: 'device-a', limit: 100,
+    } as never)).rejects.toMatchObject({ code: 'UPGRADE_REQUIRED' })
+    expect(callFunction).not.toHaveBeenCalled()
+  })
+
+  it.each(['syncPush', 'syncPull'] as const)(
+    'accepts and forwards protocol v2 for %s while retaining v1 compatibility',
+    async (action) => {
+      const response = action === 'syncPush'
+        ? { results: [{ id: mutation.id, status: 'applied', revision: 1 }] }
+        : { mutations: [], cursor: null }
+      const callFunction = vi.fn().mockResolvedValue({ result: { ok: true, data: response } })
+      const port = new CloudBaseUserDataPort({ callFunction })
+      const input: CloudBaseUserDataCall = action === 'syncPush'
+        ? { action, protocolVersion: 2, deviceId: 'device-a', mutations: [mutation] }
+        : { action, protocolVersion: 2, deviceId: 'device-a', limit: 100 }
+
+      await expect(port.call(input)).resolves.toMatchObject({ ok: true })
+      expect(callFunction).toHaveBeenCalledWith({
+        name: 'autoforge-user-data',
+        data: input,
+      })
+    },
+  )
+
+  it('keeps the separate legacy import transaction on protocol v1', async () => {
+    const callFunction = vi.fn()
+    const port = new CloudBaseUserDataPort({ callFunction })
+
+    await expect(port.call({
+      action: 'importLegacyBatch',
+      protocolVersion: 2,
+      deviceId: 'device-a',
+      batchId: 'batch_v2',
+      includeUnowned: false,
+      conversations: [],
+      messages: [],
+      cloudSyncConsent: {
+        purpose: 'cloud_sync',
+        documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z',
+        clientVersion: '0.1.0',
+      },
     } as never)).rejects.toMatchObject({ code: 'UPGRADE_REQUIRED' })
     expect(callFunction).not.toHaveBeenCalled()
   })

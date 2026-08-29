@@ -473,10 +473,16 @@ describe('cross-process contracts', () => {
       id: 'preferences_mutation_1',
       kind: 'conversation.preferences' as const,
     }
+    const compactedConversionTerminal = {
+      ...compactedMessage,
+      id: 'conversion_terminal_mutation_1',
+      kind: 'message.conversion_block_terminal' as const,
+    }
 
     expect(pulledMutationSchema.parse(compactedMessage)).toEqual(compactedMessage)
     expect(pulledMutationSchema.parse(compactedDelete)).toEqual(compactedDelete)
     expect(pulledMutationSchema.parse(compactedPreferences)).toEqual(compactedPreferences)
+    expect(pulledMutationSchema.parse(compactedConversionTerminal)).toEqual(compactedConversionTerminal)
     expect(syncMutationSchema.safeParse(compactedMessage).success).toBe(false)
     for (const invalid of [
       { ...compactedMessage, payload: { blocks: [{ type: 'text', text: 'secret' }] } },
@@ -484,6 +490,8 @@ describe('cross-process contracts', () => {
       { ...compactedDelete, conversationId: 'conversation_1' },
       { ...compactedDelete, secret: 'not allowed' },
       { ...compactedPreferences, payload: { preferences: { outputType: 'image' } } },
+      { ...compactedConversionTerminal, payload: { state: 'terminal' } },
+      { ...compactedConversionTerminal, conversationId: undefined },
       { ...compactedDelete, kind: 'usage.record' },
     ]) {
       expect(pulledMutationSchema.safeParse(invalid).success).toBe(false)

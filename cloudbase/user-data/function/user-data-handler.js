@@ -360,7 +360,7 @@ function validateWorkflowContext(value) {
   return value.buildHash === undefined
 }
 
-function validateChatBlock(block) {
+function validateChatBlock(block, allowTerminalConversion = true) {
   if (!isRecord(block) || typeof block.type !== 'string') return false
   switch (block.type) {
     case 'text':
@@ -483,8 +483,9 @@ function validateChatBlock(block) {
       )
         && identifier(block.blockId)
         && identifier(block.assetId)
-        && ['image', 'audio', 'video'].includes(block.kind)
+        && ['image', 'audio', 'video', 'file'].includes(block.kind)
         && ['input', 'output'].includes(block.purpose)
+        && (block.kind !== 'file' || block.purpose === 'input')
         && nonEmptyString(block.name)
         && nonEmptyString(block.mimeType)
         && nonnegativeInteger(block.byteSize)
@@ -506,20 +507,20 @@ function validateChatBlock(block) {
       return hasStrictShape(block, ['type', 'blockId', 'executionId', 'state'])
         && identifier(block.blockId)
         && identifier(block.executionId)
-        && ['active', 'terminal'].includes(block.state)
+        && (block.state === 'active' || (allowTerminalConversion && block.state === 'terminal'))
     default:
       return false
   }
 }
 
-function validateMessage(value, legacy = false) {
+function validateMessage(value, legacy = false, allowTerminalConversion = true) {
   const optionalKeys = legacy ? ['executionId', 'sourceUnowned'] : ['executionId']
   return hasStrictShape(value, ['id', 'conversationId', 'role', 'blocks', 'createdAt'], optionalKeys)
     && identifier(value.id)
     && identifier(value.conversationId)
     && ['user', 'assistant'].includes(value.role)
     && Array.isArray(value.blocks)
-    && value.blocks.every(validateChatBlock)
+    && value.blocks.every((block) => validateChatBlock(block, allowTerminalConversion))
     && timestamp(value.createdAt)
     && (value.executionId === undefined || identifier(value.executionId))
     && (!legacy || value.sourceUnowned === undefined || typeof value.sourceUnowned === 'boolean')
@@ -598,7 +599,7 @@ function validateUsage(value) {
     && timestamp(value.occurredAt)
 }
 
-function validateMutationPayload(kind, payload) {
+function validateMutationPayload(kind, payload, allowTerminalConversion = true) {
   switch (kind) {
     case 'conversation.create':
       return hasStrictShape(
@@ -623,7 +624,7 @@ function validateMutationPayload(kind, payload) {
     case 'conversation.restore':
       return hasStrictShape(payload, [])
     case 'message.append':
-      return validateMessage(payload)
+      return validateMessage(payload, false, allowTerminalConversion)
     case 'message.conversion_block_terminal':
       return hasStrictShape(payload, ['messageId', 'blockId', 'executionId', 'state'])
         && identifier(payload.messageId) && identifier(payload.blockId)
@@ -657,7 +658,11 @@ function validateMutation(value) {
     || !identifier(value.entityId)
     || !nonnegativeInteger(value.baseRevision)
     || !timestamp(value.occurredAt)
-    || !validateMutationPayload(value.kind, value.payload)) return false
+    || !validateMutationPayload(
+      value.kind,
+      value.payload,
+      value.kind !== 'message.append',
+    )) return false
   return mutationEntityMatches(value.kind, value.entityId, value.payload)
 }
 
@@ -710,9 +715,11 @@ function parseSyncPushResponse(value) {
 function parsePulledMutation(value) {
   if (value?.compacted === true) {
     const isMessage = value.kind === 'message.append'
+      || value.kind === 'message.conversion_block_terminal'
     const allowedKind = [
       'conversation.create', 'conversation.rename', 'conversation.delete',
       'conversation.restore', 'conversation.preferences', 'message.append',
+      'message.conversion_block_terminal',
     ].includes(value.kind)
     const requiredKeys = [
       'id', 'kind', 'entityId', 'baseRevision', 'resultRevision', 'compacted', 'receivedAt',
@@ -1008,7 +1015,7 @@ function upgradeRequired() {
 }
 
 function protocolIsCurrent(event) {
-  return event.protocolVersion === 1
+  return event.protocolVersion === 1 || event.protocolVersion === 2
 }
 
 function createUserDataHandler({ rpc }) {
@@ -1104,7 +1111,7 @@ function createUserDataHandler({ rpc }) {
         )) {
           return invalidLegacyImport('shape')
         }
-        if (!protocolIsCurrent(event)) return upgradeRequired()
+        if (event.protocolVersion !== 1) return upgradeRequired()
         if (!identifier(event.deviceId) || !identifier(event.batchId)) {
           return invalidLegacyImport('identifier')
         }

@@ -1082,6 +1082,26 @@ export class AgentOrchestrator {
     return this.recognizedExecutionIds.has(executionId)
   }
 
+  onConversionJobSubmitted(executionId: string): boolean {
+    const active = this.activeByExecution.get(executionId)
+    const pending = active?.pending
+    if (!active || active.terminal || !pending || pending.tool.executionId !== executionId) return false
+    if (!pending.tool.candidate.workflow.permissions.some(({ capability }) => (
+      capability === 'file.convert'
+    ))) return false
+    const existing = active.blocks.filter((block): block is Extract<ChatBlock, { type: 'conversion' }> => (
+      block.type === 'conversion' && block.executionId === executionId
+    ))
+    if (existing.length > 1 || (existing.length === 1 && existing[0]?.state !== 'active')) {
+      throw appFailure('CONFLICT')
+    }
+    if (existing.length === 1) return false
+    this.appendBlock(active, {
+      type: 'conversion', blockId: this.id(), executionId, state: 'active',
+    })
+    return true
+  }
+
   hasActiveRuns(): boolean {
     return this.activeByRequest.size > 0
   }
@@ -1820,11 +1840,6 @@ export class AgentOrchestrator {
     }
     pending.executionAvailable = true
     this.updateWorkflowStatus(active, pending, 'running')
-    if (tool.candidate.workflow.permissions.some(({ capability }) => capability === 'file.convert')) {
-      this.appendBlock(active, {
-        type: 'conversion', blockId: this.id(), executionId: tool.executionId, state: 'active',
-      })
-    }
     const actual: WorkflowProvenanceEntry = {
       ...this.workflowStatusContext(tool),
       executionId: tool.executionId,

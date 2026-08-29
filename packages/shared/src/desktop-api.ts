@@ -1274,6 +1274,11 @@ export const compactedPulledMutationSchema = z.discriminatedUnion('kind', [
     kind: z.literal('message.append'),
     conversationId: identifierSchema,
   }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('message.conversion_block_terminal'),
+    conversationId: identifierSchema,
+  }).strict(),
 ])
 export type CompactedPulledMutation = z.infer<typeof compactedPulledMutationSchema>
 

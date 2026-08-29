@@ -119,9 +119,7 @@ import { resolveUserConversionRoot, resolveUserMediaRoot } from './media/user-me
 import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pinned-media-transport.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
 import {
-  finalizeConversionBlockBindings,
   reconcileConversionBlockBinding,
-  registerConversionBlockBindings,
 } from './conversion/conversion-block-coordinator.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
@@ -1205,12 +1203,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await userDataSync.start(session.user.id, deviceId)
       await bindUserMedia(session)
       await bindUserConversion(session)
+      const drainedReadyOutbox = await userDataSync.drainReadyOutbox()
       boundUserId = session.user.id
       const warningSince = userDataSync.status().warningSince
       if (warningSince !== undefined) {
         notifySyncWarning(userDataSync.captureBinding(session.user.id), warningSince)
       }
-      await userDataSync.pull()
+      if (!drainedReadyOutbox) await userDataSync.pull()
       activateUserReconciliation(runtimeRecovered)
       await activateVideoJobs(runtimeRecovered)
     })
@@ -1345,19 +1344,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             },
           }
           store.outbox.recordWithMessage(mutation, assetIds)
-          if (value.role === 'assistant') {
-            const conversion = value.blocks.find((block): block is Extract<ChatBlock, { type: 'conversion' }> => (
-              typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'conversion'
-                && (block as { state?: unknown }).state === 'active'
-            ))
-            if (conversion && value.executionId) {
-              database.conversionBlockBindings.create({
-                ownerUserId: auth.currentUserId()!, conversationId: value.conversationId,
-                messageId: value.id, blockId: conversion.blockId, executionId: conversion.executionId,
-              })
-              database.conversionBlockBindings.finalize(auth.currentUserId()!, conversion.executionId, Date.now())
-            }
-          }
           queueUserDataFlush()
           const stored = store.messages.get(value.id)
           if (!stored) throw failure('INTERNAL_ERROR')
@@ -1493,6 +1479,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     runner: ConversionJobRunner
   }
   let boundConversion: BoundConversionLifecycle | undefined
+  let notifyAgentConversionJobSubmitted: (executionId: string) => void = () => undefined
   let conversionGeneration = 0
   const conversionEventListeners = new Set<(event: DesktopConversionJobEvent) => void>()
   const conversionTerminalWaiters = new Map<string, Set<ConversionTerminalWaiter>>()
@@ -1529,8 +1516,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
   }
   const reconcileConversionBlocks = (lifecycle: BoundConversionLifecycle, executionId: string): void => {
+    const store = currentUserData()
     const transition = reconcileConversionBlockBinding({
-      repositories: { durable: database, chat: chatDatabase },
+      repositories: {
+        durable: database,
+        chat: {
+          messages: store.messages,
+          chatRuns: store.chatRuns,
+          conversionBlockBindings: store.conversionBlockBindings,
+        },
+      },
       ownerUserId: lifecycle.ownerUserId,
       executionId,
     })
@@ -1664,7 +1659,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
     boundConversion = lifecycle
     runner.start()
-    for (const binding of database.conversionBlockBindings.listActive(session.user.id)) {
+    for (const binding of currentUserData().conversionBlockBindings.listRecoverable(session.user.id)) {
       reconcileConversionBlocks(lifecycle, binding.executionId)
     }
     for (const execution of database.executions.listForUser(session.user.id)) {
@@ -1739,7 +1734,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }
       return Object.freeze({ ...binding, source: Object.freeze({ ...binding.source }) })
     },
-    submit: (input) => currentConversion().runner.submit(input),
+    submit: (input) => {
+      const receipt = currentConversion().runner.submit(input)
+      notifyAgentConversionJobSubmitted(input.executionId)
+      return receipt
+    },
     waitForTerminal: async (jobId, ownerUserId, signal) => {
       currentConversion(ownerUserId)
       const job = database.conversionJobs.getOwned(jobId, ownerUserId)
@@ -2183,28 +2182,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const conversationContext = createConversationContextManager(chatDatabase)
   const agent = new AgentOrchestrator({
     workflows: registry,
-    persistence: createAgentPersistence(chatDatabase, (messageId, blocks) => {
+    persistence: createAgentPersistence(chatDatabase, undefined, (_messageId, blocks) => {
       const ownerUserId = auth.currentUserId()
       if (!ownerUserId) return
-      registerConversionBlockBindings({
-        repositories: { durable: database, chat: chatDatabase },
-        ownerUserId,
-        messageId,
-        blocks,
-      })
-    }, (messageId, blocks) => {
-      const ownerUserId = auth.currentUserId()
-      if (!ownerUserId) return
-      const executionIds = finalizeConversionBlockBindings({
-        repositories: { durable: database, chat: chatDatabase },
-        ownerUserId,
-        messageId,
-        blocks,
-        finalizedAt: Date.now(),
-      })
       const lifecycle = boundConversion
       if (!lifecycle || lifecycle.ownerUserId !== ownerUserId) return
-      for (const executionId of executionIds) reconcileConversionBlocks(lifecycle, executionId)
+      for (const block of blocks) {
+        if (block.type === 'conversion') reconcileConversionBlocks(lifecycle, block.executionId)
+      }
     }),
     history: conversationContext,
     policy,
@@ -2225,6 +2210,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       executor: browserContinuationExecutor,
     },
   })
+  notifyAgentConversionJobSubmitted = (executionId) => {
+    agent.onConversionJobSubmitted(executionId)
+  }
   isBrowserRunActive = (runId) => agent.ownsBrowserRun(runId)
   options.inspectAgent?.(agent)
   const persistence = createAgentPersistence(chatDatabase)
@@ -3564,12 +3552,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             batchId,
           })
         } catch (error) {
+          const failedStatus = userDataSync.status()
           logLegacyImportDiagnostic({
             stage: 'importer_failed',
             code: toSafeAppError(error).code,
-            syncState: userDataSync.status().state,
-            ...('errorCode' in userDataSync.status() && userDataSync.status().errorCode
-              ? { syncErrorCode: userDataSync.status().errorCode }
+            syncState: failedStatus.state,
+            ...('errorCode' in failedStatus && failedStatus.errorCode
+              ? { syncErrorCode: failedStatus.errorCode }
               : {}),
           })
           throw error
