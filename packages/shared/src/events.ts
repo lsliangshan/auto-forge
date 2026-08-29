@@ -117,6 +117,13 @@ export const mediaGenerationBlockSchema = z.object({
   errorCode: appErrorCodeSchema.optional(),
 }).strict()
 
+export const conversionBlockSchema = z.object({
+  type: z.literal('conversion'),
+  blockId: identifierSchema,
+  executionId: identifierSchema,
+  state: z.enum(['active', 'terminal']),
+}).strict()
+
 export const executionStatusSchema = z.enum([
   'queued',
   'awaiting_approval',
@@ -250,6 +257,7 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
   browserStatusBlockSchema,
   mediaBlockSchema,
   mediaGenerationBlockSchema,
+  conversionBlockSchema,
 ])
 
 export type ChatBlock = z.infer<typeof chatBlockSchema>

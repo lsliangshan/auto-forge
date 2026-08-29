@@ -1,0 +1,157 @@
+import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
+import type { ConversionJobEvent, ConversionJobView, DesktopAPI } from '@autoforge/shared'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import ConversionBlock from '../../src/components/conversion/ConversionBlock.vue'
+import MessageBlock from '../../src/components/chat/MessageBlock.vue'
+import { useConversionStore } from '../../src/stores/conversion'
+
+function job(status: ConversionJobView['status'], overrides: Partial<ConversionJobView> = {}): ConversionJobView {
+  return {
+    jobId: 'job_1', executionId: 'execution_1', targetFormat: 'png', status, epoch: 1, progress: 48,
+    errorCode: status === 'failed' ? 'CONVERSION_TIMEOUT' : undefined,
+    artifacts: status === 'completed' ? [{
+      artifactId: 'artifact_1', status: 'ready', displayName: 'result.png', detectedFormat: 'png',
+      mimeType: 'image/png', byteSize: 1234, metadata: { pdfPage: 2 },
+    }] : [],
+    ...overrides,
+  }
+}
+
+function apiFor(jobs: ConversionJobView[] = []) {
+  let listener: ((event: ConversionJobEvent) => void) | undefined
+  const unsubscribe = vi.fn()
+  const api = {
+    auth: { getSession: vi.fn(), sendOtp: vi.fn(), verifyOtp: vi.fn(), cancelOtp: vi.fn(), loginWithPassword: vi.fn(), logout: vi.fn() },
+    profile: { get: vi.fn(), update: vi.fn(), pickAndUploadAvatar: vi.fn() },
+    chat: { listConversations: vi.fn(), createConversation: vi.fn(), listMessages: vi.fn(), renameConversation: vi.fn(), deleteConversation: vi.fn(), retrySync: vi.fn(), send: vi.fn(), cancel: vi.fn(), takeOverBrowser: vi.fn(), listBrowserAudit: vi.fn(), getGenerationPreferences: vi.fn(), updateGenerationPreferences: vi.fn(), onEvent: vi.fn() },
+    workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn() },
+    executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn(), onEvent: vi.fn() },
+    settings: { get: vi.fn(), update: vi.fn(), saveProviderApiKey: vi.fn(), clearProviderApiKey: vi.fn(), validateProviderCredential: vi.fn(), listProviderModels: vi.fn(), clearLocalData: vi.fn() },
+    conversion: {
+      listForExecution: vi.fn().mockResolvedValue(jobs),
+      cancel: vi.fn().mockResolvedValue(undefined), retry: vi.fn().mockResolvedValue(undefined),
+      saveCopy: vi.fn().mockResolvedValue({ saved: true }), reveal: vi.fn().mockResolvedValue(undefined),
+      deleteArtifact: vi.fn().mockResolvedValue(undefined),
+      onEvent: vi.fn((next) => { listener = next; return unsubscribe }),
+    },
+  } as unknown as DesktopAPI
+  return { api, unsubscribe, emit: (event: ConversionJobEvent) => listener?.(event) }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+function mountBlock(api: DesktopAPI, state: 'active' | 'terminal' = 'active') {
+  Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+  return mount(ConversionBlock, {
+    props: { block: { type: 'conversion', blockId: 'conversion_1', executionId: 'execution_1', state } },
+    global: { plugins: [createPinia()] },
+  })
+}
+
+describe('conversion chat block', () => {
+  beforeEach(() => setActivePinia(createPinia()))
+  afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+
+  it.each([
+    ['queued', '等待转换队列'], ['downloading_component', '正在下载转换组件'],
+    ['converting', '正在转换'], ['verifying', '正在验证结果'],
+    ['completed', '转换完成'], ['failed', '转换失败'], ['cancelled', '转换已取消'], ['interrupted', '转换已中断'],
+  ] as const)('renders %s with localized progress or terminal status', async (status, label) => {
+    const { api } = apiFor([job(status)])
+    const wrapper = mountBlock(api)
+    await flushPromises()
+    expect(wrapper.text()).toContain(label)
+    if (['queued', 'downloading_component', 'converting', 'verifying'].includes(status)) {
+      expect(wrapper.get('[role="progressbar"]').attributes('aria-valuetext')).toContain(label)
+      expect(wrapper.text()).toContain('48%')
+    }
+    if (status === 'failed') expect(wrapper.text()).toContain('请稍后重试')
+  })
+
+  it('renders only local snapshot results and performs opaque artifact actions', async () => {
+    const { api } = apiFor([job('completed')])
+    const wrapper = mountBlock(api)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('result.png')
+    expect(wrapper.text()).toContain('第 2 页')
+    expect(wrapper.text()).not.toMatch(/\/Users\/|sha256|bytes|managedPath/i)
+    await wrapper.get('[data-testid="conversion-save-copy"]').trigger('click')
+    await wrapper.get('[data-testid="conversion-reveal"]').trigger('click')
+    await wrapper.get('[data-testid="conversion-delete"]').trigger('click')
+    expect(api.conversion.saveCopy).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
+    expect(api.conversion.reveal).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
+    expect(api.conversion.deleteArtifact).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
+  })
+
+  it('keeps deleted outputs as an audit state and disables their actions', async () => {
+    const { api } = apiFor([job('completed', {
+      artifacts: [{ artifactId: 'artifact_1', status: 'deleted', displayName: 'result.png', detectedFormat: 'png', mimeType: 'image/png', byteSize: 1234 }],
+    })])
+    const wrapper = mountBlock(api, 'terminal')
+    await flushPromises()
+    expect(wrapper.text()).toContain('已删除')
+    expect(wrapper.get('[data-testid="conversion-save-copy"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="conversion-reveal"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="conversion-delete"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('disables artifact actions while an opaque operation is pending', async () => {
+    const { api } = apiFor([job('completed')])
+    const save = deferred<{ saved: boolean }>()
+    vi.mocked(api.conversion.saveCopy).mockReturnValue(save.promise)
+    const wrapper = mountBlock(api)
+    await flushPromises()
+    await wrapper.get('[data-testid="conversion-save-copy"]').trigger('click')
+    expect(wrapper.get('[data-testid="conversion-save-copy"]').attributes('disabled')).toBeDefined()
+    save.resolve({ saved: true })
+    await flushPromises()
+    expect(wrapper.get('[data-testid="conversion-save-copy"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('shows the cross-device local-only result notice without a local job', async () => {
+    const { api } = apiFor([])
+    const wrapper = mountBlock(api, 'terminal')
+    await flushPromises()
+    expect(wrapper.text()).toContain('转换结果仅在发起转换的设备上可用')
+  })
+
+  it('releases the local conversion event subscription when its card unmounts', async () => {
+    const { api, unsubscribe } = apiFor([job('queued')])
+    const wrapper = mountBlock(api)
+    await flushPromises()
+    wrapper.unmount()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not let an older snapshot overwrite a newer event epoch and releases on reset', async () => {
+    const pending = new Promise<ConversionJobView[]>((resolve) => { setTimeout(() => resolve([job('queued', { epoch: 1, progress: 0 })]), 0) })
+    const { api, unsubscribe, emit } = apiFor()
+    vi.mocked(api.conversion.listForExecution).mockReturnValue(pending)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useConversionStore()
+    const load = store.loadForExecution('execution_1')
+    emit({ type: 'job_updated', job: job('completed', { epoch: 2, progress: 100 }) })
+    await load
+
+    expect(store.jobsForExecution('execution_1')[0]).toMatchObject({ status: 'completed', epoch: 2 })
+    store.resetLocalData()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('is rendered by MessageBlock without exposing conversion payload fields', async () => {
+    const { api } = apiFor([job('completed')])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: { id: 'message_1:conversion_1', type: 'conversion', blockId: 'conversion_1', executionId: 'execution_1', state: 'terminal' } },
+      global: { plugins: [createPinia()] },
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('转换完成')
+  })
+})

@@ -120,6 +120,8 @@ function serializeBlock(block: ChatBlock): string[] {
       return [`[请求失败: ${block.code}; ${block.message}]`]
     case 'media_generation':
       return [`[${block.kind} 生成状态: ${block.status}${block.errorCode ? `; ${block.errorCode}` : ''}]`]
+    case 'conversion':
+      return [`[本地文件转换: ${block.state === 'active' ? '进行中' : '已结束'}]`]
   }
   return unexpectedBlock(block)
 }
@@ -148,7 +150,8 @@ export function serializeHistoricalMessage(
 
 function hasMutableMediaGeneration(message: Message): boolean {
   return chatBlockSchema.array().parse(message.blocks).some((block) => (
-    block.type === 'media_generation' && block.status !== 'failed'
+    (block.type === 'media_generation' && block.status !== 'failed')
+    || (block.type === 'conversion' && block.state === 'active')
   ))
 }
 

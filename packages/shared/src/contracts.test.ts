@@ -14,6 +14,7 @@ import {
   authUserSchema,
   authorizationSnapshotSchema,
   chatBlockSchema,
+  conversionBlockSchema,
   chatEventSchema,
   chatSendInputSchema,
   byokUsageEventSchema,
@@ -64,6 +65,17 @@ import {
 } from './index'
 
 describe('cross-process contracts', () => {
+  it('accepts only payload-free conversion chat blocks', () => {
+    const block = {
+      type: 'conversion' as const, blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal' as const,
+    }
+    expect(conversionBlockSchema.parse(block)).toEqual(block)
+    expect(chatBlockSchema.parse(block)).toEqual(block)
+    for (const forbidden of ['bytes', 'path', 'sha256', 'artifactId', 'jobId', 'metadata', 'managedPath']) {
+      expect(chatBlockSchema.safeParse({ ...block, [forbidden]: 'private-value' }).success).toBe(false)
+    }
+  })
+
   it('exposes stable, safe conversion errors', () => {
     const conversionErrorCodes = [
       'CONVERSION_FORMAT_UNSUPPORTED',

@@ -150,6 +150,16 @@ describe('conversation context primitives', () => {
     expect(JSON.stringify(serialized)).not.toMatch(/execution-secret|approval-secret|\/Users\/private|block-secret|job-secret/)
   })
 
+  it('serializes conversion blocks without local job, artifact, path, hash, or byte details', () => {
+    const serialized = serializeHistoricalMessage({
+      id: 'conversion_message', conversationId: 'c1', role: 'assistant', ordinal: 5, createdAt: 5,
+      blocks: [{ type: 'conversion', blockId: 'conversion_block_secret', executionId: 'execution_secret', state: 'terminal' }],
+    })
+
+    expect(serialized).toEqual({ role: 'assistant', content: '[本地文件转换: 已结束]' })
+    expect(JSON.stringify(serialized)).not.toMatch(/conversion_block_secret|execution_secret|bytes|path|sha256|artifact|job/i)
+  })
+
   it('rejects unparsed historical block fields instead of serializing arbitrary media data', () => {
     expect(() => serializeHistoricalMessage({
       id: 'm5', conversationId: 'c1', role: 'user', ordinal: 5, createdAt: 5,

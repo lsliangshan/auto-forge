@@ -41,6 +41,10 @@
       v-else-if="block.type === 'workflow_execution'"
       :execution-id="block.executionId"
     />
+    <ConversionBlock
+      v-else-if="block.type === 'conversion'"
+      :block="block"
+    />
     <section
       v-else-if="block.type === 'execution_result'"
       class="result"
@@ -77,6 +81,7 @@ import type { UiChatBlock } from '../../stores/chat'
 import { displayError } from '../../services/desktop-api'
 import ApprovalCard from './ApprovalCard.vue'
 import BrowserStatusCard from './BrowserStatusCard.vue'
+import ConversionBlock from '../conversion/ConversionBlock.vue'
 import ExecutionCard from './ExecutionCard.vue'
 import { renderMarkdown } from './markdown'
 import MediaBlock from './MediaBlock.vue'

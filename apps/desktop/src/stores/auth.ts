@@ -3,6 +3,7 @@ import { hasBusinessCapability, type AuthCredentials, type AuthOtpChallenge, typ
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
 import { useExecutionStore } from './execution'
+import { useConversionStore } from './conversion'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
@@ -60,6 +61,7 @@ function replaceSession(store: { session: AuthSession | null }, session: AuthSes
   if (previousUserId !== undefined && previousUserId !== nextUserId) {
     useChatStore().resetLocalData()
     useExecutionStore().resetLocalData()
+    useConversionStore().resetLocalData()
   }
   store.session = session
 }

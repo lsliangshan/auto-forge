@@ -108,6 +108,16 @@ function messageMutation(id: string, conversationId: string, baseRevision: numbe
   }
 }
 
+function conversionMessageMutation(id: string, conversationId: string, baseRevision: number): MessageMutation {
+  return {
+    ...messageMutation(id, conversationId, baseRevision),
+    payload: {
+      id: `${id}_message`, conversationId, role: 'assistant', createdAt: '2026-08-25T00:03:00.000Z',
+      blocks: [{ type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal' }],
+    },
+  }
+}
+
 function success(data: SyncPushData | SyncPullData): UserDataFunctionResponse {
   return { ok: true, data }
 }
@@ -178,6 +188,35 @@ afterEach(() => {
 })
 
 describe('UserDataSyncEngine', () => {
+  it('syncs only the payload-free conversion block JSON', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const create = createMutation(0)
+    const conversion = conversionMessageMutation('conversion_payload_free', create.entityId, 1)
+    const pushed: SyncMutation[] = []
+    store.outbox.recordWithConversation(create)
+    store.outbox.recordWithMessage(conversion)
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        pushed.push(...input.mutations)
+        return success({
+          results: input.mutations.map((mutation, index) => ({
+            id: mutation.id, status: 'applied' as const, revision: index + 1,
+          })),
+          cursor: 'conversion_payload_free_push',
+        })
+      }
+      return success({ mutations: [], cursor: 'conversion_payload_free_pull' })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    const payload = JSON.stringify(pushed.find((mutation) => mutation.id === conversion.id)?.payload)
+    expect(payload).toContain('"type":"conversion"')
+    expect(payload).not.toMatch(/bytes|path|sha256|artifactId|jobId|metadata|managedPath/i)
+  })
+
   it('does not turn local conversion rows into sync outbox mutations', async () => {
     const manager = createManager()
     const database = openAppDatabase(join(roots.at(-1)!, 'app.sqlite'))
