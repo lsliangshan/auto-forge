@@ -855,13 +855,16 @@ describe('chat interactions', () => {
 
   it('keeps the persisted message creation time in renderer state', async () => {
     const { api } = createEventApi()
-    vi.mocked(api.chat.listMessages).mockResolvedValue([{
-      id: 'assistant_1',
-      conversationId: 'conversation_1',
-      role: 'assistant',
-      blocks: [{ type: 'text', text: '已持久化回复' }],
-      createdAt: '2026-08-24T06:32:00.000Z',
-    }])
+    vi.mocked(api.chat.listMessages).mockResolvedValue({
+      items: [{
+        id: 'assistant_1',
+        conversationId: 'conversation_1',
+        role: 'assistant',
+        blocks: [{ type: 'text', text: '已持久化回复' }],
+        createdAt: '2026-08-24T06:32:00.000Z',
+      }],
+      previousCursor: undefined,
+    })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const chat = useChatStore()
 
