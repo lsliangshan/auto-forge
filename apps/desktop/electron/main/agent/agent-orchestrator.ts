@@ -299,6 +299,24 @@ export interface AgentPersistencePort {
 export function createAgentPersistence(
   repositories: Pick<AppRepositories, 'messages' | 'chatRuns'>,
 ): AgentPersistencePort {
+  const mergePersistedConversions = (messageId: string, blocks: ChatBlock[]): ChatBlock[] => {
+    const get = repositories.messages.get as unknown
+    const stored = typeof get === 'function'
+      ? (get as (id: string) => { blocks: unknown[] } | undefined)(messageId)
+      : undefined
+    if (!stored) return blocks
+    const terminal = new Set(stored.blocks.filter((block): block is Extract<ChatBlock, { type: 'conversion' }> => (
+      typeof block === 'object'
+      && block !== null
+      && (block as { type?: unknown }).type === 'conversion'
+      && (block as { state?: unknown }).state === 'terminal'
+    )).map((block) => `${block.blockId}\0${block.executionId}`))
+    return blocks.map((block) => (
+      block.type === 'conversion' && terminal.has(`${block.blockId}\0${block.executionId}`)
+        ? { ...block, state: 'terminal' as const }
+        : block
+    ))
+  }
   return {
     persistUser(input) {
       const message = repositories.messages.insertWithAssets({
@@ -367,8 +385,9 @@ export function createAgentPersistence(
       return repositories.messages.replaceBlock(messageId, blockId, block)
     },
     finalize(input) {
+      const blocks = mergePersistedConversions(input.messageId, input.blocks)
       repositories.chatRuns.finalizeWithMessage(input.runId, input.messageId, input.requestId, {
-        blocks: input.blocks,
+        blocks,
         status: input.status,
         endedAt: input.endedAt,
         ...(input.generationId === undefined ? {} : { generationId: input.generationId }),

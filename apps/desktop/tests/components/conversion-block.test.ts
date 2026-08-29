@@ -157,6 +157,24 @@ describe('conversion chat block', () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1)
   })
 
+  it.each(['unavailable', 'reject'] as const)('ignores a late %s list result after a valid event', async (outcome) => {
+    const response = deferred<{ availability: 'unavailable'; jobs: [] }>()
+    const { api, emit } = apiFor()
+    vi.mocked(api.conversion.listForExecution).mockReturnValue(
+      outcome === 'unavailable' ? response.promise : new Promise((_, reject) => { response.promise.then(() => reject(new Error('late'))) }),
+    )
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useConversionStore()
+    const load = store.loadForExecution('execution_1')
+    emit({ type: 'job_updated', job: job('completed', { progress: 100 }) })
+    response.resolve({ availability: 'unavailable', jobs: [] })
+    await load
+
+    expect(store.jobsForExecution('execution_1')).toEqual([expect.objectContaining({ status: 'completed' })])
+    expect(store.unavailableByExecution.execution_1).toBeUndefined()
+    expect(store.errorsByExecution.execution_1).toBeUndefined()
+  })
+
   it('keeps same-epoch deleted outputs and unions fuller concurrent snapshots', async () => {
     const { api, emit } = apiFor([])
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -170,6 +188,24 @@ describe('conversion chat block', () => {
     ]))
     emit({ type: 'job_updated', job: job('completed', { artifacts: [{ artifactId: 'artifact_2', status: 'ready', displayName: 'second.png', detectedFormat: 'png', mimeType: 'image/png', byteSize: 1 }] }) })
     expect(store.jobsForExecution('execution_1')[0]).toMatchObject({ status: 'completed' })
+  })
+
+  it('unions same-epoch representations and retains richer metadata from lower-rank observations', () => {
+    const { api } = apiFor([])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useConversionStore()
+    store.applyEvent({ type: 'job_updated', job: job('completed', { progress: 100, artifacts: [{
+      artifactId: 'artifact_1', status: 'deleted', displayName: 'first.png', detectedFormat: 'png', mimeType: 'image/png', byteSize: 1,
+      metadata: { iconRepresentations: [16], pdfPage: 2 },
+    }] }) })
+    store.applyEvent({ type: 'job_updated', job: job('converting', { progress: 30, artifacts: [{
+      artifactId: 'artifact_1', status: 'ready', displayName: 'changed.png', detectedFormat: 'png', mimeType: 'image/png', byteSize: 99,
+      metadata: { iconRepresentations: [32], frameSelection: 'first' },
+    }] }) })
+    expect(store.jobsForExecution('execution_1')[0]).toMatchObject({ status: 'completed', progress: 100, artifacts: [{
+      artifactId: 'artifact_1', status: 'deleted', displayName: 'first.png', byteSize: 1,
+      metadata: { iconRepresentations: [16, 32], pdfPage: 2, frameSelection: 'first' },
+    }] })
   })
 
   it('releases the old module feed before a reloaded store creates one replacement feed', async () => {

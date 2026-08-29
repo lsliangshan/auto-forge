@@ -1527,14 +1527,21 @@ describe('AgentOrchestrator', () => {
 
     const finalizeWithMessage = vi.fn()
     const terminalPersistence = createAgentPersistence({
-      messages: { insert, insertWithAssets, replaceBlock },
+      messages: {
+        insert, insertWithAssets, replaceBlock,
+        get: vi.fn(() => ({ blocks: [{
+          type: 'conversion', blockId: 'conversion_1', executionId: 'execution_1', state: 'terminal',
+        }] })),
+      },
       chatRuns: { finalizeWithMessage },
     } as never)
     terminalPersistence.finalize({
       runId: 'run_1',
       requestId: 'request_1',
       messageId: 'assistant_1',
-      blocks: [pending],
+      blocks: [pending, {
+        type: 'conversion', blockId: 'conversion_1', executionId: 'execution_1', state: 'active',
+      }],
       status: 'failed',
       endedAt: 12,
       errorCode: 'MEDIA_GENERATION_FAILED',
@@ -1543,7 +1550,12 @@ describe('AgentOrchestrator', () => {
       'run_1',
       'assistant_1',
       'request_1',
-      expect.objectContaining({ status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' }),
+      expect.objectContaining({
+        status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED',
+        blocks: expect.arrayContaining([expect.objectContaining({
+          type: 'conversion', blockId: 'conversion_1', state: 'terminal',
+        })]),
+      }),
     )
   })
 

@@ -47,20 +47,48 @@ function mergeArtifacts(current: ConversionJobView['artifacts'], candidate: Conv
   const artifacts = new Map(current.map((artifact) => [artifact.artifactId, artifact]))
   for (const artifact of candidate) {
     const previous = artifacts.get(artifact.artifactId)
-    artifacts.set(artifact.artifactId, previous?.status === 'deleted' ? previous : artifact)
+    if (!previous) {
+      artifacts.set(artifact.artifactId, artifact)
+      continue
+    }
+    const metadata = previous.metadata || artifact.metadata
+      ? {
+        ...artifact.metadata,
+        ...previous.metadata,
+        ...(previous.metadata?.iconRepresentations || artifact.metadata?.iconRepresentations ? {
+          iconRepresentations: [...new Set([
+            ...(previous.metadata?.iconRepresentations ?? []),
+            ...(artifact.metadata?.iconRepresentations ?? []),
+          ])].sort((left, right) => left - right),
+        } : {}),
+      }
+      : undefined
+    artifacts.set(artifact.artifactId, {
+      ...previous,
+      status: previous.status === 'deleted' || artifact.status === 'deleted' ? 'deleted' : 'ready',
+      ...(metadata === undefined ? {} : { metadata }),
+    })
   }
   return [...artifacts.values()]
 }
 function newerJob(current: ConversionJobView | undefined, candidate: ConversionJobView): ConversionJobView {
   if (!current || candidate.epoch > current.epoch) return candidate
   if (candidate.epoch < current.epoch) return current
+  const artifacts = mergeArtifacts(current.artifacts, candidate.artifacts)
   const currentRank = statusRank(current.status)
   const candidateRank = statusRank(candidate.status)
-  if (candidateRank > currentRank) return { ...candidate, artifacts: mergeArtifacts(current.artifacts, candidate.artifacts) }
-  if (candidateRank < currentRank) return current
-  if (isTerminal(current.status) && current.status !== candidate.status) return current
-  if (candidate.progress < current.progress && !isTerminal(candidate.status)) return current
-  return { ...candidate, artifacts: mergeArtifacts(current.artifacts, candidate.artifacts) }
+  const status = candidateRank > currentRank
+    ? candidate.status
+    : candidateRank < currentRank || (isTerminal(current.status) && current.status !== candidate.status)
+      ? current.status
+      : candidate.status
+  return {
+    ...current,
+    ...(status === candidate.status ? candidate : {}),
+    status,
+    progress: Math.max(current.progress, candidate.progress),
+    artifacts,
+  }
 }
 
 function mergeJobs(current: ConversionJobView[], incoming: ConversionJobView[]): ConversionJobView[] {
@@ -78,6 +106,7 @@ export const useConversionStore = defineStore('conversion', {
     pendingArtifactIds: {} as Record<string, true>,
     actionErrorsByArtifact: {} as Record<string, string>,
     _loadVersions: {} as Record<string, number>,
+    _observations: {} as Record<string, number>,
     _stateEpoch: 0,
     _subscribed: false,
     _subscriptionUsers: 0,
@@ -99,6 +128,7 @@ export const useConversionStore = defineStore('conversion', {
       this.pendingArtifactIds = {}
       this.actionErrorsByArtifact = {}
       this._loadVersions = {}
+      this._observations = {}
     },
     ensureSubscription() {
       if (this._subscribed && runtime(this).release) return
@@ -133,30 +163,35 @@ export const useConversionStore = defineStore('conversion', {
       this.ensureSubscription()
       const epoch = this._stateEpoch
       const version = (this._loadVersions[executionId] ?? 0) + 1
+      const observation = this._observations[executionId] ?? 0
       this._loadVersions[executionId] = version
       this.loadingByExecution[executionId] = true
       delete this.errorsByExecution[executionId]
       delete this.unavailableByExecution[executionId]
       try {
         const response = await getDesktopApi().conversion.listForExecution({ executionId })
-        if (epoch !== this._stateEpoch || version !== this._loadVersions[executionId]) return
+        if (epoch !== this._stateEpoch || version !== this._loadVersions[executionId]
+          || observation !== (this._observations[executionId] ?? 0)) return
         if (response.availability === 'unavailable') {
           this.jobsByExecution[executionId] = []
           this.unavailableByExecution[executionId] = true
         }
         else this.jobsByExecution[executionId] = mergeJobs(this.jobsForExecution(executionId), response.jobs)
       } catch (error) {
-        if (epoch === this._stateEpoch && version === this._loadVersions[executionId]) {
+        if (epoch === this._stateEpoch && version === this._loadVersions[executionId]
+          && observation === (this._observations[executionId] ?? 0)) {
           this.errorsByExecution[executionId] = displayError(error, '本地转换结果加载失败')
         }
       } finally {
-        if (epoch === this._stateEpoch && version === this._loadVersions[executionId]) {
+        if (epoch === this._stateEpoch && version === this._loadVersions[executionId]
+          && observation === (this._observations[executionId] ?? 0)) {
           this.loadingByExecution[executionId] = false
         }
       }
     },
     applyEvent(event: ConversionJobEvent) {
       const executionId = event.job.executionId
+      this._observations[executionId] = (this._observations[executionId] ?? 0) + 1
       delete this.errorsByExecution[executionId]
       delete this.unavailableByExecution[executionId]
       this.jobsByExecution[executionId] = mergeJobs(this.jobsForExecution(executionId), [event.job])

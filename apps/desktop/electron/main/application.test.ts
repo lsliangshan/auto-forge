@@ -9549,6 +9549,11 @@ describe('createApplicationRuntime', () => {
       executionId: 'execution_conversion_block_terminal', sourceKind: 'artifact',
       sourceId: 'artifact_conversion_block_input', targetFormat: 'png', status: 'queued',
     })
+    database.conversionJobs.create({
+      id: 'job_conversion_block_first', ownerUserId: session.user.id,
+      executionId: 'execution_conversion_block_terminal', sourceKind: 'artifact',
+      sourceId: 'artifact_conversion_block_input', targetFormat: 'png', status: 'completed', progress: 100,
+    })
     const bytes = Buffer.from('conversion terminal source')
     database.conversionArtifacts.create({
       id: 'artifact_conversion_block_input', ownerUserId: session.user.id,
@@ -9564,12 +9569,18 @@ describe('createApplicationRuntime', () => {
     await mkdir(dirname(inputPath), { recursive: true })
     await writeFile(inputPath, bytes)
     const emitChat = vi.fn()
+    const packEntered = deferred<void>()
+    const releasePack = deferred<void>()
     const conversionRuntime: ConversionJobRuntime = {
       concurrencyClass: () => 'other',
-      acquirePack: async () => ({
+      acquirePack: async () => {
+        packEntered.resolve()
+        await releasePack.promise
+        return {
         name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
         root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
-      }),
+        }
+      },
       createWriter: async () => ({
         tempPath: join(root, 'terminal-output.partial'),
         commit: async () => { throw new Error('unexpected commit') },
@@ -9582,6 +9593,10 @@ describe('createApplicationRuntime', () => {
     runtime.services.conversion.onEvent((event) => { conversionEvents.push(event) })
     try {
       await runtime.services.auth.getSession()
+      await packEntered.promise
+      expect(emitChat).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'block_update' }))
+      expect((await listMessages(runtime, conversation.id))[0]?.blocks).toEqual([expect.objectContaining({ state: 'active' })])
+      releasePack.resolve()
       await vi.waitFor(() => expect(conversionEvents).toContainEqual(expect.objectContaining({
         type: 'job_updated', job: expect.objectContaining({
           jobId: 'job_conversion_block_terminal', status: 'failed',
@@ -9602,7 +9617,17 @@ describe('createApplicationRuntime', () => {
       expect(JSON.stringify({ events: emitChat.mock.calls, message })).not.toMatch(
         /bytes|path|sha256|artifactId|jobId|metadata/i,
       )
+      const outbox = new UserDataStoreManager(join(root, 'user-caches'))
+      const terminalMutation = outbox.open(session.user.id).outbox.list(100).find((mutation) => (
+        mutation.kind === 'message.append'
+        && mutation.entityId === 'message_conversion_block_terminal'
+        && JSON.stringify(mutation.payload).includes('"state":"terminal"')
+      ))
+      outbox.close()
+      expect(terminalMutation).toBeDefined()
+      expect(JSON.stringify(terminalMutation)).not.toMatch(/bytes|path|sha256|artifactId|jobId|metadata/i)
     } finally {
+      releasePack.resolve()
       await runtime.close()
     }
   })

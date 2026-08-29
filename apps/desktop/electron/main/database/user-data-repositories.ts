@@ -1536,8 +1536,39 @@ export function createUserDataRepositories(
       blockId: string,
       replacement: unknown,
     ) {
-      if (!getOwnedMessage(messageId)) throw new UserDataConsistencyError()
-      return repositories.messages.replaceBlock(messageId, blockId, replacement)
+      const existing = getOwnedMessage(messageId)
+      if (!existing) throw new UserDataConsistencyError()
+      const parsed = chatBlockSchema.parse(replacement)
+      if (parsed.type !== 'conversion' || parsed.state !== 'terminal') {
+        return repositories.messages.replaceBlock(messageId, blockId, parsed)
+      }
+      const blocks = existing.blocks.map((block) => (
+        typeof block === 'object'
+        && block !== null
+        && 'blockId' in block
+        && block.blockId === blockId
+          ? parsed
+          : block
+      ))
+      const mutation = messageMutation({ ...existing, blocks })
+      let updated: ReturnType<AppRepositories['messages']['replaceBlock']> | undefined
+      recordMutation(mutation, () => {
+        updated = repositories.messages.replaceBlock(messageId, blockId, parsed)
+        database.prepare(`
+          UPDATE conversations
+          SET revision = @revision,
+              last_activity_at = MAX(last_activity_at + 1, @createdAt),
+              updated_at = MAX(updated_at, last_activity_at + 1, @createdAt), sync_state = 'pending'
+          WHERE id = @conversationId AND user_id = @ownerUserId
+        `).run({
+          conversationId: existing.conversationId,
+          ownerUserId,
+          revision: mutation.baseRevision + 1,
+          createdAt: existing.createdAt,
+        })
+      })
+      if (!updated) throw new UserDataConsistencyError()
+      return updated
     },
     upgradeLegacyApprovals() {
       assertEveryMessageOwned(database, ownerUserId)

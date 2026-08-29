@@ -756,6 +756,9 @@ function executionSummary(execution: Execution): ExecutionSummary {
 const terminalConversionStatuses = new Set<ConversionJob['status']>([
   'completed', 'failed', 'cancelled', 'interrupted',
 ])
+const terminalExecutionStatuses = new Set<Execution['status']>([
+  'completed', 'failed', 'cancelled', 'interrupted',
+])
 const retryableConversionStatuses = new Set<ConversionJob['status']>([
   'failed', 'cancelled', 'interrupted',
 ])
@@ -1517,7 +1520,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       || auth.currentUserId() !== job.ownerUserId) return
     settleConversionWaiters(job)
     const execution = database.executions.getForUser(job.executionId, job.ownerUserId)
-    if (execution?.chatRunId && terminalConversionStatuses.has(job.status)) {
+    if (execution?.chatRunId
+      && terminalExecutionStatuses.has(execution.status)
+      && terminalConversionStatuses.has(job.status)) {
       const jobs = database.conversionJobs.listForExecution(job.executionId, job.ownerUserId)
       if (jobs.length > 0 && jobs.every((candidate) => terminalConversionStatuses.has(candidate.status))) {
         const run = chatDatabase.chatRuns.get(execution.chatRunId)

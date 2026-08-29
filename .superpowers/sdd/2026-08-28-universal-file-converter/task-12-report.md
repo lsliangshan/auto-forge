@@ -85,3 +85,11 @@ packages/shared/src/contracts.test.ts
 - `pnpm --filter @autoforge/shared build` passed; scoped ESLint and `git diff --check` passed.
 - Workspace/desktop typecheck remains at the same 8 unrelated pre-existing diagnostics after this round; no Task 12 file is named.
 - Production build was started after the scoped checks; final completion/SHA are recorded with the implementation commit.
+
+## Fix round 2 — terminal and observation races
+
+- Terminal conversion blocks now require a terminal owning workflow execution, at least one job, and every job terminal. The Application test holds the second foreground submission at pack acquisition and proves the first completed job leaves the block active; it then releases the final job and verifies one terminal block update plus a payload-free outbox message mutation.
+- Agent finalization reads the latest persisted message and preserves a terminal conversion block over its stale active in-memory copy. Terminal replacement is owned by the user-local message repository, records the same payload-free message mutation/outbox path, and is replay-idempotent because only active blocks can transition.
+- Renderer list loads capture an execution-local observation generation. Every valid event advances it, so late local, unavailable, and rejected results cannot clear the event snapshot or reintroduce an error.
+- Same-epoch merges now union artifacts before resolving job lifecycle, retain immutable artifact identity fields, keep deleted absorbing, union icon representations, preserve richer metadata from lower-rank observations, and keep progress monotonic.
+- Focused GREEN: conversion card/store **21/21**; terminal Application lifecycle **1/1**; Agent persistence race **1/1**. The combined Main suite retains the two recorded baseline failures plus an intermittent isolated developer-draft conflict that passes when re-run alone.
