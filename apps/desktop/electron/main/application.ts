@@ -2579,12 +2579,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             batchId,
           })
         } catch (error) {
+          const failedStatus = userDataSync.status()
           logLegacyImportDiagnostic({
             stage: 'importer_failed',
             code: toSafeAppError(error).code,
-            syncState: userDataSync.status().state,
-            ...('errorCode' in userDataSync.status() && userDataSync.status().errorCode
-              ? { syncErrorCode: userDataSync.status().errorCode }
+            syncState: failedStatus.state,
+            ...('errorCode' in failedStatus && failedStatus.errorCode
+              ? { syncErrorCode: failedStatus.errorCode }
               : {}),
           })
           throw error

@@ -95,7 +95,9 @@ function harness(events: readonly ModelStreamEvent[] = successfulEvents, streamE
     bindIdentity: vi.fn((_key, input) => input as never),
     report: vi.fn((_key, input) => input as never),
     markUnknown: vi.fn((key) => key as never),
-  } satisfies Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
+    recordByokUsage: vi.fn((event) => event),
+  } satisfies Pick<ProviderUsageRepository,
+    'start' | 'bindIdentity' | 'report' | 'markUnknown' | 'recordByokUsage'>
   const run = (
     visualBundle: BrowserVisualEvidenceBundle = bundle,
     trustedRequest = '我上传了哪些附件',
@@ -170,6 +172,10 @@ describe('resolveBrowserVisualEvidence', () => {
       operationKey: 'agent:request_1:browser-visual-evidence:1',
       chatRunId: 'run_1',
       model: 'deepseek/deepseek-v4',
+    }))
+    expect(test.providerUsage.recordByokUsage).toHaveBeenCalledWith(expect.objectContaining({
+      operationId: 'agent:request_1:browser-visual-evidence:1',
+      purpose: 'browser_visual_evidence',
     }))
   })
 
