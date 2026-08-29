@@ -56,6 +56,7 @@ const capabilities = new Set([
   'browser.open', 'browser.fill', 'browser.click', 'browser.url', 'browser.close',
   'network.fetch', 'filesystem.read', 'filesystem.write', 'clipboard.read',
   'clipboard.write', 'notification.send', 'artifact.create',
+  'file.convert',
 ])
 const executionStatuses = new Set([
   'queued', 'awaiting_approval', 'running', 'completed', 'failed', 'cancelled', 'interrupted',
@@ -333,6 +334,13 @@ function validateScope(capability, scope) {
       && scope.paths.length > 0
       && scope.paths.every((path) => nonEmptyString(path))
   }
+  if (capability === 'file.convert') {
+    return hasStrictShape(scope, ['formats'])
+      && Array.isArray(scope.formats)
+      && scope.formats.length > 0
+      && scope.formats.every((format) => typeof format === 'string'
+        && ['png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif', 'ico', 'icns', 'pdf', 'xlsx', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'mp4', 'webm', 'mov'].includes(format))
+  }
   return hasStrictShape(scope, [])
 }
 
@@ -493,6 +501,11 @@ function validateChatBlock(block) {
         && ['image', 'audio', 'video'].includes(block.kind)
         && ['pending', 'in_progress', 'downloading', 'paused', 'failed'].includes(block.status)
         && (block.errorCode === undefined || appErrorCodes.has(block.errorCode))
+    case 'conversion':
+      return hasStrictShape(block, ['type', 'blockId', 'executionId', 'state'])
+        && identifier(block.blockId)
+        && identifier(block.executionId)
+        && ['active', 'terminal'].includes(block.state)
     default:
       return false
   }

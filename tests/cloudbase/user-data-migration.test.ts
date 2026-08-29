@@ -152,8 +152,8 @@ describe('CloudBase user data migration', () => {
       additivePush.indexOf("ELSIF mutation_kind = 'message.conversion_block_terminal'"),
       additivePush.indexOf("ELSIF mutation_kind = 'message.append'"),
     )
-    expect(terminalBranch).toContain("jsonb_object_length(payload) <> 4")
-    expect(terminalBranch).toContain("existing_message.execution_id IS DISTINCT FROM payload->>'executionId'")
+    expect(terminalBranch).toContain("(SELECT count(*) FROM jsonb_object_keys(payload)) <> 4")
+    expect(terminalBranch).not.toContain("existing_message.execution_id IS DISTINCT FROM payload->>'executionId'")
     expect(terminalBranch).toContain("existing_block->>'state' = 'terminal'")
     expect(terminalBranch).toContain("mutation_status := 'duplicate'")
     expect(terminalBranch).toContain('conversation_row.revision <> base_revision_value')

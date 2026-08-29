@@ -21,9 +21,11 @@ BEGIN
   END IF;
 END $$;
 
+ALTER TABLE app_sync_mutations ALTER COLUMN kind TYPE varchar(64);
+
 -- Keep deployed databases on exactly the same strict protocol implementation
 -- as new installations. This replaces the production function atomically.
-+CREATE OR REPLACE FUNCTION autoforge_sync_push(
+CREATE OR REPLACE FUNCTION autoforge_sync_push(
   p_caller_user_id varchar,
   p_protocol_version integer,
   p_device_id varchar,
@@ -343,7 +345,7 @@ BEGIN
       IF payload->>'messageId' IS DISTINCT FROM entity_id
         OR payload->>'state' IS DISTINCT FROM 'terminal'
         OR NOT (payload ?& ARRAY['messageId', 'blockId', 'executionId', 'state'])
-        OR jsonb_object_length(payload) <> 4
+        OR (SELECT count(*) FROM jsonb_object_keys(payload)) <> 4
         OR jsonb_typeof(payload->'messageId') <> 'string'
         OR jsonb_typeof(payload->'blockId') <> 'string'
         OR jsonb_typeof(payload->'executionId') <> 'string'
@@ -360,8 +362,7 @@ BEGIN
         FROM app_messages message
         WHERE message.owner_user_id = auth_user_id AND message.id = entity_id
         FOR UPDATE;
-        IF NOT FOUND OR existing_message.execution_id IS DISTINCT FROM payload->>'executionId'
-          OR (SELECT count(*) FROM jsonb_array_elements(existing_message.blocks) block
+        IF NOT FOUND OR (SELECT count(*) FROM jsonb_array_elements(existing_message.blocks) block
               WHERE block->>'type' = 'conversion'
                 AND block->>'blockId' = payload->>'blockId'
                 AND block->>'executionId' = payload->>'executionId') <> 1 THEN

@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS app_sync_mutations (
   owner_user_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   mutation_id varchar(128) NOT NULL CHECK (length(mutation_id) BETWEEN 1 AND 128 AND mutation_id = btrim(mutation_id)),
   device_id varchar(128) NOT NULL,
-  kind varchar(32) NOT NULL CHECK (kind IN (
+  kind varchar(64) NOT NULL CHECK (kind IN (
     'conversation.create', 'conversation.rename', 'conversation.preferences',
     'conversation.delete', 'conversation.restore',
     'message.append', 'message.conversion_block_terminal', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'
@@ -570,7 +570,7 @@ BEGIN
       IF payload->>'messageId' IS DISTINCT FROM entity_id
         OR payload->>'state' IS DISTINCT FROM 'terminal'
         OR NOT (payload ?& ARRAY['messageId', 'blockId', 'executionId', 'state'])
-        OR jsonb_object_length(payload) <> 4
+        OR (SELECT count(*) FROM jsonb_object_keys(payload)) <> 4
         OR jsonb_typeof(payload->'messageId') <> 'string'
         OR jsonb_typeof(payload->'blockId') <> 'string'
         OR jsonb_typeof(payload->'executionId') <> 'string'
@@ -587,8 +587,7 @@ BEGIN
         FROM app_messages message
         WHERE message.owner_user_id = auth_user_id AND message.id = entity_id
         FOR UPDATE;
-        IF NOT FOUND OR existing_message.execution_id IS DISTINCT FROM payload->>'executionId'
-          OR (SELECT count(*) FROM jsonb_array_elements(existing_message.blocks) block
+        IF NOT FOUND OR (SELECT count(*) FROM jsonb_array_elements(existing_message.blocks) block
               WHERE block->>'type' = 'conversion'
                 AND block->>'blockId' = payload->>'blockId'
                 AND block->>'executionId' = payload->>'executionId') <> 1 THEN
