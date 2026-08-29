@@ -89,27 +89,50 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     return probeConversionInput({ displayName, mimeType, byteSize: bytes.byteLength, bytes })
   }
 
-  function icoSizes(path: string): number[] {
+  function probeBytes(bytes: Buffer, displayName: string, mimeType: string) {
+    return probeConversionInput({ displayName, mimeType, byteSize: bytes.byteLength, bytes })
+  }
+
+  function icoRepresentations(path: string): Array<{ width: number; height: number }> {
     const bytes = readFileSync(path)
     expect(bytes.subarray(0, 4)).toEqual(Buffer.from([0, 0, 1, 0]))
     const count = bytes.readUInt16LE(4)
-    return Array.from({ length: count }, (_, index) => bytes[6 + index * 16] || 256)
+    expect(probeBytes(bytes, 'icon.ico', 'image/vnd.microsoft.icon')).toMatchObject({ format: 'ico', frameCount: count })
+    return Array.from({ length: count }, (_, index) => {
+      const entry = 6 + index * 16
+      const width = bytes[entry] || 256
+      const height = bytes[entry + 1] || 256
+      const payloadBytes = bytes.readUInt32LE(entry + 8)
+      const payloadOffset = bytes.readUInt32LE(entry + 12)
+      expect(bytes[entry + 3]).toBe(0)
+      expect(payloadOffset).toBeGreaterThanOrEqual(6 + count * 16)
+      expect(payloadOffset + payloadBytes).toBeLessThanOrEqual(bytes.byteLength)
+      expect(probeBytes(bytes.subarray(payloadOffset, payloadOffset + payloadBytes), `ico-${index}.png`, 'image/png'))
+        .toMatchObject({ format: 'png', width, height, frameCount: 1 })
+      return { width, height }
+    })
   }
 
-  function icnsTypes(path: string): string[] {
+  function icnsRepresentations(path: string): Array<{ type: string; width: number; height: number }> {
     const bytes = readFileSync(path)
     expect(bytes.subarray(0, 4).toString('ascii')).toBe('icns')
     expect(bytes.readUInt32BE(4)).toBe(bytes.byteLength)
-    const types: string[] = []
+    const representations: Array<{ type: string; width: number; height: number }> = []
     let offset = 8
     while (offset < bytes.byteLength) {
-      types.push(bytes.subarray(offset, offset + 4).toString('ascii'))
+      const type = bytes.subarray(offset, offset + 4).toString('ascii')
       const length = bytes.readUInt32BE(offset + 4)
       expect(length).toBeGreaterThan(8)
+      expect(offset + length).toBeLessThanOrEqual(bytes.byteLength)
+      const embedded = probeBytes(bytes.subarray(offset + 8, offset + length), `${type}.png`, 'image/png')
+      expect(embedded).toMatchObject({ format: 'png', frameCount: 1 })
+      expect(embedded.width).toBe(embedded.height)
+      representations.push({ type, width: embedded.width!, height: embedded.height! })
       offset += length
     }
     expect(offset).toBe(bytes.byteLength)
-    return types
+    expect(probeBytes(bytes, 'icon.icns', 'image/icns')).toMatchObject({ format: 'icns', width: 1024, height: 1024 })
+    return representations
   }
 
   function pngCornerAlpha(path: string): number {
@@ -175,9 +198,28 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     if (!ffprobe) throw new Error('Signed media pack must declare bin/ffprobe')
     return JSON.parse(signedProbe(ffprobe, [
       '-v', 'error', '-count_frames',
-      '-show_entries', 'format=format_name,duration:format_tags=title,artist,comment:stream=codec_name,codec_type,width,height,nb_frames,nb_read_frames',
+      '-show_entries', 'format=format_name,duration:format_tags:stream=index,codec_name,codec_type,width,height,nb_frames,nb_read_frames:stream_tags:chapter=id,start_time,end_time:chapter_tags',
       '-of', 'json', path,
-    ])) as { format: { format_name: string; duration: string; tags?: Record<string, string> }; streams: Array<Record<string, string | number>> }
+    ])) as {
+      format: { format_name: string; duration?: string; tags?: Record<string, string> }
+      streams: Array<Record<string, string | number | Record<string, string>>>
+      chapters: Array<{ id: number; start_time: string; end_time: string; tags?: Record<string, string> }>
+    }
+  }
+
+  function expectNoSentinelMetadata(metadata: ReturnType<typeof mediaMetadata>) {
+    expect(JSON.stringify(metadata)).not.toContain('AUTOFORGE_')
+    expect(metadata.chapters).toEqual([])
+  }
+
+  function expectMagic(path: string, target: 'mp4' | 'mov' | 'webm' | 'mp3') {
+    const bytes = readFileSync(path)
+    if (target === 'mp4') expect(bytes.subarray(4, 12).toString('ascii')).toBe('ftypisom')
+    if (target === 'mov') expect(bytes.subarray(4, 12).toString('ascii')).toBe('ftypqt  ')
+    if (target === 'webm') expect(bytes.subarray(0, 4)).toEqual(Buffer.from('1a45dfa3', 'hex'))
+    if (target === 'mp3') {
+      expect(bytes.subarray(0, 3).toString('ascii') === 'ID3' || (bytes[0] === 0xff && (bytes[1]! & 0xe6) === 0xe2)).toBe(true)
+    }
   }
 
   function pdfPages(path: string): number {
@@ -199,10 +241,13 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     const favicon = (await convert(imageIconAdapter, 'image-icon', input, inputPath, { targetFormat: 'ico', preset: 'favicon' }, 'ico-favicon'))[0]!
     const icns = (await convert(imageIconAdapter, 'image-icon', input, inputPath, { targetFormat: 'icns' }, 'icns'))[0]!
 
-    expect(icoSizes(defaultIco.path)).toEqual([16, 24, 32, 48, 64, 128, 256])
-    expect(icoSizes(favicon.path)).toEqual([16, 32, 48])
+    expect(icoRepresentations(defaultIco.path)).toEqual([16, 24, 32, 48, 64, 128, 256].map((size) => ({ width: size, height: size })))
+    expect(icoRepresentations(favicon.path)).toEqual([16, 32, 48].map((size) => ({ width: size, height: size })))
     expect(defaultIco.metadata).toMatchObject({ iconRepresentations: [16, 24, 32, 48, 64, 128, 256], transparentPadding: true })
-    expect(icnsTypes(icns.path)).toEqual(['icp4', 'ic11', 'icp5', 'ic12', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10'])
+    expect(icnsRepresentations(icns.path)).toEqual([
+      ['icp4', 16], ['ic11', 32], ['icp5', 32], ['ic12', 64], ['ic07', 128],
+      ['ic13', 256], ['ic08', 256], ['ic14', 512], ['ic09', 512], ['ic10', 1024],
+    ].map(([type, size]) => ({ type, width: size, height: size })))
     expect(icns.metadata).toMatchObject({ iconRepresentations: [16, 32, 64, 128, 256, 512, 1024], transparentPadding: true })
 
     const extractedIco = await convert(imageIconAdapter, 'image-icon', {
@@ -232,11 +277,12 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     const gifProbe = probe(gif.path, 'animated.gif', 'image/gif')
     expect(gifProbe).toMatchObject({ format: 'gif', width: 32, height: 20, frameCount: 2 })
     const mp4Metadata = mediaMetadata(mp4.path)
-    expect(mp4Metadata.format.format_name).toContain('mp4')
-    expect(mp4Metadata.streams).toEqual(expect.arrayContaining([
-      expect.objectContaining({ codec_type: 'video', codec_name: 'h264', width: 32, height: 20 }),
-    ]))
-    expect(Number(mp4Metadata.streams.find((stream) => stream.codec_type === 'video')?.nb_read_frames)).toBe(2)
+    expect(mp4Metadata.format.format_name).toBe('mov,mp4,m4a,3gp,3g2,mj2')
+    expectMagic(mp4.path, 'mp4')
+    expect(mp4Metadata.streams).toHaveLength(1)
+    expect(mp4Metadata.streams[0]).toMatchObject({ codec_type: 'video', codec_name: 'h264', width: 32, height: 20 })
+    expect(Number(mp4Metadata.streams[0]?.nb_read_frames)).toBe(2)
+    expectNoSentinelMetadata(mp4Metadata)
     expect(probe(png.path, 'first.png', 'image/png')).toMatchObject({ format: 'png', width: 32, height: 20, frameCount: 1 })
     expect(png.metadata).toEqual({ frameSelection: 'first' })
   }, 120_000)
@@ -283,10 +329,16 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
   it('converts WAV to every approved audio target with the fixed codec family and stripped metadata', async () => {
     const inputPath = join(fixtureRoot, 'tone.wav')
     const input = probe(inputPath, 'tone.wav', 'audio/wav')
+    const sourceMetadata = mediaMetadata(inputPath)
+    expect(sourceMetadata.format.tags).toMatchObject({
+      title: 'AUTOFORGE_WAV_FORMAT_SENTINEL',
+      artist: 'AUTOFORGE_WAV_ARTIST_SENTINEL',
+      comment: 'AUTOFORGE_WAV_COMMENT_SENTINEL',
+    })
     const expected = {
       mp3: { codec: 'mp3', container: 'mp3', mime: 'audio/mpeg' },
       wav: { codec: 'pcm_s16le', container: 'wav', mime: 'audio/wav' },
-      m4a: { codec: 'aac', container: 'm4a', mime: 'audio/mp4' },
+      m4a: { codec: 'aac', container: 'mov,mp4,m4a,3gp,3g2,mj2', mime: 'audio/mp4' },
       aac: { codec: 'aac', container: 'aac', mime: 'audio/aac' },
       flac: { codec: 'flac', container: 'flac', mime: 'audio/flac' },
       ogg: { codec: 'vorbis', container: 'ogg', mime: 'audio/ogg' },
@@ -295,7 +347,7 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     for (const targetFormat of Object.keys(expected) as Array<keyof typeof expected>) {
       const output = (await convert(mediaAdapter, 'media', input, inputPath, { targetFormat }, `wav-${targetFormat}`))[0]!
       const metadata = mediaMetadata(output.path)
-      expect(metadata.format.format_name).toContain(expected[targetFormat].container)
+      expect(metadata.format.format_name).toBe(expected[targetFormat].container)
       let structuralFormat: string
       try {
         structuralFormat = probe(output.path, `tone.${targetFormat}`, expected[targetFormat].mime).format
@@ -303,28 +355,36 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
         throw new Error(`Structural probe rejected the real ${targetFormat} output`, { cause: error })
       }
       expect(structuralFormat).toBe(targetFormat)
-      expect(metadata.streams).toEqual(expect.arrayContaining([
-        expect.objectContaining({ codec_type: 'audio', codec_name: expected[targetFormat].codec }),
-      ]))
-      expect(metadata.streams.some((stream) => stream.codec_type === 'video')).toBe(false)
-      expect(metadata.format.tags?.title).toBeUndefined()
-      expect(metadata.format.tags?.artist).toBeUndefined()
-      expect(metadata.format.tags?.comment).toBeUndefined()
+      expect(metadata.streams).toHaveLength(1)
+      expect(metadata.streams[0]).toMatchObject({ codec_type: 'audio', codec_name: expected[targetFormat].codec })
+      expectNoSentinelMetadata(metadata)
     }
   }, 180_000)
 
   it('converts MP4 to MP4/WebM/MOV/GIF/MP3 with exact container, stream, dimension, frame, and metadata policy', async () => {
     const inputPath = join(fixtureRoot, 'sample.mp4')
+    const sourceMetadata = mediaMetadata(inputPath)
+    expect(sourceMetadata.format.format_name).toBe('mov,mp4,m4a,3gp,3g2,mj2')
+    expect(sourceMetadata.format.tags).toMatchObject({
+      title: 'AUTOFORGE_MP4_FORMAT_SENTINEL',
+      artist: 'AUTOFORGE_MP4_ARTIST_SENTINEL',
+      comment: 'AUTOFORGE_MP4_COMMENT_SENTINEL',
+    })
+    expect(sourceMetadata.streams.map((stream) => (stream.tags as Record<string, string> | undefined)?.handler_name))
+      .toEqual(['AUTOFORGE_VIDEO_STREAM_SENTINEL', 'AUTOFORGE_AUDIO_STREAM_SENTINEL', 'SubtitleHandler'])
+    expect(sourceMetadata.chapters).toEqual([
+      expect.objectContaining({ tags: { title: 'AUTOFORGE_CHAPTER_SENTINEL' } }),
+    ])
     const input: ProbedConversionInput = {
       format: 'mp4', mimeType: 'video/mp4', kind: 'video', byteSize: readFileSync(inputPath).byteLength,
       width: 48, height: 32, frameCount: 12,
     }
     const targets = {
-      mp4: { video: 'h264', audio: 'aac' },
-      webm: { video: 'vp9', audio: 'opus' },
-      mov: { video: 'h264', audio: 'aac' },
-      gif: { video: 'gif', audio: undefined },
-      mp3: { video: undefined, audio: 'mp3' },
+      mp4: { format: 'mov,mp4,m4a,3gp,3g2,mj2', video: 'h264', audio: 'aac' },
+      webm: { format: 'matroska,webm', video: 'vp9', audio: 'opus' },
+      mov: { format: 'mov,mp4,m4a,3gp,3g2,mj2', video: 'h264', audio: 'aac' },
+      gif: { format: 'gif', video: 'gif', audio: undefined },
+      mp3: { format: 'mp3', video: undefined, audio: 'mp3' },
     } as const
     for (const [targetFormat, expected] of Object.entries(targets) as Array<[keyof typeof targets, (typeof targets)[keyof typeof targets]]>) {
       const output = (await convert(mediaAdapter, 'media', input, inputPath, { targetFormat }, `mp4-${targetFormat}`))[0]!
@@ -332,6 +392,7 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
         expect(probe(output.path, 'video.gif', 'image/gif')).toMatchObject({ format: 'gif', width: 48, height: 32 })
       }
       const metadata = mediaMetadata(output.path)
+      expect(metadata.format.format_name).toBe(expected.format)
       const video = metadata.streams.find((stream) => stream.codec_type === 'video')
       const audio = metadata.streams.find((stream) => stream.codec_type === 'audio')
       if (expected.video) {
@@ -339,12 +400,14 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
         expect(Number(video?.nb_read_frames)).toBe(12)
       }
       else expect(video).toBeUndefined()
-      if (expected.audio) expect(audio?.codec_name).toMatch(new RegExp(expected.audio))
+      if (expected.audio) expect(audio?.codec_name).toBe(expected.audio)
       else expect(audio).toBeUndefined()
+      expect(metadata.streams.map((stream) => stream.codec_type)).toEqual([
+        ...(expected.video ? ['video'] : []), ...(expected.audio ? ['audio'] : []),
+      ])
+      if (targetFormat !== 'gif') expectMagic(output.path, targetFormat)
       expect(Number(metadata.format.duration)).toBeGreaterThan(0)
-      expect(metadata.format.tags?.title).toBeUndefined()
-      expect(metadata.format.tags?.artist).toBeUndefined()
-      expect(metadata.format.tags?.comment).toBeUndefined()
+      expectNoSentinelMetadata(metadata)
     }
   }, 180_000)
 })

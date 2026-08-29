@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer'
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
@@ -7,10 +7,13 @@ import {
   approvedTarget,
   archiveFilename,
   canonicalBytes,
+  compareUtf8,
   collectPayloadEntries,
   createRestrictedUstar,
   fail,
   parseArguments,
+  readCanonicalJson,
+  releaseMode,
   requireAbsolutePath,
   requireDirectory,
   safeEntryPath,
@@ -21,13 +24,7 @@ import {
 
 function exactKeys(value, expected) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
-    && Object.keys(value).sort().join('\0') === [...expected].sort().join('\0')
-}
-
-async function readJson(path, label) {
-  let value
-  try { value = JSON.parse(await readFile(path, 'utf8')) } catch { fail(`${label} is not valid JSON.`) }
-  return value
+    && Object.keys(value).sort(compareUtf8).join('\0') === [...expected].sort(compareUtf8).join('\0')
 }
 
 function validateRelease(value) {
@@ -42,7 +39,7 @@ function validateRelease(value) {
 }
 
 function validateManifest(value) {
-  if (!exactKeys(value, ['schemaVersion', 'name', 'version', 'platform', 'arch', 'archiveUrl', 'executables', 'licenses'])) {
+  if (!exactKeys(value, ['schemaVersion', 'name', 'version', 'platform', 'arch', 'archiveUrl', 'files'])) {
     fail('Pack manifest has an invalid schema.')
   }
   if (
@@ -52,29 +49,25 @@ function validateManifest(value) {
     || typeof value.platform !== 'string'
     || typeof value.arch !== 'string'
     || typeof value.archiveUrl !== 'string'
-    || !Array.isArray(value.executables)
-    || value.executables.length === 0
-    || value.executables.some((path) => !safeEntryPath(path))
-    || !Array.isArray(value.licenses)
-    || value.licenses.length === 0
-    || value.licenses.some((path) => !safeEntryPath(path) || !path.startsWith('LICENSES/'))
+    || !Array.isArray(value.files)
+    || value.files.length === 0
   ) fail('Pack manifest is invalid.')
   if (!approvedTarget(value.platform, value.arch)) fail('Pack manifest platform/architecture is unsupported.')
-  validateExecutableSet(value.name, value.platform, value.executables)
   return value
 }
 
-export async function buildConverterPackIndex({ input, output }) {
+export async function buildConverterPackIndex({ input, output, mode = 'production' }) {
+  mode = releaseMode(mode)
   requireAbsolutePath(input, 'Input root')
   requireAbsolutePath(output, 'Output root')
   await requireDirectory(input, 'Input root')
   await requireDirectory(dirname(output), 'Output parent')
-  const inputNames = (await readdir(input, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))
+  const inputNames = (await readdir(input, { withFileTypes: true })).sort((a, b) => compareUtf8(a.name, b.name))
   if (inputNames.map(({ name }) => name).join('\0') !== ['packs', 'release.json'].join('\0')) {
     fail('Input root must contain only packs and release.json.')
   }
   if (!inputNames[0]?.isDirectory() || !inputNames[1]?.isFile()) fail('Input root layout is invalid.')
-  const release = validateRelease(await readJson(join(input, 'release.json'), 'Release metadata'))
+  const release = validateRelease((await readCanonicalJson(join(input, 'release.json'), 'Release metadata')).value)
   const packsRoot = join(input, 'packs')
   await requireDirectory(packsRoot, 'Packs root')
   const packDirectories = (await readdir(packsRoot, { withFileTypes: true })).sort((a, b) => Buffer.from(a.name).compare(Buffer.from(b.name)))
@@ -85,12 +78,14 @@ export async function buildConverterPackIndex({ input, output }) {
     if (!directory.isDirectory() || directory.isSymbolicLink() || !safeEntryPath(directory.name)) fail('Packs root contains an unsafe name.')
     const packRoot = join(packsRoot, directory.name)
     await requireDirectory(packRoot, 'Pack root')
-    const children = (await readdir(packRoot, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))
+    const children = (await readdir(packRoot, { withFileTypes: true })).sort((a, b) => compareUtf8(a.name, b.name))
     if (children.map(({ name }) => name).join('\0') !== ['pack.json', 'payload'].join('\0')) fail('Pack root layout is invalid.')
     if (!children[0]?.isFile() || !children[1]?.isDirectory()) fail('Pack root layout is invalid.')
-    const manifest = validateManifest(await readJson(join(packRoot, 'pack.json'), 'Pack manifest'))
-    const entries = await collectPayloadEntries(join(packRoot, 'payload'), manifest.executables, manifest.licenses)
-    for (const executable of manifest.executables) {
+    const manifest = validateManifest((await readCanonicalJson(join(packRoot, 'pack.json'), 'Pack manifest')).value)
+    const entries = await collectPayloadEntries(join(packRoot, 'payload'), manifest.files, manifest.platform)
+    const executables = manifest.files.filter((file) => file.role === 'executable').map((file) => file.path)
+    validateExecutableSet(manifest.name, manifest.platform, executables)
+    for (const executable of executables) {
       if (!entries.some((entry) => entry.path === executable && entry.executable)) fail('Pack is missing a declared executable.')
     }
     const archive = createRestrictedUstar(entries)
@@ -102,16 +97,18 @@ export async function buildConverterPackIndex({ input, output }) {
       archiveUrl: manifest.archiveUrl,
       archiveSha256: sha256(archive),
       archiveBytes: archive.byteLength,
-      entries: entries.map(({ path, bytes, executable, sha256: digest }) => ({ path, sha256: digest, bytes: bytes.byteLength, executable })),
+      entries: entries.map(({ path, bytes, executable, role, sha256: digest }) => ({ path, sha256: digest, bytes: bytes.byteLength, executable, role })),
     }
     const archiveName = archiveFilename(descriptor)
     if (archiveNames.has(archiveName.toLowerCase())) fail('Archive filenames must be unique.')
     archiveNames.add(archiveName.toLowerCase())
     built.push({ descriptor, archiveName, archive })
   }
-  built.sort((left, right) => [left.descriptor.name, left.descriptor.version, left.descriptor.platform, left.descriptor.arch]
-    .join('\0').localeCompare([right.descriptor.name, right.descriptor.version, right.descriptor.platform, right.descriptor.arch].join('\0')))
-  const index = validateIndex({ schemaVersion: 1, generatedAt: release.generatedAt, sequence: release.sequence, packs: built.map(({ descriptor }) => descriptor) })
+  built.sort((left, right) => compareUtf8(
+    [left.descriptor.name, left.descriptor.version, left.descriptor.platform, left.descriptor.arch].join('\0'),
+    [right.descriptor.name, right.descriptor.version, right.descriptor.platform, right.descriptor.arch].join('\0'),
+  ))
+  const index = validateIndex({ schemaVersion: 1, generatedAt: release.generatedAt, sequence: release.sequence, packs: built.map(({ descriptor }) => descriptor) }, mode)
   await mkdir(output, { recursive: false, mode: 0o700 })
   await Promise.all([
     writeFile(join(output, 'index.json'), canonicalBytes(index), { flag: 'wx', mode: 0o600 }),
@@ -122,6 +119,6 @@ export async function buildConverterPackIndex({ input, output }) {
 
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(entry).href) {
-  const args = parseArguments(process.argv.slice(2), ['--input', '--output'])
-  await buildConverterPackIndex({ input: args['--input'], output: args['--output'] })
+  const args = parseArguments(process.argv.slice(2), ['--input', '--output', '--mode'], ['--input', '--output'])
+  await buildConverterPackIndex({ input: args['--input'], output: args['--output'], mode: args['--mode'] })
 }

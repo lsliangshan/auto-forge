@@ -7,7 +7,16 @@ mac:
 win:
   icon: resources/branding/autoforge-logo.ico
 files:
-  - out/**
+  - out/main/index.js
+  - out/preload/index.cjs
+  - out/renderer/index.html
+  - out/renderer/assets/**
+  - out/workers/workflow-runner.cjs
+  - package.json
+  - '!out/**/*.map'
+  - '!**/{test,tests,__tests__,spec,fixtures,e2e,.e2e,stale}/**'
+  - '!**/*.{test,spec}.{js,cjs,mjs,ts,tsx,vue}'
+  - '!**/{test-results,playwright-report}/**'
 extraResources:
   - from: resources/migrations
     to: migrations

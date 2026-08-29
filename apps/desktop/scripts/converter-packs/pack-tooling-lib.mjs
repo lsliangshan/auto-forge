@@ -1,10 +1,14 @@
 import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
-import { lstat, readFile, readdir, realpath } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join, posix } from 'node:path'
+import { constants } from 'node:fs'
+import { lstat, open, readdir, realpath } from 'node:fs/promises'
+import { dirname, join, posix, win32 } from 'node:path'
+import process from 'node:process'
 import { URL } from 'node:url'
 
 export const PACK_NAMES = Object.freeze(['image-icon', 'document', 'pdf', 'media'])
+export const PACK_ROLES = Object.freeze(['executable', 'code', 'license', 'data'])
+export const PACK_MODES = Object.freeze(['test', 'production'])
 export const PACK_LIMITS = Object.freeze({
   maxArchiveBytes: 512 * 1024 * 1024,
   maxEntries: 256,
@@ -12,10 +16,13 @@ export const PACK_LIMITS = Object.freeze({
   maxExpandedBytes: 2 * 1024 * 1024 * 1024,
 })
 const packNames = new Set(PACK_NAMES)
+const packRoles = new Set(PACK_ROLES)
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const semverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u
 const portableSegment = /^[A-Za-z0-9._-]+$/u
 const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
+const launchableExtension = /\.(?:exe|com|cmd|bat|ps1|scr|msi)$/iu
+const codeExtension = /(?:\.(?:dll|dylib|node|jar|py|pyc|pyd|pl|rb|sh|bash|zsh|fish|vbs|wsf|js|mjs|cjs)|\.so(?:\.[0-9]+)*)$/iu
 const exactExecutablePaths = Object.freeze({
   'image-icon': Object.freeze({ darwin: ['bin/autoforge-image-converter'], win32: ['bin/autoforge-image-converter.exe'] }),
   document: Object.freeze({ darwin: ['program/soffice'], win32: ['program/soffice.exe'] }),
@@ -33,7 +40,11 @@ export function fail(message) {
   throw new Error(message)
 }
 
-export function parseArguments(argv, allowed) {
+export function compareUtf8(left, right) {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'))
+}
+
+export function parseArguments(argv, allowed, required = allowed) {
   if (argv.length % 2 !== 0) fail('Arguments must be flag/value pairs.')
   const result = Object.create(null)
   for (let index = 0; index < argv.length; index += 2) {
@@ -44,21 +55,76 @@ export function parseArguments(argv, allowed) {
     }
     result[flag] = value
   }
-  if (allowed.some((flag) => result[flag] === undefined)) fail('All command arguments are required.')
+  if (required.some((flag) => result[flag] === undefined)) fail('All required command arguments must be provided.')
   return result
 }
 
+export function releaseMode(value) {
+  const mode = value ?? 'production'
+  if (!PACK_MODES.includes(mode)) fail('Mode must be test or production.')
+  return mode
+}
+
+export function isSafeAbsolutePathForPlatform(value, platform = process.platform) {
+  if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) return false
+  if (platform === 'win32') {
+    if (/^\\\\[?.]\\/u.test(value) || value.includes('/')) return false
+    const drive = /^[A-Za-z]:\\[^\\]/u.test(value)
+    const unc = /^\\\\[^\\]+\\[^\\]+(?:\\|$)/u.test(value)
+    return (drive || unc) && win32.normalize(value) === value && !value.split('\\').includes('..')
+  }
+  return platform !== 'darwin' && platform !== 'linux'
+    ? false
+    : posix.isAbsolute(value) && posix.normalize(value) === value
+}
+
 export function requireAbsolutePath(value, label) {
-  if (typeof value !== 'string' || !isAbsolute(value)) fail(`${label} must be an absolute path.`)
-  if (value.includes('\0')) fail(`${label} is invalid.`)
+  if (!isSafeAbsolutePathForPlatform(value)) fail(`${label} must be an absolute path in canonical form.`)
   return value
 }
 
-export async function requireRegularFile(path, label) {
-  const metadata = await lstat(path).catch(() => undefined)
-  if (!metadata?.isFile() || metadata.isSymbolicLink()) fail(`${label} must be a regular file and symbolic links are forbidden.`)
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+}
+
+export async function withStableRegularFile(path, label, reader) {
+  const before = await lstat(path).catch(() => undefined)
+  if (!before?.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    fail(`${label} must be one regular, non-linked file; symbolic links are forbidden.`)
+  }
   if (await realpath(path).catch(() => undefined) !== path) fail(`${label} path components must not use symbolic links.`)
-  return metadata
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(() => undefined)
+  if (!handle) fail(`${label} could not be opened without following links.`)
+  try {
+    const opened = await handle.stat()
+    if (!opened.isFile() || opened.nlink !== 1 || !sameFileIdentity(before, opened)) fail(`${label} changed while opening.`)
+    const result = await reader(handle, opened)
+    const [afterHandle, afterPath] = await Promise.all([handle.stat(), lstat(path).catch(() => undefined)])
+    if (
+      !afterPath?.isFile()
+      || afterPath.isSymbolicLink()
+      || afterPath.nlink !== 1
+      || afterHandle.nlink !== 1
+      || !sameFileIdentity(opened, afterHandle)
+      || !sameFileIdentity(opened, afterPath)
+    ) fail(`${label} changed while reading.`)
+    return result
+  } finally {
+    await handle.close()
+  }
+}
+
+export async function readStableRegularFile(path, label, maximumBytes = Number.MAX_SAFE_INTEGER) {
+  return withStableRegularFile(path, label, async (handle, metadata) => {
+    if (metadata.size > maximumBytes) fail(`${label} exceeds its size limit.`)
+    const bytes = await handle.readFile()
+    if (bytes.byteLength !== metadata.size) fail(`${label} changed while reading.`)
+    return bytes
+  })
+}
+
+export async function requireRegularFile(path, label) {
+  return withStableRegularFile(path, label, async (_handle, metadata) => metadata)
 }
 
 export async function requireDirectory(path, label) {
@@ -76,7 +142,7 @@ export function canonicalJson(value) {
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
   if (!plainRecord(value)) fail('JSON must contain plain values only.')
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  return `{${Object.keys(value).sort(compareUtf8).map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
 }
 
 export function canonicalBytes(value) {
@@ -95,8 +161,8 @@ function plainRecord(value) {
 
 function exactKeys(value, expected) {
   if (!plainRecord(value)) return false
-  const actual = Object.keys(value).sort()
-  const sortedExpected = [...expected].sort()
+  const actual = Object.keys(value).sort(compareUtf8)
+  const sortedExpected = [...expected].sort(compareUtf8)
   return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index])
 }
 
@@ -173,7 +239,7 @@ export function validatePackDescriptor(value) {
   const paths = new Set()
   let expandedBytes = 0
   for (const entry of value.entries) {
-    if (!exactKeys(entry, ['path', 'sha256', 'bytes', 'executable'])) fail('Converter pack entry has an invalid schema.')
+    if (!exactKeys(entry, ['path', 'sha256', 'bytes', 'executable', 'role'])) fail('Converter pack entry has an invalid schema.')
     if (
       !safeEntryPath(entry.path)
       || typeof entry.sha256 !== 'string'
@@ -182,6 +248,11 @@ export function validatePackDescriptor(value) {
       || entry.bytes < 0
       || entry.bytes > PACK_LIMITS.maxEntryBytes
       || typeof entry.executable !== 'boolean'
+      || !packRoles.has(entry.role)
+      || entry.executable !== (entry.role === 'executable')
+      || (entry.role === 'license') !== entry.path.startsWith('LICENSES/')
+      || (launchableExtension.test(entry.path) && entry.role !== 'executable')
+      || (codeExtension.test(entry.path) && entry.role !== 'code' && entry.role !== 'executable')
     ) fail('Converter pack entry is invalid.')
     expandedBytes += entry.bytes
     if (!Number.isSafeInteger(expandedBytes) || expandedBytes > PACK_LIMITS.maxExpandedBytes) {
@@ -192,12 +263,19 @@ export function validatePackDescriptor(value) {
     paths.add(key)
   }
   validateExecutableSet(value.name, value.platform, value.entries.filter((entry) => entry.executable).map((entry) => entry.path))
-  const licenses = value.entries.filter((entry) => entry.path.startsWith('LICENSES/') && !entry.executable && entry.bytes > 0)
+  const licenses = value.entries.filter((entry) => entry.role === 'license' && entry.bytes > 0)
   if (licenses.length === 0) fail('Converter pack is missing a license notice.')
   return value
 }
 
-export function validateIndex(value) {
+const productionCoordinates = new Set(PACK_NAMES.flatMap((name) => [
+  `${name}\0darwin\0arm64`,
+  `${name}\0darwin\0x64`,
+  `${name}\0win32\0x64`,
+]))
+
+export function validateIndex(value, mode = 'test') {
+  releaseMode(mode)
   if (!exactKeys(value, ['schemaVersion', 'generatedAt', 'sequence', 'packs'])) fail('Converter pack index has an invalid schema.')
   if (
     value.schemaVersion !== 1
@@ -220,6 +298,14 @@ export function validateIndex(value) {
     if (coordinates.has(coordinate)) fail('Converter pack coordinates must be unique.')
     coordinates.add(coordinate)
   }
+  if (mode === 'production') {
+    const inventory = new Set(value.packs.map((pack) => `${pack.name}\0${pack.platform}\0${pack.arch}`))
+    if (
+      value.packs.length !== productionCoordinates.size
+      || inventory.size !== productionCoordinates.size
+      || [...inventory].some((coordinate) => !productionCoordinates.has(coordinate))
+    ) fail('Production release must contain exactly four pack families for all three approved targets.')
+  }
   return value
 }
 
@@ -234,18 +320,38 @@ export function validateExecutableSet(name, platform, executables) {
 }
 
 export async function readCanonicalJson(path, label) {
-  await requireRegularFile(path, label)
-  const bytes = await readFile(path)
+  const bytes = await readStableRegularFile(path, label)
   let value
   try { value = JSON.parse(bytes.toString('utf8')) } catch { fail(`${label} is not valid JSON.`) }
   return { bytes, value }
 }
 
-export async function collectPayloadEntries(root, declaredExecutables, declaredLicenses) {
+function payloadCodeKind(path, bytes) {
+  if (launchableExtension.test(path)) return 'launchable'
+  if (
+    codeExtension.test(path)
+    || bytes.subarray(0, 2).equals(Buffer.from('#!'))
+    || bytes.subarray(0, 2).equals(Buffer.from('MZ'))
+    || bytes.subarray(0, 4).equals(Buffer.from('7f454c46', 'hex'))
+    || ['feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe'].includes(bytes.subarray(0, 4).toString('hex'))
+  ) return 'code'
+  return 'data'
+}
+
+export async function collectPayloadEntries(root, declaredFiles, platform) {
   await requireDirectory(root, 'Pack payload')
   const resolvedRoot = await realpath(root)
-  const executableSet = new Set(declaredExecutables)
-  const licenseSet = new Set(declaredLicenses)
+  const inventory = new Map()
+  for (const file of declaredFiles) {
+    if (
+      !plainRecord(file)
+      || !exactKeys(file, ['path', 'role'])
+      || !safeEntryPath(file.path)
+      || !packRoles.has(file.role)
+      || inventory.has(file.path.toLowerCase())
+    ) fail('Pack manifest file inventory is invalid.')
+    inventory.set(file.path.toLowerCase(), file)
+  }
   const entries = []
   let expandedBytes = 0
   const visit = async (directory, prefix = '') => {
@@ -271,23 +377,26 @@ export async function collectPayloadEntries(root, declaredExecutables, declaredL
       if (!Number.isSafeInteger(expandedBytes) || expandedBytes > PACK_LIMITS.maxExpandedBytes) {
         fail('Pack payload exceeds converter pack limits.')
       }
-      const bytes = await readFile(absolutePath)
-      const executable = executableSet.has(relativePath)
-      const executableLike = (metadata.mode & 0o111) !== 0 || relativePath.toLowerCase().endsWith('.exe')
-      if (executableLike !== executable) fail('Pack payload contains an unknown executable or incorrect executable mode.')
-      if ((metadata.mode & 0o777) !== (executable ? 0o755 : 0o644)) fail('Pack payload file modes must be exactly 0755 or 0644.')
-      entries.push({ path: relativePath, bytes, executable, sha256: sha256(bytes) })
+      const declared = inventory.get(relativePath.toLowerCase())
+      if (!declared || declared.path !== relativePath) fail('Pack payload contains executable or code outside the explicit inventory.')
+      const bytes = await readStableRegularFile(absolutePath, `Pack payload ${relativePath}`, PACK_LIMITS.maxEntryBytes)
+      if (bytes.byteLength !== metadata.size) fail(`Pack payload ${relativePath} changed while reading.`)
+      const codeKind = payloadCodeKind(relativePath, bytes)
+      if (codeKind === 'launchable' && declared.role !== 'executable') fail('Pack payload contains launchable code outside the executable allowlist.')
+      if (codeKind === 'code' && declared.role !== 'code' && declared.role !== 'executable') fail('Pack payload contains unclassified code.')
+      if (codeKind === 'data' && declared.role === 'code') fail('Pack payload code role does not match its content or extension.')
+      if ((declared.role === 'license') !== relativePath.startsWith('LICENSES/')) fail('Pack payload license role is invalid.')
+      if (declared.role === 'license' && bytes.byteLength === 0) fail('Pack payload is missing a declared license notice.')
+      const executable = declared.role === 'executable'
+      const expectedSourceMode = platform === 'darwin' && executable ? 0o755 : 0o644
+      if ((metadata.mode & 0o777) !== expectedSourceMode) fail('Pack payload file mode is invalid for its target platform.')
+      entries.push({ path: relativePath, bytes, executable, role: declared.role, sha256: sha256(bytes) })
     }
   }
   await visit(root)
   if (entries.length === 0) fail('Pack payload is empty.')
-  for (const license of licenseSet) {
-    const entry = entries.find((candidate) => candidate.path === license)
-    if (!entry || entry.executable || entry.bytes.byteLength === 0 || !license.startsWith('LICENSES/')) {
-      fail('Pack payload is missing a declared license notice.')
-    }
-  }
-  if (licenseSet.size === 0) fail('Pack payload is missing a declared license notice.')
+  if (entries.length !== inventory.size) fail('Pack payload is missing a file or license from the explicit inventory.')
+  if (!entries.some((entry) => entry.role === 'license')) fail('Pack payload is missing a declared license notice.')
   return entries
 }
 
@@ -400,6 +509,9 @@ export function verifyRestrictedUstar(archive, descriptor) {
     if (size !== entry.bytes || mode !== (entry.executable ? 0o755 : 0o644)) fail('Archive entry metadata mismatch.')
     const bytes = archive.subarray(offset, offset + size)
     if (bytes.byteLength !== size || sha256(bytes) !== entry.sha256) fail('Archive entry hash mismatch.')
+    const codeKind = payloadCodeKind(path, bytes)
+    if (codeKind === 'launchable' && entry.role !== 'executable') fail('Archive contains unclassified launchable code.')
+    if (codeKind === 'code' && entry.role !== 'code' && entry.role !== 'executable') fail('Archive contains unclassified code.')
     offset += size
     const padding = (512 - (size % 512)) % 512
     if (!archive.subarray(offset, offset + padding).every((value) => value === 0)) fail('Archive padding is unsafe.')
@@ -411,7 +523,7 @@ export function verifyRestrictedUstar(archive, descriptor) {
 
 export function archiveFilename(descriptor) {
   const url = new URL(descriptor.archiveUrl)
-  const name = basename(url.pathname)
+  const name = posix.basename(url.pathname)
   if (!safeEntryPath(name) || name.includes('/') || !name.endsWith('.tar')) fail('Archive URL must end in a safe .tar filename.')
   return name
 }

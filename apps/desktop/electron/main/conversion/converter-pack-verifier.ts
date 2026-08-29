@@ -47,6 +47,13 @@ const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 // deliberately limits every segment to ASCII letters, digits, dot, dash, and
 // underscore so the same signed name has one meaning on macOS and Windows.
 const portablePathSegment = /^[A-Za-z0-9._-]+$/u
+const packRoles = new Set(['executable', 'code', 'license', 'data'])
+const launchableExtension = /\.(?:exe|com|cmd|bat|ps1|scr|msi)$/iu
+const codeExtension = /(?:\.(?:dll|dylib|node|jar|py|pyc|pyd|pl|rb|sh|bash|zsh|fish|vbs|wsf|js|mjs|cjs)|\.so(?:\.[0-9]+)*)$/iu
+
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'))
+}
 
 function failure(reason: ConstructorParameters<typeof ConverterPackError>[0]): never {
   throw new ConverterPackError(reason)
@@ -62,8 +69,8 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value).sort()
-  const expected = [...keys].sort()
+  const actual = Object.keys(value).sort(compareUtf8)
+  const expected = [...keys].sort(compareUtf8)
   return actual.length === expected.length && actual.every((key, index) => key === expected[index])
 }
 
@@ -75,7 +82,7 @@ function canonicalJson(value: unknown): string {
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
   if (!record(value)) failure('index_invalid')
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  return `{${Object.keys(value).sort(compareUtf8).map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
 }
 
 export function canonicalConverterPackIndexBytes(index: unknown): Buffer {
@@ -196,13 +203,19 @@ function validatePack(value: unknown, limits: ConverterPackVerificationLimits): 
   const paths = new Set<string>()
   let expandedBytes = 0
   for (const entry of value.entries) {
-    if (!record(entry) || !exactKeys(entry, ['path', 'sha256', 'bytes', 'executable'])) failure('index_invalid')
+    if (!record(entry) || !exactKeys(entry, ['path', 'sha256', 'bytes', 'executable', 'role'])) failure('index_invalid')
     if (
       !safeConverterPackEntryPath(entry.path)
       || typeof entry.sha256 !== 'string'
       || !sha256Pattern.test(entry.sha256)
       || !boundedNonNegativeInteger(entry.bytes, limits.maxEntryBytes)
       || typeof entry.executable !== 'boolean'
+      || typeof entry.role !== 'string'
+      || !packRoles.has(entry.role)
+      || entry.executable !== (entry.role === 'executable')
+      || (entry.role === 'license') !== entry.path.startsWith('LICENSES/')
+      || (launchableExtension.test(entry.path) && entry.role !== 'executable')
+      || (codeExtension.test(entry.path) && entry.role !== 'code' && entry.role !== 'executable')
     ) failure('index_invalid')
     const collisionKey = converterPackPortablePathKey(entry.path)
     if (paths.has(collisionKey)) failure('index_invalid')

@@ -12,7 +12,7 @@ const sha = '0'.repeat(64)
 function sortJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortJson)
   if (typeof value !== 'object' || value === null) return value
-  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => Buffer.compare(Buffer.from(left), Buffer.from(right)))
     .map(([key, child]) => [key, sortJson(child)]))
 }
 
@@ -33,7 +33,7 @@ function fixtureIndex(overrides: Record<string, unknown> = {}): ConverterPackInd
       archiveUrl: 'https://packs.test/image-icon-1.2.3-darwin-arm64.tar',
       archiveSha256: sha,
       archiveBytes: 2_048,
-      entries: [{ path: 'bin/image-converter', sha256: sha, bytes: 12, executable: true }],
+      entries: [{ path: 'bin/image-converter', sha256: sha, bytes: 12, executable: true, role: 'executable' }],
     }],
     ...overrides,
   } as ConverterPackIndex
@@ -48,6 +48,49 @@ function signed(index: unknown, keyPair = generateKeyPairSync('ed25519')) {
 }
 
 describe('converter pack index verification', () => {
+  it('requires an explicit signed role for every entry and keeps executable identity consistent', () => {
+    const baseWithRole = fixtureIndex()
+    const legacyEntry: Record<string, unknown> = { ...baseWithRole.packs[0]!.entries[0]! }
+    delete legacyEntry.role
+    const legacy = signed({
+      ...baseWithRole,
+      packs: [{ ...baseWithRole.packs[0]!, entries: [legacyEntry] }],
+    })
+    expect(() => verifyConverterPackIndex({ ...legacy, minimumSequence: 0 }))
+      .toThrowError(expect.objectContaining({ reason: 'index_invalid' }))
+
+    const base = fixtureIndex()
+    const executable = {
+      ...base,
+      packs: [{
+        ...base.packs[0]!,
+        entries: [{ ...base.packs[0]!.entries[0]!, role: 'executable' }],
+      }],
+    }
+    const accepted = signed(executable)
+    expect(verifyConverterPackIndex({ ...accepted, minimumSequence: 0 })).toEqual(executable)
+
+    const inconsistent = signed({
+      ...executable,
+      packs: [{
+        ...executable.packs[0]!,
+        entries: [{ ...executable.packs[0]!.entries[0]!, role: 'data' }],
+      }],
+    })
+    expect(() => verifyConverterPackIndex({ ...inconsistent, minimumSequence: 0 }))
+      .toThrowError(expect.objectContaining({ reason: 'index_invalid' }))
+
+    const disguisedCode = signed({
+      ...executable,
+      packs: [{
+        ...executable.packs[0]!,
+        entries: [{ ...executable.packs[0]!.entries[0]!, path: 'bin/hidden.dll', executable: false, role: 'data' }],
+      }],
+    })
+    expect(() => verifyConverterPackIndex({ ...disguisedCode, minimumSequence: 0 }))
+      .toThrowError(expect.objectContaining({ reason: 'index_invalid' }))
+  })
+
   it('canonicalizes stable-key UTF-8 JSON independently of insertion order', () => {
     const bytes = canonicalConverterPackIndexBytes({ z: 1, a: { z: '万象', a: true }, list: [3, 2, 1] })
     expect(bytes).toEqual(Buffer.from('{"a":{"a":true,"z":"万象"},"list":[3,2,1],"z":1}', 'utf8'))
@@ -155,7 +198,7 @@ describe('converter pack index verification', () => {
     const base = fixtureIndex()
     const cases = [
       { ...base, packs: [{ ...base.packs[0]!, archiveBytes: 4_097 }] },
-      { ...base, packs: [{ ...base.packs[0]!, entries: [base.packs[0]!.entries[0]!, { path: 'bin/second', sha256: sha, bytes: 1, executable: false }] }] },
+      { ...base, packs: [{ ...base.packs[0]!, entries: [base.packs[0]!.entries[0]!, { path: 'bin/second', sha256: sha, bytes: 1, executable: false, role: 'data' }] }] },
       { ...base, packs: [{ ...base.packs[0]!, entries: [{ ...base.packs[0]!.entries[0]!, bytes: 2_049 }] }] },
     ]
     for (const index of cases) {
@@ -179,6 +222,7 @@ describe('converter pack index verification', () => {
           sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
           bytes: 0,
           executable: false,
+          role: 'data',
         }],
       }],
     })

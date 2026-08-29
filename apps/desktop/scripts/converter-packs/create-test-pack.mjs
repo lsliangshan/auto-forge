@@ -30,7 +30,7 @@ function canonicalJson(value) {
     return JSON.stringify(value)
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  return `{${Object.keys(value).sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right))).map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
 }
 
 function writeString(block, offset, length, value) {
@@ -114,7 +114,7 @@ export async function createTestConverterPack(options) {
       archiveUrl,
       archiveSha256: digest(archive),
       archiveBytes: archive.byteLength,
-      entries: [{ path: executablePath, sha256: digest(executable), bytes: executable.byteLength, executable: true }],
+      entries: [{ path: executablePath, sha256: digest(executable), bytes: executable.byteLength, executable: true, role: 'executable' }],
     }],
   }
   const indexBytes = Buffer.from(canonicalJson(index), 'utf8')

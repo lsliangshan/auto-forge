@@ -126,7 +126,7 @@ function sha256(bytes: Uint8Array): string {
 function sortJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortJson)
   if (typeof value !== 'object' || value === null) return value
-  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => Buffer.compare(Buffer.from(left), Buffer.from(right)))
     .map(([key, child]) => [key, sortJson(child)]))
 }
 
@@ -159,7 +159,7 @@ function signedIndex(input: {
       archiveSha256: input.archiveSha256 ?? sha256(input.archive),
       archiveBytes: input.archiveBytes ?? input.archive.byteLength,
       entries: input.entries ?? [{
-        path: 'bin/tool', sha256: sha256(executable), bytes: executable.byteLength, executable: true,
+        path: 'bin/tool', sha256: sha256(executable), bytes: executable.byteLength, executable: true, role: 'executable',
       }],
     }],
   }
@@ -254,7 +254,7 @@ describe('ConverterPackManager download and installation', () => {
     const entryMismatch = signedIndex({
       archive,
       archiveUrl: `https://127.0.0.1:${port}/entry.tar`,
-      entries: [{ path: 'bin/tool', sha256: '0'.repeat(64), bytes: executable.byteLength, executable: true }],
+      entries: [{ path: 'bin/tool', sha256: '0'.repeat(64), bytes: executable.byteLength, executable: true, role: 'executable' }],
       ...keyPair,
     })
     await expect(manager(packsRoot, publicKey).acquire({
@@ -330,9 +330,9 @@ describe('ConverterPackManager download and installation', () => {
       tar([{ path: 'bin/tool', bytes: executable, mode: 0o755 }]),
     ]
     const entries: ConverterPackEntry[][] = [
-      [{ path: 'bin/tool', sha256: sha256(executable), bytes: executable.byteLength, executable: true }],
-      [{ path: 'bin/tool', sha256: sha256(executable), bytes: executable.byteLength, executable: true }],
-      [{ path: 'bin/tool', sha256: sha256(executable), bytes: executable.byteLength, executable: false }],
+      [{ path: 'bin/tool', sha256: sha256(executable), bytes: executable.byteLength, executable: true, role: 'executable' }],
+      [{ path: 'bin/tool', sha256: sha256(executable), bytes: executable.byteLength, executable: true, role: 'executable' }],
+      [{ path: 'bin/tool', sha256: sha256(executable), bytes: executable.byteLength, executable: false, role: 'data' }],
     ]
     for (let index = 0; index < archives.length; index += 1) {
       const packsRoot = await temporaryRoot()

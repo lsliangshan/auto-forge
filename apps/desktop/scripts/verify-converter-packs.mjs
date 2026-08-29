@@ -1,25 +1,89 @@
 import { createPublicKey, verify as verifySignature } from 'node:crypto'
 import { Buffer } from 'node:buffer'
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import { lstat, readFile, readdir } from 'node:fs/promises'
-import { isAbsolute, join } from 'node:path'
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+} from 'node:fs'
+import { readdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import {
+  approvedTarget,
   archiveFilename,
   canonicalBytes,
+  compareUtf8,
   fail,
   parseArguments,
+  readStableRegularFile,
+  releaseMode,
   requireAbsolutePath,
   requireDirectory,
-  requireRegularFile,
   sha256,
   validateIndex,
   verifyRestrictedUstar,
 } from './converter-packs/pack-tooling-lib.mjs'
 
-function decodeAsarHeader(path) {
-  const bytes = readFileSync(path)
+const desktopRoot = fileURLToPath(new URL('..', import.meta.url))
+// Electron's Node runtime otherwise treats every `.asar` path as a virtual
+// filesystem. Boundary verification must inspect the regular archive itself.
+process.noAsar = true
+const privateKeyPattern = /-----BEGIN [^-\r\n]*PRIVATE KEY-----/u
+const forbiddenSegments = new Set([
+  'test', 'tests', '__tests__', 'spec', 'fixtures', 'e2e', '.e2e', 'stale', 'test-results', 'playwright-report',
+])
+const forbiddenEngineNames = new Set([
+  'ffmpeg', 'ffmpeg.exe', 'ffprobe', 'ffprobe.exe', 'soffice', 'soffice.exe',
+  'autoforge-image-converter', 'autoforge-image-converter.exe',
+  'autoforge-pdf-raster', 'autoforge-pdf-raster.exe', 'pdfinfo', 'pdfinfo.exe',
+])
+
+function sameFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+}
+
+function readStableRegularFileSync(path, label) {
+  const before = lstatSync(path)
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || realpathSync(path) !== path) {
+    fail(`${label} must be one regular, non-linked file without symbolic path components.`)
+  }
+  let descriptor
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    const opened = fstatSync(descriptor)
+    if (!opened.isFile() || opened.nlink !== 1 || !sameFile(before, opened)) fail(`${label} changed while opening.`)
+    const bytes = readFileSync(descriptor)
+    const afterHandle = fstatSync(descriptor)
+    const afterPath = lstatSync(path)
+    if (
+      bytes.byteLength !== opened.size
+      || afterHandle.nlink !== 1
+      || afterPath.nlink !== 1
+      || !sameFile(opened, afterHandle)
+      || !sameFile(opened, afterPath)
+    ) fail(`${label} changed while reading.`)
+    return bytes
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+  }
+}
+
+function requireStableDirectorySync(path, label) {
+  const metadata = lstatSync(path)
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || realpathSync(path) !== path) {
+    fail(`${label} must be a directory without symbolic path components.`)
+  }
+}
+
+function decodeAsar(path) {
+  const bytes = readStableRegularFileSync(path, 'Packaged app.asar')
   if (bytes.byteLength < 16 || bytes.readUInt32LE(0) !== 4) fail('Packaged app.asar header is invalid.')
   const headerSize = bytes.readUInt32LE(4)
   if (headerSize < 8 || 8 + headerSize > bytes.byteLength) fail('Packaged app.asar header is invalid.')
@@ -30,103 +94,144 @@ function decodeAsarHeader(path) {
   }
   let header
   try { header = JSON.parse(bytes.subarray(16, 16 + jsonBytes).toString('utf8')) } catch { fail('Packaged app.asar header is invalid.') }
-  return header
+  return { bytes, header, contentOffset: 8 + headerSize }
 }
 
-function flattenAsar(node, prefix = '', result = []) {
+function forbiddenPackagedPath(path) {
+  const lowerSegments = path.split('/').map((segment) => segment.toLowerCase())
+  const name = lowerSegments.at(-1) ?? ''
+  if (lowerSegments.some((segment) => forbiddenSegments.has(segment))) return 'stale/test/e2e'
+  if (forbiddenEngineNames.has(name)) return 'engine'
+  if (
+    /(?:^|[-_.])(?:private[-_]?key|test-converter-root)(?:[-_.]|$)/iu.test(name)
+    || /\.(?:pem|key|p12|pfx|tar|tgz|tar\.gz|zip|7z|rar|sig|asc)$/iu.test(name)
+    || /(?:^|\.)index\.sig$/iu.test(name)
+  ) return 'trust/archive/signature'
+  if (/\.(?:test|spec)\.(?:[cm]?[jt]sx?|vue)$/iu.test(name)) return 'test'
+  return undefined
+}
+
+function rejectPrivateKey(bytes, label) {
+  if (privateKeyPattern.test(bytes.toString('utf8'))) fail(`${label} contains private key material.`)
+}
+
+function scanAsarNode(node, archive, prefix = '') {
   if (typeof node !== 'object' || node === null || Array.isArray(node)) fail('Packaged app.asar file tree is invalid.')
   const files = node.files
-  if (typeof files !== 'object' || files === null || Array.isArray(files)) return result
-  for (const [name, value] of Object.entries(files)) {
+  if (typeof files !== 'object' || files === null || Array.isArray(files)) return
+  for (const name of Object.keys(files).sort(compareUtf8)) {
+    const value = files[name]
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) fail('Packaged app.asar file tree is invalid.')
     const path = prefix ? `${prefix}/${name}` : name
-    result.push(path)
-    flattenAsar(value, path, result)
+    const reason = forbiddenPackagedPath(path)
+    if (reason) fail(`Packaged app.asar contains forbidden ${reason} path: ${path}`)
+    if (value.files !== undefined) {
+      scanAsarNode(value, archive, path)
+      continue
+    }
+    if (value.unpacked === true) continue
+    const size = value.size
+    const offsetText = value.offset
+    if (!Number.isSafeInteger(size) || size < 0 || typeof offsetText !== 'string' || !/^(?:0|[1-9]\d*)$/u.test(offsetText)) {
+      fail('Packaged app.asar file tree is invalid.')
+    }
+    const offset = Number(offsetText)
+    if (!Number.isSafeInteger(offset) || archive.contentOffset + offset + size > archive.bytes.byteLength) {
+      fail('Packaged app.asar file tree is invalid.')
+    }
+    rejectPrivateKey(archive.bytes.subarray(archive.contentOffset + offset, archive.contentOffset + offset + size), `Packaged app.asar ${path}`)
   }
-  return result
+}
+
+function expectedMetadataBytes(name) {
+  const path = join(desktopRoot, 'resources', 'converter-packs', name)
+  const bytes = readStableRegularFileSync(path, `Pinned ${name}`)
+  let parsed
+  try { parsed = JSON.parse(bytes.toString('utf8')) } catch { fail(`Pinned ${name} is invalid.`) }
+  if (!bytes.equals(canonicalBytes(parsed))) fail(`Pinned ${name} is not canonical.`)
+  return bytes
 }
 
 function validateBootstrap(root) {
+  requireStableDirectorySync(root, 'Packaged converter metadata')
   const allowed = ['bootstrap.json', 'index.schema.json', 'root-public-key.pem']
-  const names = readdirSync(root).sort()
+  const names = readdirSync(root).sort(compareUtf8)
   if (names.some((name) => !allowed.includes(name))) fail('Packaged converter metadata contains an unexpected file.')
   if (!names.includes('bootstrap.json') || !names.includes('index.schema.json')) fail('Packaged converter metadata is incomplete.')
-  const bootstrap = JSON.parse(readFileSync(join(root, 'bootstrap.json'), 'utf8'))
-  const keys = Object.keys(bootstrap).sort()
+  for (const name of ['bootstrap.json', 'index.schema.json']) {
+    const packaged = readStableRegularFileSync(join(root, name), `Packaged ${name}`)
+    if (!packaged.equals(expectedMetadataBytes(name))) fail(`Packaged ${name} does not have exact canonical content.`)
+  }
+  const bootstrap = JSON.parse(readStableRegularFileSync(join(root, 'bootstrap.json'), 'Packaged bootstrap.json').toString('utf8'))
   if (
-    keys.join('\0') !== ['downloadsEnabled', 'indexUrl', 'requiredPackFamilies', 'rootPublicKeyFile', 'schemaVersion', 'supportedTargets'].sort().join('\0')
-    || bootstrap.schemaVersion !== 1
+    bootstrap.schemaVersion !== 1
     || bootstrap.downloadsEnabled !== false
     || bootstrap.indexUrl !== null
     || bootstrap.rootPublicKeyFile !== null
     || JSON.stringify(bootstrap.requiredPackFamilies) !== JSON.stringify(['image-icon', 'document', 'pdf', 'media'])
     || JSON.stringify(bootstrap.supportedTargets) !== JSON.stringify(['darwin-arm64', 'darwin-x64', 'win32-x64'])
   ) fail('Packaged converter bootstrap must remain fail-closed.')
-  if (names.includes('root-public-key.pem')) {
-    let key
-    try { key = createPublicKey(readFileSync(join(root, 'root-public-key.pem'))) } catch { fail('Packaged converter root key is invalid.') }
-    if (key.asymmetricKeyType !== 'ed25519') fail('Packaged converter root key is invalid.')
-    fail('Packaged root key is present while the converter download kill switch is disabled.')
-  }
+  if (names.includes('root-public-key.pem')) fail('Packaged root key is present while the converter download kill switch is disabled.')
 }
 
-function packagedResources(app) {
-  if (process.platform === 'darwin') return join(app, 'Contents', 'Resources')
-  if (process.platform === 'win32') return join(app, 'resources')
+function packagedResources(app, platform) {
+  if (platform === 'darwin') return join(app, 'Contents', 'Resources')
+  if (platform === 'win32') return join(app, 'resources')
   fail('Packaged converter verification supports macOS and Windows only.')
 }
 
-export function verifyPackagedConverterBoundary(appPath) {
+export function verifyPackagedConverterBoundary(appPath, { platform = process.platform, arch = process.arch } = {}) {
   requireAbsolutePath(appPath, 'Packaged app path')
-  const metadata = lstatSync(appPath)
-  if (!metadata.isDirectory() || metadata.isSymbolicLink() || realpathSync(appPath) !== appPath) fail('Packaged app path is invalid.')
-  const resources = packagedResources(appPath)
+  if (!approvedTarget(platform, arch)) fail('Packaged converter target is unsupported.')
+  requireStableDirectorySync(appPath, 'Packaged app path')
+  const resources = packagedResources(appPath, platform)
+  requireStableDirectorySync(resources, 'Packaged resources')
   const appAsar = join(resources, 'app.asar')
   const converterMetadata = join(resources, 'converter-packs')
-  if (!existsSync(appAsar) || !statSync(appAsar).isFile()) fail('Packaged app.asar is missing.')
-  if (!existsSync(converterMetadata) || !statSync(converterMetadata).isDirectory()) fail('Packaged converter metadata is missing.')
+  if (!existsSync(appAsar) || !existsSync(converterMetadata)) fail('Packaged converter boundary is incomplete.')
   validateBootstrap(converterMetadata)
-
-  const forbidden = /(?:^|\/)(?:[^/]*(?:private[-_]?key|test-converter-root)[^/]*|[^/]+\.pem|[^/]+\.tar|index\.sig|ffmpeg(?:\.exe)?|ffprobe(?:\.exe)?|soffice(?:\.exe)?|autoforge-image-converter(?:\.exe)?|autoforge-pdf-raster(?:\.exe)?)$/iu
-  const asarPaths = flattenAsar(decodeAsarHeader(appAsar))
-  if (asarPaths.some((path) => forbidden.test(path))) fail('Packaged app.asar contains forbidden converter trust or engine material.')
+  const archive = decodeAsar(appAsar)
+  scanAsarNode(archive.header, archive)
 
   const visit = (directory, prefix = '') => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => compareUtf8(a.name, b.name))) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name
       const absolute = join(directory, entry.name)
       const node = lstatSync(absolute)
       if (node.isSymbolicLink()) fail('Packaged resources contain a symbolic link.')
-      if (entry.isDirectory()) visit(absolute, path)
-      else if (path !== 'app.asar' && !path.startsWith('converter-packs/') && forbidden.test(path)) {
-        fail('Packaged resources contain forbidden converter trust or engine material.')
+      if (entry.isDirectory()) {
+        requireStableDirectorySync(absolute, `Packaged resource ${path}`)
+        visit(absolute, path)
+      } else {
+        const bytes = readStableRegularFileSync(absolute, `Packaged resource ${path}`)
+        if (path !== 'app.asar' && !path.startsWith('converter-packs/')) {
+          const reason = forbiddenPackagedPath(path)
+          if (reason) fail(`Packaged resources contain forbidden ${reason} path: ${path}`)
+          rejectPrivateKey(bytes, `Packaged resource ${path}`)
+        }
       }
     }
   }
   visit(resources)
-  process.stdout.write('verified packaged converter boundary: kill switch off, no private key, unsigned engine, archive, or fixture root\n')
+  process.stdout.write(`verified ${platform}-${arch} packaged converter boundary: kill switch off, no private key, unsigned engine, archive, signature, test, e2e, or stale material\n`)
 }
 
-export async function verifyConverterPackRelease({ root, publicKeyPath }) {
+export async function verifyConverterPackRelease({ root, publicKeyPath, mode = 'production' }) {
+  mode = releaseMode(mode)
   requireAbsolutePath(root, 'Release root')
   requireAbsolutePath(publicKeyPath, 'Public key path')
   await requireDirectory(root, 'Release root')
-  await requireRegularFile(publicKeyPath, 'Public key')
-  const rootReal = await realpathSafe(root)
-  const keyReal = await realpathSafe(publicKeyPath)
-  if (rootReal === keyReal || !isAbsolute(rootReal) || !isAbsolute(keyReal)) fail('Release verification paths are invalid.')
-  const indexPath = join(root, 'index.json')
-  const signaturePath = join(root, 'index.sig')
-  await requireRegularFile(indexPath, 'Index')
-  await requireRegularFile(signaturePath, 'Signature')
-  const indexBytes = await readFile(indexPath)
+  const indexBytes = await readStableRegularFile(join(root, 'index.json'), 'Index')
+  const signatureBytes = await readStableRegularFile(join(root, 'index.sig'), 'Signature')
+  const publicKeyBytes = await readStableRegularFile(publicKeyPath, 'Public key')
   let index
-  try { index = validateIndex(JSON.parse(indexBytes.toString('utf8'))) } catch { fail('Signed index is invalid.') }
+  try { index = validateIndex(JSON.parse(indexBytes.toString('utf8')), mode) } catch { fail('Signed index is invalid.') }
   if (!indexBytes.equals(canonicalBytes(index))) fail('Signed index is not canonical.')
-  const signatureText = (await readFile(signaturePath, 'utf8')).trim()
+  const signatureText = signatureBytes.toString('utf8').trim()
   const signature = Buffer.from(signatureText, 'base64')
   if (signature.byteLength !== 64 || signature.toString('base64') !== signatureText) fail('Signed index signature is invalid.')
   let publicKey
-  try { publicKey = createPublicKey(await readFile(publicKeyPath)) } catch { fail('Public key is invalid.') }
+  try { publicKey = createPublicKey(publicKeyBytes) } catch { fail('Public key is invalid.') }
   if (publicKey.asymmetricKeyType !== 'ed25519' || !verifySignature(null, indexBytes, publicKey, signature)) {
     fail('Signed index signature is invalid.')
   }
@@ -136,9 +241,7 @@ export async function verifyConverterPackRelease({ root, publicKeyPath }) {
     const archiveName = archiveFilename(descriptor)
     if (expectedNames.has(archiveName)) fail('Release contains duplicate archive names.')
     expectedNames.add(archiveName)
-    const archivePath = join(root, archiveName)
-    await requireRegularFile(archivePath, 'Pack archive')
-    const archive = await readFile(archivePath)
+    const archive = await readStableRegularFile(join(root, archiveName), 'Pack archive', descriptor.archiveBytes)
     if (archive.byteLength !== descriptor.archiveBytes) fail('Pack archive size mismatch.')
     if (sha256(archive) !== descriptor.archiveSha256) fail('Pack archive hash mismatch.')
     verifyRestrictedUstar(archive, descriptor)
@@ -151,18 +254,10 @@ export async function verifyConverterPackRelease({ root, publicKeyPath }) {
   process.stdout.write(`verified ${index.packs.length} signed converter pack${index.packs.length === 1 ? '' : 's'}\n`)
 }
 
-async function realpathSafe(path) {
-  const metadata = await lstat(path).catch(() => undefined)
-  if (!metadata || metadata.isSymbolicLink()) fail('Verification paths may not use symbolic links.')
-  const resolved = await import('node:fs/promises').then(({ realpath }) => realpath(path))
-  return resolved
-}
-
 function defaultPackagedApp() {
-  const desktop = fileURLToPath(new URL('..', import.meta.url))
-  if (process.platform === 'darwin' && process.arch === 'arm64') return join(desktop, 'dist', 'mac-arm64', 'AutoForge.app')
-  if (process.platform === 'darwin' && process.arch === 'x64') return join(desktop, 'dist', 'mac', 'AutoForge.app')
-  if (process.platform === 'win32' && process.arch === 'x64') return join(desktop, 'dist', 'win-unpacked')
+  if (process.platform === 'darwin' && process.arch === 'arm64') return join(desktopRoot, 'dist', 'mac-arm64', 'AutoForge.app')
+  if (process.platform === 'darwin' && process.arch === 'x64') return join(desktopRoot, 'dist', 'mac', 'AutoForge.app')
+  if (process.platform === 'win32' && process.arch === 'x64') return join(desktopRoot, 'dist', 'win-unpacked')
   fail('Packaged converter verification supports darwin arm64/x64 and win32 x64 only.')
 }
 
@@ -171,10 +266,10 @@ if (entry && import.meta.url === pathToFileURL(entry).href) {
   if (process.argv.length === 2) {
     verifyPackagedConverterBoundary(defaultPackagedApp())
   } else if (process.argv[2] === '--packaged-app') {
-    const args = parseArguments(process.argv.slice(2), ['--packaged-app'])
-    verifyPackagedConverterBoundary(args['--packaged-app'])
+    const args = parseArguments(process.argv.slice(2), ['--packaged-app', '--platform', '--arch'], ['--packaged-app'])
+    verifyPackagedConverterBoundary(args['--packaged-app'], { platform: args['--platform'] ?? process.platform, arch: args['--arch'] ?? process.arch })
   } else {
-    const args = parseArguments(process.argv.slice(2), ['--root', '--public-key'])
-    await verifyConverterPackRelease({ root: args['--root'], publicKeyPath: args['--public-key'] })
+    const args = parseArguments(process.argv.slice(2), ['--root', '--public-key', '--mode'], ['--root', '--public-key'])
+    await verifyConverterPackRelease({ root: args['--root'], publicKeyPath: args['--public-key'], mode: args['--mode'] })
   }
 }

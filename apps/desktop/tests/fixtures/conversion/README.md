@@ -23,9 +23,13 @@ bundle with this shape:
   fixtures/sample.mp4
 ```
 
-The index must contain all four pack families for the running platform and
-architecture. The preinstalled trees must exactly match the signed entry
-hashes and modes. `image-icon` declares `bin/autoforge-image-converter`,
+The fixture index is built, signed, and verified only with explicit
+`--mode test`; the production default requires the exact 12-coordinate
+inventory and rejects this single-platform subset. The index must contain all
+four pack families for the running platform and architecture. Every signed
+entry includes an explicit `executable`, `code`, `license`, or `data` role,
+and the preinstalled trees must exactly match the signed entry hashes and
+target modes. `image-icon` declares `bin/autoforge-image-converter`,
 `document` declares `program/soffice`, `pdf` declares
 `bin/autoforge-pdf-raster` plus `bin/pdfinfo`, and `media` declares `bin/ffmpeg`
 plus `bin/ffprobe`. Tests execute only these lease-resolved absolute paths;
@@ -33,15 +37,21 @@ they never search or fall back to system `PATH`. An invalid or unsigned bundle
 fails before any converter process starts.
 
 The minimal inputs are self-created deterministic shapes, text, tables,
-slides, tones, and color frames. `fixtures/PROVENANCE.md` must identify how
+slides, tones, and color frames. The WAV includes unique title, artist, and
+comment sentinels. The MP4 includes unique format title/artist/comment,
+video/audio handler names, and a chapter title; the matrix asserts those
+preconditions and then proves that every converted output removes them and
+all chapters. `fixtures/PROVENANCE.md` must identify how
 they were generated, the exact local engine versions, and their licenses.
 They contain no third-party document or media corpus. Generated fixture
 bundles and private test keys belong under repository-root `.test-artifacts/`,
 which is outside production `out/**` and is not committed or packaged.
 
-This suite checks content, not filenames: magic bytes, icon representations,
-transparent square padding, dimensions, PDF pages, animation frames, stream
-codecs, containers, duration, and first-frame metadata.
+This suite checks content, not filenames: magic bytes, every ICO/ICNS header
+and embedded representation, structural probes, transparent square padding,
+dimensions, PDF pages, animation frames, canonical `ffprobe` container names,
+exact stream types/codecs, duration, stripped sentinels/chapters, and
+first-frame metadata.
 
 Passing with a test root is local evidence only. Production release remains
 blocked until release engineering supplies the production root public key,

@@ -1,10 +1,13 @@
 import { createHash, generateKeyPairSync, sign as signBytes } from 'node:crypto'
 import {
   chmodSync,
+  copyFileSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -31,8 +34,20 @@ function temporaryRoot(): string {
   return root
 }
 
-function run(script: string, args: readonly string[]) {
-  return spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', cwd: desktopRoot })
+function run(script: string, args: readonly string[], env: NodeJS.ProcessEnv = process.env) {
+  return spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', cwd: desktopRoot, env })
+}
+
+function build(stage: string, output: string, mode: 'test' | 'production' = 'test', env?: NodeJS.ProcessEnv) {
+  return run(buildScript, ['--input', stage, '--output', output, '--mode', mode], env)
+}
+
+function signIndex(index: string, privateKey: string, mode: 'test' | 'production' = 'test') {
+  return run(signScript, ['--index', index, '--private-key', privateKey, '--mode', mode])
+}
+
+function verifyRelease(root: string, publicKey: string, mode: 'test' | 'production' = 'test') {
+  return run(verifyScript, ['--root', root, '--public-key', publicKey, '--mode', mode])
 }
 
 function canonicalJson(value: unknown): string {
@@ -65,11 +80,100 @@ function stagePack(root: string, overrides: Partial<Record<string, unknown>> = {
     platform: 'darwin',
     arch: 'arm64',
     archiveUrl: 'https://packs.example.test/media-1.0.0-darwin-arm64.tar',
-    executables: ['bin/ffmpeg'],
-    licenses: ['LICENSES/ffmpeg.txt'],
+    files: [
+      { path: 'bin/ffmpeg', role: 'executable' },
+      { path: 'LICENSES/ffmpeg.txt', role: 'license' },
+    ],
     ...overrides,
   }))
   return stage
+}
+
+const targetExecutablePaths = {
+  'image-icon': { darwin: ['bin/autoforge-image-converter'], win32: ['bin/autoforge-image-converter.exe'] },
+  document: { darwin: ['program/soffice'], win32: ['program/soffice.exe'] },
+  pdf: { darwin: ['bin/autoforge-pdf-raster', 'bin/pdfinfo'], win32: ['bin/autoforge-pdf-raster.exe', 'bin/pdfinfo.exe'] },
+  media: { darwin: ['bin/ffmpeg', 'bin/ffprobe'], win32: ['bin/ffmpeg.exe', 'bin/ffprobe.exe'] },
+} as const
+
+function stageProduction(root: string): string {
+  const stage = join(root, 'production-stage')
+  mkdirSync(join(stage, 'packs'), { recursive: true })
+  writeFileSync(join(stage, 'release.json'), JSON.stringify({
+    schemaVersion: 1,
+    generatedAt: '2026-08-29T00:00:00.000Z',
+    sequence: 13,
+  }))
+  for (const [platform, arch] of [['darwin', 'arm64'], ['darwin', 'x64'], ['win32', 'x64']] as const) {
+    for (const name of ['image-icon', 'document', 'pdf', 'media'] as const) {
+      const pack = join(stage, 'packs', `${name}-${platform}-${arch}`)
+      const payload = join(pack, 'payload')
+      const files = targetExecutablePaths[name][platform]
+      mkdirSync(join(payload, 'LICENSES'), { recursive: true })
+      for (const path of files) {
+        const absolute = join(payload, ...path.split('/'))
+        mkdirSync(join(absolute, '..'), { recursive: true })
+        writeFileSync(absolute, `${name} ${platform}-${arch} fixture\n`)
+        chmodSync(absolute, platform === 'darwin' ? 0o755 : 0o644)
+      }
+      const licensePath = `LICENSES/${name}.txt`
+      writeFileSync(join(payload, licensePath), `${name} fixture license\n`)
+      writeFileSync(join(pack, 'pack.json'), JSON.stringify({
+        schemaVersion: 1,
+        name,
+        version: '1.0.0',
+        platform,
+        arch,
+        archiveUrl: `https://packs.example.test/${name}-1.0.0-${platform}-${arch}.tar`,
+        files: [
+          ...files.map((path) => ({ path, role: 'executable' })),
+          { path: licensePath, role: 'license' },
+        ],
+      }))
+    }
+  }
+  return stage
+}
+
+function createAsar(path: string, files: Record<string, Buffer>) {
+  const header: { files: Record<string, unknown> } = { files: {} }
+  const payloads: Buffer[] = []
+  let offset = 0
+  for (const name of Object.keys(files).sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))) {
+    const segments = name.split('/')
+    let directory = header
+    for (const segment of segments.slice(0, -1)) {
+      const node = (directory.files[segment] ??= { files: {} }) as { files: Record<string, unknown> }
+      directory = node
+    }
+    const bytes = files[name]!
+    directory.files[segments.at(-1)!] = { size: bytes.byteLength, offset: String(offset) }
+    payloads.push(bytes)
+    offset += bytes.byteLength
+  }
+  const json = Buffer.from(JSON.stringify(header))
+  const innerPayloadBytes = 4 + Math.ceil(json.byteLength / 4) * 4
+  const inner = Buffer.alloc(4 + innerPayloadBytes)
+  inner.writeUInt32LE(innerPayloadBytes, 0)
+  inner.writeUInt32LE(json.byteLength, 4)
+  json.copy(inner, 8)
+  const outer = Buffer.alloc(8)
+  outer.writeUInt32LE(4, 0)
+  outer.writeUInt32LE(inner.byteLength, 4)
+  const temporary = `${path}.building`
+  writeFileSync(temporary, Buffer.concat([outer, inner, ...payloads]))
+  renameSync(temporary, path)
+}
+
+function packagedApp(root: string, platform: 'darwin' | 'win32', files: Record<string, Buffer> = { 'package.json': Buffer.from('{}') }) {
+  const app = join(root, platform === 'darwin' ? 'Fixture.app' : 'win-unpacked')
+  const resources = platform === 'darwin' ? join(app, 'Contents', 'Resources') : join(app, 'resources')
+  const converter = join(resources, 'converter-packs')
+  mkdirSync(converter, { recursive: true })
+  createAsar(join(resources, 'app.asar'), files)
+  copyFileSync(join(desktopRoot, 'resources/converter-packs/bootstrap.json'), join(converter, 'bootstrap.json'))
+  copyFileSync(join(desktopRoot, 'resources/converter-packs/index.schema.json'), join(converter, 'index.schema.json'))
+  return { app, resources, converter }
 }
 
 function keyPair(root: string) {
@@ -90,8 +194,8 @@ describe('converter pack release tooling', () => {
     const second = join(root, 'release-b')
     const keys = keyPair(root)
 
-    expect(run(buildScript, ['--input', stage, '--output', first])).toMatchObject({ status: 0 })
-    expect(run(buildScript, ['--input', stage, '--output', second])).toMatchObject({ status: 0 })
+    expect(build(stage, first)).toMatchObject({ status: 0 })
+    expect(build(stage, second)).toMatchObject({ status: 0 })
     const firstIndex = readFileSync(join(first, 'index.json'))
     expect(firstIndex.equals(readFileSync(join(second, 'index.json')))).toBe(true)
     const index = JSON.parse(firstIndex.toString('utf8')) as { packs: Array<{ archiveUrl: string }> }
@@ -99,21 +203,24 @@ describe('converter pack release tooling', () => {
     const archiveFile = basename(new URL(index.packs[0]!.archiveUrl).pathname)
     expect(readFileSync(join(first, archiveFile)).equals(readFileSync(join(second, archiveFile)))).toBe(true)
 
-    const signed = run(signScript, ['--index', join(first, 'index.json'), '--private-key', keys.privateKey])
+    const signed = signIndex(join(first, 'index.json'), keys.privateKey)
     expect(signed.status).toBe(0)
     expect(`${signed.stdout}${signed.stderr}`).not.toContain(keys.privateKey)
-    const verified = run(verifyScript, ['--root', first, '--public-key', keys.publicKey])
+    const repeatedSignature = signIndex(join(second, 'index.json'), keys.privateKey)
+    expect(repeatedSignature.status).toBe(0)
+    expect(readFileSync(join(first, 'index.sig'))).toEqual(readFileSync(join(second, 'index.sig')))
+    const verified = verifyRelease(first, keys.publicKey)
     expect(verified.status).toBe(0)
     expect(verified.stdout).toContain('verified 1 signed converter pack')
   })
 
   it.each([
-    [buildScript, ['--input', 'relative-stage', '--output', '/tmp/release']],
-    [buildScript, ['--input', '/tmp/stage', '--output', 'relative-release']],
-    [signScript, ['--index', 'relative-index.json', '--private-key', '/tmp/private.pem']],
-    [signScript, ['--index', '/tmp/index.json', '--private-key', 'relative-private.pem']],
-    [verifyScript, ['--root', 'relative-release', '--public-key', '/tmp/public.pem']],
-    [verifyScript, ['--root', '/tmp/release', '--public-key', 'relative-public.pem']],
+    [buildScript, ['--input', 'relative-stage', '--output', '/tmp/release', '--mode', 'test']],
+    [buildScript, ['--input', '/tmp/stage', '--output', 'relative-release', '--mode', 'test']],
+    [signScript, ['--index', 'relative-index.json', '--private-key', '/tmp/private.pem', '--mode', 'test']],
+    [signScript, ['--index', '/tmp/index.json', '--private-key', 'relative-private.pem', '--mode', 'test']],
+    [verifyScript, ['--root', 'relative-release', '--public-key', '/tmp/public.pem', '--mode', 'test']],
+    [verifyScript, ['--root', '/tmp/release', '--public-key', 'relative-public.pem', '--mode', 'test']],
   ])('rejects relative paths before filesystem access: %s', (script, args) => {
     const result = run(script, args)
     expect(result.status).not.toBe(0)
@@ -125,26 +232,23 @@ describe('converter pack release tooling', () => {
     const stage = stagePack(root)
     symlinkSync(join(stage, 'packs', 'media-darwin-arm64', 'payload', 'LICENSES', 'ffmpeg.txt'),
       join(stage, 'packs', 'media-darwin-arm64', 'payload', 'LICENSES', 'linked.txt'))
-    const built = run(buildScript, ['--input', stage, '--output', join(root, 'release')])
+    const built = build(stage, join(root, 'release'))
     expect(built.status).not.toBe(0)
     expect(built.stderr).toContain('symbolic links')
 
     rmSync(join(stage, 'packs', 'media-darwin-arm64', 'payload', 'LICENSES', 'linked.txt'))
     const parentLink = join(root, 'linked-parent')
     symlinkSync(root, parentLink)
-    const linkedParent = run(buildScript, [
-      '--input', join(parentLink, 'stage'),
-      '--output', join(root, 'release-linked-parent'),
-    ])
+    const linkedParent = build(join(parentLink, 'stage'), join(root, 'release-linked-parent'))
     expect(linkedParent.status).not.toBe(0)
     expect(linkedParent.stderr).toContain('symbolic links')
 
     const output = join(root, 'release-valid')
-    expect(run(buildScript, ['--input', stage, '--output', output]).status).toBe(0)
+    expect(build(stage, output).status).toBe(0)
     const keys = keyPair(root)
     const keyLink = join(root, 'linked-private.pem')
     symlinkSync(keys.privateKey, keyLink)
-    const signed = run(signScript, ['--index', join(output, 'index.json'), '--private-key', keyLink])
+    const signed = signIndex(join(output, 'index.json'), keyLink)
     expect(signed.status).not.toBe(0)
     expect(signed.stderr).toContain('symbolic links')
     expect(signed.stderr).not.toContain(keys.privateKey)
@@ -195,7 +299,7 @@ describe('converter pack release tooling', () => {
       const root = temporaryRoot()
       const stage = stagePack(root)
       item.prepare(stage)
-      const result = run(buildScript, ['--input', stage, '--output', join(root, 'release')])
+      const result = build(stage, join(root, 'release'))
       expect(result.status, item.name).not.toBe(0)
       expect(result.stderr.toLowerCase(), item.name).toContain(item.message)
     }
@@ -206,18 +310,18 @@ describe('converter pack release tooling', () => {
     const stage = stagePack(root)
     const output = join(root, 'release')
     const keys = keyPair(root)
-    expect(run(buildScript, ['--input', stage, '--output', output]).status).toBe(0)
+    expect(build(stage, output).status).toBe(0)
 
-    const unsigned = run(verifyScript, ['--root', output, '--public-key', keys.publicKey])
+    const unsigned = verifyRelease(output, keys.publicKey)
     expect(unsigned.status).not.toBe(0)
     expect(unsigned.stderr.toLowerCase()).toContain('signature')
 
-    expect(run(signScript, ['--index', join(output, 'index.json'), '--private-key', keys.privateKey]).status).toBe(0)
+    expect(signIndex(join(output, 'index.json'), keys.privateKey).status).toBe(0)
     const cleanOutput = join(root, 'clean-release')
-    expect(run(buildScript, ['--input', stage, '--output', cleanOutput]).status).toBe(0)
-    expect(run(signScript, ['--index', join(cleanOutput, 'index.json'), '--private-key', keys.privateKey]).status).toBe(0)
+    expect(build(stage, cleanOutput).status).toBe(0)
+    expect(signIndex(join(cleanOutput, 'index.json'), keys.privateKey).status).toBe(0)
     writeFileSync(join(cleanOutput, 'unexpected-engine'), 'unsigned engine')
-    const unknown = run(verifyScript, ['--root', cleanOutput, '--public-key', keys.publicKey])
+    const unknown = verifyRelease(cleanOutput, keys.publicKey)
     expect(unknown.status).not.toBe(0)
     expect(unknown.stderr.toLowerCase()).toContain('unexpected')
 
@@ -226,7 +330,7 @@ describe('converter pack release tooling', () => {
     const archive = readFileSync(join(output, archiveFile))
     archive[archive.byteLength - 1] ^= 1
     writeFileSync(join(output, archiveFile), archive)
-    const mismatched = run(verifyScript, ['--root', output, '--public-key', keys.publicKey])
+    const mismatched = verifyRelease(output, keys.publicKey)
     expect(mismatched.status).not.toBe(0)
     expect(mismatched.stderr).toContain('hash')
     expect(basename(keys.privateKey)).not.toBe('index.sig')
@@ -237,7 +341,7 @@ describe('converter pack release tooling', () => {
     const stage = stagePack(root)
     const output = join(root, 'unsafe-release')
     const keys = keyPair(root)
-    expect(run(buildScript, ['--input', stage, '--output', output]).status).toBe(0)
+    expect(build(stage, output).status).toBe(0)
     const indexPath = join(output, 'index.json')
     const index = JSON.parse(readFileSync(indexPath, 'utf8')) as {
       packs: Array<{ archiveUrl: string; archiveSha256: string }>
@@ -252,9 +356,9 @@ describe('converter pack release tooling', () => {
     writeFileSync(archivePath, archive)
     index.packs[0]!.archiveSha256 = createHash('sha256').update(archive).digest('hex')
     writeFileSync(indexPath, canonicalJson(index))
-    expect(run(signScript, ['--index', indexPath, '--private-key', keys.privateKey]).status).toBe(0)
+    expect(signIndex(indexPath, keys.privateKey).status).toBe(0)
 
-    const result = run(verifyScript, ['--root', output, '--public-key', keys.publicKey])
+    const result = verifyRelease(output, keys.publicKey)
     expect(result.status).not.toBe(0)
     expect(result.stderr.toLowerCase()).toContain('unsafe')
   })
@@ -268,7 +372,7 @@ describe('converter pack release tooling', () => {
       const stage = stagePack(root)
       const output = join(root, 'oversized-release')
       const keys = keyPair(root)
-      expect(run(buildScript, ['--input', stage, '--output', output]).status).toBe(0)
+      expect(build(stage, output).status).toBe(0)
       const indexPath = join(output, 'index.json')
       const index = JSON.parse(readFileSync(indexPath, 'utf8'))
       mutate(index)
@@ -276,9 +380,208 @@ describe('converter pack release tooling', () => {
       writeFileSync(indexPath, canonical)
       writeFileSync(join(output, 'index.sig'), signBytes(null, Buffer.from(canonical), readFileSync(keys.privateKey)).toString('base64'))
 
-      const result = run(verifyScript, ['--root', output, '--public-key', keys.publicKey])
+      const result = verifyRelease(output, keys.publicKey)
       expect(result.status).not.toBe(0)
       expect(result.stderr.toLowerCase()).toContain('signed index is invalid')
+    }
+  })
+
+  it('defaults to the exact 12-coordinate production inventory and accepts subsets only in explicit test mode', () => {
+    const subsetRoot = temporaryRoot()
+    const subsetStage = stagePack(subsetRoot)
+    const defaultProduction = run(buildScript, [
+      '--input', subsetStage,
+      '--output', join(subsetRoot, 'default-production'),
+    ])
+    expect(defaultProduction.status).not.toBe(0)
+    expect(defaultProduction.stderr.toLowerCase()).toContain('production')
+    const explicitProduction = build(subsetStage, join(subsetRoot, 'explicit-production'), 'production')
+    expect(explicitProduction.status).not.toBe(0)
+    expect(explicitProduction.stderr.toLowerCase()).toContain('production')
+
+    const fixtureRelease = join(subsetRoot, 'test-release')
+    const fixtureKeys = keyPair(subsetRoot)
+    expect(build(subsetStage, fixtureRelease, 'test').status).toBe(0)
+    expect(signIndex(join(fixtureRelease, 'index.json'), fixtureKeys.privateKey, 'test').status).toBe(0)
+    expect(verifyRelease(fixtureRelease, fixtureKeys.publicKey, 'test').status).toBe(0)
+
+    const productionRoot = temporaryRoot()
+    const productionStage = stageProduction(productionRoot)
+    const productionRelease = join(productionRoot, 'release')
+    const productionKeys = keyPair(productionRoot)
+    expect(run(buildScript, ['--input', productionStage, '--output', productionRelease]).status).toBe(0)
+    const index = JSON.parse(readFileSync(join(productionRelease, 'index.json'), 'utf8')) as { packs: unknown[] }
+    expect(index.packs).toHaveLength(12)
+    expect(run(signScript, ['--index', join(productionRelease, 'index.json'), '--private-key', productionKeys.privateKey]).status).toBe(0)
+    expect(run(verifyScript, ['--root', productionRelease, '--public-key', productionKeys.publicKey]).status).toBe(0)
+  })
+
+  it('uses UTF-8 byte ordering and produces identical bytes under en_US and tr_TR locales', () => {
+    const source = [buildScript, signScript, verifyScript, join(desktopRoot, 'scripts/converter-packs/pack-tooling-lib.mjs')]
+      .map((path) => readFileSync(path, 'utf8')).join('\n')
+    expect(source).not.toContain('localeCompare')
+
+    const root = temporaryRoot()
+    const stage = stagePack(root)
+    const english = join(root, 'release-en')
+    const turkish = join(root, 'release-tr')
+    expect(build(stage, english, 'test', { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' }).status).toBe(0)
+    expect(build(stage, turkish, 'test', { ...process.env, LANG: 'tr_TR.UTF-8', LC_ALL: 'tr_TR.UTF-8' }).status).toBe(0)
+    expect(readFileSync(join(english, 'index.json'))).toEqual(readFileSync(join(turkish, 'index.json')))
+    expect(readFileSync(join(english, 'media-1.0.0-darwin-arm64.tar')))
+      .toEqual(readFileSync(join(turkish, 'media-1.0.0-darwin-arm64.tar')))
+  })
+
+  it('rejects hard-linked payload, key, index, signature, public-key, and archive inputs', () => {
+    for (const relativePath of [
+      'release.json',
+      'packs/media-darwin-arm64/pack.json',
+      'packs/media-darwin-arm64/payload/bin/ffmpeg',
+      'packs/media-darwin-arm64/payload/LICENSES/ffmpeg.txt',
+    ]) {
+      const payloadRoot = temporaryRoot()
+      const payloadStage = stagePack(payloadRoot)
+      linkSync(join(payloadStage, relativePath), join(payloadRoot, `external-${basename(relativePath)}`))
+      expect(build(payloadStage, join(payloadRoot, 'release')).status, relativePath).not.toBe(0)
+    }
+
+    const root = temporaryRoot()
+    const stage = stagePack(root)
+    const release = join(root, 'release')
+    const keys = keyPair(root)
+    expect(build(stage, release).status).toBe(0)
+    linkSync(keys.privateKey, join(root, 'private-hardlink'))
+    expect(signIndex(join(release, 'index.json'), keys.privateKey).status).not.toBe(0)
+
+    const indexRoot = temporaryRoot()
+    const indexStage = stagePack(indexRoot)
+    const indexRelease = join(indexRoot, 'release')
+    const indexKeys = keyPair(indexRoot)
+    expect(build(indexStage, indexRelease).status).toBe(0)
+    linkSync(join(indexRelease, 'index.json'), join(indexRoot, 'index-hardlink'))
+    expect(signIndex(join(indexRelease, 'index.json'), indexKeys.privateKey).status).not.toBe(0)
+
+    const verifyRoot = temporaryRoot()
+    const verifyStage = stagePack(verifyRoot)
+    const verifyOutput = join(verifyRoot, 'release')
+    const verifyKeys = keyPair(verifyRoot)
+    expect(build(verifyStage, verifyOutput).status).toBe(0)
+    expect(signIndex(join(verifyOutput, 'index.json'), verifyKeys.privateKey).status).toBe(0)
+    const index = JSON.parse(readFileSync(join(verifyOutput, 'index.json'), 'utf8')) as { packs: Array<{ archiveUrl: string }> }
+    const archive = join(verifyOutput, basename(new URL(index.packs[0]!.archiveUrl).pathname))
+    linkSync(archive, join(verifyRoot, 'archive-hardlink'))
+    expect(verifyRelease(verifyOutput, verifyKeys.publicKey).status).not.toBe(0)
+    rmSync(join(verifyRoot, 'archive-hardlink'))
+    linkSync(join(verifyOutput, 'index.sig'), join(verifyRoot, 'signature-hardlink'))
+    expect(verifyRelease(verifyOutput, verifyKeys.publicKey).status).not.toBe(0)
+    rmSync(join(verifyRoot, 'signature-hardlink'))
+    linkSync(verifyKeys.publicKey, join(verifyRoot, 'public-hardlink'))
+    expect(verifyRelease(verifyOutput, verifyKeys.publicKey).status).not.toBe(0)
+  })
+
+  it('detects a path swap after opening a no-follow regular-file handle', () => {
+    const root = temporaryRoot()
+    const path = join(root, 'input.txt')
+    writeFileSync(path, 'original')
+    const modulePath = join(desktopRoot, 'scripts/converter-packs/pack-tooling-lib.mjs')
+    const program = `
+      import { rename, writeFile } from 'node:fs/promises';
+      import { withStableRegularFile } from ${JSON.stringify(`file://${modulePath}`)};
+      const path = ${JSON.stringify(path)};
+      await withStableRegularFile(path, 'Swap fixture', async (handle) => {
+        await rename(path, path + '.original');
+        await writeFile(path, 'replacement');
+        return handle.readFile();
+      });
+    `
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', program], { encoding: 'utf8' })
+    expect(result.status).not.toBe(0)
+    expect(result.stderr.toLowerCase()).toContain('changed while reading')
+  })
+
+  it('uses target-aware Windows paths/modes and rejects disguised launchable or library code', () => {
+    const modulePath = join(desktopRoot, 'scripts/converter-packs/pack-tooling-lib.mjs')
+    const program = `
+      import { isSafeAbsolutePathForPlatform } from ${JSON.stringify(`file://${modulePath}`)};
+      const result = [
+        isSafeAbsolutePathForPlatform('C:\\\\packs\\\\release', 'win32'),
+        isSafeAbsolutePathForPlatform('\\\\\\\\server\\\\share\\\\release', 'win32'),
+        isSafeAbsolutePathForPlatform('C:relative', 'win32'),
+        isSafeAbsolutePathForPlatform('\\\\rooted-without-volume', 'win32'),
+        isSafeAbsolutePathForPlatform('\\\\\\\\?\\\\C:\\\\device', 'win32'),
+      ];
+      if (JSON.stringify(result) !== JSON.stringify([true, true, false, false, false])) process.exit(2);
+    `
+    expect(spawnSync(process.execPath, ['--input-type=module', '--eval', program]).status).toBe(0)
+
+    for (const [name, contents] of [
+      ['hidden.exe', 'MZ unsafe executable'],
+      ['hidden.com', 'unsafe executable'],
+      ['hidden.cmd', '@echo unsafe\r\n'],
+      ['hidden.bat', '@echo unsafe\r\n'],
+      ['hidden.ps1', 'exit 0\r\n'],
+      ['hidden.scr', 'MZ unsafe executable'],
+      ['hidden.msi', 'unsafe installer'],
+      ['hidden.dll', 'MZ unsafe library'],
+      ['hidden.dylib', 'unsafe library'],
+      ['hidden.so', 'unsafe library'],
+      ['hidden.node', 'unsafe native library'],
+      ['hidden.js', 'process.exit(0)\n'],
+      ['hidden.sh', '#!/bin/sh\nexit 0\n'],
+      ['hidden-script', '#!/bin/sh\nexit 0\n'],
+    ] as const) {
+      const root = temporaryRoot()
+      const stage = stagePack(root)
+      const payload = join(stage, 'packs/media-darwin-arm64/payload')
+      writeFileSync(join(payload, name), contents)
+      const manifestPath = join(stage, 'packs/media-darwin-arm64/pack.json')
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { files: Array<{ path: string; role: string }> }
+      manifest.files.push({ path: name, role: 'data' })
+      writeFileSync(manifestPath, JSON.stringify(manifest))
+      const result = build(stage, join(root, 'release'))
+      expect(result.status, name).not.toBe(0)
+      expect(result.stderr.toLowerCase(), name).toContain('code')
+    }
+
+    const windowsRoot = temporaryRoot()
+    const production = stageProduction(windowsRoot)
+    expect(build(production, join(windowsRoot, 'release'), 'production').status).toBe(0)
+  })
+
+  it('verifies canonical package metadata and recursively rejects engines, archives, signatures, tests, e2e, stale paths, or disguised private keys', () => {
+    for (const [platform, arch] of [['darwin', 'arm64'], ['darwin', 'x64'], ['win32', 'x64']] as const) {
+      const root = temporaryRoot()
+      const fixture = packagedApp(root, platform)
+      const result = run(verifyScript, ['--packaged-app', fixture.app, '--platform', platform, '--arch', arch])
+      expect(result.status, `${platform}-${arch}: ${result.stderr}`).toBe(0)
+    }
+
+    const invalidTargetRoot = temporaryRoot()
+    const invalidTarget = packagedApp(invalidTargetRoot, 'win32')
+    expect(run(verifyScript, ['--packaged-app', invalidTarget.app, '--platform', 'win32', '--arch', 'arm64']).status).not.toBe(0)
+
+    const alteredRoot = temporaryRoot()
+    const altered = packagedApp(alteredRoot, 'darwin')
+    writeFileSync(join(altered.converter, 'index.schema.json'), '{}')
+    const alteredResult = run(verifyScript, ['--packaged-app', altered.app, '--platform', 'darwin', '--arch', 'arm64'])
+    expect(alteredResult.status).not.toBe(0)
+    expect(alteredResult.stderr.toLowerCase()).toContain('canonical')
+
+    for (const [name, files, message] of [
+      ['private material', { 'assets/harmless.dat': Buffer.from('-----BEGIN OPENSSH PRIVATE KEY-----\nsecret') }, 'private'],
+      ['encrypted private material', { 'assets/also-harmless.dat': Buffer.from('-----BEGIN ENCRYPTED PRIVATE KEY-----\nsecret') }, 'private'],
+      ['engine', { 'assets/ffmpeg': Buffer.from('unsigned engine') }, 'engine'],
+      ['archive', { 'assets/old-pack.zip': Buffer.from('unsigned archive') }, 'archive'],
+      ['signature', { 'assets/index.sig': Buffer.from('unsigned signature') }, 'signature'],
+      ['test path', { 'tests/helper.js': Buffer.from('test') }, 'test'],
+      ['e2e path', { 'e2e/run.js': Buffer.from('e2e') }, 'e2e'],
+      ['stale path', { 'stale/old-output.js': Buffer.from('stale') }, 'stale'],
+    ] as const) {
+      const root = temporaryRoot()
+      const fixture = packagedApp(root, 'darwin', files)
+      const result = run(verifyScript, ['--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64'])
+      expect(result.status, name).not.toBe(0)
+      expect(result.stderr.toLowerCase(), name).toContain(message)
     }
   })
 })

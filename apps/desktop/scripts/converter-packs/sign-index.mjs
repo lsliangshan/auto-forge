@@ -1,5 +1,5 @@
 import { createPrivateKey, sign } from 'node:crypto'
-import { open, readFile } from 'node:fs/promises'
+import { open } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
@@ -7,24 +7,27 @@ import {
   canonicalBytes,
   fail,
   parseArguments,
+  releaseMode,
   requireAbsolutePath,
-  requireRegularFile,
   validateIndex,
+  withStableRegularFile,
 } from './pack-tooling-lib.mjs'
 
-export async function signConverterPackIndex({ indexPath, privateKeyPath }) {
+export async function signConverterPackIndex({ indexPath, privateKeyPath, mode = 'production' }) {
+  mode = releaseMode(mode)
   requireAbsolutePath(indexPath, 'Index path')
   requireAbsolutePath(privateKeyPath, 'Private key path')
-  await requireRegularFile(indexPath, 'Index')
-  const keyMetadata = await requireRegularFile(privateKeyPath, 'Private key')
-  if (process.platform !== 'win32' && (keyMetadata.mode & 0o077) !== 0) fail('Private key permissions must be 0600 or stricter.')
-  const indexBytes = await readFile(indexPath)
+  const indexBytes = await withStableRegularFile(indexPath, 'Index', (handle) => handle.readFile())
+  const privateKeyBytes = await withStableRegularFile(privateKeyPath, 'Private key', async (handle, metadata) => {
+    if (process.platform !== 'win32' && (metadata.mode & 0o077) !== 0) fail('Private key permissions must be 0600 or stricter.')
+    return handle.readFile()
+  })
   let index
-  try { index = validateIndex(JSON.parse(indexBytes.toString('utf8'))) } catch { fail('Index is invalid or non-canonical.') }
+  try { index = validateIndex(JSON.parse(indexBytes.toString('utf8')), mode) } catch { fail('Index is invalid or non-canonical.') }
   if (!indexBytes.equals(canonicalBytes(index))) fail('Index is invalid or non-canonical.')
   let privateKey
   try {
-    privateKey = createPrivateKey(await readFile(privateKeyPath))
+    privateKey = createPrivateKey(privateKeyBytes)
   } catch {
     fail('Private key is invalid.')
   }
@@ -43,6 +46,6 @@ export async function signConverterPackIndex({ indexPath, privateKeyPath }) {
 
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(entry).href) {
-  const args = parseArguments(process.argv.slice(2), ['--index', '--private-key'])
-  await signConverterPackIndex({ indexPath: args['--index'], privateKeyPath: args['--private-key'] })
+  const args = parseArguments(process.argv.slice(2), ['--index', '--private-key', '--mode'], ['--index', '--private-key'])
+  await signConverterPackIndex({ indexPath: args['--index'], privateKeyPath: args['--private-key'], mode: args['--mode'] })
 }

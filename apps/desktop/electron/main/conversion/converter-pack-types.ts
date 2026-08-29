@@ -3,12 +3,14 @@ export type ConverterPackName = typeof CONVERTER_PACK_NAMES[number]
 
 export type ConverterPackPlatform = 'darwin' | 'win32'
 export type ConverterPackArchitecture = 'arm64' | 'x64'
+export type ConverterPackEntryRole = 'executable' | 'code' | 'license' | 'data'
 
 export interface ConverterPackEntry {
   path: string
   sha256: string
   bytes: number
   executable: boolean
+  role: ConverterPackEntryRole
 }
 
 export interface ConverterPackDescriptor {
