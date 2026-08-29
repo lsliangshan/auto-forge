@@ -624,6 +624,24 @@ state on startup. It validates every application-relative path and never
 follows symlinks. Clearing local data includes conversion jobs, artifacts,
 staging, and downloaded packs according to the existing clear-data contract.
 
+Startup recovery recognizes strict direct-child `results/batch-<UUID>`
+directories and paired `.trash/rollback-<UUID>` plus
+`.rollback-<UUID>.reserve` evidence. It retains a result batch only when its
+complete leaf set maps to ready output artifacts whose owner, execution, and
+completed job all agree. A batch with no durable ownership is atomically moved
+out of `results` after directory identity checks. Quarantine first creates the
+private `rollback-<UUID>` container exclusively, then moves the source batch to
+its fixed `batch` child; an empty or non-empty competing container therefore
+cannot be overwritten by directory rename. Recovery accepts both this nested
+layout and the earlier direct-leaf layout. It opens and validates every
+rollback leaf no-follow before changing any content, then truncates and fsyncs
+only those retained handles. It leaves zero-byte tombstones and their identity
+reservation until explicit local-data clear because deleting a revalidated
+path would reintroduce a replacement race. Symlinks, swaps, destination
+conflicts, forged rows, anonymous extra leaves, or identity mismatches create
+durable owner-local conflict evidence; later bindings fail before touching
+either node.
+
 ## Testing Strategy
 
 Implementation follows test-driven development. Each behavior begins with a
@@ -803,6 +821,22 @@ whole exact batch directory is atomically retained under the owner-local
 `.trash` quarantine, including when staging cleanup fails. ICO probes retain
 ordered source indexes, dimensions and payload hashes, deduplicate only equal
 dimension-plus-hash entries, and persist truthful representation metadata.
+
+The startup recovery closure was also developed against discriminatory tests.
+Before wiring, the orphan-batch, rollback/CAS residue, symlink, replacement,
+and destination-conflict group reported **5 failed / 1 passed**; rollback
+directory identity evidence separately reported **1 failed / 27 skipped**.
+The directory-rename no-clobber review then added two focused REDs: an empty
+destination created after Application's pre-check reported **1 failed / 276
+skipped**, and the same empty-container race in normal artifact rollback
+reported **1 failed / 28 skipped**. Both paths now use the same exclusive
+container plus nested payload layout.
+The completed implementation covers a crash after durable batch moves but
+before the SQLite CAS, normal completed multi-output ownership, forged
+in-flight ownership, anonymous extra leaves, same-owner double binding,
+symlink escape, source replacement, empty and non-empty quarantine conflicts,
+and rollback-leaf replacement. Normal reconciliation is idempotent; a detected
+conflict remains durably fail-closed until the user clears local data.
 
 This local Darwin arm64 fixture evidence is not release acceptance. Production
 signing keys and index, hosted packs and CDN behavior, all twelve production

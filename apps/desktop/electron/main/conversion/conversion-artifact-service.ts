@@ -141,6 +141,7 @@ interface CreateConversionArtifactServiceOptions {
   id?: () => string
   now?: () => number
   filesystem?: {
+    mkdir?(path: string): Promise<void>
     rename?(source: string, destination: string): Promise<void>
   }
 }
@@ -352,6 +353,8 @@ export function createConversionArtifactService(
 ): ConversionArtifactService {
   const makeId = options.id ?? randomUUID
   const now = options.now ?? Date.now
+  const makeQuarantineDirectory = options.filesystem?.mkdir
+    ?? (async (path: string) => { await mkdir(path, { mode: 0o700 }) })
   const renameFile = options.filesystem?.rename ?? rename
 
   return {
@@ -495,7 +498,12 @@ export function createConversionArtifactService(
           ) return false
           const quarantineId = randomUUID()
           const reservation = await open(join(trashRealPath, `.rollback-${quarantineId}.reserve`), 'wx', 0o600)
-          await reservation.close()
+          try {
+            await reservation.writeFile(`v1 ${batchDirectoryMetadata.dev} ${batchDirectoryMetadata.ino}\n`)
+            await reservation.sync()
+          } finally {
+            await reservation.close()
+          }
           const isolated = join(trashRealPath, `rollback-${quarantineId}`)
           const conflict = await lstat(isolated).then(
             () => true,
@@ -505,7 +513,18 @@ export function createConversionArtifactService(
             },
           )
           if (conflict) return false
-          await renameFile(batchDirectoryRealPath, isolated)
+          await makeQuarantineDirectory(isolated)
+          const isolatedContainer = await lstat(isolated)
+          const isolatedContainerRealPath = await realpath(isolated)
+          if (
+            isolatedContainer.isSymbolicLink()
+            || !isolatedContainer.isDirectory()
+            || isolatedContainer.dev !== trashMetadata.dev
+            || isolatedContainerRealPath !== isolated
+            || !inside(trashRealPath, isolatedContainerRealPath)
+          ) return false
+          const payload = join(isolatedContainerRealPath, 'batch')
+          await renameFile(batchDirectoryRealPath, payload)
           const replacementAtSource = await lstat(batchDirectoryRealPath).then(
             () => true,
             (error: unknown) => {
@@ -513,8 +532,12 @@ export function createConversionArtifactService(
               throw error
             },
           )
-          const isolatedMetadata = await lstat(isolated)
+          const isolatedContainerAfter = await lstat(isolated)
+          const isolatedMetadata = await lstat(payload)
           return !replacementAtSource
+            && !isolatedContainerAfter.isSymbolicLink()
+            && isolatedContainerAfter.isDirectory()
+            && sameNode(isolatedContainer, isolatedContainerAfter)
             && !isolatedMetadata.isSymbolicLink()
             && isolatedMetadata.isDirectory()
             && sameNode(batchDirectoryMetadata, isolatedMetadata)

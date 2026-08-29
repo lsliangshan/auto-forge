@@ -477,7 +477,7 @@ async function seedConversion(input: {
   ownerUserId: string
   executionId?: string
   jobId?: string
-  status?: 'queued' | 'converting' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  status?: 'queued' | 'converting' | 'verifying' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
   artifact?: { id: string; bytes: Buffer; displayName?: string }
 }) {
   const executionId = input.executionId ?? 'execution_conversion'
@@ -9669,6 +9669,368 @@ describe('createApplicationRuntime', () => {
       ]) {
         await expect(action()).rejects.toMatchObject({ code: 'NOT_FOUND' })
       }
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('reconciles orphan result batches and rollback tombstones idempotently across same-owner rebinds', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-batch-recovery-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_batchrecovery'
+    const executionId = 'execution_batch_recovery'
+    const jobId = 'job_batch_recovery'
+    await seedConversion({ root, ownerUserId, executionId, jobId, status: 'verifying' })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const results = join(conversionRoot, 'results')
+    const trash = join(conversionRoot, '.trash')
+    const batchName = 'batch-11111111-1111-4111-8111-111111111111'
+    const orphanBatch = join(results, batchName)
+    const rollbackId = '22222222-2222-4222-8222-222222222222'
+    const existingRollback = join(trash, `rollback-${rollbackId}`)
+    const existingReserve = join(trash, `.rollback-${rollbackId}.reserve`)
+    await mkdir(orphanBatch, { recursive: true })
+    await mkdir(existingRollback, { recursive: true })
+    await writeFile(join(orphanBatch, 'crash-window.png'), 'uncommitted sensitive output')
+    await writeFile(join(existingRollback, 'cas-loss.png'), 'failed CAS sensitive output')
+    await writeFile(existingReserve, '')
+    const orphanIdentity = await lstat(orphanBatch)
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await authenticate(runtime, 'BatchRecovery', false)
+      await vi.waitFor(async () => expect(runtime.services.conversion.listForExecution({ executionId }))
+        .resolves.toMatchObject({ jobs: [expect.objectContaining({
+          jobId, status: 'interrupted', errorCode: 'CONVERSION_INTERRUPTED',
+        })] }))
+      await expect(access(orphanBatch)).rejects.toMatchObject({ code: 'ENOENT' })
+      const firstTrashEntries = (await readdir(trash)).sort()
+      const rollbackNames = firstTrashEntries.filter((name) => (
+        /^rollback-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(name)
+      ))
+      expect(rollbackNames).toHaveLength(2)
+      const recoveredName = (await Promise.all(rollbackNames.map(async (name) => ({
+        name,
+        metadata: await lstat(join(trash, name, 'batch')).catch(() => undefined),
+      })))).find(({ metadata }) => (
+        metadata?.dev === orphanIdentity.dev && metadata.ino === orphanIdentity.ino
+      ))?.name
+      expect(recoveredName).toBeDefined()
+      await expect(readFile(join(existingRollback, 'cas-loss.png'))).resolves.toHaveLength(0)
+      await expect(readFile(join(trash, recoveredName!, 'batch', 'crash-window.png')))
+        .resolves.toHaveLength(0)
+      for (const name of rollbackNames) {
+        const id = name.slice('rollback-'.length)
+        expect(firstTrashEntries).toContain(`.rollback-${id}.reserve`)
+      }
+      const firstIdentities = new Map(await Promise.all(firstTrashEntries.map(async (name) => {
+        const metadata = await lstat(join(trash, name))
+        return [name, { dev: metadata.dev, ino: metadata.ino }] as const
+      })))
+
+      await runtime.services.auth.logout({ discardPending: true })
+      await runtime.services.auth.loginWithPassword({ account: 'BatchRecovery', password: 'password' })
+      expect((await readdir(trash)).sort()).toEqual(firstTrashEntries)
+      for (const [name, identity] of firstIdentities) {
+        const metadata = await lstat(join(trash, name))
+        expect({ dev: metadata.dev, ino: metadata.ino }).toEqual(identity)
+      }
+      await expect(readFile(join(existingRollback, 'cas-loss.png'))).resolves.toHaveLength(0)
+      await expect(readFile(join(trash, recoveredName!, 'batch', 'crash-window.png')))
+        .resolves.toHaveLength(0)
+      expect(rmProbe.mock.calls.map(([path]) => path).filter((path) => (
+        path.startsWith(results) || path.startsWith(trash)
+      ))).toEqual([])
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('preserves an exact completed multi-output batch owned by matching artifact rows', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-owned-batch-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_ownedbatch'
+    const executionId = 'execution_owned_batch'
+    const jobId = 'job_owned_batch'
+    await seedConversion({ root, ownerUserId, executionId, jobId, status: 'completed' })
+    const batchName = 'batch-33333333-3333-4333-8333-333333333333'
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const batch = join(conversionRoot, 'results', batchName)
+    const outputs = [
+      { id: 'artifact_owned_page_1', leaf: 'artifact_owned_page_1.png', bytes: Buffer.from('page one') },
+      { id: 'artifact_owned_page_2', leaf: 'artifact_owned_page_2.png', bytes: Buffer.from('page two') },
+    ]
+    await mkdir(batch, { recursive: true })
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.conversionArtifacts.createBatch(outputs.map(({ id, leaf, bytes }, index) => ({
+      id, ownerUserId, executionId, conversionJobId: jobId, role: 'output' as const,
+      displayName: `page-${index + 1}.png`, detectedFormat: 'png', mimeType: 'image/png',
+      byteSize: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex'),
+      relativePath: `results/${batchName}/${leaf}`,
+      metadata: { pdfPage: index + 1 },
+    })))
+    database.close()
+    await Promise.all(outputs.map(({ leaf, bytes }) => writeFile(join(batch, leaf), bytes)))
+    const before = await lstat(batch)
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await authenticate(runtime, 'OwnedBatch', false)
+      const after = await lstat(batch)
+      expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.dev, ino: before.ino })
+      for (const { leaf, bytes } of outputs) {
+        await expect(readFile(join(batch, leaf))).resolves.toEqual(bytes)
+      }
+      expect((await readdir(join(conversionRoot, '.trash')))
+        .filter((name) => name.startsWith('rollback-'))).toEqual([])
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('fails closed on a result batch claimed by a non-completed conversion job', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-invalid-batch-owner-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_invalidbatchowner'
+    const executionId = 'execution_invalid_batch_owner'
+    const jobId = 'job_invalid_batch_owner'
+    await seedConversion({ root, ownerUserId, executionId, jobId, status: 'verifying' })
+    const batchName = 'batch-88888888-8888-4888-8888-888888888888'
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const batch = join(conversionRoot, 'results', batchName)
+    const leaf = join(batch, 'artifact_invalid_owner.png')
+    const bytes = Buffer.from('must not become owned by an in-flight job')
+    await mkdir(batch, { recursive: true })
+    await writeFile(leaf, bytes)
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.conversionArtifacts.create({
+      id: 'artifact_invalid_owner', ownerUserId, executionId, conversionJobId: jobId,
+      role: 'output', displayName: 'invalid.png', detectedFormat: 'png', mimeType: 'image/png',
+      byteSize: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex'),
+      relativePath: `results/${batchName}/artifact_invalid_owner.png`,
+    })
+    database.close()
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await expect(authenticate(runtime, 'InvalidBatchOwner', false))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      await expect(readFile(leaf)).resolves.toEqual(bytes)
+      await expect(readFile(join(conversionRoot, '.trash', '.conversion-recovery-conflict'), 'utf8'))
+        .resolves.toBe('v1\n')
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('fails closed when a completed batch contains an unowned extra leaf', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-extra-batch-leaf-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_extrabatchleaf'
+    const executionId = 'execution_extra_batch_leaf'
+    const jobId = 'job_extra_batch_leaf'
+    await seedConversion({ root, ownerUserId, executionId, jobId, status: 'completed' })
+    const batchName = 'batch-99999999-9999-4999-8999-999999999999'
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const batch = join(conversionRoot, 'results', batchName)
+    const ownedBytes = Buffer.from('owned output')
+    const extraBytes = Buffer.from('anonymous extra output')
+    await mkdir(batch, { recursive: true })
+    await writeFile(join(batch, 'artifact_owned.png'), ownedBytes)
+    await writeFile(join(batch, 'anonymous.png'), extraBytes)
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.conversionArtifacts.create({
+      id: 'artifact_owned', ownerUserId, executionId, conversionJobId: jobId,
+      role: 'output', displayName: 'owned.png', detectedFormat: 'png', mimeType: 'image/png',
+      byteSize: ownedBytes.byteLength, sha256: createHash('sha256').update(ownedBytes).digest('hex'),
+      relativePath: `results/${batchName}/artifact_owned.png`,
+    })
+    database.close()
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await expect(authenticate(runtime, 'ExtraBatchLeaf', false))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      await expect(readFile(join(batch, 'artifact_owned.png'))).resolves.toEqual(ownedBytes)
+      await expect(readFile(join(batch, 'anonymous.png'))).resolves.toEqual(extraBytes)
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('fails closed without following an orphan result-batch symlink', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-batch-symlink-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_batchsymlink'
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_batch_symlink',
+      jobId: 'job_batch_symlink', status: 'verifying',
+    })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const results = join(conversionRoot, 'results')
+    const outside = join(root, 'outside-conversion-batch')
+    const sentinel = join(outside, 'sentinel.txt')
+    const linkedBatch = join(results, 'batch-44444444-4444-4444-8444-444444444444')
+    await mkdir(results, { recursive: true })
+    await mkdir(outside)
+    await writeFile(sentinel, 'outside must remain')
+    await symlink(outside, linkedBatch, 'dir')
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await expect(authenticate(runtime, 'BatchSymlink', false))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      await expect(readFile(sentinel, 'utf8')).resolves.toBe('outside must remain')
+      expect(rmProbe.mock.calls.map(([path]) => path)
+        .some((path) => path.includes('outside-conversion-batch'))).toBe(false)
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('fails closed before quarantine when an orphan result batch is replaced after inspection', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-batch-swap-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_batchswap'
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_batch_swap',
+      jobId: 'job_batch_swap', status: 'verifying',
+    })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const batch = join(
+      conversionRoot, 'results', 'batch-55555555-5555-4555-8555-555555555555',
+    )
+    const preserved = join(root, 'preserved-original-batch')
+    await mkdir(batch, { recursive: true })
+    await writeFile(join(batch, 'original.png'), 'original bytes')
+    let swapped = false
+    lstatProbe.mockImplementation(async (path) => {
+      if (basename(path) !== basename(batch) || swapped) return
+      swapped = true
+      await rename(batch, preserved)
+      await mkdir(batch)
+      await writeFile(join(batch, 'replacement.png'), 'replacement bytes')
+    })
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await expect(authenticate(runtime, 'BatchSwap', false))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      expect(swapped).toBe(true)
+      await expect(readFile(join(preserved, 'original.png'), 'utf8')).resolves.toBe('original bytes')
+      await expect(readFile(join(batch, 'replacement.png'), 'utf8')).resolves.toBe('replacement bytes')
+      expect((await readdir(join(conversionRoot, '.trash')))
+        .filter((name) => name.startsWith('rollback-'))).toEqual([])
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('preserves an orphan batch and a conflicting quarantine destination', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-batch-conflict-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_batchconflict'
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_batch_conflict',
+      jobId: 'job_batch_conflict', status: 'verifying',
+    })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const batch = join(
+      conversionRoot, 'results', 'batch-66666666-6666-4666-8666-666666666666',
+    )
+    await mkdir(batch, { recursive: true })
+    await writeFile(join(batch, 'original.png'), 'original bytes')
+    let conflict: string | undefined
+    renameProbe.mockImplementation(async (from, to) => {
+      if (basename(from) !== basename(batch) || conflict !== undefined) return
+      conflict = to
+      await mkdir(to)
+      await writeFile(join(to, 'conflict.txt'), 'conflict bytes')
+    })
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await expect(authenticate(runtime, 'BatchConflict', false))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      expect(conflict).toBeDefined()
+      await expect(readFile(join(batch, 'original.png'), 'utf8')).resolves.toBe('original bytes')
+      await expect(readFile(join(conflict!, 'conflict.txt'), 'utf8')).resolves.toBe('conflict bytes')
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('does not overwrite an empty quarantine directory created after the conflict pre-check', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-empty-conflict-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_emptybatchconflict'
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_empty_batch_conflict',
+      jobId: 'job_empty_batch_conflict', status: 'verifying',
+    })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const batch = join(
+      conversionRoot, 'results', 'batch-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    )
+    await mkdir(batch, { recursive: true })
+    await writeFile(join(batch, 'original.png'), 'original bytes')
+    let conflict: string | undefined
+    let conflictIdentity: { dev: number; ino: number } | undefined
+    lstatProbe.mockImplementation(async (path) => {
+      if (conflict !== undefined || !/^rollback-[0-9a-f-]{36}$/u.test(basename(path))) return
+      conflict = path
+      await mkdir(path)
+      const metadata = await lstat(path)
+      conflictIdentity = { dev: metadata.dev, ino: metadata.ino }
+    })
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await expect(authenticate(runtime, 'EmptyBatchConflict', false))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      expect(conflict).toBeDefined()
+      await expect(readFile(join(batch, 'original.png'), 'utf8')).resolves.toBe('original bytes')
+      const preservedConflict = await lstat(conflict!)
+      expect({ dev: preservedConflict.dev, ino: preservedConflict.ino }).toEqual(conflictIdentity)
+      expect(await readdir(conflict!)).toEqual([])
+      await expect(readFile(join(conversionRoot, '.trash', '.conversion-recovery-conflict'), 'utf8'))
+        .resolves.toBe('v1\n')
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('does not truncate a rollback replacement introduced after its original leaf is opened', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-rollback-swap-'))
+    directories.push(root)
+    const ownerUserId = 'test_user_rollbackage'
+    await seedConversion({
+      root, ownerUserId, executionId: 'execution_rollback_swap',
+      jobId: 'job_rollback_swap', status: 'verifying',
+    })
+    const conversionRoot = resolveUserConversionRoot(root, ownerUserId)
+    const rollbackId = '77777777-7777-4777-8777-777777777777'
+    const rollback = join(conversionRoot, '.trash', `rollback-${rollbackId}`)
+    const leaf = join(rollback, 'output.png')
+    const preserved = join(root, 'preserved-rollback-output.png')
+    await mkdir(rollback, { recursive: true })
+    await writeFile(join(conversionRoot, '.trash', `.rollback-${rollbackId}.reserve`), '')
+    await writeFile(leaf, 'original rollback bytes')
+    let swapped = false
+    openProbe.mockImplementation(async (path) => {
+      if (basename(path) !== basename(leaf) || basename(dirname(path)) !== basename(rollback) || swapped) return
+      swapped = true
+      await rename(leaf, preserved)
+      await writeFile(leaf, 'replacement rollback bytes')
+    })
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await expect(authenticate(runtime, 'RollbackAge', false))
+        .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+      expect(swapped).toBe(true)
+      await expect(readFile(preserved, 'utf8')).resolves.toBe('original rollback bytes')
+      await expect(readFile(leaf, 'utf8')).resolves.toBe('replacement rollback bytes')
     } finally {
       await runtime.close()
     }

@@ -493,8 +493,14 @@ describe('managed output writer', () => {
     const directory = await lstat(rollbackDirectory)
     expect(directory.isDirectory()).toBe(true)
     expect(directory.mode & 0o777).toBe(0o700)
-    expect(await readdir(rollbackDirectory)).toEqual(['output-1.png'])
-    const isolated = await lstat(join(rollbackDirectory, 'output-1.png'))
+    const rollbackPayload = join(rollbackDirectory, 'batch')
+    const payloadDirectory = await lstat(rollbackPayload)
+    const rollbackId = rollbackNames[0]!.slice('rollback-'.length)
+    await expect(readFile(join(ownerRoot, '.trash', `.rollback-${rollbackId}.reserve`), 'utf8'))
+      .resolves.toBe(`v1 ${payloadDirectory.dev} ${payloadDirectory.ino}\n`)
+    expect(await readdir(rollbackDirectory)).toEqual(['batch'])
+    expect(await readdir(rollbackPayload)).toEqual(['output-1.png'])
+    const isolated = await lstat(join(rollbackPayload, 'output-1.png'))
     expect({ dev: isolated.dev, ino: isolated.ino, size: isolated.size }).toEqual({
       dev: firstDestinationIdentity?.dev,
       ino: firstDestinationIdentity?.ino,
@@ -549,7 +555,8 @@ describe('managed output writer', () => {
     const rollback = (await readdir(join(ownerRoot, '.trash')))
       .find((name) => /^rollback-[0-9a-f-]{36}$/u.test(name))
     expect(rollback).toBeTypeOf('string')
-    await expect(readFile(join(ownerRoot, '.trash', rollback!, 'output-1.png'))).resolves.toEqual(replacement)
+    await expect(readFile(join(ownerRoot, '.trash', rollback!, 'batch', 'output-1.png')))
+      .resolves.toEqual(replacement)
   })
 
   it('quarantines the exclusive result batch even when staging cleanup fails', async () => {
@@ -575,7 +582,8 @@ describe('managed output writer', () => {
       .filter((name) => /^rollback-[0-9a-f-]{36}$/u.test(name))
     expect(quarantines).toHaveLength(1)
     const quarantined = join(ownerRoot, '.trash', quarantines[0]!)
-    expect((await readdir(quarantined)).sort()).toEqual(['output-1.png', 'output-2.png'])
+    expect(await readdir(quarantined)).toEqual(['batch'])
+    expect((await readdir(join(quarantined, 'batch'))).sort()).toEqual(['output-1.png', 'output-2.png'])
   })
 
   it('fails closed on a quarantine-name conflict without moving the conflicting node or a replacement batch', async () => {
@@ -621,6 +629,44 @@ describe('managed output writer', () => {
     await expect(readFile(join(replacementBatch!, 'replacement.txt'), 'utf8')).resolves.toBe('must remain')
     await expect(readFile(join(quarantineConflict!, 'conflict.txt'), 'utf8')).resolves.toBe('must remain')
     expect((await readdir(preservedBatch!)).sort()).toEqual(['output-1.png', 'output-2.png'])
+  })
+
+  it('does not overwrite an empty rollback container created at exclusive allocation', async () => {
+    let nextId = 0
+    let conflict: string | undefined
+    let conflictIdentity: { dev: number; ino: number } | undefined
+    const { dataRoot, db, service } = await fixture({
+      id: () => `output-${++nextId}`,
+      filesystem: {
+        mkdir: async (path: string) => {
+          conflict = path
+          await mkdir(path, { mode: 0o700 })
+          const metadata = await lstat(path)
+          conflictIdentity = { dev: metadata.dev, ino: metadata.ino }
+          throw Object.assign(new Error('injected empty rollback conflict'), { code: 'EEXIST' })
+        },
+      },
+    })
+    const batch = await service.createOutputBatch([1, 2].map((page) => ({
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: `report-page-00${page}.png`, targetFormat: 'png' as const,
+    })))
+    await Promise.all(batch.outputs.map(({ tempPath }) => writeFile(tempPath, png())))
+    db.conversionArtifacts.createBatch = () => { throw new Error('injected database failure') }
+
+    await expect(batch.commit([{ metadata: { pdfPage: 1 } }, { metadata: { pdfPage: 2 } }]))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+
+    expect(conflict).toBeDefined()
+    const preservedConflict = await lstat(conflict!)
+    expect({ dev: preservedConflict.dev, ino: preservedConflict.ino }).toEqual(conflictIdentity)
+    expect(await readdir(conflict!)).toEqual([])
+    expect([...db.artifacts.values()]).toEqual([])
+    const ownerRoot = resolveUserConversionRoot(dataRoot, 'user-a')
+    const resultBatches = await readdir(join(ownerRoot, 'results'))
+    expect(resultBatches).toHaveLength(1)
+    expect((await readdir(join(ownerRoot, 'results', resultBatches[0]!))).sort())
+      .toEqual(['output-1.png', 'output-2.png'])
   })
 
   it('enforces the 500 MiB limit over the aggregate batch before verification', async () => {

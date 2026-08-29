@@ -766,6 +766,13 @@ const retryableConversionStatuses = new Set<ConversionJob['status']>([
   'failed', 'cancelled', 'interrupted',
 ])
 const conversionQuarantinePattern = /^(?<artifactId>[A-Za-z0-9][A-Za-z0-9._-]{0,255})\.quarantine-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+const conversionBatchPattern = /^batch-(?<id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u
+const conversionRollbackPattern = /^rollback-(?<id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u
+const conversionRollbackReservePattern = /^\.rollback-(?<id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.reserve$/u
+const conversionRollbackEvidencePattern = /^v1 (?<dev>[0-9]+) (?<ino>[0-9]+)\n$/u
+const conversionRecoveryConflictName = '.conversion-recovery-conflict'
+const conversionRecoveryConflictEvidence = 'v1\n'
+const conversionRollbackPayloadName = 'batch'
 
 function insidePath(root: string, candidate: string): boolean {
   const path = relative(root, candidate)
@@ -815,6 +822,382 @@ async function ensureManagedDirectory(path: string): Promise<string> {
   const metadata = await lstat(path)
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw failure('CONVERSION_INPUT_INVALID')
   return realpath(path)
+}
+
+function sameDirectoryIdentity(
+  left: { dev: number | bigint; ino: number | bigint },
+  right: { dev: number | bigint; ino: number | bigint },
+): boolean {
+  return String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino)
+}
+
+function conversionBatchRelativePath(relativePath: string): { batchName: string; leaf: string } | undefined {
+  if (!safeManagedRelativePath(relativePath)) return undefined
+  const segments = relativePath.split('/')
+  if (segments.length !== 3 || segments[0] !== 'results' || !conversionBatchPattern.test(segments[1]!)) {
+    return undefined
+  }
+  return { batchName: segments[1]!, leaf: segments[2]! }
+}
+
+async function inspectManagedConversionDirectory(
+  parentRealPath: string,
+  path: string,
+): Promise<Awaited<ReturnType<typeof lstat>>> {
+  if (dirname(path) !== parentRealPath || !insidePath(parentRealPath, path)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const before = await lstat(path)
+  if (before.isSymbolicLink() || !before.isDirectory()) throw failure('CONVERSION_INPUT_INVALID')
+  const canonicalPath = await realpath(path)
+  if (canonicalPath !== path || !insidePath(parentRealPath, canonicalPath)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const after = await lstat(path)
+  if (after.isSymbolicLink() || !after.isDirectory() || !sameDirectoryIdentity(before, after)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  return after
+}
+
+async function assertManagedConversionDirectoryIdentity(
+  parentRealPath: string,
+  path: string,
+  expected: { dev: number | bigint; ino: number | bigint },
+): Promise<void> {
+  const current = await inspectManagedConversionDirectory(parentRealPath, path)
+  if (!sameDirectoryIdentity(expected, current)) throw failure('CONVERSION_INPUT_INVALID')
+}
+
+async function readConversionRollbackReservation(
+  trashRealPath: string,
+  path: string,
+): Promise<{ dev: bigint; ino: bigint } | undefined> {
+  if (dirname(path) !== trashRealPath || !insidePath(trashRealPath, path)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    const before = await lstat(path)
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size > 128) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    const canonicalPath = await realpath(path)
+    if (canonicalPath !== path || !insidePath(trashRealPath, canonicalPath)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const opened = await handle.stat()
+    if (!sameFileMetadata(before, opened)) throw failure('CONVERSION_INPUT_INVALID')
+    const evidence = await handle.readFile({ encoding: 'utf8' })
+    const after = await handle.stat()
+    if (!sameFileMetadata(opened, after)) throw failure('CONVERSION_INPUT_INVALID')
+    if (evidence.length === 0) return undefined
+    const match = conversionRollbackEvidencePattern.exec(evidence)
+    if (!match?.groups?.dev || !match.groups.ino) throw failure('CONVERSION_INPUT_INVALID')
+    return { dev: BigInt(match.groups.dev), ino: BigInt(match.groups.ino) }
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error
+      && String((error as { code: unknown }).code).startsWith('CONVERSION_')) throw error
+    throw failure('CONVERSION_INPUT_INVALID')
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function validateConversionRecoveryConflictMarker(trashRealPath: string): Promise<boolean> {
+  const markerPath = join(trashRealPath, conversionRecoveryConflictName)
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    const before = await lstat(markerPath)
+    if (before.isSymbolicLink()
+      || !before.isFile()
+      || before.nlink !== 1
+      || before.size !== Buffer.byteLength(conversionRecoveryConflictEvidence)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    if (await realpath(markerPath) !== markerPath) throw failure('CONVERSION_INPUT_INVALID')
+    handle = await open(markerPath, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const opened = await handle.stat()
+    if (!sameFileMetadata(before, opened)) throw failure('CONVERSION_INPUT_INVALID')
+    const evidence = await handle.readFile({ encoding: 'utf8' })
+    const after = await handle.stat()
+    if (evidence !== conversionRecoveryConflictEvidence || !sameFileMetadata(opened, after)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    if (typeof error === 'object' && error !== null && 'code' in error
+      && String((error as { code: unknown }).code).startsWith('CONVERSION_')) throw error
+    throw failure('CONVERSION_INPUT_INVALID')
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function markConversionRecoveryConflict(trashRealPath: string): Promise<void> {
+  const markerPath = join(trashRealPath, conversionRecoveryConflictName)
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    handle = await open(markerPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
+    await handle.writeFile(conversionRecoveryConflictEvidence)
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw failure('CONVERSION_INPUT_INVALID')
+    await validateConversionRecoveryConflictMarker(trashRealPath)
+  }
+}
+
+async function scrubConversionRollbackDirectory(
+  trashRealPath: string,
+  path: string,
+  expectedEvidence?: { dev: number | bigint; ino: number | bigint },
+): Promise<void> {
+  const directory = await inspectManagedConversionDirectory(trashRealPath, path)
+  if (expectedEvidence && !sameDirectoryIdentity(directory, expectedEvidence)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const opened: Array<{
+    path: string
+    handle: Awaited<ReturnType<typeof open>>
+    metadata: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>
+  }> = []
+  try {
+    const names = await readdir(path)
+    if (names.length > 256) throw failure('CONVERSION_INPUT_INVALID')
+    for (const name of names) {
+      if (!safeManagedRelativePath(name) || name.includes('/')) throw failure('CONVERSION_INPUT_INVALID')
+      await assertManagedConversionDirectoryIdentity(trashRealPath, path, directory)
+      const leafPath = join(path, name)
+      const before = await lstat(leafPath)
+      if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      const canonicalPath = await realpath(leafPath)
+      if (canonicalPath !== leafPath || !insidePath(path, canonicalPath)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      const handle = await open(leafPath, constants.O_RDWR | constants.O_NOFOLLOW)
+      const metadata = await handle.stat()
+      if (!sameFileMetadata(before, metadata)) {
+        await handle.close()
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      opened.push({ path: leafPath, handle, metadata })
+    }
+
+    await assertManagedConversionDirectoryIdentity(trashRealPath, path, directory)
+    for (const leaf of opened) {
+      const named = await lstat(leaf.path)
+      if (named.isSymbolicLink() || !named.isFile() || !sameFileMetadata(leaf.metadata, named)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+    }
+    for (const leaf of opened) {
+      await leaf.handle.truncate(0)
+      await leaf.handle.sync()
+      const scrubbed = await leaf.handle.stat()
+      if (!scrubbed.isFile()
+        || scrubbed.nlink !== 1
+        || scrubbed.size !== 0
+        || !sameDirectoryIdentity(leaf.metadata, scrubbed)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+    }
+    await assertManagedConversionDirectoryIdentity(trashRealPath, path, directory)
+    for (const leaf of opened) {
+      const named = await lstat(leaf.path)
+      if (named.isSymbolicLink()
+        || !named.isFile()
+        || named.nlink !== 1
+        || named.size !== 0
+        || !sameDirectoryIdentity(leaf.metadata, named)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+    }
+  } finally {
+    await Promise.allSettled(opened.map(({ handle }) => handle.close()))
+  }
+}
+
+async function reconcileConversionRollbackStorage(trashRealPath: string): Promise<void> {
+  const entries = await readdir(trashRealPath)
+  const reservations = new Map<string, string>()
+  const rollbacks = new Map<string, string>()
+  for (const name of entries) {
+    const reservation = conversionRollbackReservePattern.exec(name)
+    if (reservation?.groups?.id) reservations.set(reservation.groups.id, join(trashRealPath, name))
+    const rollback = conversionRollbackPattern.exec(name)
+    if (rollback?.groups?.id) rollbacks.set(rollback.groups.id, join(trashRealPath, name))
+  }
+  const evidenceById = new Map<string, { dev: bigint; ino: bigint } | undefined>()
+  for (const [id, reservation] of reservations) {
+    evidenceById.set(id, await readConversionRollbackReservation(trashRealPath, reservation))
+  }
+  for (const [id, rollback] of rollbacks) {
+    if (!reservations.has(id)) throw failure('CONVERSION_INPUT_INVALID')
+    try {
+      const container = await inspectManagedConversionDirectory(trashRealPath, rollback)
+      const names = await readdir(rollback)
+      if (names.length === 0) continue
+      if (names.length === 1 && names[0] === conversionRollbackPayloadName) {
+        const evidence = evidenceById.get(id)
+        if (!evidence) throw failure('CONVERSION_INPUT_INVALID')
+        await scrubConversionRollbackDirectory(
+          rollback,
+          join(rollback, conversionRollbackPayloadName),
+          evidence,
+        )
+        await assertManagedConversionDirectoryIdentity(trashRealPath, rollback, container)
+      } else {
+        await scrubConversionRollbackDirectory(trashRealPath, rollback, evidenceById.get(id))
+      }
+    } catch (error) {
+      await markConversionRecoveryConflict(trashRealPath)
+      throw error
+    }
+  }
+}
+
+function ownedConversionResultBatches(
+  database: Pick<AppRepositories, 'executions' | 'conversionJobs' | 'conversionArtifacts'>,
+  ownerUserId: string,
+): {
+  batches: Map<string, Map<string, ConversionArtifact>>
+  invalidClaims: Set<string>
+} {
+  const batches = new Map<string, Map<string, ConversionArtifact>>()
+  const invalidClaims = new Set<string>()
+  for (const execution of database.executions.listForUser(ownerUserId)) {
+    const jobs = new Map(database.conversionJobs.listForExecution(execution.id, ownerUserId)
+      .map((job) => [job.id, job]))
+    for (const artifact of database.conversionArtifacts.listForExecution(execution.id, ownerUserId)) {
+      const batchPath = conversionBatchRelativePath(artifact.relativePath)
+      if (!batchPath || artifact.status === 'deleted') continue
+      const job = artifact.conversionJobId === undefined ? undefined : jobs.get(artifact.conversionJobId)
+      if (artifact.ownerUserId !== ownerUserId
+        || artifact.executionId !== execution.id
+        || artifact.role !== 'output'
+        || artifact.status !== 'ready'
+        || !job
+        || job.ownerUserId !== ownerUserId
+        || job.executionId !== execution.id
+        || job.status !== 'completed') {
+        invalidClaims.add(batchPath.batchName)
+        continue
+      }
+      const artifacts = batches.get(batchPath.batchName) ?? new Map<string, ConversionArtifact>()
+      if (artifacts.has(batchPath.leaf)) invalidClaims.add(batchPath.batchName)
+      else artifacts.set(batchPath.leaf, artifact)
+      batches.set(batchPath.batchName, artifacts)
+    }
+  }
+  return { batches, invalidClaims }
+}
+
+async function validateOwnedConversionBatch(
+  resultsRealPath: string,
+  path: string,
+  artifacts: Map<string, ConversionArtifact>,
+): Promise<void> {
+  const directory = await inspectManagedConversionDirectory(resultsRealPath, path)
+  const names = (await readdir(path)).sort()
+  const expectedNames = [...artifacts.keys()].sort()
+  if (names.length !== expectedNames.length || names.some((name, index) => name !== expectedNames[index])) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  for (const name of names) {
+    await assertManagedConversionDirectoryIdentity(resultsRealPath, path, directory)
+    const artifact = artifacts.get(name)!
+    const leafPath = join(path, name)
+    const metadata = await lstat(leafPath)
+    if (metadata.isSymbolicLink()
+      || !metadata.isFile()
+      || metadata.nlink !== 1
+      || metadata.size !== artifact.byteSize
+      || await realpath(leafPath) !== leafPath) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+  }
+  await assertManagedConversionDirectoryIdentity(resultsRealPath, path, directory)
+}
+
+async function quarantineOrphanConversionBatch(
+  resultsRealPath: string,
+  trashRealPath: string,
+  path: string,
+): Promise<void> {
+  const directory = await inspectManagedConversionDirectory(resultsRealPath, path)
+  const id = randomUUID()
+  const reservePath = join(trashRealPath, `.rollback-${id}.reserve`)
+  const destination = join(trashRealPath, `rollback-${id}`)
+  const payload = join(destination, conversionRollbackPayloadName)
+  let reservation: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    reservation = await open(reservePath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
+    await reservation.writeFile(`v1 ${directory.dev} ${directory.ino}\n`)
+    await reservation.sync()
+    await reservation.close()
+    reservation = undefined
+    const conflict = await lstat(destination).then(
+      () => true,
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw error
+      },
+    )
+    if (conflict) throw failure('CONVERSION_INPUT_INVALID')
+    await mkdir(destination, { mode: 0o700 })
+    const container = await inspectManagedConversionDirectory(trashRealPath, destination)
+    await assertManagedConversionDirectoryIdentity(resultsRealPath, path, directory)
+    await rename(path, payload)
+    const replacementAtSource = await lstat(path).then(
+      () => true,
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw error
+      },
+    )
+    await assertManagedConversionDirectoryIdentity(trashRealPath, destination, container)
+    const isolated = await inspectManagedConversionDirectory(destination, payload)
+    if (replacementAtSource || !sameDirectoryIdentity(directory, isolated)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    await scrubConversionRollbackDirectory(destination, payload, directory)
+    await assertManagedConversionDirectoryIdentity(trashRealPath, destination, container)
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error
+      && String((error as { code: unknown }).code).startsWith('CONVERSION_')) throw error
+    throw failure('CONVERSION_INPUT_INVALID')
+  } finally {
+    await reservation?.close().catch(() => undefined)
+  }
+}
+
+async function reconcileConversionResultBatches(
+  resultsRealPath: string,
+  trashRealPath: string,
+  database: Pick<AppRepositories, 'executions' | 'conversionJobs' | 'conversionArtifacts'>,
+  ownerUserId: string,
+): Promise<void> {
+  const { batches, invalidClaims } = ownedConversionResultBatches(database, ownerUserId)
+  for (const name of await readdir(resultsRealPath)) {
+    if (!conversionBatchPattern.test(name)) continue
+    const path = join(resultsRealPath, name)
+    try {
+      if (invalidClaims.has(name)) throw failure('CONVERSION_INPUT_INVALID')
+      const artifacts = batches.get(name)
+      if (artifacts && artifacts.size > 0) await validateOwnedConversionBatch(resultsRealPath, path, artifacts)
+      else await quarantineOrphanConversionBatch(resultsRealPath, trashRealPath, path)
+    } catch (error) {
+      await markConversionRecoveryConflict(trashRealPath)
+      throw error
+    }
+  }
 }
 
 async function openVerifiedConversionArtifact(
@@ -984,8 +1367,17 @@ async function recoverOwnerConversionStorage(
   const rootRealPath = await ensureManagedDirectory(root)
   if (!insidePath(dataRootRealPath, rootRealPath)) throw failure('CONVERSION_INPUT_INVALID')
   const staging = await ensureManagedDirectory(join(rootRealPath, '.staging'))
+  const results = await ensureManagedDirectory(join(rootRealPath, 'results'))
   const quarantine = await ensureManagedDirectory(join(rootRealPath, '.trash'))
-  if (!insidePath(rootRealPath, staging) || !insidePath(rootRealPath, quarantine)) {
+  if (!insidePath(rootRealPath, staging)
+    || !insidePath(rootRealPath, results)
+    || !insidePath(rootRealPath, quarantine)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const resultsMetadata = await lstat(results)
+  const quarantineMetadata = await lstat(quarantine)
+  if (resultsMetadata.dev !== quarantineMetadata.dev) throw failure('CONVERSION_INPUT_INVALID')
+  if (await validateConversionRecoveryConflictMarker(quarantine)) {
     throw failure('CONVERSION_INPUT_INVALID')
   }
   for (const name of await readdir(staging)) {
@@ -993,6 +1385,8 @@ async function recoverOwnerConversionStorage(
     if (!insidePath(staging, candidate)) throw failure('CONVERSION_INPUT_INVALID')
     await rm(candidate, { recursive: true, force: true })
   }
+  await reconcileConversionRollbackStorage(quarantine)
+  await reconcileConversionResultBatches(results, quarantine, database, ownerUserId)
   const quarantinedByArtifact = new Map<string, string[]>()
   const residueArtifactIds = new Set<string>()
   for (const name of await readdir(quarantine)) {
