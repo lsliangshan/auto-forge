@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import type { ConversionTargetFormat } from '@autoforge/shared'
 import { deflateSync } from 'node:zlib'
@@ -28,13 +29,13 @@ function chunk(type: string, data = Buffer.alloc(0)): Buffer {
   return Buffer.concat([header, data, crc])
 }
 
-function png(width: number, height: number): Buffer {
+function png(width: number, height: number, fill = 0): Buffer {
   const ihdr = Buffer.alloc(13)
   ihdr.writeUInt32BE(width, 0)
   ihdr.writeUInt32BE(height, 4)
   ihdr[8] = 8
   ihdr[9] = 6
-  const scanline = width * height <= 10_000 ? Buffer.alloc((width * 4 + 1) * height) : Buffer.from([0])
+  const scanline = width * height <= 10_000 ? Buffer.alloc((width * 4 + 1) * height, fill) : Buffer.from([0])
   return Buffer.concat([
     Buffer.from('89504e470d0a1a0a', 'hex'),
     chunk('IHDR', ihdr),
@@ -238,6 +239,26 @@ function ico(): Buffer {
   bytes.writeUInt32LE(image.byteLength, 14)
   bytes.writeUInt32LE(22, 18)
   return Buffer.concat([bytes, image])
+}
+
+function icoRepresentations(payloads: readonly Buffer[]): Buffer {
+  const header = Buffer.alloc(6 + payloads.length * 16)
+  header.writeUInt16LE(1, 2)
+  header.writeUInt16LE(payloads.length, 4)
+  let offset = header.byteLength
+  for (const [index, payload] of payloads.entries()) {
+    const width = payload.readUInt32BE(16)
+    const height = payload.readUInt32BE(20)
+    const entry = 6 + index * 16
+    header[entry] = width === 256 ? 0 : width
+    header[entry + 1] = height === 256 ? 0 : height
+    header.writeUInt16LE(1, entry + 4)
+    header.writeUInt16LE(32, entry + 6)
+    header.writeUInt32LE(payload.byteLength, entry + 8)
+    header.writeUInt32LE(offset, entry + 12)
+    offset += payload.byteLength
+  }
+  return Buffer.concat([header, ...payloads])
 }
 
 function dibIco(options: {
@@ -473,6 +494,16 @@ describe('conversion catalog input probing', () => {
     expect(probe(pdf(1, true), 'one.pdf', 'application/pdf')).toMatchObject({ pageCount: 1 })
   })
 
+  it('accepts a structurally valid PDF trailer when Root precedes Size', () => {
+    const input = pdf(3).toString('latin1').replace(
+      '<< /Size 6 /Root 1 0 R >>',
+      '<< /Root 1 0 R /Size 6 >>',
+    )
+
+    expect(probe(Buffer.from(input, 'latin1'), 'three.pdf', 'application/pdf'))
+      .toMatchObject({ pageCount: 3 })
+  })
+
   it.each([
     ['PNG signature only', Buffer.from('89504e470d0a1a0a', 'hex'), 'broken.png', 'image/png'],
     ['GIF header only', Buffer.from('GIF89a', 'ascii'), 'broken.gif', 'image/gif'],
@@ -580,6 +611,27 @@ describe('conversion catalog input probing', () => {
       expect(() => probe(bytes, 'icon.ico', 'image/vnd.microsoft.icon'), label)
         .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
     }
+  })
+
+  it('emits ordered ICO descriptors and stably deduplicates only equal dimensions plus payload hash', () => {
+    const first = png(16, 16)
+    const second = png(32, 32)
+    const distinctAtSameSize = png(16, 16, 1)
+    const result = probe(
+      icoRepresentations([first, second, Buffer.from(first), distinctAtSameSize]),
+      'icon.ico',
+      'image/vnd.microsoft.icon',
+    )
+
+    expect(result).toMatchObject({
+      format: 'ico',
+      frameCount: 3,
+      icoRepresentations: [
+        { sourceIndex: 1, width: 16, height: 16, payloadSha256: createHash('sha256').update(first).digest('hex') },
+        { sourceIndex: 2, width: 32, height: 32, payloadSha256: createHash('sha256').update(second).digest('hex') },
+        { sourceIndex: 4, width: 16, height: 16, payloadSha256: createHash('sha256').update(distinctAtSameSize).digest('hex') },
+      ],
+    })
   })
 
   it('distinguishes Ogg Opus from Ogg Vorbis', () => {

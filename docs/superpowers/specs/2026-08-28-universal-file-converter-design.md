@@ -320,7 +320,8 @@ The existing media limits remain authoritative:
 - video input: 200 MiB per file;
 - other file input: 100 MiB per file;
 - total input per request: 250 MiB;
-- output: 500 MiB per artifact.
+- output: 500 MiB in aggregate per conversion job; each artifact is necessarily
+  bounded by the same aggregate cap.
 
 Additional limits are:
 
@@ -773,11 +774,35 @@ visible conversion card. With an explicit Task 13 test-pack root, it proves:
   Playwright emulates the corresponding Renderer media query for deterministic
   screenshot capture. Final computer-use visual inspection remains pending.
 
-The page/representation fixture is visual evidence only. The current job
-runtime still commits one process output per job, and the current card lists
-all artifacts instead of implementing the specified collapsible multi-output
-group. Those are local design gaps and are not represented as real multi-output
-converter-process acceptance by Task 14.
+The page/representation screenshots remain visual fixture evidence. A later
+Task 14 production-runtime closure separately proves real multi-output process
+acceptance: three PDF pages and three ICNS/ICO representations cross the job
+runner, per-output content and metadata verification, one atomic SQLite job and
+artifact transaction, and durable artifact reads. The existing card lists all
+artifacts; collapsible grouping remains presentation behavior rather than a
+storage/runtime gap.
+
+The ordinary Electron entrypoint now installs an owner-bound production
+runtime factory. It reads only packaged `converter-packs/bootstrap.json` and a
+packaged root key through no-follow stable handles, accepts only an HTTPS index
+and sibling signature fetched under one controlled network lease with streamed
+byte caps, and never consults `PATH`. The checked-in bootstrap keeps downloads
+disabled and carries no key, so an unreleased build remains deterministically
+unavailable. Windows also remains unavailable unless Main receives a real Job
+Object process-tree port.
+
+Before adapter planning, the runtime copies the already-owned no-follow input
+handle into an exclusive private work directory, verifies size, hash, inode and
+timestamps, and passes only that private path to the fixed adapter. Every plan
+must declare a complete, unique output mapping directly inside that work root.
+The artifact service validates every output and its page/representation
+metadata before moving all leaves into one exclusive per-batch result directory
+and committing job completion plus every ready artifact in one transaction.
+Failure, cancellation, stale epoch, or CAS loss produces no ready subset; the
+whole exact batch directory is atomically retained under the owner-local
+`.trash` quarantine, including when staging cleanup fails. ICO probes retain
+ordered source indexes, dimensions and payload hashes, deduplicate only equal
+dimension-plus-hash entries, and persist truthful representation metadata.
 
 This local Darwin arm64 fixture evidence is not release acceptance. Production
 signing keys and index, hosted packs and CDN behavior, all twelve production

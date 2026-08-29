@@ -23,6 +23,11 @@ const expectedIcnsSlots = [
   { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 },
   { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 },
 ] as const
+const icoDescriptors = [
+  { sourceIndex: 1, width: 16, height: 16, payloadSha256: '1'.repeat(64) },
+  { sourceIndex: 2, width: 32, height: 32, payloadSha256: '2'.repeat(64) },
+  { sourceIndex: 4, width: 16, height: 16, payloadSha256: '3'.repeat(64) },
+] as const
 
 function image(overrides: Partial<ProbedConversionInput> = {}): ProbedConversionInput {
   return { format: 'png', mimeType: 'image/png', kind: 'image', byteSize: 100, width: 120, height: 80, frameCount: 1, ...overrides }
@@ -114,19 +119,49 @@ describe('image/icon conversion adapter', () => {
     })
   })
 
-  it('exports every structurally probed ICO/ICNS representation', () => {
-    const plan = imageIconAdapter.plan(image({ format: 'ico', mimeType: 'image/vnd.microsoft.icon', frameCount: 3 }), {
+  it('exports each deduplicated ICO descriptor in source order with persistable size metadata', () => {
+    const plan = imageIconAdapter.plan(image({
+      format: 'ico', mimeType: 'image/vnd.microsoft.icon', frameCount: 3,
+      icoRepresentations: icoDescriptors,
+    }), {
       inputPath: '/input/icon.ico', targetFormat: 'png',
     }, lease, '/work')
     expect(plan.args).toEqual([
       'extract-icon', '--input-format', 'ico', '--output-format', 'png', '--all-representations',
+      '--representation-indexes', '1,2,4',
       '--output-pattern', '/work/representation-%03d.png', '--', '/input/icon.ico',
     ])
     expect(plan.outputs).toEqual([
-      { path: '/work/representation-001.png', format: 'png' },
-      { path: '/work/representation-002.png', format: 'png' },
-      { path: '/work/representation-003.png', format: 'png' },
+      {
+        path: '/work/representation-001.png', format: 'png',
+        metadata: { iconRepresentation: {
+          sourceType: 'ico', sourceIndex: 1, logicalWidth: 16, logicalHeight: 16,
+          pixelWidth: 16, pixelHeight: 16, scale: 1,
+        } },
+      },
+      {
+        path: '/work/representation-002.png', format: 'png',
+        metadata: { iconRepresentation: {
+          sourceType: 'ico', sourceIndex: 2, logicalWidth: 32, logicalHeight: 32,
+          pixelWidth: 32, pixelHeight: 32, scale: 1,
+        } },
+      },
+      {
+        path: '/work/representation-004.png', format: 'png',
+        metadata: { iconRepresentation: {
+          sourceType: 'ico', sourceIndex: 4, logicalWidth: 16, logicalHeight: 16,
+          pixelWidth: 16, pixelHeight: 16, scale: 1,
+        } },
+      },
     ])
+  })
+
+  it('refuses ICO extraction when ordered representation descriptors are absent', () => {
+    expect(() => imageIconAdapter.plan(image({
+      format: 'ico', mimeType: 'image/vnd.microsoft.icon', frameCount: 3,
+    }), { inputPath: '/input/icon.ico', targetFormat: 'png' }, lease, '/work')).toThrowError(
+      expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }),
+    )
   })
 
   it('plans ten collision-free extraction outputs for the full scale-specific ICNS chain', () => {
@@ -161,8 +196,14 @@ describe('image/icon conversion adapter', () => {
   })
 
   it.each([101, 256])('exports all %i trusted ICO representations without the PDF page cap', (frameCount) => {
+    const descriptors = Array.from({ length: frameCount }, (_, index) => ({
+      sourceIndex: index + 1,
+      width: (index % 256) + 1,
+      height: (index % 256) + 1,
+      payloadSha256: index.toString(16).padStart(64, '0'),
+    }))
     const plan = imageIconAdapter.plan(image({
-      format: 'ico', mimeType: 'image/vnd.microsoft.icon', frameCount,
+      format: 'ico', mimeType: 'image/vnd.microsoft.icon', frameCount, icoRepresentations: descriptors,
     }), { inputPath: '/input/icon.ico', targetFormat: 'png' }, lease, '/work')
 
     expect(plan.outputContract).toEqual({ kind: 'icon-representations', count: frameCount })

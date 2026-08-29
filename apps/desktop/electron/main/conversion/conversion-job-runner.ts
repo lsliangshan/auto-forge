@@ -5,10 +5,7 @@ import type {
   ConversionJobTransition,
   NewConversionJob,
 } from '../database/repositories.js'
-import type {
-  ManagedOutputWriter,
-  VerifiedConversionOutput,
-} from './conversion-artifact-service.js'
+import type { ConversionArtifact } from '../database/repositories.js'
 import type { ConverterPackLease } from './converter-pack-types.js'
 
 export const CONVERSION_JOB_TRANSITIONS = Object.freeze({
@@ -45,16 +42,20 @@ export interface ConversionJobEvent {
 }
 
 /** Main-owned composition of pack, fixed adapter/process, input, and output ports. */
+export interface ManagedConversionAttempt {
+  readonly atomicJobCompletion?: true
+  execute(options: {
+    readonly signal: AbortSignal
+    onProgress(progress: number): boolean
+  }): Promise<void>
+  commit(options: { readonly endedAt: number }): Promise<readonly ConversionArtifact[]>
+  abort(): Promise<void>
+}
+
 export interface ConversionJobRuntime {
   concurrencyClass(job: ConversionJob): ConversionConcurrencyClass
   acquirePack(job: ConversionJob, signal: AbortSignal): Promise<ConverterPackLease>
-  createWriter(job: ConversionJob, lease: ConverterPackLease, signal: AbortSignal): Promise<ManagedOutputWriter>
-  convert(
-    job: ConversionJob,
-    lease: ConverterPackLease,
-    writer: ManagedOutputWriter,
-    options: { readonly signal: AbortSignal; onProgress(progress: number): boolean },
-  ): Promise<VerifiedConversionOutput>
+  prepare(job: ConversionJob, lease: ConverterPackLease, signal: AbortSignal): Promise<ManagedConversionAttempt>
 }
 
 export interface ConversionJobRepository {
@@ -116,8 +117,8 @@ interface ActiveJob extends PendingJob {
   readonly controller: AbortController
   status: 'downloading_component' | 'converting' | 'verifying' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
   lease?: ConverterPackLease
-  writer?: ManagedOutputWriter
-  writerAbortTask?: Promise<void>
+  attempt?: ManagedConversionAttempt
+  attemptAbortTask?: Promise<void>
   finalizationTail: Promise<void>
   done: Promise<void>
 }
@@ -225,10 +226,10 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
     return ![...active.values()].some((running) => running.resource === resource)
   }
 
-  const abortWriter = (running: ActiveJob): Promise<void> => {
-    if (running.writer === undefined) return Promise.resolve()
-    running.writerAbortTask ??= running.writer.abort().catch(() => undefined)
-    return running.writerAbortTask
+  const abortAttempt = (running: ActiveJob): Promise<void> => {
+    if (running.attempt === undefined) return Promise.resolve()
+    running.attemptAbortTask ??= running.attempt.abort().catch(() => undefined)
+    return running.attemptAbortTask
   }
 
   const run = async (running: ActiveJob): Promise<void> => {
@@ -238,13 +239,13 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
       running.lease = lease
       if (!guard(running.job, 'downloading_component')) return
 
-      const writer = await options.runtime.createWriter(running.job, lease, running.controller.signal)
-      running.writer = writer
+      const attempt = await options.runtime.prepare(running.job, lease, running.controller.signal)
+      running.attempt = attempt
       if (!guard(running.job, 'downloading_component')) return
       if (!move(running, 'converting')) return
       publish(running.job.id, running.job.epoch, 'converting')
 
-      const output = await options.runtime.convert(running.job, lease, writer, {
+      await attempt.execute({
         signal: running.controller.signal,
         onProgress(progress) {
           if (!Number.isFinite(progress)) return false
@@ -262,15 +263,25 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
 
       await withFinalization(running, async () => {
         if (!guard(running.job, 'verifying') || running.controller.signal.aborted) return
+        const endedAt = now()
         try {
-          await writer.commit(output)
+          await attempt.commit({ endedAt })
         } catch (error) {
           commitFailure = error
           return
         }
         // Successful registration wins the race. Cancellation waits on this
         // section, so a cancelled state cannot retain this new artifact.
-        if (move(running, 'completed', { progress: 100, endedAt: now() })) {
+        if (attempt.atomicJobCompletion === true) {
+          if (current(running.job.id, running.job.epoch, 'completed')) {
+            running.status = 'completed'
+            publish(running.job.id, running.job.epoch, 'completed')
+          } else {
+            commitFailure = Object.assign(new Error('Atomic conversion completion was not durable.'), {
+              code: 'CONVERSION_INTERRUPTED' as const,
+            })
+          }
+        } else if (move(running, 'completed', { progress: 100, endedAt })) {
           publish(running.job.id, running.job.epoch, 'completed')
         }
       })
@@ -283,7 +294,7 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
         }
       }
     } finally {
-      await abortWriter(running)
+      await abortAttempt(running)
       try {
         running.lease?.release()
       } catch {
@@ -379,7 +390,7 @@ export function createConversionJobRunner(options: CreateConversionJobRunnerOpti
       await running.done
       return changed
     }
-    await abortWriter(running)
+    await abortAttempt(running)
     const accepted = await withFinalization(running, () => {
       if (!activeStatuses.has(running.status)) return false
       const changed = move(running, target, { errorCode: code, endedAt: now() })

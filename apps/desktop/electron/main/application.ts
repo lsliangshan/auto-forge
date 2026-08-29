@@ -166,6 +166,7 @@ import {
   type ConversionJobRuntime,
 } from './conversion/conversion-job-runner.js'
 import { ConverterPackManager } from './conversion/converter-pack-manager.js'
+import type { ProductionConversionRuntimeFactory } from './conversion/production-conversion-runtime.js'
 
 export interface ApplicationPaths {
   database: string
@@ -308,6 +309,8 @@ export interface ApplicationRuntimeOptions {
   logoutSyncTimeoutMs?: number
   /** @internal Trusted Main-only conversion runtime used by focused lifecycle tests and signed-pack integration. */
   conversionRuntime?: ConversionJobRuntime
+  /** Main-owned owner-binding factory used by the ordinary production Electron entrypoint. */
+  conversionRuntimeFactory?: ProductionConversionRuntimeFactory
 }
 
 interface ObservedAuthService extends AuthService {
@@ -1125,8 +1128,7 @@ function unavailableConversionRuntime(packManager: ConverterPackManager): Conver
   return {
     concurrencyClass: () => 'other',
     acquirePack: unavailable,
-    createWriter: unavailable,
-    convert: unavailable,
+    prepare: unavailable,
   }
 }
 
@@ -1643,7 +1645,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       ownerUserId: session.user.id,
       artifacts: database.conversionArtifacts,
     })
-    const packManager = new ConverterPackManager({
+    const productionBinding = options.conversionRuntime === undefined && options.conversionRuntimeFactory !== undefined
+      ? await options.conversionRuntimeFactory({
+        ownerUserId: session.user.id,
+        dataRoot: options.paths.data,
+        packsRoot: join(options.paths.data, 'converter-packs'),
+        database: chatDatabase,
+        artifacts,
+      })
+      : undefined
+    const packManager = productionBinding?.packManager ?? new ConverterPackManager({
       packsRoot: join(options.paths.data, 'converter-packs'),
     })
     await packManager.initialize()
@@ -1653,7 +1664,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     const runner = createConversionJobRunner({
       ownerUserId: session.user.id,
       jobs: database.conversionJobs,
-      runtime: options.conversionRuntime ?? unavailableConversionRuntime(packManager),
+      runtime: options.conversionRuntime ?? productionBinding?.runtime ?? unavailableConversionRuntime(packManager),
       onEvent: (event) => { runnerEvent(generation, event) },
     })
     const lifecycle: BoundConversionLifecycle = {

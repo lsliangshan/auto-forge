@@ -10,11 +10,13 @@ import {
   type ConversionTargetFormat,
 } from '@autoforge/shared'
 import type {
+  CompleteConversionJobWithArtifactsInput,
   ConversionArtifact,
   ConversionArtifactMetadata,
   MediaAssetRecord,
   NewConversionArtifact,
 } from '../database/repositories.js'
+import { conversionArtifactMetadataSchema } from '../database/repositories.js'
 import { resolveUserConversionRoot, resolveUserMediaRoot } from '../media/user-media-root.js'
 import {
   CONVERSION_LIMITS,
@@ -22,6 +24,29 @@ import {
   probeConversionInput,
   type ProbedConversionInput,
 } from './conversion-catalog.js'
+
+function matchesIconContainerMetadata(
+  probe: ProbedConversionInput,
+  declared: readonly number[] | undefined,
+): boolean {
+  if (probe.format === 'ico') {
+    if (declared === undefined || probe.icoRepresentations?.length !== probe.frameCount) return false
+    const actual = probe.icoRepresentations.map((representation) => {
+      if (representation.width !== representation.height) return -1
+      return representation.width
+    })
+    return actual.length === declared.length && actual.every((size, index) => size === declared[index])
+  }
+  if (probe.format === 'icns') {
+    if (declared === undefined || probe.iconSlots?.length !== probe.frameCount) return false
+    const actual = probe.iconSlots.reduce<number[]>((sizes, slot) => {
+      if (!sizes.includes(slot.pixelSize)) sizes.push(slot.pixelSize)
+      return sizes
+    }, [])
+    return actual.length === declared.length && actual.every((size, index) => size === declared[index])
+  }
+  return declared === undefined
+}
 
 export type ConversionSourceRef =
   | { kind: 'media'; mediaAssetId: string }
@@ -46,6 +71,24 @@ export interface ManagedOutputWriter {
   abort(): Promise<void>
 }
 
+export interface ManagedOutputBatchCompletion {
+  readonly jobId: string
+  readonly ownerUserId: string
+  readonly executionId: string
+  readonly expectedEpoch: number
+  readonly endedAt: number
+}
+
+export interface ManagedOutputBatch {
+  readonly atomicJobCompletion: true
+  readonly outputs: readonly { readonly tempPath: string }[]
+  commit(
+    outputs: readonly VerifiedConversionOutput[],
+    completion?: ManagedOutputBatchCompletion,
+  ): Promise<readonly ConversionArtifact[]>
+  abort(): Promise<void>
+}
+
 export interface ResolvedOwnedInput {
   readonly handle: FileHandle
   readonly mainPath: string
@@ -64,12 +107,18 @@ interface MediaAssetRepository {
 interface ConversionArtifactRepository {
   getOwned(artifactId: string, ownerUserId: string): ConversionArtifact | null
   create(input: NewConversionArtifact): ConversionArtifact
+  createBatch(inputs: readonly NewConversionArtifact[]): ConversionArtifact[]
+}
+
+interface ConversionJobCompletionRepository {
+  completeWithArtifacts(input: CompleteConversionJobWithArtifactsInput): ConversionArtifact[] | null
 }
 
 export interface ConversionArtifactServiceDatabase {
   conversations: ConversationRepository
   mediaAssets: MediaAssetRepository
   conversionArtifacts: ConversionArtifactRepository
+  conversionJobs?: ConversionJobCompletionRepository
 }
 
 export interface CreateOutputWriterInput {
@@ -83,6 +132,7 @@ export interface CreateOutputWriterInput {
 export interface ConversionArtifactService {
   resolveOwnedInput(binding: ExecutionAttachmentBinding): Promise<ResolvedOwnedInput>
   createOutputWriter(input: CreateOutputWriterInput): Promise<ManagedOutputWriter>
+  createOutputBatch(inputs: readonly CreateOutputWriterInput[]): Promise<ManagedOutputBatch>
 }
 
 interface CreateConversionArtifactServiceOptions {
@@ -119,6 +169,13 @@ function sameFile(
   right: { dev: number | bigint; ino: number | bigint; size: number },
 ): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+}
+
+function sameNode(
+  left: { dev: number | bigint; ino: number | bigint },
+  right: { dev: number | bigint; ino: number | bigint },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino
 }
 
 async function ensureManagedDirectory(path: string): Promise<string> {
@@ -332,6 +389,294 @@ export function createConversionArtifactService(
           throw error
         }
         throw failure('CONVERSION_INPUT_INVALID')
+      }
+    },
+
+    async createOutputBatch(inputs) {
+      if (inputs.length === 0 || inputs.length > 256) throw failure('CONVERSION_INPUT_INVALID')
+      const first = inputs[0]!
+      if (
+        !identifier(first.ownerUserId)
+        || !identifier(first.executionId)
+        || !identifier(first.conversionJobId ?? '')
+        || inputs.some((input) => (
+          input.ownerUserId !== first.ownerUserId
+          || input.executionId !== first.executionId
+          || input.conversionJobId !== first.conversionJobId
+        ))
+      ) throw failure('CONVERSION_INPUT_INVALID')
+
+      const root = resolveUserConversionRoot(options.dataRoot, first.ownerUserId)
+      const dataRootRealPath = await realpath(options.dataRoot)
+      const parentRealPath = await ensureManagedDirectory(dirname(root))
+      if (!inside(dataRootRealPath, parentRealPath)) throw failure('CONVERSION_INPUT_INVALID')
+      const rootRealPath = await ensureManagedDirectory(root)
+      if (!inside(parentRealPath, rootRealPath)) throw failure('CONVERSION_INPUT_INVALID')
+      const staging = join(root, '.staging')
+      const results = join(root, 'results')
+      const trash = join(root, '.trash')
+      const stagingRealPath = await ensureManagedDirectory(staging)
+      const resultsRealPath = await ensureManagedDirectory(results)
+      const trashRealPath = await ensureManagedDirectory(trash)
+      if (
+        !inside(rootRealPath, stagingRealPath)
+        || !inside(rootRealPath, resultsRealPath)
+        || !inside(rootRealPath, trashRealPath)
+      ) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      const resultsMetadata = await lstat(resultsRealPath)
+      const trashMetadata = await lstat(trashRealPath)
+      if (resultsMetadata.dev !== trashMetadata.dev) throw failure('CONVERSION_INPUT_INVALID')
+      const batchDirectoryName = `batch-${randomUUID()}`
+      const batchDirectory = join(resultsRealPath, batchDirectoryName)
+      await mkdir(batchDirectory, { mode: 0o700 })
+      const batchDirectoryMetadata = await lstat(batchDirectory)
+      const batchDirectoryRealPath = await realpath(batchDirectory)
+      if (
+        batchDirectoryMetadata.isSymbolicLink()
+        || !batchDirectoryMetadata.isDirectory()
+        || batchDirectoryMetadata.dev !== resultsMetadata.dev
+        || !inside(resultsRealPath, batchDirectoryRealPath)
+      ) throw failure('CONVERSION_INPUT_INVALID')
+
+      const allocated: Array<{
+        input: CreateOutputWriterInput
+        artifactId: string
+        tempPath: string
+        verifierPath: string
+        destination: string
+        relativePath: string
+      }> = []
+      try {
+        for (const input of inputs) {
+          const artifactId = makeId()
+          if (!identifier(artifactId) || allocated.some((output) => output.artifactId === artifactId)) {
+            throw failure('CONVERSION_INPUT_INVALID')
+          }
+          const tempPath = join(staging, `${artifactId}.partial`)
+          const created = await open(tempPath, 'wx', 0o600)
+          await created.close()
+          allocated.push({
+            input,
+            artifactId,
+            tempPath,
+            verifierPath: join(staging, `${artifactId}.${randomUUID()}.verify`),
+            destination: join(batchDirectoryRealPath, `${artifactId}.${input.targetFormat}`),
+            relativePath: posix.join('results', batchDirectoryName, `${artifactId}.${input.targetFormat}`),
+          })
+        }
+      } catch (error) {
+        await Promise.all(allocated.map(({ tempPath, verifierPath }) => Promise.all([
+          rm(tempPath, { force: true }),
+          rm(verifierPath, { force: true }),
+        ])))
+        await rm(batchDirectoryRealPath, { force: true }).catch(() => undefined)
+        throw error
+      }
+
+      let state: 'open' | 'committing' | 'committed' | 'aborted' = 'open'
+      let cancelRequested = false
+      let commitTask: Promise<readonly ConversionArtifact[]> | undefined
+      const cleanupStaging = async () => {
+        await Promise.all(allocated.flatMap(({ tempPath, verifierPath }) => [
+          rm(tempPath, { force: true }),
+          rm(verifierPath, { force: true }),
+        ]))
+      }
+      const quarantineBatch = async (): Promise<boolean> => {
+        try {
+          const named = await lstat(batchDirectoryRealPath)
+          if (
+            named.isSymbolicLink()
+            || !named.isDirectory()
+            || !sameNode(batchDirectoryMetadata, named)
+            || named.dev !== trashMetadata.dev
+          ) return false
+          const quarantineId = randomUUID()
+          const reservation = await open(join(trashRealPath, `.rollback-${quarantineId}.reserve`), 'wx', 0o600)
+          await reservation.close()
+          const isolated = join(trashRealPath, `rollback-${quarantineId}`)
+          const conflict = await lstat(isolated).then(
+            () => true,
+            (error: unknown) => {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+              throw error
+            },
+          )
+          if (conflict) return false
+          await renameFile(batchDirectoryRealPath, isolated)
+          const replacementAtSource = await lstat(batchDirectoryRealPath).then(
+            () => true,
+            (error: unknown) => {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+              throw error
+            },
+          )
+          const isolatedMetadata = await lstat(isolated)
+          return !replacementAtSource
+            && !isolatedMetadata.isSymbolicLink()
+            && isolatedMetadata.isDirectory()
+            && sameNode(batchDirectoryMetadata, isolatedMetadata)
+        } catch {
+          // The exclusive result batch and any conflicting/replacement node are
+          // preserved rather than being removed through a shared leaf path.
+          return false
+        }
+      }
+
+      return {
+        atomicJobCompletion: true,
+        outputs: Object.freeze(allocated.map(({ tempPath }) => Object.freeze({ tempPath }))),
+        async abort() {
+          if (state === 'committed' || state === 'aborted') return
+          if (state === 'committing') {
+            cancelRequested = true
+            await commitTask?.catch(() => undefined)
+            return
+          }
+          state = 'aborted'
+          await Promise.allSettled([cleanupStaging(), quarantineBatch()])
+        },
+        commit(outputs, completion) {
+          if (state !== 'open' || outputs.length !== allocated.length) throw failure('CONVERSION_INPUT_INVALID')
+          const parsedMetadata = outputs.map((output) => {
+            if (output.metadata === undefined) return undefined
+            const parsed = conversionArtifactMetadataSchema.safeParse(output.metadata)
+            if (!parsed.success) throw failure('CONVERSION_INPUT_INVALID')
+            return parsed.data
+          })
+          if (completion !== undefined && (
+            completion.jobId !== first.conversionJobId
+            || completion.ownerUserId !== first.ownerUserId
+            || completion.executionId !== first.executionId
+            || !Number.isSafeInteger(completion.expectedEpoch)
+            || completion.expectedEpoch < 0
+            || !Number.isSafeInteger(completion.endedAt)
+          )) throw failure('CONVERSION_INPUT_INVALID')
+          state = 'committing'
+          commitTask = (async () => {
+            try {
+              const sourceMetadata = await Promise.all(allocated.map(({ tempPath }) => lstat(tempPath)))
+              let aggregateBytes = 0
+              for (const metadata of sourceMetadata) {
+                if (metadata.isSymbolicLink() || !metadata.isFile()) throw failure('CONVERSION_INPUT_INVALID')
+                aggregateBytes += metadata.size
+                if (!Number.isSafeInteger(aggregateBytes) || aggregateBytes > CONVERSION_LIMITS.outputBytes) {
+                  throw failure('CONVERSION_OUTPUT_TOO_LARGE')
+                }
+              }
+
+              const prepared: NewConversionArtifact[] = []
+              const batchTimestamp = now()
+              if (!Number.isSafeInteger(batchTimestamp + allocated.length - 1)) throw failure('CONVERSION_INPUT_INVALID')
+              for (const [index, output] of allocated.entries()) {
+                if (cancelRequested) throw failure('CONVERSION_CANCELLED')
+                const before = sourceMetadata[index]!
+                const tempRealPath = await realpath(output.tempPath)
+                if (!inside(stagingRealPath, tempRealPath)) throw failure('CONVERSION_INPUT_INVALID')
+                const source = await open(output.tempPath, constants.O_RDONLY | constants.O_NOFOLLOW)
+                const verifier = await open(output.verifierPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
+                try {
+                  const opened = await source.stat()
+                  if (!sameFile(before, opened)) throw failure('CONVERSION_INPUT_INVALID')
+                  const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, before.size)))
+                  let offset = 0
+                  while (offset < before.size) {
+                    if (cancelRequested) throw failure('CONVERSION_CANCELLED')
+                    const read = await source.read(chunk, 0, Math.min(chunk.byteLength, before.size - offset), offset)
+                    if (read.bytesRead === 0) throw failure('CONVERSION_INPUT_INVALID')
+                    let written = 0
+                    while (written < read.bytesRead) {
+                      const result = await verifier.write(chunk, written, read.bytesRead - written, offset + written)
+                      if (result.bytesWritten === 0) throw failure('CONVERSION_INPUT_INVALID')
+                      written += result.bytesWritten
+                    }
+                    offset += read.bytesRead
+                  }
+                  const after = await source.stat()
+                  if (!sameFile(opened, after) || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+                    throw failure('CONVERSION_INPUT_INVALID')
+                  }
+                  await verifier.sync()
+                } finally {
+                  await Promise.all([source.close(), verifier.close()])
+                }
+                await rm(output.tempPath, { force: true })
+
+                const verifiedBefore = await lstat(output.verifierPath)
+                if (verifiedBefore.isSymbolicLink() || !verifiedBefore.isFile() || verifiedBefore.size !== before.size) {
+                  throw failure('CONVERSION_INPUT_INVALID')
+                }
+                const bytes = await readFile(output.verifierPath)
+                const probe = probeConversionInput({
+                  bytes,
+                  displayName: output.input.displayName,
+                  mimeType: expectedMimeType(output.input.targetFormat),
+                  byteSize: verifiedBefore.size,
+                })
+                if (probe.format !== output.input.targetFormat) throw failure('CONVERSION_INPUT_INVALID')
+                if (!matchesIconContainerMetadata(probe, parsedMetadata[index]?.iconRepresentations)) {
+                  throw failure('CONVERSION_INPUT_INVALID')
+                }
+                const representation = parsedMetadata[index]?.iconRepresentation
+                if (representation !== undefined && (
+                  probe.width !== representation.pixelWidth
+                  || probe.height !== representation.pixelHeight
+                )) throw failure('CONVERSION_INPUT_INVALID')
+                const verifiedAfter = await lstat(output.verifierPath)
+                if (!sameFile(verifiedBefore, verifiedAfter)) throw failure('CONVERSION_INPUT_INVALID')
+                const timestamp = batchTimestamp + index
+                prepared.push({
+                  id: output.artifactId,
+                  ownerUserId: output.input.ownerUserId,
+                  executionId: output.input.executionId,
+                  conversionJobId: output.input.conversionJobId,
+                  role: 'output',
+                  displayName: output.input.displayName,
+                  detectedFormat: probe.format,
+                  mimeType: probe.mimeType,
+                  byteSize: probe.byteSize,
+                  sha256: createHash('sha256').update(bytes).digest('hex'),
+                  relativePath: output.relativePath,
+                  ...(parsedMetadata[index] === undefined ? {} : { metadata: parsedMetadata[index] }),
+                  status: 'ready',
+                  createdAt: timestamp,
+                  updatedAt: timestamp,
+                })
+              }
+
+              if (cancelRequested) throw failure('CONVERSION_CANCELLED')
+              for (const output of allocated) {
+                const identity = await lstat(output.verifierPath)
+                await renameFile(output.verifierPath, output.destination)
+                const destination = await lstat(output.destination)
+                if (destination.isSymbolicLink() || !destination.isFile() || !sameFile(identity, destination)) {
+                  throw failure('CONVERSION_INPUT_INVALID')
+                }
+                if (cancelRequested) throw failure('CONVERSION_CANCELLED')
+              }
+
+              const artifacts = completion === undefined
+                ? options.database.conversionArtifacts.createBatch(prepared)
+                : options.database.conversionJobs?.completeWithArtifacts({
+                  ...completion,
+                  artifacts: prepared,
+                })
+              if (!artifacts) throw failure('CONVERSION_INTERRUPTED')
+              state = 'committed'
+              return artifacts
+            } catch (error) {
+              state = 'aborted'
+              await Promise.allSettled([cleanupStaging(), quarantineBatch()])
+              if (typeof error === 'object' && error !== null && 'code' in error && String((error as { code: unknown }).code).startsWith('CONVERSION_')) {
+                throw error
+              }
+              throw failure('CONVERSION_INPUT_INVALID')
+            }
+          })()
+          return commitTask
+        },
       }
     },
 

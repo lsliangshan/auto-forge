@@ -9690,20 +9690,19 @@ describe('createApplicationRuntime', () => {
         name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
         root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
       }),
-      createWriter: async () => ({
-        tempPath: join(root, 'conversion-output.partial'),
+      prepare: async () => ({
+        execute: async ({ signal }) => {
+          started.resolve(signal)
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve()
+            else signal.addEventListener('abort', () => resolve(), { once: true })
+          })
+          drained = true
+          throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
+        },
         commit: async () => { throw new Error('unexpected commit') },
         abort: async () => undefined,
       }),
-      convert: async (_job, _lease, _writer, { signal }) => {
-        started.resolve(signal)
-        await new Promise<void>((resolve) => {
-          if (signal.aborted) resolve()
-          else signal.addEventListener('abort', () => resolve(), { once: true })
-        })
-        drained = true
-        throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
-      },
     }
     const runtime = createApplicationRuntime(options(root, { conversionRuntime }))
     await authenticate(runtime, 'ConversionClearDrain', false)
@@ -9787,20 +9786,19 @@ describe('createApplicationRuntime', () => {
         name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
         root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
       }),
-      createWriter: async () => ({
-        tempPath: join(root, 'conversation-output.partial'),
+      prepare: async () => ({
+        execute: async ({ signal }) => {
+          started.resolve(signal)
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve()
+            else signal.addEventListener('abort', () => resolve(), { once: true })
+          })
+          drained = true
+          throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
+        },
         commit: async () => { throw new Error('unexpected commit') },
         abort: async () => undefined,
       }),
-      convert: async (_job, _lease, _writer, { signal }) => {
-        started.resolve(signal)
-        await new Promise<void>((resolve) => {
-          if (signal.aborted) resolve()
-          else signal.addEventListener('abort', () => resolve(), { once: true })
-        })
-        drained = true
-        throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
-      },
     }
     const runtime = createApplicationRuntime(options(root, { authService, conversionRuntime }))
     await runtime.services.auth.getSession()
@@ -9926,12 +9924,11 @@ describe('createApplicationRuntime', () => {
         root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
         }
       },
-      createWriter: async () => ({
-        tempPath: join(root, 'terminal-output.partial'),
+      prepare: async () => ({
+        execute: async () => { throw toSafeAppError({ code: 'CONVERSION_CANCELLED' }) },
         commit: async () => { throw new Error('unexpected commit') },
         abort: async () => undefined,
       }),
-      convert: async () => { throw toSafeAppError({ code: 'CONVERSION_CANCELLED' }) },
     }
     const runtime = createApplicationRuntime(options(root, {
       authService,
@@ -10408,19 +10405,18 @@ describe('createApplicationRuntime', () => {
         root: join(root, 'fake-pack'), executables: {},
         release: () => { released = true },
       }),
-      createWriter: async () => ({
-        tempPath: join(root, 'conversion-output.partial'),
+      prepare: async () => ({
+        execute: async ({ signal }) => {
+          started.resolve(signal)
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve()
+            else signal.addEventListener('abort', () => resolve(), { once: true })
+          })
+          throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
+        },
         commit: async () => { throw new Error('late commit') },
         abort: async () => { writerAborted = true },
       }),
-      convert: async (_job, _lease, _writer, { signal }) => {
-        started.resolve(signal)
-        await new Promise<void>((resolve) => {
-          if (signal.aborted) resolve()
-          else signal.addEventListener('abort', () => resolve(), { once: true })
-        })
-        throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
-      },
     }
     const closeEvidence: Array<{ aborted: boolean; released: boolean; writerAborted: boolean }> = []
     class ObservedUserDataStores extends UserDataStoreManager {
@@ -10468,24 +10464,23 @@ describe('createApplicationRuntime', () => {
         name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
         root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
       }),
-      createWriter: async () => ({
-        tempPath: join(root, 'stop-cas-output.partial'),
+      prepare: async () => ({
+        execute: async ({ signal }) => {
+          started.resolve(signal)
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve()
+            else signal.addEventListener('abort', () => resolve(), { once: true })
+          })
+          await new Promise<void>((resolve) => { setImmediate(resolve) })
+          const sqlite = new Database(join(root, 'autoforge.sqlite'))
+          sqlite.exec('DROP TRIGGER fail_conversion_interrupt')
+          sqlite.close()
+          drained = true
+          throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
+        },
         commit: async () => { throw new Error('unexpected commit') },
         abort: async () => undefined,
       }),
-      convert: async (_job, _lease, _writer, { signal }) => {
-        started.resolve(signal)
-        await new Promise<void>((resolve) => {
-          if (signal.aborted) resolve()
-          else signal.addEventListener('abort', () => resolve(), { once: true })
-        })
-        await new Promise<void>((resolve) => { setImmediate(resolve) })
-        const sqlite = new Database(join(root, 'autoforge.sqlite'))
-        sqlite.exec('DROP TRIGGER fail_conversion_interrupt')
-        sqlite.close()
-        drained = true
-        throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
-      },
     }
     let closes = 0
     class ObservedUserDataStores extends UserDataStoreManager {

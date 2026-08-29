@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { ConversionTargetFormat } from '@autoforge/shared'
 import { toSafeAppError, type AppError, type AppErrorCode } from '@autoforge/shared'
 import { detectMediaType, isSafeSvg } from '../media/media-sniffer.js'
@@ -32,6 +33,13 @@ export interface ProbedIcnsSlot {
   readonly pixelSize: 16 | 32 | 64 | 128 | 256 | 512 | 1024
 }
 
+export interface ProbedIcoRepresentation {
+  readonly sourceIndex: number
+  readonly width: number
+  readonly height: number
+  readonly payloadSha256: string
+}
+
 export interface ProbedConversionInput {
   format: ConversionInputFormat
   mimeType: string
@@ -42,6 +50,7 @@ export interface ProbedConversionInput {
   frameCount: number
   pageCount?: number
   iconSlots?: readonly ProbedIcnsSlot[]
+  icoRepresentations?: readonly ProbedIcoRepresentation[]
 }
 
 export interface ConversionRoute {
@@ -144,6 +153,7 @@ interface StructuralProbe {
   pageCount?: number
   pixelCounts?: number[]
   iconSlots?: readonly ProbedIcnsSlot[]
+  icoRepresentations?: readonly ProbedIcoRepresentation[]
 }
 
 function crc32(bytes: Uint8Array): number {
@@ -490,7 +500,11 @@ function pdfProbe(bytes: Uint8Array): StructuralProbe | undefined {
   const trailerEnd = text.indexOf('startxref', cursor)
   if (trailerEnd < 0) return undefined
   const trailer = text.slice(cursor, trailerEnd)
-  if (!/<<[\s\S]*\/Size\s+\d+[\s\S]*\/Root\s+\d+\s+\d+\s+R[\s\S]*>>/.test(trailer)) return undefined
+  if (
+    !/<<[\s\S]*>>/.test(trailer)
+    || !/\/Size\s+\d+/.test(trailer)
+    || !/\/Root\s+\d+\s+\d+\s+R/.test(trailer)
+  ) return undefined
   let pageCount = 0
   for (const entry of objectOffsets) {
     if (entry.offset <= 0 || entry.offset >= xref) return undefined
@@ -733,6 +747,8 @@ function iconProbe(bytes: Uint8Array): StructuralProbe | undefined {
   const count = buffer.readUInt16LE(4)
   if (count < 1 || count > 256 || 6 + count * 16 > bytes.length) return undefined
   const pixels: number[] = []
+  const icoRepresentations: ProbedIcoRepresentation[] = []
+  const seenRepresentations = new Set<string>()
   const payloadRanges: Array<{ start: number; end: number }> = []
   let width = 0
   let height = 0
@@ -790,11 +806,20 @@ function iconProbe(bytes: Uint8Array): StructuralProbe | undefined {
       const requiredSize = headerSize + paletteEntries * 4 + xorBytes + maskBytes
       if (requiredSize !== size) return undefined
     }
-    width = Math.max(width, entryWidth)
-    height = Math.max(height, entryHeight)
-    pixels.push(entryWidth * entryHeight)
+    const payloadSha256 = createHash('sha256').update(payload).digest('hex')
+    const representationKey = `${entryWidth}x${entryHeight}:${payloadSha256}`
+    if (!seenRepresentations.has(representationKey)) {
+      seenRepresentations.add(representationKey)
+      width = Math.max(width, entryWidth)
+      height = Math.max(height, entryHeight)
+      pixels.push(entryWidth * entryHeight)
+      icoRepresentations.push({ sourceIndex: index + 1, width: entryWidth, height: entryHeight, payloadSha256 })
+    }
   }
-  return { format: 'ico', width, height, frameCount: count, pixelCounts: pixels }
+  return {
+    format: 'ico', width, height, frameCount: icoRepresentations.length,
+    pixelCounts: pixels, icoRepresentations,
+  }
 }
 
 function icnsProbe(bytes: Uint8Array): StructuralProbe | undefined {
@@ -1101,6 +1126,7 @@ export function probeConversionInput(input: {
     frameCount: structure.frameCount,
     ...(pageCount === undefined ? {} : { pageCount }),
     ...(structure.iconSlots === undefined ? {} : { iconSlots: structure.iconSlots }),
+    ...(structure.icoRepresentations === undefined ? {} : { icoRepresentations: structure.icoRepresentations }),
   }
 }
 

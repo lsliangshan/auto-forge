@@ -67,4 +67,15 @@ describe('main process build', () => {
     expect(packageJson.scripts?.['verify:converter-packs']).toContain('verify-converter-packs.mjs')
     expect(packageJson.scripts?.['dist:dir']).toContain('verify:converter-packs')
   })
+
+  it('wires the ordinary Electron Main entrypoint to the production conversion runtime factory', () => {
+    const mainEntryPath = fileURLToPath(new URL('./index.ts', import.meta.url))
+    const source = readFileSync(mainEntryPath, 'utf8')
+
+    expect(source).toContain("import { createProductionConversionRuntimeFactory } from './conversion/production-conversion-runtime.js'")
+    expect(source).toContain("join(process.resourcesPath, 'converter-packs')")
+    expect(source).toContain("join(app.getAppPath(), 'resources', 'converter-packs')")
+    expect(source).toMatch(/conversionRuntimeFactory:\s*createProductionConversionRuntimeFactory\(\{[\s\S]*resourcesRoot:\s*converterPackResources,[\s\S]*network:\s*networkProxy/u)
+    expect(source).not.toMatch(/process\.env[^\n]*(?:converter|pack|public.?key|index)/iu)
+  })
 })

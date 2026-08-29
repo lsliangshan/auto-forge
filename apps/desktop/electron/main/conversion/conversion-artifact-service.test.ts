@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { deflateSync } from 'node:zlib'
-import { link, mkdir, open, readFile, readdir, symlink, truncate, writeFile } from 'node:fs/promises'
+import { link, lstat, mkdir, open, readFile, readdir, rename, symlink, truncate, writeFile } from 'node:fs/promises'
+import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { mkdtemp } from 'node:fs/promises'
@@ -52,6 +53,40 @@ const png = (width = 2, height = 3) => {
   ])
 }
 
+function icoRepresentations(sizes: readonly number[]): Buffer {
+  const payloads = sizes.map((size) => png(size, size))
+  const header = Buffer.alloc(6 + payloads.length * 16)
+  header.writeUInt16LE(1, 2)
+  header.writeUInt16LE(payloads.length, 4)
+  let offset = header.byteLength
+  for (const [index, payload] of payloads.entries()) {
+    const size = sizes[index]!
+    const entry = 6 + index * 16
+    header[entry] = size === 256 ? 0 : size
+    header[entry + 1] = size === 256 ? 0 : size
+    header.writeUInt16LE(1, entry + 4)
+    header.writeUInt16LE(32, entry + 6)
+    header.writeUInt32LE(payload.byteLength, entry + 8)
+    header.writeUInt32LE(offset, entry + 12)
+    offset += payload.byteLength
+  }
+  return Buffer.concat([header, ...payloads])
+}
+
+function icnsRepresentations(slots: readonly { type: 'icp4' | 'ic11' | 'ic12'; size: 16 | 32 | 64 }[]): Buffer {
+  const chunks = slots.map(({ type, size }) => {
+    const payload = png(size, size)
+    const header = Buffer.alloc(8)
+    header.write(type)
+    header.writeUInt32BE(8 + payload.byteLength, 4)
+    return Buffer.concat([header, payload])
+  })
+  const header = Buffer.alloc(8)
+  header.write('icns')
+  header.writeUInt32BE(8 + chunks.reduce((total, value) => total + value.byteLength, 0), 4)
+  return Buffer.concat([header, ...chunks])
+}
+
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
 
 function opus(): Buffer {
@@ -94,6 +129,16 @@ function database(): ConversionArtifactServiceDatabase & { artifacts: Map<string
         artifacts.set(artifact.id, artifact)
         return artifact
       },
+      createBatch: (inputs: readonly NewConversionArtifact[]) => inputs.map((input) => {
+        const artifact: ConversionArtifact = {
+          ...input,
+          status: input.status ?? 'ready',
+          createdAt: input.createdAt ?? 1,
+          updatedAt: input.updatedAt ?? 1,
+        }
+        artifacts.set(artifact.id, artifact)
+        return artifact
+      }),
     },
   }
 }
@@ -311,6 +356,306 @@ describe('resolveOwnedInput', () => {
 })
 
 describe('managed output writer', () => {
+  it('commits every page in one output batch with stable names and metadata', async () => {
+    let nextId = 0
+    const { db, service } = await fixture({ id: () => `output-${++nextId}` })
+    const batch = await service.createOutputBatch([
+      {
+        ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+        displayName: 'report-page-001.png', targetFormat: 'png',
+      },
+      {
+        ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+        displayName: 'report-page-002.png', targetFormat: 'png',
+      },
+      {
+        ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+        displayName: 'report-page-003.png', targetFormat: 'png',
+      },
+    ])
+    await Promise.all(batch.outputs.map(({ tempPath }, index) => writeFile(tempPath, png(index + 1, index + 1))))
+
+    const artifacts = await batch.commit([
+      { metadata: { pdfPage: 1 } },
+      { metadata: { pdfPage: 2 } },
+      { metadata: { pdfPage: 3 } },
+    ])
+
+    expect(artifacts.map(({ displayName, metadata }) => ({ displayName, metadata }))).toEqual([
+      { displayName: 'report-page-001.png', metadata: { pdfPage: 1 } },
+      { displayName: 'report-page-002.png', metadata: { pdfPage: 2 } },
+      { displayName: 'report-page-003.png', metadata: { pdfPage: 3 } },
+    ])
+    expect([...db.artifacts.values()].map(({ id }) => id)).toEqual(['output-1', 'output-2', 'output-3'])
+  })
+
+  it('leaves no ready subset when a later output in the batch fails verification', async () => {
+    let nextId = 0
+    const { dataRoot, db, service } = await fixture({ id: () => `output-${++nextId}` })
+    const batch = await service.createOutputBatch([
+      {
+        ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+        displayName: 'icon-16.png', targetFormat: 'png',
+      },
+      {
+        ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+        displayName: 'icon-32.png', targetFormat: 'png',
+      },
+      {
+        ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+        displayName: 'icon-48.png', targetFormat: 'png',
+      },
+    ])
+    await writeFile(batch.outputs[0]!.tempPath, png(16, 16))
+    await writeFile(batch.outputs[1]!.tempPath, Buffer.from('not a png'))
+    await writeFile(batch.outputs[2]!.tempPath, png(48, 48))
+
+    await expect(batch.commit([
+      { metadata: { pdfPage: 1 } },
+      { metadata: { pdfPage: 2 } },
+      { metadata: { pdfPage: 3 } },
+    ])).rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+
+    expect([...db.artifacts.values()]).toEqual([])
+    expect(await readdir(join(resolveUserConversionRoot(dataRoot, 'user-a'), 'results'))).toEqual([])
+  })
+
+  it.each([
+    {
+      targetFormat: 'ico' as const,
+      bytes: icoRepresentations([16, 32]),
+      metadata: { iconRepresentations: [16, 32, 48] as const },
+    },
+    {
+      targetFormat: 'icns' as const,
+      bytes: icnsRepresentations([{ type: 'icp4', size: 16 }, { type: 'ic11', size: 32 }]),
+      metadata: { iconRepresentations: [16, 32, 64] as const },
+    },
+  ])('rejects a $targetFormat container whose content omits declared representations', async ({ targetFormat, bytes, metadata }) => {
+    const { dataRoot, db, service } = await fixture()
+    const batch = await service.createOutputBatch([{
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: `App.${targetFormat}`, targetFormat,
+    }])
+    await writeFile(batch.outputs[0]!.tempPath, bytes)
+
+    await expect(batch.commit([{ metadata: { iconRepresentations: [...metadata.iconRepresentations] } }]))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+
+    expect([...db.artifacts.values()]).toEqual([])
+    expect(await readdir(join(resolveUserConversionRoot(dataRoot, 'user-a'), 'results'))).toEqual([])
+  })
+
+  it('persists an icon container only when every declared representation matches its content', async () => {
+    const { db, service } = await fixture()
+    const batch = await service.createOutputBatch([{
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: 'App.ico', targetFormat: 'ico',
+    }])
+    await writeFile(batch.outputs[0]!.tempPath, icoRepresentations([16, 32, 48]))
+
+    await expect(batch.commit([{ metadata: { iconRepresentations: [16, 32, 48] } }]))
+      .resolves.toMatchObject([{ metadata: { iconRepresentations: [16, 32, 48] } }])
+    expect([...db.artifacts.values()]).toHaveLength(1)
+  })
+
+  it('rolls back every exact destination when a later batch rename fails', async () => {
+    let nextId = 0
+    let renames = 0
+    let firstDestinationIdentity: Awaited<ReturnType<typeof lstat>> | undefined
+    const { dataRoot, db, service } = await fixture({
+      id: () => `output-${++nextId}`,
+      filesystem: {
+        rename: async (source: string, destination: string) => {
+          renames += 1
+          if (renames === 2) throw new Error('injected second rename failure')
+          const { rename } = await import('node:fs/promises')
+          await rename(source, destination)
+          if (renames === 1) firstDestinationIdentity = await lstat(destination)
+        },
+      },
+    })
+    const batch = await service.createOutputBatch([1, 2, 3].map((page) => ({
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: `report-page-00${page}.png`, targetFormat: 'png' as const,
+    })))
+    await Promise.all(batch.outputs.map(({ tempPath }, index) => writeFile(tempPath, png(index + 1, index + 1))))
+
+    await expect(batch.commit([1, 2, 3].map((pdfPage) => ({ metadata: { pdfPage } }))))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    expect([...db.artifacts.values()]).toEqual([])
+    const ownerRoot = resolveUserConversionRoot(dataRoot, 'user-a')
+    expect(await readdir(join(ownerRoot, 'results'))).toEqual([])
+    const rollbackNames = (await readdir(join(ownerRoot, '.trash')))
+      .filter((name) => /^rollback-[0-9a-f-]{36}$/u.test(name))
+    expect(rollbackNames).toHaveLength(1)
+    const rollbackDirectory = join(ownerRoot, '.trash', rollbackNames[0]!)
+    const directory = await lstat(rollbackDirectory)
+    expect(directory.isDirectory()).toBe(true)
+    expect(directory.mode & 0o777).toBe(0o700)
+    expect(await readdir(rollbackDirectory)).toEqual(['output-1.png'])
+    const isolated = await lstat(join(rollbackDirectory, 'output-1.png'))
+    expect({ dev: isolated.dev, ino: isolated.ino, size: isolated.size }).toEqual({
+      dev: firstDestinationIdentity?.dev,
+      ino: firstDestinationIdentity?.ino,
+      size: firstDestinationIdentity?.size,
+    })
+  })
+
+  it('fails closed without touching a replacement introduced before rollback isolation', async () => {
+    let nextId = 0
+    let renames = 0
+    let firstDestination: string | undefined
+    const replacement = Buffer.from('replacement must remain at the result leaf')
+    const preservedRoot = await mkdtemp(join(tmpdir(), 'autoforge-preserved-output-'))
+    roots.push(preservedRoot)
+    const preservedOriginal = join(preservedRoot, 'original.png')
+    const { dataRoot, db, service } = await fixture({
+      id: () => `output-${++nextId}`,
+      filesystem: {
+        rename: async (source: string, destination: string) => {
+          renames += 1
+          const { rename } = await import('node:fs/promises')
+          if (renames === 1) {
+            await rename(source, destination)
+            firstDestination = destination
+            return
+          }
+          if (renames === 2) {
+            if (!firstDestination) throw new Error('missing first destination')
+            await rename(firstDestination, preservedOriginal)
+            await writeFile(firstDestination, replacement)
+            throw new Error('injected second rename failure after replacement')
+          }
+          await rename(source, destination)
+        },
+      },
+    })
+    const batch = await service.createOutputBatch([1, 2].map((page) => ({
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: `report-page-00${page}.png`, targetFormat: 'png' as const,
+    })))
+    const original = png(4, 4)
+    await Promise.all(batch.outputs.map(({ tempPath }) => writeFile(tempPath, original)))
+
+    await expect(batch.commit([{ metadata: { pdfPage: 1 } }, { metadata: { pdfPage: 2 } }]))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+
+    expect([...db.artifacts.values()]).toEqual([])
+    expect(firstDestination).toBeTypeOf('string')
+    await expect(readFile(preservedOriginal)).resolves.toEqual(original)
+    const ownerRoot = resolveUserConversionRoot(dataRoot, 'user-a')
+    expect(await readdir(join(ownerRoot, 'results'))).toEqual([])
+    const rollback = (await readdir(join(ownerRoot, '.trash')))
+      .find((name) => /^rollback-[0-9a-f-]{36}$/u.test(name))
+    expect(rollback).toBeTypeOf('string')
+    await expect(readFile(join(ownerRoot, '.trash', rollback!, 'output-1.png'))).resolves.toEqual(replacement)
+  })
+
+  it('quarantines the exclusive result batch even when staging cleanup fails', async () => {
+    let nextId = 0
+    const { dataRoot, db, service } = await fixture({ id: () => `output-${++nextId}` })
+    const batch = await service.createOutputBatch([1, 2].map((page) => ({
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: `report-page-00${page}.png`, targetFormat: 'png' as const,
+    })))
+    await Promise.all(batch.outputs.map(({ tempPath }) => writeFile(tempPath, png())))
+    db.conversionArtifacts.createBatch = () => {
+      mkdirSync(batch.outputs[0]!.tempPath)
+      throw new Error('injected database failure after durable moves')
+    }
+
+    await expect(batch.commit([{ metadata: { pdfPage: 1 } }, { metadata: { pdfPage: 2 } }]))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+
+    const ownerRoot = resolveUserConversionRoot(dataRoot, 'user-a')
+    expect([...db.artifacts.values()]).toEqual([])
+    expect(await readdir(join(ownerRoot, 'results'))).toEqual([])
+    const quarantines = (await readdir(join(ownerRoot, '.trash')))
+      .filter((name) => /^rollback-[0-9a-f-]{36}$/u.test(name))
+    expect(quarantines).toHaveLength(1)
+    const quarantined = join(ownerRoot, '.trash', quarantines[0]!)
+    expect((await readdir(quarantined)).sort()).toEqual(['output-1.png', 'output-2.png'])
+  })
+
+  it('fails closed on a quarantine-name conflict without moving the conflicting node or a replacement batch', async () => {
+    let nextId = 0
+    let renames = 0
+    let preservedBatch: string | undefined
+    let replacementBatch: string | undefined
+    let quarantineConflict: string | undefined
+    const preservedRoot = await mkdtemp(join(tmpdir(), 'autoforge-preserved-batch-'))
+    roots.push(preservedRoot)
+    const { db, service } = await fixture({
+      id: () => `output-${++nextId}`,
+      filesystem: {
+        rename: async (source: string, destination: string) => {
+          renames += 1
+          if (renames <= 2) {
+            await rename(source, destination)
+            return
+          }
+          preservedBatch = join(preservedRoot, 'original-batch')
+          replacementBatch = source
+          quarantineConflict = destination
+          await rename(source, preservedBatch)
+          await mkdir(replacementBatch, { mode: 0o700 })
+          await writeFile(join(replacementBatch, 'replacement.txt'), 'must remain')
+          await mkdir(quarantineConflict, { mode: 0o700 })
+          await writeFile(join(quarantineConflict, 'conflict.txt'), 'must remain')
+          throw new Error('injected quarantine collision after batch replacement')
+        },
+      },
+    })
+    const batch = await service.createOutputBatch([1, 2].map((page) => ({
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: `report-page-00${page}.png`, targetFormat: 'png' as const,
+    })))
+    await Promise.all(batch.outputs.map(({ tempPath }) => writeFile(tempPath, png())))
+    db.conversionArtifacts.createBatch = () => { throw new Error('injected database failure') }
+
+    await expect(batch.commit([{ metadata: { pdfPage: 1 } }, { metadata: { pdfPage: 2 } }]))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+
+    expect([...db.artifacts.values()]).toEqual([])
+    await expect(readFile(join(replacementBatch!, 'replacement.txt'), 'utf8')).resolves.toBe('must remain')
+    await expect(readFile(join(quarantineConflict!, 'conflict.txt'), 'utf8')).resolves.toBe('must remain')
+    expect((await readdir(preservedBatch!)).sort()).toEqual(['output-1.png', 'output-2.png'])
+  })
+
+  it('enforces the 500 MiB limit over the aggregate batch before verification', async () => {
+    let nextId = 0
+    const { db, service } = await fixture({ id: () => `output-${++nextId}` })
+    const batch = await service.createOutputBatch([1, 2].map((page) => ({
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: `large-page-00${page}.png`, targetFormat: 'png' as const,
+    })))
+    await Promise.all(batch.outputs.map(async ({ tempPath }) => {
+      await writeFile(tempPath, png())
+      await truncate(tempPath, 300 * 1024 * 1024)
+    }))
+
+    await expect(batch.commit([{ metadata: { pdfPage: 1 } }, { metadata: { pdfPage: 2 } }]))
+      .rejects.toMatchObject({ code: 'CONVERSION_OUTPUT_TOO_LARGE' })
+    expect([...db.artifacts.values()]).toEqual([])
+  })
+
+  it('removes verified files when the atomic job completion CAS is unavailable', async () => {
+    let nextId = 0
+    const { dataRoot, db, service } = await fixture({ id: () => `output-${++nextId}` })
+    const batch = await service.createOutputBatch([1, 2].map((page) => ({
+      ownerUserId: 'user-a', executionId: 'execution-a', conversionJobId: 'job-a',
+      displayName: `stale-page-00${page}.png`, targetFormat: 'png' as const,
+    })))
+    await Promise.all(batch.outputs.map(({ tempPath }) => writeFile(tempPath, png())))
+
+    await expect(batch.commit([{ metadata: { pdfPage: 1 } }, { metadata: { pdfPage: 2 } }], {
+      jobId: 'job-a', ownerUserId: 'user-a', executionId: 'execution-a', expectedEpoch: 1, endedAt: 10,
+    })).rejects.toMatchObject({ code: 'CONVERSION_INTERRUPTED' })
+    expect([...db.artifacts.values()]).toEqual([])
+    expect(await readdir(join(resolveUserConversionRoot(dataRoot, 'user-a'), 'results'))).toEqual([])
+  })
+
   it('rejects a managed-root parent symlink that escapes the data root', async () => {
     const { dataRoot, service } = await fixture()
     const outside = await mkdtemp(join(tmpdir(), 'autoforge-conversion-escape-'))

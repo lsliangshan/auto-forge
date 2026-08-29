@@ -51,6 +51,26 @@ describe('file conversion contracts', () => {
     }).success).toBe(false)
   })
 
+  it('projects ordered ICO representation metadata to the artifact view', () => {
+    const artifact = {
+      artifactId: 'artifact_ico_4', status: 'ready' as const, displayName: 'icon-16x16@1x.png',
+      detectedFormat: 'png' as const, mimeType: 'image/png', byteSize: 100,
+      metadata: {
+        iconRepresentation: {
+          sourceType: 'ico' as const, sourceIndex: 4,
+          logicalWidth: 16, logicalHeight: 16,
+          pixelWidth: 16, pixelHeight: 16,
+          scale: 1,
+        },
+      },
+    }
+    expect(conversionArtifactViewSchema.parse(artifact)).toEqual(artifact)
+    expect(conversionArtifactViewSchema.safeParse({
+      ...artifact,
+      metadata: { iconRepresentation: { ...artifact.metadata.iconRepresentation, scale: 2 } },
+    }).success).toBe(false)
+  })
+
   it.each([
     { scope: { formats: [] }, arguments: { attachmentIndex: 0, targetFormat: 'png' } },
     { scope: { formats: ['png', 'png'] }, arguments: { attachmentIndex: 0, targetFormat: 'png' } },

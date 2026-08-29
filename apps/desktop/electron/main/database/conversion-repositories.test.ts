@@ -55,6 +55,47 @@ afterEach(() => {
 })
 
 describe('conversion repositories', () => {
+  it('atomically completes one epoch with all output artifacts or none', () => {
+    const { database } = openTestDatabase()
+    createExecution(database, 'execution_atomic_outputs')
+    const job = createJob(database, 'job_atomic_outputs', 'execution_atomic_outputs', 1, 'verifying')
+    const artifacts = [1, 2, 3].map((page) => ({
+      id: `artifact_page_${page}`, ownerUserId: 'alice', executionId: 'execution_atomic_outputs',
+      conversionJobId: job.id, role: 'output' as const, displayName: `report-page-00${page}.png`,
+      detectedFormat: 'png', mimeType: 'image/png', byteSize: 12, sha256: String(page).repeat(64),
+      relativePath: `results/artifact_page_${page}.png`, metadata: { pdfPage: page },
+      status: 'ready' as const, createdAt: 10, updatedAt: 10,
+    }))
+
+    expect(database.conversionJobs.completeWithArtifacts({
+      jobId: job.id, ownerUserId: 'alice', executionId: 'execution_atomic_outputs',
+      expectedEpoch: 0, endedAt: 20, artifacts,
+    })).toHaveLength(3)
+    expect(database.conversionJobs.getOwned(job.id, 'alice')).toMatchObject({ status: 'completed', progress: 100, endedAt: 20 })
+    expect(database.conversionArtifacts.listForJob(job.id, 'alice')).toHaveLength(3)
+
+    const stale = createJob(database, 'job_stale_outputs', 'execution_atomic_outputs', 2, 'verifying')
+    expect(database.conversionJobs.completeWithArtifacts({
+      jobId: stale.id, ownerUserId: 'alice', executionId: 'execution_atomic_outputs',
+      expectedEpoch: 1, endedAt: 30,
+      artifacts: [{ ...artifacts[0]!, id: 'artifact_stale', conversionJobId: stale.id, relativePath: 'results/artifact_stale.png' }],
+    })).toBeNull()
+    expect(database.conversionArtifacts.listForJob(stale.id, 'alice')).toEqual([])
+
+    const failing = createJob(database, 'job_failed_outputs', 'execution_atomic_outputs', 3, 'verifying')
+    expect(() => database.conversionJobs.completeWithArtifacts({
+      jobId: failing.id, ownerUserId: 'alice', executionId: 'execution_atomic_outputs',
+      expectedEpoch: 0, endedAt: 40,
+      artifacts: [
+        { ...artifacts[0]!, id: 'artifact_duplicate', conversionJobId: failing.id, relativePath: 'results/duplicate-1.png' },
+        { ...artifacts[1]!, id: 'artifact_duplicate', conversionJobId: failing.id, relativePath: 'results/duplicate-2.png' },
+      ],
+    })).toThrow()
+    expect(database.conversionJobs.getOwned(failing.id, 'alice')).toMatchObject({ status: 'verifying', epoch: 0 })
+    expect(database.conversionArtifacts.listForJob(failing.id, 'alice')).toEqual([])
+    database.close()
+  })
+
   it('fails closed for cross-user jobs and artifacts', () => {
     const { database } = openTestDatabase()
     createExecution(database, 'execution_alice')
@@ -300,6 +341,32 @@ describe('conversion repositories', () => {
       .toEqual(slots.map((iconRepresentation) => ({ iconRepresentation })))
     expect(reopened.conversionArtifacts.listForJob(job.id, 'alice')[1]?.metadata)
       .not.toEqual(reopened.conversionArtifacts.listForJob(job.id, 'alice')[2]?.metadata)
+    reopened.close()
+  })
+
+  it('persists ordered ICO representation dimensions and original source indexes', () => {
+    const { database, path } = openTestDatabase()
+    createExecution(database, 'execution_ico_metadata')
+    const job = createJob(database, 'job_ico_metadata', 'execution_ico_metadata', 1)
+    const representations = [
+      { sourceType: 'ico', sourceIndex: 1, logicalWidth: 16, logicalHeight: 16, pixelWidth: 16, pixelHeight: 16, scale: 1 },
+      { sourceType: 'ico', sourceIndex: 2, logicalWidth: 32, logicalHeight: 32, pixelWidth: 32, pixelHeight: 32, scale: 1 },
+      { sourceType: 'ico', sourceIndex: 4, logicalWidth: 16, logicalHeight: 16, pixelWidth: 16, pixelHeight: 16, scale: 1 },
+    ] as const
+    for (const [index, iconRepresentation] of representations.entries()) {
+      database.conversionArtifacts.create({
+        id: `artifact_ico_${index}`, ownerUserId: 'alice', executionId: 'execution_ico_metadata',
+        conversionJobId: job.id, role: 'output', displayName: `icon-${iconRepresentation.pixelWidth}.png`,
+        detectedFormat: 'png', mimeType: 'image/png', byteSize: 12,
+        sha256: String(index).padStart(64, '0'), relativePath: `artifacts/ico-${index}.png`,
+        metadata: { iconRepresentation },
+      })
+    }
+    database.close()
+
+    const reopened = openAppDatabase(path)
+    expect(reopened.conversionArtifacts.listForJob(job.id, 'alice').map((artifact) => artifact.metadata))
+      .toEqual(representations.map((iconRepresentation) => ({ iconRepresentation })))
     reopened.close()
   })
 

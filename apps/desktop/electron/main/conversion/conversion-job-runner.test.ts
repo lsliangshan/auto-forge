@@ -138,6 +138,18 @@ class ControlledRuntime implements ConversionJobRuntime {
     }
   }
 
+  async prepare(job: ConversionJob, lease: ConverterPackLease, signal: AbortSignal) {
+    const writer = await this.createWriter(job, lease, signal)
+    let output: VerifiedConversionOutput | undefined
+    return {
+      execute: async (options: { signal: AbortSignal; onProgress(progress: number): boolean }) => {
+        output = await this.convert(job, lease, writer, options)
+      },
+      commit: async () => [await writer.commit(output ?? {})],
+      abort: () => writer.abort(),
+    }
+  }
+
   async createWriter(job: ConversionJob, _lease: ConverterPackLease, signal: AbortSignal): Promise<ManagedOutputWriter> {
     if (signal.aborted) throw conversionFailure('CONVERSION_CANCELLED')
     const key = this.key(job.id, job.epoch)
@@ -307,6 +319,61 @@ describe('conversion job runner', () => {
     expect(runtime.releases.get(key)).toBe(1)
     expect(database.conversionJobs.getOwned(submitted.jobId, 'alice')?.status).toBe('cancelled')
     expect(events.filter((event) => event.jobId === submitted.jobId && event.status === 'completed')).toEqual([])
+    database.close()
+  })
+
+  it('drops every output from a late multi-output attempt after cancellation', async () => {
+    const { database } = fixture()
+    const executing = deferred<void>()
+    const releaseExecute = deferred<void>()
+    let commits = 0
+    let aborts = 0
+    const runtime = {
+      concurrencyClass: () => 'other' as const,
+      async acquirePack() {
+        return {
+          name: 'pdf' as const, version: '1.0.0', platform: 'darwin' as const, arch: 'arm64' as const,
+          root: '/signed-pack', executables: Object.freeze({}), release() {},
+        }
+      },
+      async prepare() {
+        return {
+          atomicJobCompletion: true as const,
+          async execute() {
+            executing.resolve(undefined)
+            await releaseExecute.promise
+          },
+          async commit() {
+            commits += 1
+            return []
+          },
+          async abort() {
+            aborts += 1
+            releaseExecute.resolve(undefined)
+          },
+        }
+      },
+    } as unknown as ConversionJobRuntime
+    const runner = createConversionJobRunner({
+      ownerUserId: 'alice', jobs: database.conversionJobs, runtime, id: () => 'batch-job',
+    })
+    runner.start()
+    const submitted = runner.submit({
+      executionId: 'execution', sourceKind: 'artifact', sourceId: 'pdf-three-pages', targetFormat: 'png',
+    })
+    await executing.promise
+
+    const cancelling = runner.cancel(submitted.jobId)
+    releaseExecute.resolve(undefined)
+    await cancelling
+    await runner.idle()
+
+    expect(commits).toBe(0)
+    expect(aborts).toBe(1)
+    expect(database.conversionJobs.getOwned(submitted.jobId, 'alice')).toMatchObject({
+      status: 'cancelled', epoch: 0,
+    })
+    expect(database.conversionArtifacts.listForJob(submitted.jobId, 'alice')).toEqual([])
     database.close()
   })
 

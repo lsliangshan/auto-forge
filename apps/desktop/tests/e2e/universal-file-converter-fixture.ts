@@ -44,6 +44,7 @@ import { mediaAdapter } from '../../electron/main/conversion/adapters/media.js'
 import {
   createConversionProcessRunner,
   createNodeConversionProcessTreePort,
+  type ConversionProcessPlan,
   type ConverterAdapter,
 } from '../../electron/main/conversion/conversion-process-runner.js'
 import { ConverterPackManager } from '../../electron/main/conversion/converter-pack-manager.js'
@@ -253,13 +254,6 @@ const adapters: readonly AdapterEntry[] = [
   { adapter: mediaAdapter, pack: 'media' },
 ]
 
-type ConversionContext = {
-  input: ResolvedOwnedInput
-  displayName: string
-  adapter: ConverterAdapter
-  workRoot?: string
-}
-
 type HoldMode = 'none' | 'download' | 'late-cancel' | 'restart'
 type HeldConversion = { mode: Exclude<HoldMode, 'none'>; release(): void; promise: Promise<void> }
 let nextHoldMode: HoldMode = 'none'
@@ -287,6 +281,28 @@ function outputDisplayName(sourceName: string, targetFormat: ConversionTargetFor
   return `${[...sourceBase].slice(0, maximumBaseLength).join('')}${targetExtension}`
 }
 
+function outputBatchDisplayName(
+  sourceName: string,
+  targetFormat: ConversionTargetFormat,
+  plan: ConversionProcessPlan,
+  index: number,
+): string {
+  const safe = sanitizeDisplayName(sourceName)
+  const extension = extname(safe)
+  const sourceBase = basename(safe, extension) || 'converted'
+  if (plan.outputContract.kind === 'pdf-pages') {
+    return `${sourceBase}-page-${String(index + 1).padStart(3, '0')}.${targetFormat}`
+  }
+  const representation = plan.outputs[index]?.metadata?.iconRepresentation
+  if (representation) {
+    return `${sourceBase}-${representation.logicalWidth}x${representation.logicalHeight}@${representation.scale}x.${targetFormat}`
+  }
+  if (plan.outputContract.kind === 'icon-representations') {
+    return `${sourceBase}-representation-${String(index + 1).padStart(3, '0')}.${targetFormat}`
+  }
+  return outputDisplayName(sourceName, targetFormat)
+}
+
 function createSignedConversionRuntime(
   database: ReturnType<typeof openAppDatabase>,
   userDataStores: UserDataStoreManager,
@@ -309,9 +325,9 @@ function createSignedConversionRuntime(
       conversations: { get: (id) => userDataStores.current()?.conversations.get(id) },
       mediaAssets: { get: (id) => userDataStores.current()?.mediaAssets.get(id) },
       conversionArtifacts: database.conversionArtifacts,
+      conversionJobs: database.conversionJobs,
     },
   })
-  const contexts = new Map<string, ConversionContext>()
   let initialized: Promise<void> | undefined
   const initialize = () => (initialized ??= manager.initialize())
 
@@ -370,71 +386,95 @@ function createSignedConversionRuntime(
           try { await held.promise } finally { heldConversions.delete(job.id) }
           if (signal.aborted) throw toSafeAppError({ code: 'CONVERSION_CANCELLED' })
         }
-        const lease = await manager.acquire({ signedIndex, name: selected.pack })
-        contexts.set(`${job.id}:${job.epoch}`, { ...source, adapter: selected.adapter })
-        return lease
-      } catch (error) {
-        await source.input.close()
-        throw error
+        return await manager.acquire({ signedIndex, name: selected.pack })
+      } finally {
+        await source.input.close().catch(() => undefined)
       }
     },
-    async createWriter(job) {
-      const context = contexts.get(`${job.id}:${job.epoch}`)
-      if (!context) throw toSafeAppError({ code: 'CONVERSION_INTERRUPTED' })
-      return artifacts.createOutputWriter({
-        ownerUserId: job.ownerUserId,
-        executionId: job.executionId,
-        conversionJobId: job.id,
-        displayName: outputDisplayName(context.displayName, job.targetFormat),
-        targetFormat: job.targetFormat,
-      })
-    },
-    async convert(job, lease, writer, options) {
-      const key = `${job.id}:${job.epoch}`
-      const context = contexts.get(key)
-      if (!context) throw toSafeAppError({ code: 'CONVERSION_INTERRUPTED' })
+    async prepare(job, lease) {
+      const context = await resolveJobInput(job)
+      const selected = adapters.find(({ adapter }) => adapter.supports(context.input.probe, job.targetFormat))
+      if (!selected || selected.pack !== lease.name) {
+        await context.input.close()
+        throw toSafeAppError({ code: 'CONVERSION_INTERRUPTED' })
+      }
+      let workRoot: string | undefined
       try {
         await mkdir(join(userData, 'temporary'), { recursive: true, mode: 0o700 })
-        context.workRoot = await realpath(await mkdtemp(join(userData, 'temporary', 'converter-e2e-')))
-        const plan = context.adapter.plan(context.input.probe, {
+        workRoot = await realpath(await mkdtemp(join(userData, 'temporary', 'converter-e2e-')))
+        const plan = selected.adapter.plan(context.input.probe, {
           inputPath: context.input.mainPath,
           targetFormat: job.targetFormat,
           ...(job.preset === undefined ? {} : { preset: job.preset }),
-        }, lease, context.workRoot)
-        if (plan.outputs.length !== 1) throw toSafeAppError({ code: 'CONVERSION_INPUT_INVALID' })
-        options.onProgress(35)
-        await processRunner.run(plan, lease, { signal: options.signal })
-        processEvidence.push({
-          jobId: job.id,
-          epoch: job.epoch,
-          pack: lease.name,
+        }, lease, workRoot)
+        const batch = await artifacts.createOutputBatch(plan.outputs.map((_, index) => ({
+          ownerUserId: job.ownerUserId,
+          executionId: job.executionId,
+          conversionJobId: job.id,
+          displayName: outputBatchDisplayName(context.displayName, job.targetFormat, plan, index),
           targetFormat: job.targetFormat,
-          processExited: true,
-        })
-        await copyFile(plan.outputs[0]!.path, writer.tempPath)
-        options.onProgress(90)
-
-        const mode = nextHoldMode
-        nextHoldMode = 'none'
-        if (mode !== 'none') {
-          const held = newHold(mode)
-          heldConversions.set(job.id, held)
-          if (mode === 'restart') {
-            const releaseOnAbort = () => held.release()
-            options.signal.addEventListener('abort', releaseOnAbort, { once: true })
-            try { await held.promise } finally { options.signal.removeEventListener('abort', releaseOnAbort) }
-          } else {
-            await held.promise
-          }
-          heldConversions.delete(job.id)
+        })))
+        let cleaned = false
+        const cleanup = async () => {
+          if (cleaned) return
+          cleaned = true
+          await context.input.close().catch(() => undefined)
+          if (workRoot) await rm(workRoot, { recursive: true, force: true })
         }
         return {
-          ...(plan.outputs[0]!.metadata === undefined ? {} : { metadata: plan.outputs[0]!.metadata }),
+          atomicJobCompletion: true as const,
+          async execute(options) {
+            options.onProgress(35)
+            await processRunner.run(plan, lease, { signal: options.signal })
+            processEvidence.push({
+              jobId: job.id,
+              epoch: job.epoch,
+              pack: lease.name,
+              targetFormat: job.targetFormat,
+              processExited: true,
+            })
+            await Promise.all(plan.outputs.map((output, index) => copyFile(output.path, batch.outputs[index]!.tempPath)))
+            options.onProgress(90)
+
+            const mode = nextHoldMode
+            nextHoldMode = 'none'
+            if (mode !== 'none') {
+              const held = newHold(mode)
+              heldConversions.set(job.id, held)
+              if (mode === 'restart') {
+                const releaseOnAbort = () => held.release()
+                options.signal.addEventListener('abort', releaseOnAbort, { once: true })
+                try { await held.promise } finally { options.signal.removeEventListener('abort', releaseOnAbort) }
+              } else {
+                await held.promise
+              }
+              heldConversions.delete(job.id)
+            }
+          },
+          async commit({ endedAt }) {
+            try {
+              return await batch.commit(plan.outputs.map((output) => (
+                output.metadata === undefined ? {} : { metadata: output.metadata }
+              )), {
+                jobId: job.id,
+                ownerUserId: job.ownerUserId,
+                executionId: job.executionId,
+                expectedEpoch: job.epoch,
+                endedAt,
+              })
+            } finally {
+              await cleanup()
+            }
+          },
+          async abort() {
+            await batch.abort()
+            await cleanup()
+          },
         }
-      } finally {
-        contexts.delete(key)
+      } catch (error) {
         await context.input.close().catch(() => undefined)
-        if (context.workRoot) await rm(context.workRoot, { recursive: true, force: true })
+        if (workRoot) await rm(workRoot, { recursive: true, force: true })
+        throw error
       }
     },
   }

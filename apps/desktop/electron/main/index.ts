@@ -35,6 +35,7 @@ import { NetworkProxyService } from './network/network-proxy-service.js'
 import { ElectronBrowserWorkspace } from './browser/electron-browser-workspace.js'
 import { UserDataStoreManager } from './database/user-data-client.js'
 import { createSecureWindow } from './window.js'
+import { createProductionConversionRuntimeFactory } from './conversion/production-conversion-runtime.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
 
@@ -95,6 +96,9 @@ async function initialize(): Promise<ApplicationRuntime> {
     backgroundColor: () => nativeTheme.shouldUseDarkColors ? '#11151c' : '#f3f5f8',
   })
   nativeTheme.on('updated', () => browserWorkspace.updateTheme())
+  const converterPackResources = app.isPackaged
+    ? join(process.resourcesPath, 'converter-packs')
+    : join(app.getAppPath(), 'resources', 'converter-packs')
   return createApplicationRuntime({
     paths: {
       database: join(userData, 'autoforge.sqlite'),
@@ -111,6 +115,10 @@ async function initialize(): Promise<ApplicationRuntime> {
       decrypt: async (value) => ({ value: safeStorage.decryptString(value), shouldReEncrypt: false }),
     },
     networkProxy,
+    conversionRuntimeFactory: createProductionConversionRuntimeFactory({
+      resourcesRoot: converterPackResources,
+      network: networkProxy,
+    }),
     browserWorkspace,
     applyTheme: (theme) => {
       nativeTheme.themeSource = theme

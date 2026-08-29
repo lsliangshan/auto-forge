@@ -323,10 +323,14 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     })))
     expect(icns.metadata).toMatchObject({ iconRepresentations: [16, 32, 64, 128, 256, 512, 1024], transparentPadding: true })
 
-    const extractedIco = await convert(imageIconAdapter, 'image-icon', {
-      format: 'ico', mimeType: 'image/vnd.microsoft.icon', kind: 'image', byteSize: readFileSync(defaultIco.path).byteLength,
-      width: 256, height: 256, frameCount: 7,
-    }, defaultIco.path, { targetFormat: 'png' }, 'extract-ico')
+    const extractedIco = await convert(
+      imageIconAdapter,
+      'image-icon',
+      probe(defaultIco.path, 'icon.ico', 'image/vnd.microsoft.icon'),
+      defaultIco.path,
+      { targetFormat: 'png' },
+      'extract-ico',
+    )
     expect(extractedIco.map((output) => probe(output.path, 'representation.png', 'image/png').width))
       .toEqual([16, 24, 32, 48, 64, 128, 256])
     expect(extractedIco.map((output) => pngCornerAlpha(output.path))).toEqual(Array(7).fill(0))

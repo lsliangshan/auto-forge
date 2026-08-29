@@ -335,7 +335,7 @@ const conversionIcnsSlotDimensions = {
   icp6: [64, 1, 64], ic07: [128, 1, 128], ic13: [128, 2, 256],
   ic08: [256, 1, 256], ic14: [256, 2, 512], ic09: [512, 1, 512], ic10: [512, 2, 1024],
 } as const
-const conversionIconRepresentationSchema = z.object({
+const conversionIcnsRepresentationSchema = z.object({
   sourceType: z.enum(['icp4', 'ic11', 'icp5', 'ic12', 'icp6', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10']),
   logicalWidth: conversionIconRepresentationSizeSchema,
   logicalHeight: conversionIconRepresentationSizeSchema,
@@ -349,6 +349,24 @@ const conversionIconRepresentationSchema = z.object({
     || value.pixelWidth !== pixelSize || value.pixelHeight !== pixelSize || value.scale !== scale
   ) context.addIssue({ code: 'custom', message: 'ICNS representation metadata must match its source slot' })
 })
+const conversionIcoDimensionSchema = z.number().int().min(1).max(256)
+const conversionIcoRepresentationSchema = z.object({
+  sourceType: z.literal('ico'),
+  sourceIndex: z.number().int().min(1).max(256),
+  logicalWidth: conversionIcoDimensionSchema,
+  logicalHeight: conversionIcoDimensionSchema,
+  pixelWidth: conversionIcoDimensionSchema,
+  pixelHeight: conversionIcoDimensionSchema,
+  scale: z.literal(1),
+}).strict().superRefine((value, context) => {
+  if (value.logicalWidth !== value.pixelWidth || value.logicalHeight !== value.pixelHeight) {
+    context.addIssue({ code: 'custom', message: 'ICO representation metadata must preserve its pixel dimensions' })
+  }
+})
+const conversionIconRepresentationSchema = z.union([
+  conversionIcnsRepresentationSchema,
+  conversionIcoRepresentationSchema,
+])
 
 export const conversionArtifactMetadataSchema = z.object({
   iconRepresentations: z.array(conversionIconRepresentationSizeSchema).min(1).max(9)
@@ -385,6 +403,15 @@ export type NewConversionArtifact = Pick<
   ConversionArtifact,
   'id' | 'ownerUserId' | 'executionId' | 'role' | 'displayName' | 'detectedFormat' | 'mimeType' | 'byteSize' | 'sha256' | 'relativePath'
 > & Partial<Pick<ConversionArtifact, 'conversionJobId' | 'metadata' | 'status' | 'createdAt' | 'updatedAt' | 'deletedAt'>>
+
+export interface CompleteConversionJobWithArtifactsInput {
+  jobId: string
+  ownerUserId: string
+  executionId: string
+  expectedEpoch: number
+  endedAt: number
+  artifacts: readonly NewConversionArtifact[]
+}
 
 export interface ExecutionStep {
   id: string
@@ -886,10 +913,12 @@ export interface AppRepositories {
       ownerUserId: string
       expectedEpoch: number
     }): boolean
+    completeWithArtifacts(input: CompleteConversionJobWithArtifactsInput): ConversionArtifact[] | null
     interruptInFlight(ownerUserId: string): number
   }
   conversionArtifacts: {
     create(input: NewConversionArtifact): ConversionArtifact
+    createBatch(inputs: readonly NewConversionArtifact[]): ConversionArtifact[]
     getOwned(artifactId: string, ownerUserId: string): ConversionArtifact | null
     listForExecution(executionId: string, ownerUserId: string): ConversionArtifact[]
     listForJob(jobId: string, ownerUserId: string): ConversionArtifact[]
@@ -1701,6 +1730,49 @@ function relativeConversionArtifactPath(value: unknown): string {
     || value.includes('\0')
   ) throw new Error('Invalid conversion artifact path')
   return value
+}
+
+function insertConversionArtifact(
+  database: SqliteDatabase,
+  input: NewConversionArtifact,
+): ConversionArtifact {
+  const createdAt = input.createdAt ?? now()
+  const updatedAt = input.updatedAt ?? createdAt
+  const status = input.status ?? 'ready'
+  const metadata = conversionArtifactMetadata(input.metadata)
+  const relativePath = relativeConversionArtifactPath(input.relativePath)
+  const inserted = database.prepare(`
+    INSERT INTO conversion_artifacts (
+      id, owner_user_id, execution_id, conversion_job_id, role, display_name,
+      detected_format, mime_type, byte_size, sha256, relative_path, metadata_json,
+      status, created_at, updated_at, deleted_at
+    )
+    SELECT
+      @id, @ownerUserId, @executionId, @conversionJobId, @role, @displayName,
+      @detectedFormat, @mimeType, @byteSize, @sha256, @relativePath, @metadataJson,
+      @status, @createdAt, @updatedAt, @deletedAt
+    WHERE EXISTS (
+      SELECT 1 FROM executions WHERE id = @executionId AND owner_user_id = @ownerUserId
+    ) AND (
+      @conversionJobId IS NULL OR EXISTS (
+        SELECT 1 FROM conversion_jobs
+        WHERE id = @conversionJobId AND owner_user_id = @ownerUserId AND execution_id = @executionId
+      )
+    )
+  `).run({
+    ...input,
+    conversionJobId: input.conversionJobId ?? null,
+    metadataJson: metadata === undefined ? null : JSON.stringify(metadata),
+    relativePath,
+    status,
+    createdAt,
+    updatedAt,
+    deletedAt: input.deletedAt ?? (status === 'deleted' ? updatedAt : null),
+  }).changes
+  if (inserted !== 1) throw new Error('Conversion artifact ownership mismatch')
+  const row = one<Query>(database, `SELECT ${conversionArtifactColumns} FROM conversion_artifacts WHERE id = @id`, { id: input.id })
+  if (!row) throw new Error('Conversion artifact was not created')
+  return conversionArtifactFromRow(row)
 }
 
 function permissionFromRow(row: Query): PermissionGrant {
@@ -3008,6 +3080,43 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           interruptedAt,
         }).changes === 1)
       },
+      completeWithArtifacts(input) {
+        if (input.artifacts.length === 0 || input.artifacts.length > 256) {
+          throw new Error('Invalid conversion artifact batch')
+        }
+        return transaction(database, () => {
+          const completed = database.prepare(`
+            UPDATE conversion_jobs
+            SET status = 'completed',
+                progress = 100,
+                error_code = NULL,
+                updated_at = @endedAt,
+                ended_at = @endedAt
+            WHERE id = @jobId
+              AND owner_user_id = @ownerUserId
+              AND execution_id = @executionId
+              AND epoch = @expectedEpoch
+              AND status = 'verifying'
+          `).run({
+            jobId: input.jobId,
+            ownerUserId: input.ownerUserId,
+            executionId: input.executionId,
+            expectedEpoch: input.expectedEpoch,
+            endedAt: input.endedAt,
+          }).changes
+          if (completed !== 1) return null
+          return input.artifacts.map((artifact) => {
+            if (
+              artifact.ownerUserId !== input.ownerUserId
+              || artifact.executionId !== input.executionId
+              || artifact.conversionJobId !== input.jobId
+              || artifact.role !== 'output'
+              || artifact.status === 'deleted'
+            ) throw new Error('Conversion artifact batch identity mismatch')
+            return insertConversionArtifact(database, artifact)
+          })
+        })
+      },
       interruptInFlight(ownerUserId) {
         return transaction(database, () => {
           const interruptedAt = now()
@@ -3025,43 +3134,11 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
     },
     conversionArtifacts: {
       create(input) {
-        const createdAt = input.createdAt ?? now()
-        const updatedAt = input.updatedAt ?? createdAt
-        const status = input.status ?? 'ready'
-        const metadata = conversionArtifactMetadata(input.metadata)
-        const relativePath = relativeConversionArtifactPath(input.relativePath)
-        const inserted = transaction(database, () => database.prepare(`
-          INSERT INTO conversion_artifacts (
-            id, owner_user_id, execution_id, conversion_job_id, role, display_name,
-            detected_format, mime_type, byte_size, sha256, relative_path, metadata_json,
-            status, created_at, updated_at, deleted_at
-          )
-          SELECT
-            @id, @ownerUserId, @executionId, @conversionJobId, @role, @displayName,
-            @detectedFormat, @mimeType, @byteSize, @sha256, @relativePath, @metadataJson,
-            @status, @createdAt, @updatedAt, @deletedAt
-          WHERE EXISTS (
-            SELECT 1 FROM executions WHERE id = @executionId AND owner_user_id = @ownerUserId
-          ) AND (
-            @conversionJobId IS NULL OR EXISTS (
-              SELECT 1 FROM conversion_jobs
-              WHERE id = @conversionJobId AND owner_user_id = @ownerUserId AND execution_id = @executionId
-            )
-          )
-        `).run({
-          ...input,
-          conversionJobId: input.conversionJobId ?? null,
-          metadataJson: metadata === undefined ? null : JSON.stringify(metadata),
-          relativePath,
-          status,
-          createdAt,
-          updatedAt,
-          deletedAt: input.deletedAt ?? (status === 'deleted' ? updatedAt : null),
-        }).changes)
-        if (inserted !== 1) throw new Error('Conversion artifact ownership mismatch')
-        const row = one<Query>(database, `SELECT ${conversionArtifactColumns} FROM conversion_artifacts WHERE id = @id`, { id: input.id })
-        if (!row) throw new Error('Conversion artifact was not created')
-        return conversionArtifactFromRow(row)
+        return transaction(database, () => insertConversionArtifact(database, input))
+      },
+      createBatch(inputs) {
+        if (inputs.length === 0 || inputs.length > 256) throw new Error('Invalid conversion artifact batch')
+        return transaction(database, () => inputs.map((input) => insertConversionArtifact(database, input)))
       },
       getOwned(artifactId, ownerUserId) {
         const row = one<Query>(database, `

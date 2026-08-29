@@ -125,6 +125,7 @@ export const imageIconAdapter: ConverterAdapter = {
         throw new ConversionProcessError('CONVERSION_INPUT_INVALID')
       }
       const extractionSlots = input.format === 'icns' ? input.iconSlots : undefined
+      const extractionRepresentations = input.format === 'ico' ? input.icoRepresentations : undefined
       if (input.format === 'icns' && (
         extractionSlots?.length !== input.frameCount
         || new Set(extractionSlots.map((slot) => slot.type)).size !== extractionSlots.length
@@ -136,30 +137,62 @@ export const imageIconAdapter: ConverterAdapter = {
             || expected.scale !== slot.scale
         })
       )) throw new ConversionProcessError('CONVERSION_INPUT_INVALID')
+      if (input.format === 'ico' && (
+        extractionRepresentations?.length !== input.frameCount
+        || extractionRepresentations.some((representation, index) => (
+          !Number.isSafeInteger(representation.sourceIndex)
+          || representation.sourceIndex < 1
+          || representation.sourceIndex > 256
+          || (index > 0 && representation.sourceIndex <= extractionRepresentations[index - 1]!.sourceIndex)
+          || !Number.isSafeInteger(representation.width)
+          || representation.width < 1
+          || representation.width > 256
+          || !Number.isSafeInteger(representation.height)
+          || representation.height < 1
+          || representation.height > 256
+          || !/^[a-f0-9]{64}$/u.test(representation.payloadSha256)
+        ))
+        || new Set(extractionRepresentations.map((representation) => (
+          `${representation.width}x${representation.height}:${representation.payloadSha256}`
+        ))).size !== extractionRepresentations.length
+      )) throw new ConversionProcessError('CONVERSION_INPUT_INVALID')
       const pattern = join(outputRoot, `representation-%03d.${request.targetFormat}`)
       const outputs = Array.from({ length: input.frameCount }, (_, index) => {
         const slot = extractionSlots?.[index]
+        const representation = extractionRepresentations?.[index]
+        const sourceIndex = representation?.sourceIndex ?? index + 1
+        const iconRepresentation = representation === undefined
+          ? (slot === undefined ? undefined : {
+              sourceType: slot.type,
+              logicalWidth: slot.logicalSize,
+              logicalHeight: slot.logicalSize,
+              pixelWidth: slot.pixelSize,
+              pixelHeight: slot.pixelSize,
+              scale: slot.scale,
+            })
+          : {
+              sourceType: 'ico' as const,
+              sourceIndex: representation.sourceIndex,
+              logicalWidth: representation.width,
+              logicalHeight: representation.height,
+              pixelWidth: representation.width,
+              pixelHeight: representation.height,
+              scale: 1 as const,
+            }
         return {
-          path: join(outputRoot, `representation-${String(index + 1).padStart(3, '0')}.${request.targetFormat}`),
+          path: join(outputRoot, `representation-${String(sourceIndex).padStart(3, '0')}.${request.targetFormat}`),
           format: request.targetFormat,
-          ...(slot === undefined ? {} : {
-            metadata: {
-              iconRepresentation: {
-                sourceType: slot.type,
-                logicalWidth: slot.logicalSize,
-                logicalHeight: slot.logicalSize,
-                pixelWidth: slot.pixelSize,
-                pixelHeight: slot.pixelSize,
-                scale: slot.scale,
-              },
-            },
-          }),
+          ...(iconRepresentation === undefined ? {} : { metadata: { iconRepresentation } }),
         }
       })
       return planResult(lease, outputRoot, [
         'extract-icon', '--input-format', input.format, '--output-format', request.targetFormat,
-        '--all-representations', '--output-pattern', pattern, '--', request.inputPath,
-      ], outputs, { kind: 'icon-representations', count: input.frameCount })
+        '--all-representations',
+        ...(extractionRepresentations === undefined ? [] : [
+          '--representation-indexes', extractionRepresentations.map(({ sourceIndex }) => sourceIndex).join(','),
+        ]),
+        '--output-pattern', pattern, '--', request.inputPath,
+      ], outputs, { kind: 'icon-representations', count: outputs.length })
     }
 
     const outputPath = join(outputRoot, `output.${request.targetFormat}`)

@@ -1456,29 +1456,48 @@ const conversionDisplayNameSchema = z.string().trim().min(1).max(255).refine(
     && !/^(?:[A-Za-z]:|file:|https?:)/iu.test(value),
   'A safe display name is required',
 )
+const conversionIconRepresentationSizeSchema = z.union([
+  z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64),
+  z.literal(128), z.literal(256), z.literal(512), z.literal(1024),
+])
+const conversionIcnsRepresentationSchema = z.object({
+  sourceType: z.enum(['icp4', 'ic11', 'icp5', 'ic12', 'icp6', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10']),
+  logicalWidth: conversionIconRepresentationSizeSchema,
+  logicalHeight: conversionIconRepresentationSizeSchema,
+  pixelWidth: conversionIconRepresentationSizeSchema,
+  pixelHeight: conversionIconRepresentationSizeSchema,
+  scale: z.union([z.literal(1), z.literal(2)]),
+}).strict().superRefine((value, context) => {
+  const expected = ({
+    icp4: [16, 1, 16], ic11: [16, 2, 32], icp5: [32, 1, 32], ic12: [32, 2, 64],
+    icp6: [64, 1, 64], ic07: [128, 1, 128], ic13: [128, 2, 256],
+    ic08: [256, 1, 256], ic14: [256, 2, 512], ic09: [512, 1, 512], ic10: [512, 2, 1024],
+  } as const)[value.sourceType]
+  if (
+    value.logicalWidth !== expected[0] || value.logicalHeight !== expected[0]
+    || value.pixelWidth !== expected[2] || value.pixelHeight !== expected[2] || value.scale !== expected[1]
+  ) context.addIssue({ code: 'custom', message: 'ICNS representation metadata must match its source slot' })
+})
+const conversionIcoDimensionSchema = z.number().int().min(1).max(256)
+const conversionIcoRepresentationSchema = z.object({
+  sourceType: z.literal('ico'),
+  sourceIndex: z.number().int().min(1).max(256),
+  logicalWidth: conversionIcoDimensionSchema,
+  logicalHeight: conversionIcoDimensionSchema,
+  pixelWidth: conversionIcoDimensionSchema,
+  pixelHeight: conversionIcoDimensionSchema,
+  scale: z.literal(1),
+}).strict().superRefine((value, context) => {
+  if (value.logicalWidth !== value.pixelWidth || value.logicalHeight !== value.pixelHeight) {
+    context.addIssue({ code: 'custom', message: 'ICO representation metadata must preserve its pixel dimensions' })
+  }
+})
 const conversionArtifactMetadataSchema = z.object({
-  iconRepresentations: z.array(z.union([
-    z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64),
-    z.literal(128), z.literal(256), z.literal(512), z.literal(1024),
-  ])).min(1).max(9).optional(),
-  iconRepresentation: z.object({
-    sourceType: z.enum(['icp4', 'ic11', 'icp5', 'ic12', 'icp6', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10']),
-    logicalWidth: z.union([z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)]),
-    logicalHeight: z.union([z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)]),
-    pixelWidth: z.union([z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)]),
-    pixelHeight: z.union([z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)]),
-    scale: z.union([z.literal(1), z.literal(2)]),
-  }).strict().superRefine((value, context) => {
-    const expected = ({
-      icp4: [16, 1, 16], ic11: [16, 2, 32], icp5: [32, 1, 32], ic12: [32, 2, 64],
-      icp6: [64, 1, 64], ic07: [128, 1, 128], ic13: [128, 2, 256],
-      ic08: [256, 1, 256], ic14: [256, 2, 512], ic09: [512, 1, 512], ic10: [512, 2, 1024],
-    } as const)[value.sourceType]
-    if (
-      value.logicalWidth !== expected[0] || value.logicalHeight !== expected[0]
-      || value.pixelWidth !== expected[2] || value.pixelHeight !== expected[2] || value.scale !== expected[1]
-    ) context.addIssue({ code: 'custom', message: 'ICNS representation metadata must match its source slot' })
-  }).optional(),
+  iconRepresentations: z.array(conversionIconRepresentationSizeSchema).min(1).max(9).optional(),
+  iconRepresentation: z.union([
+    conversionIcnsRepresentationSchema,
+    conversionIcoRepresentationSchema,
+  ]).optional(),
   pdfPage: z.number().int().min(1).max(100).optional(),
   frameSelection: z.literal('first').optional(),
   transparentPadding: z.literal(true).optional(),
