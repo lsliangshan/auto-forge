@@ -392,13 +392,12 @@ export function createDeveloperAttachmentDraftService(
         const handle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW)
         let destinationHandle: Awaited<ReturnType<typeof open>> | undefined
         let destinationIdentity: NodeIdentity | undefined
-        let materializedBytes: Buffer | undefined
-        let sourceRemoved = false
+        let artifact: ConversionArtifact | undefined
+        let preserveDestination = false
         try {
           const opened = await handle.stat()
           if (!sameFile(before, opened)) throw failure('CONVERSION_INPUT_INVALID')
           const bytes = await handle.readFile()
-          materializedBytes = bytes
           const after = await handle.stat()
           if (!sameFile(opened, after)
             || bytes.byteLength !== record.byteSize
@@ -440,22 +439,8 @@ export function createDeveloperAttachmentDraftService(
           if (!sameFile(before, sourceAfter) || !sameFile(before, sourcePathAfter)) {
             throw failure('CONVERSION_INPUT_INVALID')
           }
-          const sourceBeforeRemove: NodeIdentity = {
-            dev: sourceAfter.dev, ino: sourceAfter.ino,
-            size: sourceAfter.size, nlink: sourceAfter.nlink,
-          }
-          await removeExact(source, sourceBeforeRemove)
-          const sourceReappeared = await lstat(source).then(
-            () => true,
-            (error: unknown) => {
-              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-              throw error
-            },
-          )
-          if (sourceReappeared) throw failure('CONVERSION_INPUT_INVALID')
-          sourceRemoved = true
           if (!destinationIdentity) throw failure('CONVERSION_INPUT_INVALID')
-          options.artifacts.create({
+          artifact = options.artifacts.create({
             id,
             ownerUserId: options.ownerUserId,
             executionId,
@@ -469,32 +454,34 @@ export function createDeveloperAttachmentDraftService(
           })
           claim.materialized = true
           claim.materializedIdentity = destinationIdentity
+          const sourceBeforeRemove: NodeIdentity = {
+            dev: sourceAfter.dev, ino: sourceAfter.ino,
+            size: sourceAfter.size, nlink: sourceAfter.nlink,
+          }
+          await removeExact(source, sourceBeforeRemove)
         } catch (error) {
-          if (sourceRemoved && materializedBytes) {
-            const restored = await open(
-              source,
-              constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-              0o600,
-            ).then(async (restoredHandle) => {
-              try {
-                await restoredHandle.writeFile(materializedBytes!)
-                await restoredHandle.sync()
-                return true
-              } finally {
-                await restoredHandle.close().catch(() => undefined)
-              }
-            }).catch(() => false)
-            if (!restored) destinationIdentity = undefined
+          if (artifact) {
+            const rolledBack = options.artifacts.markDeleted(artifact.id, options.ownerUserId, artifact)
+            if (!rolledBack) {
+              claim.materialized = true
+              claim.materializedIdentity = destinationIdentity
+              preserveDestination = true
+            } else {
+              claim.materialized = false
+              claim.materializedIdentity = undefined
+            }
           }
           await destinationHandle?.truncate(0).catch(() => undefined)
           await destinationHandle?.close().catch(() => undefined)
-          if (destinationIdentity) {
+          if (destinationIdentity && !preserveDestination) {
             const current = await lstat(destination).catch(() => undefined)
-            if (current && !current.isSymbolicLink() && sameInode(destinationIdentity, current)) {
+            if (current && !current.isSymbolicLink()
+              && current.dev === destinationIdentity.dev && current.ino === destinationIdentity.ino) {
               await removeCreated(destination, destinationIdentity, [1]).catch(() => undefined)
             }
           }
-          throw error
+          const safe = toSafeAppError(error)
+          throw safe.code === 'INTERNAL_ERROR' ? failure('CONVERSION_INPUT_INVALID') : safe
         } finally {
           await handle.close().catch(() => undefined)
           await destinationHandle?.close().catch(() => undefined)
@@ -562,6 +549,15 @@ export function createDeveloperAttachmentDraftService(
           if (sourceRemaining) throw failure('CONVERSION_INPUT_INVALID')
           if (!options.artifacts.markDeleted(id, options.ownerUserId, artifact)) {
             throw failure('CONVERSION_INPUT_INVALID')
+          }
+          const drafts = await verifiedDraftDirectory()
+          const draftPath = join(drafts, `${id}.input`)
+          const draftLive = await lstat(draftPath).catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+            throw error
+          })
+          if (draftLive) {
+            await removeExact(draftPath, record.draftIdentity)
           }
         } finally {
           await sourceHandle.close().catch(() => undefined)

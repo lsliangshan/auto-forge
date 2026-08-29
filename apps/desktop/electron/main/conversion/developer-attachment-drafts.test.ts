@@ -27,11 +27,12 @@ function bmp(red: number): Buffer {
   return bytes
 }
 
-function artifactRepository() {
+function artifactRepository(options: { failCreate?: boolean } = {}) {
   const records = new Map<string, ConversionArtifact>()
   return {
     records,
     create(input: NewConversionArtifact) {
+      if (options.failCreate) throw new Error('artifact persistence failed')
       const artifact = {
         ...input, status: 'ready' as const, createdAt: 1, updatedAt: 1,
       } as ConversionArtifact
@@ -268,5 +269,50 @@ describe('developer attachment drafts', () => {
       .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
     expect(await readFile(input)).toEqual(bytes)
     expect(artifacts.records.get('draft_1')).toMatchObject({ status: 'ready' })
+  })
+
+  it('rolls back only the destination when artifact persistence fails, then retries', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-artifact-rollback-'))
+    roots.push(root)
+    const source = join(root, 'source.bmp')
+    const bytes = bmp(6)
+    await writeFile(source, bytes)
+    let failCreate = true
+    const records = new Map<string, ConversionArtifact>()
+    const artifacts = {
+      records,
+      create(input: NewConversionArtifact) {
+        if (failCreate) throw new Error('artifact persistence failed')
+        const artifact = { ...input, status: 'ready' as const, createdAt: 1, updatedAt: 1 } as ConversionArtifact
+        records.set(artifact.id, artifact)
+        return artifact
+      },
+      getOwned(id: string, ownerUserId: string) {
+        const artifact = records.get(id)
+        return artifact?.ownerUserId === ownerUserId ? artifact : null
+      },
+      markDeleted(id: string, ownerUserId: string, expected: ConversionArtifact) {
+        if (records.get(id) !== expected || expected.ownerUserId !== ownerUserId) return false
+        records.set(id, { ...expected, status: 'deleted', updatedAt: 2, deletedAt: 2 })
+        return true
+      },
+    }
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts, id: () => 'draft_1',
+    })
+    await service.recover()
+    const [draft] = await service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: [source] })
+    const draftPath = join(resolveUserConversionRoot(root, 'user_1'), '.developer-drafts', `${draft!.id}.input`)
+    const before = await lstat(draftPath)
+    service.claim('project_1', 'execution_1', [draft!.id])
+
+    await expect(service.materialize('execution_1', [draft!.id])).rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    expect(await lstat(draftPath)).toMatchObject({ dev: before.dev, ino: before.ino, size: before.size })
+    await expect(lstat(join(resolveUserConversionRoot(root, 'user_1'), 'inputs', `${draft!.id}.input`))).rejects.toMatchObject({ code: 'ENOENT' })
+
+    failCreate = false
+    await expect(service.materialize('execution_1', [draft!.id])).resolves.toBeUndefined()
+    await expect(service.releaseExecution('execution_1', new Set())).resolves.toBeUndefined()
+    expect(records.get('draft_1')).toMatchObject({ status: 'deleted' })
   })
 })
