@@ -19,6 +19,14 @@ export interface DeveloperDraftRecord extends DeveloperAttachmentDraft {
   readonly sha256: string
   readonly relativePath: string
   readonly probe: ProbedConversionInput
+  readonly draftIdentity: NodeIdentity
+}
+
+interface NodeIdentity {
+  dev: number | bigint
+  ino: number | bigint
+  size: number
+  nlink: number
 }
 
 export interface DeveloperAttachmentDraftService {
@@ -68,12 +76,26 @@ function sameFile(
     && left.ctimeMs === right.ctimeMs
 }
 
-function sameNode(left: { dev: number | bigint; ino: number | bigint; nlink: number }, right: { dev: number | bigint; ino: number | bigint; nlink: number }): boolean {
+function sameNode(left: NodeIdentity, right: NodeIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink
 }
 
-function sameInode(left: { dev: number | bigint; ino: number | bigint; size: number }, right: { dev: number | bigint; ino: number | bigint; size: number }): boolean {
+function sameInode(left: NodeIdentity, right: NodeIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+}
+
+async function removeExact(path: string, expected: NodeIdentity, allowedLinks = [expected.nlink]): Promise<void> {
+  const current = await lstat(path)
+  const actual: NodeIdentity = { dev: current.dev, ino: current.ino, size: current.size, nlink: current.nlink }
+  if (current.isSymbolicLink() || !current.isFile() || !sameInode(expected, actual) || !allowedLinks.includes(actual.nlink)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  await rm(path)
+  const remaining = await lstat(path).then(() => true, (error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  })
+  if (remaining) throw failure('CONVERSION_INPUT_INVALID')
 }
 
 async function ensureDirectory(path: string): Promise<string> {
@@ -108,11 +130,11 @@ export function createDeveloperAttachmentDraftService(
   }
 
   const removeRecord = async (record: DeveloperDraftRecord) => {
-    records.delete(record.id)
     const drafts = await verifiedDraftDirectory()
     const path = join(drafts, `${record.id}.input`)
     if (!inside(drafts, path)) throw failure('CONVERSION_INPUT_INVALID')
-    await rm(path, { force: true })
+    await removeExact(path, record.draftIdentity)
+    records.delete(record.id)
   }
 
   async function withProjectLock<T>(projectId: string, operation: () => Promise<T>): Promise<T> {
@@ -148,7 +170,9 @@ export function createDeveloperAttachmentDraftService(
         if (!inside(drafts, path)) throw failure('CONVERSION_INPUT_INVALID')
         const metadata = await lstat(path)
         if (metadata.isSymbolicLink() || !metadata.isFile()) throw failure('CONVERSION_INPUT_INVALID')
-        await rm(path, { force: true })
+        // No trusted identity survives a restart for an unregistered node.
+        // Keep residue as evidence instead of deleting a possible replacement.
+        void metadata
       }
     },
 
@@ -168,7 +192,7 @@ export function createDeveloperAttachmentDraftService(
         const selectedPaths = input.paths.filter(Boolean).slice(0, remaining)
         if (selectedPaths.length === 0) return []
         const drafts = await verifiedDraftDirectory()
-        const staged: Array<{ record?: DeveloperDraftRecord; temporary: string; final: string }> = []
+        const staged: Array<{ record?: DeveloperDraftRecord; temporary: string; final: string; temporaryIdentity?: NodeIdentity; finalIdentity?: NodeIdentity }> = []
         try {
         for (const sourcePath of selectedPaths) {
           const name = basename(sourcePath)
@@ -213,6 +237,15 @@ export function createDeveloperAttachmentDraftService(
           } finally {
             await destination.close()
           }
+          const temporaryMetadata = await lstat(temporary)
+          if (temporaryMetadata.isSymbolicLink() || !temporaryMetadata.isFile()
+            || temporaryMetadata.nlink !== 1 || temporaryMetadata.size !== bytes.byteLength) {
+            throw failure('CONVERSION_INPUT_INVALID')
+          }
+          const temporaryIdentity: NodeIdentity = {
+            dev: temporaryMetadata.dev, ino: temporaryMetadata.ino,
+            size: temporaryMetadata.size, nlink: temporaryMetadata.nlink,
+          }
           const record: DeveloperDraftRecord = Object.freeze({
             id,
             ownerUserId: options.ownerUserId,
@@ -224,21 +257,37 @@ export function createDeveloperAttachmentDraftService(
             sha256: createHash('sha256').update(bytes).digest('hex'),
             relativePath: `.developer-drafts/${id}.input`,
             probe,
+            draftIdentity: temporaryIdentity,
           })
+          staged[staged.length - 1]!.temporaryIdentity = temporaryIdentity
           staged[staged.length - 1]!.record = record
         }
         assertProjectLimits(input.projectId, staged.map(({ record }) => record!.probe))
         for (const item of staged) {
           await link(item.temporary, item.final)
-          await rm(item.temporary)
+          const linked = await lstat(item.final)
+          if (linked.isSymbolicLink() || !linked.isFile() || linked.nlink !== 2 || !item.temporaryIdentity
+            || !sameInode(item.temporaryIdentity, {
+              dev: linked.dev, ino: linked.ino, size: linked.size, nlink: linked.nlink,
+            })) throw failure('CONVERSION_INPUT_INVALID')
+          item.finalIdentity = { ...item.temporaryIdentity, nlink: 1 }
+        }
+        for (const item of staged) {
+          if (!item.temporaryIdentity) throw failure('CONVERSION_INPUT_INVALID')
+          await removeExact(item.temporary, { ...item.temporaryIdentity, nlink: 2 }, [2])
+        }
+        for (const item of staged) {
           records.set(item.record!.id, item.record!)
         }
           return staged.map(({ record }) => publicDraft(record!))
         } catch (error) {
-          await Promise.all(staged.flatMap(({ temporary, final }) => [
-            rm(temporary, { force: true }),
-            rm(final, { force: true }),
-          ]))
+          for (const item of staged) {
+            if (item.temporaryIdentity) {
+              await removeExact(item.temporary, { ...item.temporaryIdentity, nlink: 2 }, [1, 2]).catch(() => undefined)
+            }
+            if (item.finalIdentity) await removeExact(item.final, item.finalIdentity).catch(() => undefined)
+          }
+          for (const item of staged) records.delete(item.record?.id ?? '')
           const safe = toSafeAppError(error)
           throw safe.code === 'INTERNAL_ERROR' ? failure('CONVERSION_INPUT_INVALID') : safe
         }
@@ -323,7 +372,7 @@ export function createDeveloperAttachmentDraftService(
         }
         const handle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW)
         let destinationHandle: Awaited<ReturnType<typeof open>> | undefined
-        let destinationIdentity: { dev: number | bigint; ino: number | bigint; nlink: number } | undefined
+        let destinationIdentity: NodeIdentity | undefined
         let materializedBytes: Buffer | undefined
         let sourceRemoved = false
         try {
@@ -352,19 +401,31 @@ export function createDeveloperAttachmentDraftService(
             constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
             0o600,
           )
-          destinationIdentity = await destinationHandle.stat()
+          const destinationOpened = await destinationHandle.stat()
+          destinationIdentity = {
+            dev: destinationOpened.dev, ino: destinationOpened.ino,
+            size: destinationOpened.size, nlink: destinationOpened.nlink,
+          }
           await destinationHandle.writeFile(bytes)
           await destinationHandle.sync()
           const moved = await destinationHandle.stat()
           if (!moved.isFile() || moved.nlink !== 1 || moved.size !== record.byteSize) {
             throw failure('CONVERSION_INPUT_INVALID')
           }
+          destinationIdentity = {
+            dev: moved.dev, ino: moved.ino,
+            size: moved.size, nlink: moved.nlink,
+          }
           const sourceAfter = await handle.stat()
           const sourcePathAfter = await lstat(source)
           if (!sameFile(before, sourceAfter) || !sameFile(before, sourcePathAfter)) {
             throw failure('CONVERSION_INPUT_INVALID')
           }
-          await rm(source)
+          const sourceBeforeRemove: NodeIdentity = {
+            dev: sourceAfter.dev, ino: sourceAfter.ino,
+            size: sourceAfter.size, nlink: sourceAfter.nlink,
+          }
+          await removeExact(source, sourceBeforeRemove)
           const sourceReappeared = await lstat(source).then(
             () => true,
             (error: unknown) => {
@@ -408,8 +469,8 @@ export function createDeveloperAttachmentDraftService(
           await destinationHandle?.close().catch(() => undefined)
           if (destinationIdentity) {
             const current = await lstat(destination).catch(() => undefined)
-            if (current && !current.isSymbolicLink() && sameNode(destinationIdentity, current)) {
-              await rm(destination, { force: true }).catch(() => undefined)
+            if (current && !current.isSymbolicLink() && sameInode(destinationIdentity, current)) {
+              await removeExact(destination, destinationIdentity).catch(() => undefined)
             }
           }
           throw error
@@ -465,7 +526,10 @@ export function createDeveloperAttachmentDraftService(
           if (!sameInode(sourceIdentity, quarantinedIdentity) || quarantinedIdentity.nlink !== 2) throw failure('CONVERSION_INPUT_INVALID')
           const sourceBeforeRemove = await lstat(source)
           if (!sameInode(sourceIdentity, sourceBeforeRemove) || sourceBeforeRemove.nlink !== 2) throw failure('CONVERSION_INPUT_INVALID')
-          await rm(source)
+          await removeExact(source, {
+            dev: sourceIdentity.dev, ino: sourceIdentity.ino,
+            size: sourceIdentity.size, nlink: 2,
+          }, [2])
           const sourceRemaining = await lstat(source).then(() => true, (error: unknown) => {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
             throw error

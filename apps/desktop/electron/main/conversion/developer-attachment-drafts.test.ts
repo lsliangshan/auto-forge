@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -180,5 +180,48 @@ describe('developer attachment drafts', () => {
     const quarantinedIdentity = await lstat(join(quarantine, candidate!))
     expect({ dev: quarantinedIdentity.dev, ino: quarantinedIdentity.ino }).toEqual({ dev: inputIdentity.dev, ino: inputIdentity.ino })
     expect(artifacts.records.get('draft_1')).toMatchObject({ status: 'deleted' })
+  })
+
+  it('preserves a replacement node when removing a draft record', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-replacement-'))
+    roots.push(root)
+    const source = join(root, 'source.bmp')
+    await writeFile(source, bmp(3))
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts: artifactRepository(), id: () => 'draft_1',
+    })
+    await service.recover()
+    const [draft] = await service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: [source] })
+    const input = join(resolveUserConversionRoot(root, 'user_1'), '.developer-drafts', `${draft!.id}.input`)
+    await unlink(input)
+    await writeFile(input, 'sentinel')
+
+    await expect(service.remove('project_1', draft!.id)).rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    expect(await readFile(input, 'utf8')).toBe('sentinel')
+    expect(service.get('project_1', draft!.id)).toBeDefined()
+  })
+
+  it('publishes no records and preserves a colliding sentinel on a later batch failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-atomic-'))
+    roots.push(root)
+    const sourcePaths = await Promise.all([1, 2].map(async (value) => {
+      const path = join(root, `source-${value}.bmp`)
+      await writeFile(path, bmp(value))
+      return path
+    }))
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts: artifactRepository(),
+      id: (() => { let index = 0; return () => `draft_${++index}` })(),
+    })
+    await service.recover()
+    const drafts = join(resolveUserConversionRoot(root, 'user_1'), '.developer-drafts')
+    const sentinel = join(drafts, 'draft_2.input')
+    await writeFile(sentinel, 'sentinel')
+
+    await expect(service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: sourcePaths }))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    expect(await readFile(sentinel, 'utf8')).toBe('sentinel')
+    expect((await readdir(drafts)).filter((name) => name.endsWith('.input'))).toEqual(['draft_2.input'])
+    expect(service.get('project_1', 'draft_1')).toBeUndefined()
   })
 })

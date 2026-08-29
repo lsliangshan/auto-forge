@@ -30,6 +30,9 @@ interface DeveloperRuntime {
   unsubscribe?: () => void
   pendingEvents: ExecutionEvent[]
   lifecycleWrapped: boolean
+  pickerGeneration: number
+  retryableCleanup: Map<string, Set<string>>
+  disposed: boolean
 }
 
 const runtimeKey = Symbol.for('autoforge.developer.runtime')
@@ -39,6 +42,7 @@ function runtime(store: object): DeveloperRuntime {
   if (existing) return existing
   const created: DeveloperRuntime = {
     timers: new Map(), queues: new Map(), pendingEvents: [], lifecycleWrapped: false,
+    pickerGeneration: 0, retryableCleanup: new Map(), disposed: false,
   }
   Reflect.defineProperty(store, runtimeKey, { configurable: true, value: created })
   return created
@@ -140,6 +144,8 @@ export const useDeveloperStore = defineStore('developer', {
       state.lifecycleWrapped = true
       const dispose = this.$dispose.bind(this)
       this.$dispose = () => {
+        state.disposed = true
+        state.pickerGeneration += 1
         void this.flushPendingSaves()
         void this._clearDeveloperAttachments()
         for (const timer of state.timers.values()) clearTimeout(timer)
@@ -191,6 +197,7 @@ export const useDeveloperStore = defineStore('developer', {
       const project = this.projects.find(({ id }) => id === projectId)
       if (!project) return
       if (this.selectedProjectId && this.selectedProjectId !== projectId) {
+        runtime(this).pickerGeneration += 1
         const cleared = await this._clearDeveloperAttachments(this.selectedProjectId)
         if (!cleared) return
       }
@@ -470,6 +477,8 @@ export const useDeveloperStore = defineStore('developer', {
     },
     configureDeveloperAttachmentField(name: string) {
       if (this.developerAttachmentField === name) return
+      this._ensureLifecycle()
+      runtime(this).pickerGeneration += 1
       if (this.developerAttachmentField || this.developerAttachments.length > 0) {
         const previous = [...this.developerAttachments]
         void this._clearDeveloperAttachments().then((cleared) => {
@@ -489,26 +498,22 @@ export const useDeveloperStore = defineStore('developer', {
       ;(this.debugInput as Record<string, unknown>)[name] = this.developerAttachments.map((_draft, index) => index)
     },
     async pickDeveloperAttachments() {
+      this._ensureLifecycle()
+      await this._retryDeveloperAttachmentCleanup()
       const projectId = this.selectedProjectId
       const field = this.developerAttachmentField
       if (!projectId || !field || this.developerAttachments.length >= 5) return
       const existingIds = this.developerAttachments.map(({ id }) => id)
+      const lifecycle = runtime(this)
+      const generation = lifecycle.pickerGeneration
       try {
         const selected = await getDesktopApi().developer.pickFiles({
           projectId,
           existingAttachmentIds: existingIds,
         })
-        if (this.selectedProjectId !== projectId || this.developerAttachmentField !== field) {
-          const cleanup = await Promise.allSettled(selected.map(({ id }) => getDesktopApi().developer.removeAttachment({
-            projectId, attachmentId: id,
-          })))
-          if (cleanup.some(({ status }) => status === 'rejected')) {
-            try {
-              await getDesktopApi().developer.clearAttachments({ projectId })
-            } catch (error) {
-              this.debugError = displayError(error, '文件清理失败，请重试')
-            }
-          }
+        if (lifecycle.disposed || lifecycle.pickerGeneration !== generation
+          || this.selectedProjectId !== projectId || this.developerAttachmentField !== field) {
+          await this._cleanupStaleDeveloperAttachments(projectId, selected.map(({ id }) => id))
           return
         }
         const known = new Set(existingIds)
@@ -542,6 +547,7 @@ export const useDeveloperStore = defineStore('developer', {
       const shouldReset = projectId === this.selectedProjectId
       try {
         await getDesktopApi().developer.clearAttachments({ projectId })
+        runtime(this).retryableCleanup.delete(projectId)
         if (shouldReset) {
           this.developerAttachments = []
           this._syncDeveloperAttachmentInput()
@@ -550,6 +556,35 @@ export const useDeveloperStore = defineStore('developer', {
       } catch (error) {
         if (shouldReset) this.debugError = displayError(error, '文件清理失败')
         return false
+      }
+    },
+    async _cleanupStaleDeveloperAttachments(projectId: string, ids: readonly string[]) {
+      const state = runtime(this)
+      const pending = new Set(ids)
+      state.retryableCleanup.get(projectId)?.forEach((id) => pending.add(id))
+      if (!pending.size) return true
+      const results = await Promise.allSettled([...pending].map((id) => getDesktopApi().developer.removeAttachment({
+        projectId, attachmentId: id,
+      })))
+      const failed = results.some(({ status }) => status === 'rejected')
+      if (!failed) {
+        state.retryableCleanup.delete(projectId)
+        return true
+      }
+      try {
+        await getDesktopApi().developer.clearAttachments({ projectId })
+        state.retryableCleanup.delete(projectId)
+        return true
+      } catch (error) {
+        state.retryableCleanup.set(projectId, pending)
+        this.debugError = displayError(error, '文件清理失败，请重试')
+        return false
+      }
+    },
+    async _retryDeveloperAttachmentCleanup() {
+      const state = runtime(this)
+      for (const [projectId, ids] of [...state.retryableCleanup]) {
+        await this._cleanupStaleDeveloperAttachments(projectId, [...ids])
       }
     },
     ensureExecutionSubscription() { this._ensureLifecycle() },
