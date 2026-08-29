@@ -6655,6 +6655,43 @@ describe('createApplicationRuntime', () => {
   })
 
   it.each([
+    { initialConversionCapable: true, runConversionCapable: false },
+    { initialConversionCapable: false, runConversionCapable: true },
+  ])(
+    'reports conversionCapable=$runConversionCapable from the exact manifest rebuilt by developer.run',
+    async ({ initialConversionCapable, runConversionCapable }) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-developer-run-snapshot-'))
+      directories.push(root)
+      const baseOptions = options(root)
+      const runtime = createApplicationRuntime({
+        ...baseOptions,
+        paths: { ...baseOptions.paths, workflowRunner: join(import.meta.dirname, '../workers/workflow-runner.ts') },
+      })
+      await authenticate(runtime)
+      const project = await runtime.services.developer.createProject('Run Snapshot')
+      const manifest = JSON.parse(
+        await runtime.services.developer.readFile(project.id, 'workflow.json'),
+      ) as Record<string, unknown>
+      const permissions = (conversionCapable: boolean) => conversionCapable
+        ? [{ capability: 'file.convert', scope: { formats: ['webm'] } }]
+        : []
+      manifest.permissions = permissions(initialConversionCapable)
+      await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+      await runtime.services.developer.build(project.id)
+
+      manifest.permissions = permissions(runConversionCapable)
+      await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+      const result = await runtime.services.developer.run({ projectId: project.id, input: {} })
+
+      expect(result).toEqual({
+        executionId: expect.any(String),
+        conversionCapable: runConversionCapable,
+      })
+      await runtime.close()
+    },
+  )
+
+  it.each([
     {
       name: 'missing required property',
       inputSchema: { type: 'object', required: ['keyword'], properties: { keyword: { type: 'string', title: '搜索关键词' } } },

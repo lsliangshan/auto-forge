@@ -189,6 +189,18 @@ function harness(
 }
 
 describe('registerDesktopIpc', () => {
+  it('returns the Main-owned developer execution capability snapshot through the strict IPC contract', async () => {
+    const app = harness('http://127.0.0.1:5173/developer', undefined, (dependencies) => {
+      vi.mocked(dependencies.developer.run).mockResolvedValue({
+        executionId: 'execution_1', conversionCapable: true,
+      } as never)
+    })
+
+    await expect(app.invoke(ipcChannels.developerRun, {
+      projectId: 'project_1', input: {},
+    })).resolves.toEqual({ executionId: 'execution_1', conversionCapable: true })
+  })
+
   it('authenticates strict developer draft commands without accepting a path', async () => {
     const app = harness()
 

@@ -1964,6 +1964,13 @@ describe('cross-process contracts', () => {
     expect(ipcResponseSchemas[ipcChannels.developerRun].safeParse(result).success).toBe(true)
   })
 
+  it('binds a successful developer run id to its authoritative conversion capability snapshot', () => {
+    const result = { executionId: 'execution_1', conversionCapable: true }
+
+    expect(ipcResponseSchemas[ipcChannels.developerRun].parse(result)).toEqual(result)
+    expect(() => ipcResponseSchemas[ipcChannels.developerRun].parse({ executionId: 'execution_1' })).toThrow()
+  })
+
   it('keeps developer file drafts opaque and attachment ids out of workflow input', () => {
     const draft = { id: 'draft_1', name: 'same.png', mimeType: 'image/png', byteSize: 123 }
     const channel = ipcChannels.developerPickFiles

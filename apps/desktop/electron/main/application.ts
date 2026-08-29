@@ -3074,6 +3074,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           }
           const workflow = await registry.getDevelopmentProject(projectId)
           if (!workflow) throw failure('WORKFLOW_INTEGRITY_FAILED')
+          const conversionCapable = manifest.permissions.some(
+            (permission) => permission.capability === 'file.convert',
+          )
           let started: Awaited<ReturnType<ExecutionService['start']>>
           if (selectedAttachmentIds.length === 0) {
             started = await executions.start({
@@ -3136,7 +3139,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             }).catch((error) => { recordFailure(error, 'conversion-stop') })
           }
           void started.finished.catch(() => undefined)
-          return { executionId: started.id }
+          return { executionId: started.id, conversionCapable }
         } catch (error) {
           if (!claimedExecutionId) await clearUnclaimedDrafts()
           else if (draftService) await draftService.releaseExecution(claimedExecutionId, new Set()).catch(() => undefined)

@@ -777,7 +777,7 @@ export const developerRunInputSchema = z.object({
 export type DeveloperRunInput = z.infer<typeof developerRunInputSchema>
 
 export const developerRunResultSchema = z.union([
-  z.object({ executionId: identifierSchema }).strict(),
+  z.object({ executionId: identifierSchema, conversionCapable: z.boolean() }).strict(),
   z.object({ validationError: nonEmptyStringSchema.max(500) }).strict(),
 ])
 

@@ -661,9 +661,6 @@ export const useDeveloperStore = defineStore('developer', {
         if (!isCurrent()) return
         this._upsertProject(built)
         if (!await this._refreshBuiltManifest(projectId, isCurrent) || !isCurrent()) return
-        const executionConversionCapable = this.manifests[projectId]?.permissions.some(
-          (permission) => permission.capability === 'file.convert',
-        ) ?? false
         const validation = await getDesktopApi().developer.validate(projectId)
         if (!isCurrent()) return
         this._applyValidation(validation)
@@ -694,10 +691,10 @@ export const useDeveloperStore = defineStore('developer', {
           this.debugError = runResult.validationError
           return
         }
-        const { executionId } = runResult
+        const { executionId, conversionCapable } = runResult
         this.$patch({
           debugExecutionId: executionId,
-          debugExecutionConversionCapable: executionConversionCapable,
+          debugExecutionConversionCapable: conversionCapable,
           debugStatus: 'queued',
         })
         for (const event of state.pendingEvents) if (event.executionId === executionId) this._applyExecutionEvent(event)

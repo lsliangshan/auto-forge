@@ -139,7 +139,7 @@ function createApi() {
       createEntry: vi.fn().mockResolvedValue(project), renameEntry: vi.fn().mockResolvedValue(project), deleteEntry: vi.fn().mockResolvedValue(project),
       build: vi.fn().mockResolvedValue({ ...project, status: 'ready' }),
       validate: vi.fn().mockResolvedValue({ valid: true, diagnostics: [] } satisfies ValidationResult),
-      run: vi.fn().mockResolvedValue({ executionId: 'exec_1' }),
+      run: vi.fn().mockResolvedValue({ executionId: 'exec_1', conversionCapable: false }),
     },
     executions: {
       onEvent: vi.fn((listener: (event: ExecutionEvent) => void) => { executionListener = listener; return vi.fn() }),
@@ -896,8 +896,8 @@ describe('developer workbench', () => {
   it('submits an unchanged schema-driven input on consecutive debug runs', async () => {
     const { api, raw, emit } = createApi()
     raw.developer.run
-      .mockResolvedValueOnce({ executionId: 'exec_1' })
-      .mockResolvedValueOnce({ executionId: 'exec_2' })
+      .mockResolvedValueOnce({ executionId: 'exec_1', conversionCapable: false })
+      .mockResolvedValueOnce({ executionId: 'exec_2', conversionCapable: false })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useDeveloperStore()
     await store.loadProjects()
@@ -959,6 +959,7 @@ describe('developer workbench', () => {
     manifest.permissions = [{ capability: 'file.convert', scope: { formats: ['pdf', 'webm'] } }]
     raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
       ? JSON.stringify(manifest) : 'export default 1')
+    raw.developer.run.mockResolvedValueOnce({ executionId: 'exec_1', conversionCapable: true })
     let resolveValidation!: (value: ValidationResult) => void
     raw.developer.validate.mockReturnValueOnce(new Promise((resolve) => { resolveValidation = resolve }))
     raw.conversion.listForExecution.mockResolvedValue({
@@ -1009,6 +1010,69 @@ describe('developer workbench', () => {
     expect(raw.executions.cancel).not.toHaveBeenCalled()
   })
 
+  it.each([
+    { rendererBuildConversionCapable: true, mainRunConversionCapable: false },
+    { rendererBuildConversionCapable: false, mainRunConversionCapable: true },
+  ])(
+    'uses Main conversionCapable=$mainRunConversionCapable when workflow.json saves after the first build',
+    async ({ rendererBuildConversionCapable, mainRunConversionCapable }) => {
+      const { api, raw } = createApi()
+      const baseManifest = JSON.parse(
+        await raw.developer.readFile('project_1', 'workflow.json'),
+      ) as Record<string, unknown>
+      const permissions = (conversionCapable: boolean) => conversionCapable
+        ? [{ capability: 'file.convert', scope: { formats: ['webm'] } }]
+        : []
+      let savedManifest = {
+        ...baseManifest,
+        permissions: permissions(rendererBuildConversionCapable),
+      }
+      raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+        ? `${JSON.stringify(savedManifest, null, 2)}\n`
+        : 'export default 1')
+      raw.developer.writeFile.mockImplementation(async (_projectId: string, path: string, content: string) => {
+        if (path === 'workflow.json') savedManifest = JSON.parse(content) as Record<string, unknown>
+      })
+      let resolveFirstValidation!: (value: ValidationResult) => void
+      raw.developer.validate
+        .mockReturnValueOnce(new Promise((resolve) => { resolveFirstValidation = resolve }))
+        .mockResolvedValue({ valid: true, diagnostics: [] })
+      raw.developer.run.mockImplementationOnce(async () => ({
+        executionId: 'exec_authoritative',
+        conversionCapable: (savedManifest.permissions as Array<{ capability: string }>).some(
+          ({ capability }) => capability === 'file.convert',
+        ),
+      }))
+      Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+      const store = useDeveloperStore()
+      await store.loadProjects()
+      await store.selectFile('workflow.json')
+      const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+      const running = store.runDebug()
+      await vi.waitFor(() => expect(raw.developer.validate).toHaveBeenCalledTimes(1))
+      const savedDuringValidation = {
+        ...baseManifest,
+        permissions: permissions(mainRunConversionCapable),
+      }
+      store.editCurrent(`${JSON.stringify(savedDuringValidation, null, 2)}\n`)
+      await store.saveCurrent()
+      expect(raw.developer.writeFile).toHaveBeenCalledWith(
+        'project_1', 'workflow.json', `${JSON.stringify(savedDuringValidation, null, 2)}\n`,
+      )
+
+      resolveFirstValidation({ valid: true, diagnostics: [] })
+      await running
+      await wrapper.vm.$nextTick()
+
+      expect(raw.developer.build).toHaveBeenCalledTimes(1)
+      expect(raw.developer.run).toHaveBeenCalledTimes(1)
+      expect(store.debugExecutionId).toBe('exec_authoritative')
+      expect(store.debugExecutionConversionCapable).toBe(mainRunConversionCapable)
+      expect(wrapper.find('[aria-label="文件转换结果"]').exists()).toBe(mainRunConversionCapable)
+    },
+  )
+
   it('resets the conversion snapshot and hides the block when a newer non-conversion run starts', async () => {
     const { api, raw } = createApi()
     const browserManifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
@@ -1020,9 +1084,9 @@ describe('developer workbench', () => {
     let builtManifest = conversionManifest
     raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
       ? JSON.stringify(builtManifest) : 'export default 1')
-    let resolveBrowserRun!: (value: { executionId: string }) => void
+    let resolveBrowserRun!: (value: { executionId: string; conversionCapable: boolean }) => void
     raw.developer.run
-      .mockResolvedValueOnce({ executionId: 'exec_conversion' })
+      .mockResolvedValueOnce({ executionId: 'exec_conversion', conversionCapable: true })
       .mockReturnValueOnce(new Promise((resolve) => { resolveBrowserRun = resolve }))
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useDeveloperStore()
@@ -1042,7 +1106,7 @@ describe('developer workbench', () => {
     expect(store.debugExecutionConversionCapable).toBe(false)
     expect(wrapper.find('[aria-label="文件转换结果"]').exists()).toBe(false)
 
-    resolveBrowserRun({ executionId: 'exec_browser' })
+    resolveBrowserRun({ executionId: 'exec_browser', conversionCapable: false })
     await browserRun
     expect(store.debugExecutionId).toBe('exec_browser')
     expect(store.debugExecutionConversionCapable).toBe(false)
@@ -1174,7 +1238,7 @@ describe('developer workbench', () => {
     const { api, raw } = createApi()
     const second = { ...project, id: 'project_2', name: 'Second project', rootPath: '/private/second' }
     raw.developer.listProjects.mockResolvedValue([project, second])
-    let resolveRun!: (value: { executionId: string }) => void
+    let resolveRun!: (value: { executionId: string; conversionCapable: boolean }) => void
     raw.developer.run.mockReturnValueOnce(new Promise((resolve) => { resolveRun = resolve }))
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useDeveloperStore()
@@ -1184,7 +1248,7 @@ describe('developer workbench', () => {
     await vi.waitFor(() => expect(raw.developer.run).toHaveBeenCalled())
     ;(store.debugInput as { nested: { value: string } }).nested.value = 'mutated'
     await store.selectProject(second.id)
-    resolveRun({ executionId: 'exec_late' })
+    resolveRun({ executionId: 'exec_late', conversionCapable: false })
     await run
 
     expect(raw.developer.run).toHaveBeenCalledWith({ projectId: project.id, input: { keyword: 'captured', nested: { value: 'captured' } } })
@@ -1206,10 +1270,10 @@ describe('developer workbench', () => {
     raw.developer.readFile.mockImplementation(async (projectId: string, path: string) => path === 'workflow.json'
       ? JSON.stringify(projectId === project.id ? conversionManifest : browserManifest)
       : 'export default 1')
-    let resolveStaleRun!: (value: { executionId: string }) => void
+    let resolveStaleRun!: (value: { executionId: string; conversionCapable: boolean }) => void
     raw.developer.run
       .mockReturnValueOnce(new Promise((resolve) => { resolveStaleRun = resolve }))
-      .mockResolvedValueOnce({ executionId: 'exec_new' })
+      .mockResolvedValueOnce({ executionId: 'exec_new', conversionCapable: false })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useDeveloperStore()
     await store.loadProjects()
@@ -1221,7 +1285,7 @@ describe('developer workbench', () => {
     expect(store.debugExecutionConversionCapable).toBe(false)
 
     await store.runDebug()
-    resolveStaleRun({ executionId: 'exec_stale' })
+    resolveStaleRun({ executionId: 'exec_stale', conversionCapable: true })
     await staleRun
 
     expect(store.debugExecutionId).toBe('exec_new')

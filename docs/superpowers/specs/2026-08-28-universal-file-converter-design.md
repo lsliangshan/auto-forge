@@ -748,13 +748,18 @@ visible conversion card. With an explicit Task 13 test-pack root, it proves:
   workflow page, Debug Panel native selection sends only indexes plus opaque
   attachment IDs, and a real MP4-to-WebM process result arriving after cancel
   cannot replace the durable cancelled state;
-- the Debug Panel pins conversion-card capability to the successful built/run
-  execution snapshot rather than the mutable editor manifest. The live card,
-  status, cancel, and retry controls survive permission removal, invalid
-  `workflow.json`, editor switching, and state-preserving HMR; a new run,
-  project/session invalidation, or store disposal clears the execution ID and
-  capability together, and a stale run result cannot attach its capability to
-  a newer execution;
+- the typed Main `developer.run` success response binds `executionId` to a
+  `conversionCapable` boolean derived from the exact `built.manifest` used by
+  that same run. The Renderer commits the pair atomically under its run token
+  and never infers this execution property from its earlier build or the
+  mutable editor manifest. A deterministic two-direction race holds the first
+  validation while a valid `workflow.json` save flips `file.convert` before
+  Main rebuilds; the card follows Main's returned snapshot in both directions.
+  Once started, the live card, status, cancel, and retry controls survive
+  permission removal, invalid `workflow.json`, editor switching, and
+  state-preserving HMR; a new run, project/session invalidation, or store
+  disposal clears the execution ID and capability together, and a stale run
+  result cannot attach its capability to a newer execution;
 - quitting with a conversion in flight and reopening the same local profile
   recovers the job as interrupted, while explicit retry advances its epoch and
   produces a verified durable artifact;

@@ -231,13 +231,18 @@ describe('preload desktop bridge', () => {
   it('maps developer draft operations and run attachments to fixed path-free channels', async () => {
     const app = harness()
 
+    vi.mocked(app.ipcRenderer.invoke).mockResolvedValueOnce([])
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ executionId: 'execution_1', conversionCapable: true })
+
     expect(app.api.developer.pickFiles).toBeTypeOf('function')
     expect(app.api.developer.removeAttachment).toBeTypeOf('function')
     expect(app.api.developer.clearAttachments).toBeTypeOf('function')
     await app.api.developer.pickFiles({ projectId: 'project_1', existingAttachmentIds: ['draft_1'] })
     await app.api.developer.removeAttachment({ projectId: 'project_1', attachmentId: 'draft_1' })
     await app.api.developer.clearAttachments({ projectId: 'project_1' })
-    await app.api.developer.run({
+    const runResult = await app.api.developer.run({
       projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'],
     })
 
@@ -253,6 +258,7 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.developerRun, {
       projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'],
     })
+    expect(runResult).toEqual({ executionId: 'execution_1', conversionCapable: true })
     expect(JSON.stringify(vi.mocked(app.ipcRenderer.invoke).mock.calls)).not.toContain('/private/')
   })
 
