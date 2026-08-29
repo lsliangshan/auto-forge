@@ -250,9 +250,14 @@ function normalizeGeneration(
   if (output === 'audio') {
     const capability = model.generation.audio
     if (!capability) failure('MODEL_MODALITY_UNSUPPORTED')
+    const voice = requested.audio.voice ?? (
+      model.id === 'openai/gpt-audio' || model.id.startsWith('openai/gpt-audio-')
+        ? 'alloy'
+        : undefined
+    )
     normalized.audio = {
       format: selectString(requested.audio.format, capability.formats),
-      ...(requested.audio.voice === undefined ? {} : { voice: selectString(requested.audio.voice, capability.voices) }),
+      ...(voice === undefined ? {} : { voice: selectString(voice, capability.voices) }),
     }
   }
   if (output === 'video') {

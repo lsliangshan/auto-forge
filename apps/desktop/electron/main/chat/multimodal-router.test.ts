@@ -428,6 +428,36 @@ describe('resolveChatRoute', () => {
     })
   })
 
+  it.each([
+    ['openai/gpt-audio', undefined, [], { format: 'mp3', voice: 'alloy' }],
+    ['openai/gpt-audio-mini', undefined, [], { format: 'mp3', voice: 'alloy' }],
+    ['openai/gpt-audio', undefined, ['echo'], { format: 'mp3', voice: 'echo' }],
+    ['openai/gpt-audio', 'nova', ['alloy', 'nova'], { format: 'mp3', voice: 'nova' }],
+    ['google/lyria-3-pro-preview', undefined, [], { format: 'mp3' }],
+  ] as const)('normalizes the audio voice for %s', (modelId, requestedVoice, voices, expectedAudio) => {
+    const audioModel = model({
+      id: modelId,
+      outputModalities: ['audio'],
+      generation: { audio: { voices: [...voices], formats: [] } },
+    })
+    const requestedGeneration: GenerationOptions = {
+      ...generation,
+      audio: {
+        format: 'mp3',
+        ...(requestedVoice === undefined ? {} : { voice: requestedVoice }),
+      },
+    }
+
+    const resolved = resolveChatRoute(input({
+      requestedModel: modelId,
+      requestedOutput: 'audio',
+      requestedGeneration,
+      models: [audioModel],
+    }))
+    if (!('generation' in resolved)) throw new Error('expected a resolved route')
+    expect(resolved.generation.audio).toEqual(expectedAudio)
+  })
+
   it('orders compatible model selections with fixed code-point comparison', () => {
     const imageGeneration = { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } }
     expect(resolveChatRoute(input({
