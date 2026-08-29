@@ -1533,6 +1533,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     if (!message || !block) return
     const replacement = { ...block, state: 'terminal' as const }
     chatDatabase.messages.replaceBlock(message.id, block.blockId, replacement)
+    queueUserDataFlush()
     options.emitChat({ type: 'block_update', conversationId: run.conversationId, messageId: message.id, blockId: replacement.blockId, block: replacement })
   }
   const emitConversionJob = (lifecycle: BoundConversionLifecycle, job: ConversionJob): void => {
