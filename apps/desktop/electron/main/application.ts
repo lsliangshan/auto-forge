@@ -151,6 +151,7 @@ type ApplicationFailureSource =
   | 'continuation-shutdown'
   | 'browser-shutdown'
   | 'sync-pause'
+  | 'diagnostic-flush'
   | 'user-cache-close'
   | 'database-close'
 
@@ -171,15 +172,21 @@ type LegacyImportDiagnostic = {
   messageCount?: number
 }
 
-function createLegacyImportDiagnosticLog(directory: string): (diagnostic: LegacyImportDiagnostic) => void {
+type LegacyImportDiagnosticLog = ((diagnostic: LegacyImportDiagnostic) => void) & {
+  flush(): Promise<void>
+}
+
+function createLegacyImportDiagnosticLog(directory: string): LegacyImportDiagnosticLog {
   let tail = Promise.resolve()
-  return (diagnostic) => {
+  const log = (diagnostic: LegacyImportDiagnostic) => {
     tail = tail.then(async () => {
       const line = `${JSON.stringify({ occurredAt: new Date().toISOString(), ...diagnostic })}\n`
       await mkdir(directory, { recursive: true })
       await appendFile(join(directory, LEGACY_IMPORT_DIAGNOSTIC_LOG), line, 'utf8')
     }).catch(() => undefined)
   }
+  log.flush = async () => { await tail }
+  return log
 }
 
 interface ApplicationFailureRecord {
@@ -204,6 +211,7 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'continuation-shutdown': 80,
   'browser-shutdown': 90,
   'sync-pause': 95,
+  'diagnostic-flush': 96,
   'user-cache-close': 96,
   'database-close': 100,
 }
@@ -2905,6 +2913,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await capture('browser-shutdown', () => browser.shutdown())
         await reconciliationStopped
         await capture('sync-pause', () => userDataSync.pause())
+        await capture('diagnostic-flush', async () => {
+          await logLegacyImportDiagnostic.flush()
+          await providerDiagnostics.flush()
+        })
         await capture('user-cache-close', () => {
           userDataStores.close()
           boundUserId = undefined

@@ -5515,7 +5515,7 @@ describe('createApplicationRuntime', () => {
     })
     const emitChat = vi.fn()
     const provider = snapshotProvider('openrouter', {
-      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 1_000 }]),
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 8_192 }]),
       validateCredential: vi.fn(async () => ({ valid: true })),
       stream,
     })
