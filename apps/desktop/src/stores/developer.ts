@@ -191,7 +191,8 @@ export const useDeveloperStore = defineStore('developer', {
       const project = this.projects.find(({ id }) => id === projectId)
       if (!project) return
       if (this.selectedProjectId && this.selectedProjectId !== projectId) {
-        await this._clearDeveloperAttachments(this.selectedProjectId)
+        const cleared = await this._clearDeveloperAttachments(this.selectedProjectId)
+        if (!cleared) return
       }
       this._selectionGeneration += 1
       this._runToken += 1
@@ -470,7 +471,13 @@ export const useDeveloperStore = defineStore('developer', {
     configureDeveloperAttachmentField(name: string) {
       if (this.developerAttachmentField === name) return
       if (this.developerAttachmentField || this.developerAttachments.length > 0) {
-        void this._clearDeveloperAttachments()
+        const previous = [...this.developerAttachments]
+        void this._clearDeveloperAttachments().then((cleared) => {
+          if (!cleared && this.developerAttachmentField === name && this.developerAttachments.length === 0) {
+            this.developerAttachments = previous
+            this._syncDeveloperAttachmentInput()
+          }
+        })
       }
       this.developerAttachmentField = name
       this.developerAttachments = []
@@ -492,9 +499,16 @@ export const useDeveloperStore = defineStore('developer', {
           existingAttachmentIds: existingIds,
         })
         if (this.selectedProjectId !== projectId || this.developerAttachmentField !== field) {
-          await Promise.allSettled(selected.map(({ id }) => getDesktopApi().developer.removeAttachment({
+          const cleanup = await Promise.allSettled(selected.map(({ id }) => getDesktopApi().developer.removeAttachment({
             projectId, attachmentId: id,
           })))
+          if (cleanup.some(({ status }) => status === 'rejected')) {
+            try {
+              await getDesktopApi().developer.clearAttachments({ projectId })
+            } catch (error) {
+              this.debugError = displayError(error, '文件清理失败，请重试')
+            }
+          }
           return
         }
         const known = new Set(existingIds)
@@ -526,14 +540,16 @@ export const useDeveloperStore = defineStore('developer', {
     async _clearDeveloperAttachments(projectId = this.selectedProjectId) {
       if (!projectId) return
       const shouldReset = projectId === this.selectedProjectId
-      if (shouldReset) {
-        this.developerAttachments = []
-        this._syncDeveloperAttachmentInput()
-      }
       try {
         await getDesktopApi().developer.clearAttachments({ projectId })
-      } catch {
-        // Main also clears unsubmitted drafts on logout and owner lifecycle disposal.
+        if (shouldReset) {
+          this.developerAttachments = []
+          this._syncDeveloperAttachmentInput()
+        }
+        return true
+      } catch (error) {
+        if (shouldReset) this.debugError = displayError(error, '文件清理失败')
+        return false
       }
     },
     ensureExecutionSubscription() { this._ensureLifecycle() },

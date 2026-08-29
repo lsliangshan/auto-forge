@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -74,6 +74,27 @@ describe('developer attachment drafts', () => {
     expect(artifacts.records.size).toBe(0)
   })
 
+  it('accepts an unchanged inode after intentional materialization rename', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-materialize-'))
+    roots.push(root)
+    const source = join(root, 'source.bmp')
+    const bytes = bmp(7)
+    await writeFile(source, bytes)
+    const artifacts = artifactRepository()
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts, id: () => 'draft_1',
+    })
+    await service.recover()
+    const [draft] = await service.importPaths({
+      projectId: 'project_1', existingAttachmentIds: [], paths: [source],
+    })
+    service.claim('project_1', 'execution_1', [draft!.id])
+
+    await expect(service.materialize('execution_1', [draft!.id])).resolves.toBeUndefined()
+    expect(await readFile(join(resolveUserConversionRoot(root, 'user_1'), 'inputs', 'draft_1.input'))).toEqual(bytes)
+    expect(artifacts.records.get('draft_1')).toMatchObject({ role: 'input', status: 'ready' })
+  })
+
   it('does not overwrite an existing execution input when materializing a draft', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-collision-'))
     roots.push(root)
@@ -110,5 +131,54 @@ describe('developer attachment drafts', () => {
     await expect(service.importPaths({
       projectId: 'project_1', existingAttachmentIds: [], paths: [join(root, 'missing-source.bmp')],
     })).rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+  })
+
+  it('serializes concurrent picks against the Main-owned five-file inventory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-quota-'))
+    roots.push(root)
+    const sources = await Promise.all(Array.from({ length: 6 }, async (_, index) => {
+      const path = join(root, `source-${index}.bmp`)
+      await writeFile(path, bmp(index))
+      return path
+    }))
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts: artifactRepository(),
+    })
+    await service.recover()
+
+    const results = await Promise.all([
+      service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: sources.slice(0, 3) }),
+      service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: sources.slice(3) }),
+    ])
+    expect(results.flat()).toHaveLength(5)
+    expect((await readdir(join(resolveUserConversionRoot(root, 'user_1'), '.developer-drafts')))
+      .filter((name) => name.endsWith('.input'))).toHaveLength(5)
+  })
+
+  it('retains the exact materialized inode in quarantine after execution release', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-release-'))
+    roots.push(root)
+    const source = join(root, 'source.bmp')
+    const bytes = bmp(9)
+    await writeFile(source, bytes)
+    const artifacts = artifactRepository()
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts, id: () => 'draft_1',
+    })
+    await service.recover()
+    const [draft] = await service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: [source] })
+    service.claim('project_1', 'execution_1', [draft!.id])
+    await service.materialize('execution_1', [draft!.id])
+    const input = join(resolveUserConversionRoot(root, 'user_1'), 'inputs', 'draft_1.input')
+    const inputIdentity = await lstat(input)
+
+    await service.releaseExecution('execution_1', new Set())
+
+    const quarantine = join(resolveUserConversionRoot(root, 'user_1'), '.trash')
+    const candidate = (await readdir(quarantine)).find((name) => name.startsWith('draft_1.quarantine-'))
+    expect(candidate).toBeDefined()
+    const quarantinedIdentity = await lstat(join(quarantine, candidate!))
+    expect({ dev: quarantinedIdentity.dev, ino: quarantinedIdentity.ino }).toEqual({ dev: inputIdentity.dev, ino: inputIdentity.ino })
+    expect(artifacts.records.get('draft_1')).toMatchObject({ status: 'deleted' })
   })
 })

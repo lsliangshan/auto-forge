@@ -1057,6 +1057,20 @@ async function recoverOwnerConversionStorage(
         }
       }
     }
+    const jobs = database.conversionJobs.listForExecution(execution.id, ownerUserId)
+    const referencedInputs = new Set(jobs.flatMap((job) => (
+      job.sourceKind === 'artifact' ? [job.sourceId] : []
+    )))
+    for (const artifact of database.conversionArtifacts.listForExecution(execution.id, ownerUserId)) {
+      if (artifact.status !== 'ready' || artifact.role !== 'input' || referencedInputs.has(artifact.id)) continue
+      await quarantineManagedConversionArtifact(
+        dataRoot,
+        ownerUserId,
+        database.conversionArtifacts,
+        artifact,
+        false,
+      )
+    }
   }
 }
 
@@ -2949,7 +2963,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         }
         try {
           const session = await requireAuthenticatedSession()
-          draftService = currentConversion(session.user.id).developerDrafts
+          const conversionLifecycle = currentConversion(session.user.id)
+          draftService = conversionLifecycle.developerDrafts
           for (const attachmentId of selectedAttachmentIds) {
             if (!draftService.get(projectId, attachmentId)) throw failure('NOT_FOUND')
           }
@@ -3054,7 +3069,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 .listForExecution(started.id, session.user.id)
                 .filter((job) => job.sourceKind === 'artifact')
                 .map((job) => job.sourceId))
-              await draftService!.releaseExecution(started.id, referenced)
+              const release = () => draftService!.releaseExecution(started.id, referenced)
+              await userDataAdmission.run(release).catch(async (error) => {
+                if (boundConversion === conversionLifecycle && auth.currentUserId() === session.user.id) throw error
+                await release()
+              })
             }).catch((error) => { recordFailure(error, 'conversion-stop') })
           }
           void started.finished.catch(() => undefined)
@@ -3677,6 +3696,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     chat: gateUserDataService(ungatedServices.chat),
     media: gateUserDataService(ungatedServices.media),
     executions: gateUserDataService(ungatedServices.executions),
+    developer: gateUserDataService(ungatedServices.developer),
     conversion: {
       ...gateUserDataService(ungatedServices.conversion),
       onEvent: ungatedServices.conversion.onEvent,

@@ -871,6 +871,7 @@ export interface AppRepositories {
   conversionArtifacts: {
     create(input: NewConversionArtifact): ConversionArtifact
     getOwned(artifactId: string, ownerUserId: string): ConversionArtifact | null
+    listForExecution(executionId: string, ownerUserId: string): ConversionArtifact[]
     listForJob(jobId: string, ownerUserId: string): ConversionArtifact[]
     markDeleted(
       artifactId: string,
@@ -3048,6 +3049,13 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           WHERE id = @artifactId AND owner_user_id = @ownerUserId
         `, { artifactId, ownerUserId })
         return row ? conversionArtifactFromRow(row) : null
+      },
+      listForExecution(executionId, ownerUserId) {
+        return many<Query>(database, `
+          SELECT ${conversionArtifactColumns} FROM conversion_artifacts
+          WHERE execution_id = @executionId AND owner_user_id = @ownerUserId
+          ORDER BY created_at, id
+        `, { executionId, ownerUserId }).map(conversionArtifactFromRow)
       },
       listForJob(jobId, ownerUserId) {
         return many<Query>(database, `
