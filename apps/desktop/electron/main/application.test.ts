@@ -5067,6 +5067,13 @@ describe('createApplicationRuntime', () => {
     'Which formats can it convert to and save this image as WebP',
     'not PNG but JPG',
     'not 7z but rar',
+    '不要解释直接转换这个附件',
+    "Don't explain just convert this file to PDF",
+    '描述图片并把它转成 PDF',
+    '查看这个文件以及导出为 DOCX',
+    'Explain which formats are supported and convert this file to PDF',
+    "don't convert this file, but save it as PDF",
+    '不要转换这个附件，但是导出为 PDF',
   ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
@@ -5091,7 +5098,7 @@ describe('createApplicationRuntime', () => {
     const provider = snapshotProvider('openrouter', {
       listModels: async () => [{
         ...visionTextModelInfo('openrouter/implicit-conversion'),
-        supportsTools: content !== 'Which formats can it convert to and save this image as WebP',
+        supportsTools: content !== "Don't explain just convert this file to PDF",
       }],
       validateCredential: async () => ({ valid: true }),
       stream: async function* (request) {
@@ -5155,7 +5162,7 @@ describe('createApplicationRuntime', () => {
     const agentPayload = JSON.stringify(agentRequests(captured)[0])
     expect(agentPayload).toContain(`[附件 0: 文件-1, image/png, ${privateBytes.byteLength} bytes]`)
     expect(agentPayload).not.toContain('附件 9：private-source.png')
-    expect(agentPayload).toContain(content === 'Which formats can it convert to and save this image as WebP'
+    expect(agentPayload).toContain(content === "Don't explain just convert this file to PDF"
       ? '当前所选模型或本次请求不允许调用工作流或浏览器工具'
       : '你是由 AutoForge Main 管理的工作流 Agent')
     const titleRequest = captured.find(isConversationTitleRequest)
@@ -5206,6 +5213,19 @@ describe('createApplicationRuntime', () => {
     '制作海报并查看附件',
     '保存对话并描述图片',
     'export chat history and analyze image',
+    'This image is not dark but vivid',
+    'This file is not PNG but JPG',
+    'The attachment is not safe but risky',
+    'save this conversation as PDF',
+    'export chat history as PDF',
+    '把对话保存为 PDF',
+    '把聊天记录导出为 PDF',
+    'convert this conversation to PDF',
+    'save chat history as PDF',
+    '把这段对话转为 PDF',
+    '将聊天记录导出为 PDF',
+    "don't convert this file, or save it as PDF",
+    '不要转换这个附件，或导出为 PDF',
   ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
     directories.push(root)

@@ -86,6 +86,13 @@ describe('local conversion intent', () => {
     'Which formats can it convert to and save this image as WebP',
     'not PNG but JPG',
     'not 7z but rar',
+    '不要解释直接转换这个附件',
+    "Don't explain just convert this file to PDF",
+    '描述图片并把它转成 PDF',
+    '查看这个文件以及导出为 DOCX',
+    'Explain which formats are supported and convert this file to PDF',
+    "don't convert this file, but save it as PDF",
+    '不要转换这个附件，但是导出为 PDF',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -161,6 +168,19 @@ describe('local conversion intent', () => {
     ['制作海报并查看附件', attachments],
     ['保存对话并描述图片', attachments],
     ['export chat history and analyze image', attachments],
+    ['This image is not dark but vivid', attachments],
+    ['This file is not PNG but JPG', attachments],
+    ['The attachment is not safe but risky', attachments],
+    ['save this conversation as PDF', attachments],
+    ['export chat history as PDF', attachments],
+    ['把对话保存为 PDF', attachments],
+    ['把聊天记录导出为 PDF', attachments],
+    ['convert this conversation to PDF', attachments],
+    ['save chat history as PDF', attachments],
+    ['把这段对话转为 PDF', attachments],
+    ['将聊天记录导出为 PDF', attachments],
+    ["don't convert this file, or save it as PDF", attachments],
+    ['不要转换这个附件，或导出为 PDF', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)

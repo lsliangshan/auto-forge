@@ -32,7 +32,8 @@ const ATTACHMENT_REFERENCE = new RegExp(
 )
 const CONVERSION_NEGATION = /(?:不要|不用|不需要|无需|不必|别|禁止|请勿)|\b(?:do\s+not|don't|never|no\s+need\s+to|do\s+not\s+need\s+to|don't\s+need\s+to|need\s+not|needn't)\b/giu
 const OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION = /(?:解释|询问|问|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:explain|ask|summari[sz]e|describe|discuss|analy[sz]e|review|check|read|tell)\b/iu
-const ACTION_EMBEDDING_OTHER_INTENT = /(?:解释|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:explain|summari[sz]e|describe|discuss|analy[sz]e|review|check|read)\b/iu
+const ACTION_EMBEDDING_OTHER_INTENT = /(?:解释|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:explain|summari[sz]e|describe|discuss|analy[sz]e|review|check|read)\b/giu
+const ACTION_PIVOT = /(?:直接|立即|马上|以及|并且|并|同时|然后|而是|或)|\b(?:just|and|or|then|but|instead)\b/iu
 const OPEN_INFORMATION_QUESTION = /(?:(?:(?:请问)?(?:万象转换|这个工具|它|你)?(?:支持|能否|能不能|能|可以|能够))[^，,；;。.!！？?]{0,32}(?:哪些|什么|何种)\s*格式|(?:哪些|什么|何种)\s*格式|(?:介绍|说明|了解)[^，,；;。.!！？?]{0,24}(?:万象转换|转换)|(?:万象转换|转换)[^，,；;。.!！？?]{0,24}(?:是什么|什么意思|含义|安全|隐私|上传|能做什么|如何工作|怎么用)|\b(?:what\s+is|what\s+does|how\s+does|tell\s+me\s+about|describe|explain)[^,;.!?]{0,32}(?:conversion|converter|it)\b|\b(?:conversion|converter|it)\b[^,;.!?]{0,24}\b(?:safe|privacy|upload|mean)\b)/giu
 const ENGLISH_OPEN_FORMAT_QUESTION = /\b(?:what|which)\s+formats?\b(?:(?!\b(?:and|but|then|while)\b|[,;.!?])[\s\S]){0,48}/giu
 const BARE_TARGET_PATTERN = `(?:${[
@@ -49,23 +50,24 @@ const BARE_CONVERSION_TARGET = new RegExp(
 )
 const UPPERCASE_BARE_CONVERSION_TARGET = /^(?:(?:an?)\s+)?\.?[A-Z0-9]{2,10}(?:\s+(?:FORMAT|FILE))?(?:\s+(?:instead|rather))?$/u
 const CONTRASTIVE_TARGET = /\b(?:instead|rather)\b/iu
-const FORMAT_SHORTHAND = `\\.?[A-Za-z0-9]{2,5}`
+const FORMAT_SHORTHAND = `\\.?${BARE_TARGET_PATTERN}`
 const CHINESE_CONTRASTIVE_SHORTHAND = new RegExp(
   `(?:不要|不用|别)\\s*${FORMAT_SHORTHAND}\\s*(?:，|,|；|;)?\\s*(?:而是|改成|改为|换成|换为)\\s*${FORMAT_SHORTHAND}`,
   'iu',
 )
 const ENGLISH_CONTRASTIVE_SHORTHAND = new RegExp(
-  `(?:not|do\\s+not\\s+use|don't\\s+use)\\s+${FORMAT_SHORTHAND}\\s*(?:(?:[,;.]\\s*(?:an?\\s+)?${FORMAT_SHORTHAND}\\s+instead)|(?:but\\s+(?:an?\\s+)?${FORMAT_SHORTHAND}))`,
+  `^(?:not|do\\s+not\\s+use|don't\\s+use)\\s+${FORMAT_SHORTHAND}\\s*(?:(?:[,;.]\\s*(?:an?\\s+)?${FORMAT_SHORTHAND}\\s+instead)|(?:but\\s+(?:an?\\s+)?${FORMAT_SHORTHAND}))$`,
   'iu',
 )
 const CLAUSE_CONNECTOR = /(?:而是|但是|然后|并且|但)|\b(?:and\s+then|but|however|then)\b/giu
 const CLAUSE_SEPARATOR = new RegExp(
-  `[，,；;。!！？?]|…+|\\.(?![A-Za-z0-9]{2,10}\\b)`,
+  `(?:[，,；;](?!\\s*(?:或|or\\b))|[。!！？?])|…+|\\.(?![A-Za-z0-9]{2,10}\\b)`,
   'giu',
 )
 const UPPERCASE_FORMAT_REFERENCE = /(?:^|[^\p{L}\p{N}])\.?[A-Z0-9]{2,10}(?=$|[^\p{L}\p{N}])/u
 const COORDINATED_ACTION_BRIDGE = /(?:或|和|及|以及|并|并且)\s*$|\b(?:or|and|nor)\s*$/iu
 const WEAK_CONTEXT_BOUNDARY = /(?:而是|但是|然后|并且|同时|以及|并|和|或|解释|询问|问|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:and|or|while|then|explain|ask|summari[sz]e|describe|discuss|analy[sz]e|review|check|read|tell)\b/giu
+const NON_ATTACHMENT_OBJECT = /(?:对话|聊天记录|聊天历史)|\b(?:conversation|chat\s+history)\b/iu
 const RESERVED_SUMMARY_LABEL = /(?:附\s*件|目\s*标\s*格\s*式)/iu
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 
@@ -88,10 +90,14 @@ function conversionActionIsNegated(
 }
 
 function actionIsEmbeddedInOtherIntent(clause: string, start: number, actionIndex: number): boolean {
-  return ACTION_EMBEDDING_OTHER_INTENT.test(clause.slice(start, actionIndex))
+  const prefix = clause.slice(start, actionIndex)
+  const otherIntent = [...prefix.matchAll(ACTION_EMBEDDING_OTHER_INTENT)].at(-1)
+  if (otherIntent?.index === undefined) return false
+  const bridge = prefix.slice(otherIntent.index + otherIntent[0].length)
+  return !ACTION_PIVOT.test(bridge)
 }
 
-function weakActionHasConversionContext(clause: string, actionIndex: number, actionEnd: number): boolean {
+function actionOperandContext(clause: string, actionIndex: number, actionEnd: number): string {
   const prefixWindow = clause.slice(Math.max(0, actionIndex - 48), actionIndex)
   const prefixBoundaries = [...prefixWindow.matchAll(WEAK_CONTEXT_BOUNDARY)]
   const lastPrefixBoundary = prefixBoundaries.at(-1)
@@ -103,7 +109,10 @@ function weakActionHasConversionContext(clause: string, actionIndex: number, act
   const suffix = suffixBoundary?.index === undefined
     ? suffixWindow
     : suffixWindow.slice(0, suffixBoundary.index)
-  const context = `${prefix}${clause.slice(actionIndex, actionEnd)}${suffix}`
+  return `${prefix}${clause.slice(actionIndex, actionEnd)}${suffix}`
+}
+
+function weakActionHasConversionContext(context: string): boolean {
   return ATTACHMENT_REFERENCE.test(context)
     || FORMAT_LIKE_REFERENCE.test(context)
     || UPPERCASE_FORMAT_REFERENCE.test(context)
@@ -180,8 +189,10 @@ export function hasLocalConversionIntent(
       )
       previousActionEnd = actionIndex + action[0].length
       previousActionWasNegated = negated
+      const operandContext = actionOperandContext(clause, actionIndex, previousActionEnd)
+      if (NON_ATTACHMENT_OBJECT.test(operandContext)) continue
       const strong = action.groups?.strong !== undefined
-      if (!strong && !weakActionHasConversionContext(clause, actionIndex, previousActionEnd)) continue
+      if (!strong && !weakActionHasConversionContext(operandContext)) continue
       if (negated) {
         sawNegatedConversion = true
         continue
