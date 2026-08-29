@@ -6618,10 +6618,14 @@ describe('AgentOrchestrator knowledge grounding', () => {
 
     expect(knowledge.search).toHaveBeenCalledWith({
       ownerId: 'user_1', conversationId: 'knowledge_conversation', baseIds: ['base_selected'],
-      query: '合同何时生效', signal: expect.any(AbortSignal),
+      query: '合同何时生效？', signal: expect.any(AbortSignal),
     })
     const requests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls.map(call => call[0])
     expect(requests[0]?.tools?.map(tool => tool.function.name)).toContain('knowledge_search')
+    expect(requests[0]?.messages).toContainEqual(expect.objectContaining({
+      role: 'system',
+      content: expect.stringMatching(/自然.*直接.*回答/u),
+    }))
     expect(JSON.stringify(requests[1]?.messages)).toContain('UNTRUSTED_KNOWLEDGE_EVIDENCE')
     const terminal = dependencies.records.terminal.at(-1) as { blocks: Array<{ type: string }> }
     expect(terminal.blocks).toEqual(expect.arrayContaining([
@@ -6631,6 +6635,148 @@ describe('AgentOrchestrator knowledge grounding', () => {
         documentId: 'document_1', versionId: 'version_1',
       }),
     ]))
+  })
+
+  it('prefers the original query over a lossy model rewrite', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search',
+        arguments: { query: '班级名称是？', rewrite: '查询班级名称相关信息' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '班级名称是KA-001班。[[kb:evidence:class-name]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+    const search = vi.fn(async (
+      input: Parameters<NonNullable<AgentOrchestratorDependencies['knowledge']>['search']>[0],
+    ) => input.query === '班级名称是？'
+      ? {
+          kind: 'results' as const, strategy: 'bounded-instr' as const, evidence: [{
+            ...retrievedEvidence,
+            id: 'evidence:class-name',
+            snippet: '班级：KA-001班',
+            citation: { ...retrievedEvidence.citation, evidenceId: 'evidence:class-name' },
+          }],
+        }
+      : { kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })
+    dependencies.knowledge!.search = search
+
+    await expect(new AgentOrchestrator(dependencies).run(knowledgeRunInput('班级名称是？')))
+      .resolves.toMatchObject({ status: 'completed' })
+
+    expect(search.mock.calls.map(([input]) => input.query)).toEqual(['班级名称是？'])
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      status: 'completed',
+      blocks: expect.arrayContaining([
+        expect.objectContaining({ type: 'knowledge_status', status: 'found', searchIndex: 1 }),
+        expect.objectContaining({ type: 'knowledge_citation', evidenceId: 'evidence:class-name' }),
+        expect.objectContaining({ type: 'text', text: '班级名称是KA-001班。' }),
+      ]),
+    })
+  })
+
+  it('prefers the current user text over a lossy model tool query', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search',
+        arguments: { query: '查询相关班级信息' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '班级名称是KA-001班。[[kb:evidence:class-name]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+    const search = vi.fn(async (
+      input: Parameters<NonNullable<AgentOrchestratorDependencies['knowledge']>['search']>[0],
+    ) => input.query === '班级名称是？'
+      ? {
+          kind: 'results' as const, strategy: 'bounded-instr' as const, evidence: [{
+            ...retrievedEvidence,
+            id: 'evidence:class-name',
+            snippet: '班级：KA-001班',
+            citation: { ...retrievedEvidence.citation, evidenceId: 'evidence:class-name' },
+          }],
+        }
+      : { kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })
+    dependencies.knowledge!.search = search
+
+    await expect(new AgentOrchestrator(dependencies).run(knowledgeRunInput('班级名称是？')))
+      .resolves.toMatchObject({ status: 'completed' })
+
+    expect(search.mock.calls.map(([input]) => input.query)).toEqual(['班级名称是？'])
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      status: 'completed',
+      blocks: expect.arrayContaining([
+        expect.objectContaining({ type: 'knowledge_status', status: 'found', searchIndex: 1 }),
+        expect.objectContaining({ type: 'knowledge_citation', evidenceId: 'evidence:class-name' }),
+      ]),
+    })
+  })
+
+  it('requires a selected mixed knowledge base to retrieve before answering', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'mixed_knowledge_call',
+        name: 'knowledge_search', arguments: { query: '班级名称' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '班级名称是高一（3）班。[[kb:evidence:class-name]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const knowledge = attachKnowledge(dependencies)
+    knowledge.search.mockResolvedValue({
+      kind: 'results',
+      strategy: 'trigram',
+      evidence: [{
+        ...retrievedEvidence,
+        id: 'evidence:class-name',
+        snippet: '班级名称是高一（3）班。',
+        citation: { ...retrievedEvidence.citation, evidenceId: 'evidence:class-name' },
+      }],
+    })
+
+    await new AgentOrchestrator(dependencies).run(Object.assign(knowledgeRunInput('班级名称是？'), {
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
+    }))
+
+    const firstRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0]
+    expect(firstRequest?.toolChoice).toEqual({
+      type: 'function', function: { name: 'knowledge_search' },
+    })
+    expect(dependencies.knowledge?.search).toHaveBeenCalledWith(expect.objectContaining({
+      baseIds: ['base_selected'], query: '班级名称是？',
+    }))
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('班级名称是高一（3）班。')
+    expect(terminal).not.toContain('【知识库依据】')
+    expect(terminal).not.toContain('【一般信息】')
+  })
+
+  it('forces selected knowledge before passive workflow candidates', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_before_passive_workflow',
+        name: 'knowledge_search', arguments: { query: '合同何时生效？' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const knowledge = attachKnowledge(dependencies, { keepWorkflows: true })
+
+    await new AgentOrchestrator(dependencies).run(knowledgeRunInput('合同何时生效？'))
+
+    const firstRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0]
+    expect(firstRequest?.tools?.map(tool => tool.function.name)).toContain('knowledge_search')
+    expect(firstRequest?.toolChoice).toEqual({
+      type: 'function', function: { name: 'knowledge_search' },
+    })
+    expect(knowledge.search).toHaveBeenCalledOnce()
   })
 
   it('keeps a strict cold-start remote citation when its immutable scope projection is verifiable', async () => {
@@ -7023,7 +7169,7 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(JSON.stringify(terminal.blocks)).not.toContain('合同生效。')
   })
 
-  it('downgrades unavailable mixed sources and persists no stale citation', async () => {
+  it('explains unavailable mixed sources naturally and persists no stale citation', async () => {
     const dependencies = harness([[
       { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
@@ -7039,8 +7185,8 @@ describe('AgentOrchestrator knowledge grounding', () => {
     await new AgentOrchestrator(dependencies).run(input)
 
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
-    expect(terminal).toContain('【一般信息】')
-    expect(terminal).toContain('来源当前不可用')
+    expect(terminal).toContain('原知识库来源当前不可用')
+    expect(terminal).not.toContain('【一般信息】')
     expect(terminal).not.toContain('【知识库依据】')
     expect(terminal).not.toContain('knowledge_citation')
   })
@@ -7074,7 +7220,7 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(terminal.blocks.some(block => block.type === 'knowledge_citation')).toBe(false)
   })
 
-  it('labels no-evidence mixed answers and keeps strict mode closed without tool support', async () => {
+  it('keeps no-evidence mixed answers natural and strict mode closed without tool support', async () => {
     const mixedDependencies = harness([[
       { type: 'text_delta', choiceIndex: 0, text: '一般合同知识' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
@@ -7086,8 +7232,9 @@ describe('AgentOrchestrator knowledge grounding', () => {
     })
     await new AgentOrchestrator(mixedDependencies).run(mixedInput)
     const mixedTerminal = JSON.stringify(mixedDependencies.records.terminal.at(-1))
-    expect(mixedTerminal).toContain('【一般信息】一般合同知识')
-    expect(mixedTerminal).not.toContain('【知识库依据】一般合同知识')
+    expect(mixedTerminal).toContain('一般合同知识')
+    expect(mixedTerminal).not.toContain('【一般信息】')
+    expect(mixedTerminal).not.toContain('【知识库依据】')
 
     const strictDependencies = harness([[
       { type: 'text_delta', choiceIndex: 0, text: '模型猜测' },
@@ -7104,7 +7251,7 @@ describe('AgentOrchestrator knowledge grounding', () => {
     ['complete forged marker', '一般合同知识 [[kb:evidence:forged]]'],
     ['incomplete forged marker', '一般合同知识 [[kb:evidence:forged'],
     ['malformed marker prefix', '一般合同知识 [[kb:'],
-  ])('sanitizes %s before labeling mixed no-evidence output', async (_name, answer) => {
+  ])('sanitizes %s before returning mixed no-evidence output', async (_name, answer) => {
     const dependencies = harness([[
       { type: 'text_delta', choiceIndex: 0, text: answer },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
@@ -7118,7 +7265,8 @@ describe('AgentOrchestrator knowledge grounding', () => {
     await new AgentOrchestrator(dependencies).run(input)
 
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
-    expect(terminal).toContain('【一般信息】一般合同知识')
+    expect(terminal).toContain('一般合同知识')
+    expect(terminal).not.toContain('【一般信息】')
     expect(terminal).not.toContain('[[kb:')
     expect(terminal).not.toContain('forged')
   })
@@ -7172,7 +7320,8 @@ describe('AgentOrchestrator knowledge grounding', () => {
     await new AgentOrchestrator(dependencies).run(input)
 
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
-    expect(terminal).toContain('【知识库依据】合同经双方签字后生效。')
+    expect(terminal).toContain('合同经双方签字后生效。')
+    expect(terminal).not.toContain('【知识库依据】')
     expect(terminal).toContain('knowledge_citation')
     expect(terminal).not.toContain('[[kb:')
   })
@@ -7193,7 +7342,8 @@ describe('AgentOrchestrator knowledge grounding', () => {
     await new AgentOrchestrator(dependencies).run(input)
 
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
-    expect(terminal).toContain('【知识库依据】合同经双方签字后生效。')
+    expect(terminal).toContain('合同经双方签字后生效。')
+    expect(terminal).not.toContain('【知识库依据】')
     expect(terminal).toContain('knowledge_citation')
     expect(terminal).not.toContain('forged')
   })
@@ -7214,7 +7364,8 @@ describe('AgentOrchestrator knowledge grounding', () => {
     await new AgentOrchestrator(dependencies).run(input)
 
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
-    expect(terminal).toContain('【知识库依据】合同经双方签字后生效。')
+    expect(terminal).toContain('合同经双方签字后生效。')
+    expect(terminal).not.toContain('【知识库依据】')
     expect(terminal).toContain('knowledge_citation')
     expect(terminal).not.toContain('payload')
     expect(terminal).not.toContain('not-kb')

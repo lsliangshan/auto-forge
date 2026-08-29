@@ -1114,6 +1114,27 @@ describe('chat interactions', () => {
     expect(wrapper.get('p code').text()).toBe('pnpm test')
   })
 
+  it('repairs legacy knowledge answers whose list markers and bold labels were split across lines', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message_1:block_text',
+        type: 'text',
+        text: [
+          '1.',
+          '**不准迟到**',
+          '2.',
+          '**不准早退**',
+          '**注',
+          '**',
+        ].join('\n'),
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.findAll('ol > li').map(item => item.text())).toEqual(['不准迟到', '不准早退'])
+    expect(wrapper.findAll('strong').map(item => item.text())).toContain('注')
+  })
+
   it('escapes raw HTML instead of creating live chat elements', () => {
     const wrapper = mount(MessageBlock, {
       props: { block: {

@@ -182,7 +182,7 @@ describe('knowledge tool and answer validation', () => {
       kind: 'valid', citedEvidenceIds: [id], generalKnowledge: false, text: '合同生效。',
     })
     expect(validateKnowledgeAnswer(`合同生效。${marker}`, registry.snapshot(), 'mixed', 1)).toEqual({
-      kind: 'valid', citedEvidenceIds: [id], generalKnowledge: false, text: '【知识库依据】合同生效。',
+      kind: 'valid', citedEvidenceIds: [id], generalKnowledge: false, text: '合同生效。',
     })
   })
 
@@ -203,7 +203,7 @@ describe('knowledge tool and answer validation', () => {
     }).toEqual({
       strict: { kind: 'insufficient', reason: 'invalid-citation' },
       mixed: {
-        kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '【一般信息】合同生效',
+        kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '合同生效',
       },
     })
 
@@ -211,12 +211,12 @@ describe('knowledge tool and answer validation', () => {
     expect(() => registry.add([current])).toThrow('Knowledge evidence identity is invalid')
   })
 
-  it('fails strict answers closed and labels uncited mixed answers as general knowledge', () => {
+  it('fails strict answers closed and keeps uncited mixed answers user-facing', () => {
     expect(validateKnowledgeAnswer('没有证据的结论', [], 'strict', 0)).toEqual({
       kind: 'insufficient', reason: 'no-evidence',
     })
     expect(validateKnowledgeAnswer('一般信息', [], 'mixed', 0)).toEqual({
-      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '【一般信息】一般信息',
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '一般信息',
     })
     expect(validateKnowledgeAnswer(
       '第 0 条证据 [[kb:evidence:0]]\n\n未由依据支持的补充', [evidence(0)], 'strict', 0,
@@ -225,7 +225,19 @@ describe('knowledge tool and answer validation', () => {
       '第 0 条证据 [[kb:evidence:0]]\n\n一般补充', [evidence(0)], 'mixed', 0,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
-      text: '【知识库依据】第 0 条证据\n【一般信息】一般补充',
+      text: '第 0 条证据\n\n一般补充',
+    })
+  })
+
+  it('keeps validated mixed answers free of internal classification labels', () => {
+    expect(validateKnowledgeAnswer(
+      '班级名称是KA-001班。[[kb:evidence:0]]',
+      [evidence(0, { snippet: '班级：KA-001班' })],
+      'mixed',
+      0,
+    )).toMatchObject({
+      kind: 'valid',
+      text: '班级名称是KA-001班。',
     })
   })
 
@@ -243,7 +255,7 @@ describe('knowledge tool and answer validation', () => {
       [contract], 'mixed', 0,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
-      text: '【一般信息】合同经双方签字后生效\n【一般信息】但月球由奶酪构成。',
+      text: '合同经双方签字后生效，但月球由奶酪构成。',
     })
   })
 
@@ -279,7 +291,7 @@ describe('knowledge tool and answer validation', () => {
       '双方签订协议后，协议即开始起效。[[kb:evidence:0]]', [contract], 'strict', 0,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
-      text: '双方签订协议后\n协议即开始起效。',
+      text: '双方签订协议后，协议即开始起效。',
     })
   })
 
@@ -647,12 +659,12 @@ describe('knowledge tool and answer validation', () => {
   })
 
   it.each([
-    ['一般结论 [[kb:evidence:forged]]', '【一般信息】一般结论'],
-    ['一般结论 [[kb:evidence:forged', '【一般信息】一般结论'],
-    ['一般结论 [[kb:', '【一般信息】一般结论'],
-    ['一般结论 [[kb:\nforged]]', '【一般信息】一般结论'],
-    ['一般结论 [[ kb ： forged ]]', '【一般信息】一般结论'],
-    ['一般结论 [[\u200bkb：forged]]', '【一般信息】一般结论'],
+    ['一般结论 [[kb:evidence:forged]]', '一般结论'],
+    ['一般结论 [[kb:evidence:forged', '一般结论'],
+    ['一般结论 [[kb:', '一般结论'],
+    ['一般结论 [[kb:\nforged]]', '一般结论'],
+    ['一般结论 [[ kb ： forged ]]', '一般结论'],
+    ['一般结论 [[\u200bkb：forged]]', '一般结论'],
   ])('strips complete or malformed markers from mixed no-evidence output: %s', (answer, expected) => {
     expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
       kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: expected,
@@ -683,7 +695,7 @@ describe('knowledge tool and answer validation', () => {
       'mixed', 1,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
-      text: '【知识库依据】合同生效。',
+      text: '合同生效。',
     })
   })
 
@@ -694,7 +706,7 @@ describe('knowledge tool and answer validation', () => {
       'mixed', 1,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
-      text: '【知识库依据】合同生效。',
+      text: '合同生效。',
     })
   })
 
@@ -705,7 +717,7 @@ describe('knowledge tool and answer validation', () => {
       'mixed', 1,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
-      text: '【知识库依据】合同生效。',
+      text: '合同生效。',
     })
   })
 
@@ -713,7 +725,7 @@ describe('knowledge tool and answer validation', () => {
     const prefix = '一般说明'.padEnd(4_000, '甲')
     expect(validateKnowledgeAnswer(`${prefix}[[kb:[[not-kb]]payload]]tail`, [], 'mixed', 0)).toEqual({
       kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
-      text: `【一般信息】${prefix}`,
+      text: prefix,
     })
   })
 
@@ -723,7 +735,7 @@ describe('knowledge tool and answer validation', () => {
   ])('does not remove ordinary external bracket text in mixed mode: %s', (answer) => {
     expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
       kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
-      text: `【一般信息】${answer}`,
+      text: answer,
     })
   })
 
@@ -744,6 +756,15 @@ describe('knowledge tool and answer validation', () => {
   ])('accepts bounded same-clause copula/location paraphrase: %s', (snippet, claim) => {
     expect(validateKnowledgeAnswer(
       `${claim}[[kb:evidence:0]]`, [evidence(0, { snippet })], 'strict', 1,
+    )).toMatchObject({ kind: 'valid', generalKnowledge: false })
+  })
+
+  it('accepts a field-name answer supported by the shorter source label', () => {
+    expect(validateKnowledgeAnswer(
+      '班级名称是KA-001班。[[kb:evidence:0]]',
+      [evidence(0, { snippet: '班级：KA-001班' })],
+      'strict',
+      1,
     )).toMatchObject({ kind: 'valid', generalKnowledge: false })
   })
 
@@ -805,7 +826,30 @@ describe('knowledge tool and answer validation', () => {
       [contract], 'mixed', 0,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
-      text: '【一般信息】合同经双方签字后生效\n【一般信息】月球由奶酪构成。',
+      text: '合同经双方签字后生效，月球由奶酪构成。',
+    })
+  })
+
+  it('preserves Markdown structure while validating knowledge answer claims', () => {
+    const answer = [
+      '根据知识库信息',
+      '',
+      '**KA-001班** 的班规如下：',
+      '',
+      '1. **不准迟到**',
+      '2. **不准早退**',
+      '3. **不准逃课**',
+      '4. **上课不许吃零食**',
+      '5. **课堂不许喧哗**',
+      '',
+      '**注：**',
+      '',
+      '- 班规仅适用于上课期间。',
+      '- 班规在自然日内有效。',
+    ].join('\n')
+
+    expect(validateKnowledgeAnswer(answer, [], 'mixed', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: answer,
     })
   })
 
@@ -817,7 +861,7 @@ describe('knowledge tool and answer validation', () => {
     expect(validation.kind).toBe('valid')
     if (validation.kind !== 'valid') throw new Error('Expected valid answer')
     expect(formatValidatedKnowledgeAnswer(validation, 'mixed', new Set())).toBe(
-      '【一般信息】合同经双方签字后生效。（来源当前不可用）',
+      '合同经双方签字后生效。（原知识库来源当前不可用）',
     )
   })
 

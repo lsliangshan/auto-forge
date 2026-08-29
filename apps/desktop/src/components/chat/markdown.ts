@@ -36,6 +36,12 @@ const markdown = new MarkdownIt({
   highlight: highlightCode,
 })
 
+function normalizeMarkdownLayout(text: string): string {
+  return text
+    .replace(/^([ \t]*\d+[.)])[ \t]*\r?\n(?=[ \t]*\S)/gmu, '$1 ')
+    .replace(/^([ \t]*\*\*[^*\r\n]+)\r?\n[ \t]*\*\*[ \t]*$/gmu, '\n$1**')
+}
+
 export function renderMarkdown(text: string): string {
-  return markdown.render(text)
+  return markdown.render(normalizeMarkdownLayout(text))
 }

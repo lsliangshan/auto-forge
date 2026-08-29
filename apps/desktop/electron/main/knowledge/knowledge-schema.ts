@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 14
+export const KNOWLEDGE_SCHEMA_VERSION = 16
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -446,6 +446,25 @@ const KNOWLEDGE_SCHEMA_V14 = `
       CHECK (upload_retiring IN (0, 1));
 `
 
+const KNOWLEDGE_SCHEMA_V15 = `
+  CREATE TABLE kb_chunk_embeddings (
+    chunk_id TEXT PRIMARY KEY REFERENCES kb_chunks(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0 AND dimensions <= 4096),
+    embedding BLOB NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK (length(embedding) = dimensions * 4)
+  ) STRICT;
+  CREATE INDEX kb_chunk_embeddings_model_idx
+    ON kb_chunk_embeddings(model, chunk_id);
+`
+
+const KNOWLEDGE_SCHEMA_V16 = `
+  ALTER TABLE document_versions
+    ADD COLUMN chunking_revision INTEGER NOT NULL DEFAULT 1
+      CHECK (chunking_revision > 0);
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
@@ -461,6 +480,8 @@ const migrations = new Map<number, string>([
   [12, KNOWLEDGE_SCHEMA_V12],
   [13, KNOWLEDGE_SCHEMA_V13],
   [14, KNOWLEDGE_SCHEMA_V14],
+  [15, KNOWLEDGE_SCHEMA_V15],
+  [16, KNOWLEDGE_SCHEMA_V16],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {

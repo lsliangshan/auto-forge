@@ -57,8 +57,8 @@ export function reciprocalRankFusion(
 }
 
 export function cosineSimilarity(
-  left: readonly number[],
-  right: readonly number[],
+  left: ArrayLike<number>,
+  right: ArrayLike<number>,
   dimensions: number,
 ): number | undefined {
   if (left.length !== dimensions || right.length !== dimensions) return undefined
@@ -77,12 +77,15 @@ export function cosineSimilarity(
   return dot / (Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude))
 }
 
-export function rankByCosine<T extends RankedIdentifier & { vector: readonly number[] }>(
-  query: readonly number[],
+export function rankByCosine<T extends RankedIdentifier & { vector: ArrayLike<number> }>(
+  query: ArrayLike<number>,
   candidates: readonly T[],
   dimensions: number,
 ): Array<T & { score: number }> {
-  if (query.length !== dimensions || query.some(value => !Number.isFinite(value))) return []
+  if (query.length !== dimensions) return []
+  for (let index = 0; index < dimensions; index += 1) {
+    if (!Number.isFinite(query[index])) return []
+  }
   return candidates.flatMap(candidate => {
     const score = cosineSimilarity(query, candidate.vector, dimensions)
     return score === undefined ? [] : [{ ...candidate, score }]

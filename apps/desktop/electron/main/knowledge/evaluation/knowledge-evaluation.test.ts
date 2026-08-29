@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { net } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { readFileSync, readdirSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -10,6 +11,8 @@ import corpus from './corpus.json' with { type: 'json' }
 import { validateKnowledgeAnswer } from '../../agent/knowledge-evidence.js'
 import { KnowledgeStoreFactory } from '../encrypted-database.js'
 import { LocalKnowledgeRetriever } from '../local-retriever.js'
+import { TransformersLocalTextEmbedder } from '../local-embedding.js'
+import { LocalSemanticIndex } from '../local-semantic-index.js'
 import { memoryKnowledgeStore } from '../knowledge-test-support.js'
 import { DEFAULT_PARSER_LIMITS } from '../parser-protocol.js'
 import { minimalDocxWithText, minimalPdf } from '../test-fixtures/document-fixtures.js'
@@ -295,3 +298,51 @@ describe('personal knowledge release evaluation corpus', () => {
     }
   }, 30_000)
 })
+
+describe.runIf(process.env.AUTOFORGE_KNOWLEDGE_EMBEDDING_EVAL === '1')(
+  'personal knowledge real local embedding evaluation',
+  () => {
+    it('meets semantic Recall@8 on natural questions with the pinned production model', async () => {
+      const temporaryCache = process.env.AUTOFORGE_KNOWLEDGE_MODEL_CACHE === undefined
+      const cacheDirectory = process.env.AUTOFORGE_KNOWLEDGE_MODEL_CACHE
+        ?? await mkdtemp(join(tmpdir(), 'autoforge-knowledge-model-'))
+      const memory = seedRetrievalCorpus()
+      const semantic = new LocalSemanticIndex(
+        memory.database,
+        new TransformersLocalTextEmbedder(cacheDirectory, (url, signal) => net.fetch(url, { signal })),
+      )
+      const retriever = new LocalKnowledgeRetriever(memory.database, semantic)
+      const missed: string[] = []
+      const diagnostics: string[] = []
+      try {
+        await semantic.indexMissing()
+        for (const item of corpus.semanticRetrieval.cases) {
+          const result = await retriever.search(item.query, ['evaluation-base'])
+          if (result.kind !== 'results' || !result.evidence.some(
+            value => item.relevantDocumentIds.includes(value.documentId),
+          )) {
+            missed.push(item.id)
+            diagnostics.push(`${item.id}:${result.kind === 'results'
+              ? `${result.strategy}:${result.evidence.map(value => value.documentId).join('|')}`
+              : result.kind}`)
+          }
+        }
+        const recallAt8 = percent(
+          corpus.semanticRetrieval.cases.length - missed.length,
+          corpus.semanticRetrieval.cases.length,
+        )
+        expect(recallAt8, `semantic Recall@8 misses: ${diagnostics.join(', ')}`)
+          .toBeGreaterThanOrEqual(corpus.semanticRetrieval.threshold)
+        reportGate('semantic-retrieval', {
+          recallAt8,
+          queries: corpus.semanticRetrieval.cases.length,
+          realPinnedModel: true,
+          localOnly: true,
+        })
+      } finally {
+        await semantic.dispose()
+        if (temporaryCache) await rm(cacheDirectory, { recursive: true, force: true })
+      }
+    }, 180_000)
+  },
+)

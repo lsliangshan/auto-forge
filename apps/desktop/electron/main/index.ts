@@ -42,6 +42,8 @@ import {
   type SelectedKnowledgeFile,
 } from './knowledge/knowledge-service.js'
 import { createElectronParserSupervisor } from './knowledge/parser-supervisor.js'
+import { TransformersLocalTextEmbedder } from './knowledge/local-embedding.js'
+import { LocalSemanticIndex } from './knowledge/local-semantic-index.js'
 import { readKnowledgeImportFile, writeKnowledgeExportFile } from './knowledge/knowledge-file-io.js'
 import {
   AUTOFORGE_KNOWLEDGE_ENTITLEMENT_PUBLIC_KEYS,
@@ -157,6 +159,13 @@ async function initialize(): Promise<ApplicationRuntime> {
       preloadPath: fileURLToPath(new URL('../preload/knowledgeParser.cjs', import.meta.url)),
       resolveObject: objectId => store.objects.read(objectId),
     }),
+    createSemanticIndex: store => new LocalSemanticIndex(
+      store.database,
+      new TransformersLocalTextEmbedder(
+        join(userData, 'knowledge-models'),
+        (url, signal) => net.fetch(url, { signal }),
+      ),
+    ),
     saveExport: async (name, contents) => {
       const result = mainWindow
         ? await dialog.showSaveDialog(mainWindow, { defaultPath: name })

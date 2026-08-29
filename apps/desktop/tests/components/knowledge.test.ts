@@ -100,6 +100,29 @@ describe('personal knowledge workspace', () => {
     expect(inspector.text()).not.toContain('ready')
   })
 
+  it('guides a free user to replace the active file instead of starting a conflicting import', async () => {
+    const client = api({
+      list: vi.fn().mockResolvedValue([base('base_1', '个人资料')]),
+      listDocuments: vi.fn().mockResolvedValue([document('doc_1', 'base_1')]),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia] } })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    await flushPromises()
+
+    const importButton = wrapper.get('[data-testid="knowledge-import"]')
+    expect(importButton.attributes()).toHaveProperty('disabled')
+    expect(importButton.attributes('title')).toBe('免费版仅支持 1 个有效文件，请使用“替换文件”更新现有文件')
+    await importButton.trigger('click')
+    expect(client.knowledge.pickImportFiles).not.toHaveBeenCalled()
+    await store.importDocuments()
+    expect(store.error).toBe('免费版仅支持 1 个有效文件，请使用“替换文件”更新现有文件')
+    expect(client.knowledge.pickImportFiles).not.toHaveBeenCalled()
+  })
+
   it('renders expired extras read-only and sends the chosen keep-one pair through preload', async () => {
     const client = api({
       list: vi.fn().mockResolvedValue([

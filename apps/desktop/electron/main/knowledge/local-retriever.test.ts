@@ -1,6 +1,14 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { LocalKnowledgeRetriever } from './local-retriever.js'
+import { LocalSemanticIndex } from './local-semantic-index.js'
+import type { LocalTextEmbedder } from './local-embedding.js'
 import { memoryKnowledgeStore } from './knowledge-test-support.js'
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise })
+  return { promise, resolve }
+}
 
 function seedSearchable(memory: ReturnType<typeof memoryKnowledgeStore>) {
   const db = memory.database
@@ -69,5 +77,145 @@ describe('local knowledge retriever', () => {
     await expect(new LocalKnowledgeRetriever(db).search('命中', ['base'])).resolves.toEqual({
       kind: 'results', strategy: 'bounded-instr', evidence: [],
     })
+  })
+
+  it('matches a Chinese field question after removing its interrogative suffix', async () => {
+    const memory = memoryKnowledgeStore()
+    seedSearchable(memory)
+    memory.database.prepare(`
+      UPDATE kb_chunks
+      SET body = '班级：KA-001班'
+      WHERE id = 'chunk-0'
+    `).run()
+
+    const result = await new LocalKnowledgeRetriever(memory.database)
+      .search('班级名称是？', ['base'])
+
+    expect(result).toMatchObject({
+      kind: 'results',
+      strategy: 'bounded-instr',
+      evidence: [expect.objectContaining({ snippet: '班级：KA-001班' })],
+    })
+  })
+
+  it('matches a two-character Chinese section question after removing its suffix', async () => {
+    const memory = memoryKnowledgeStore()
+    seedSearchable(memory)
+    memory.database.prepare(`
+      UPDATE kb_chunks
+      SET body = '班规：\n1. 不准迟到\n2. 不准早退\n3. 不准逃课'
+      WHERE id = 'chunk-0'
+    `).run()
+
+    const result = await new LocalKnowledgeRetriever(memory.database)
+      .search('班规是？', ['base'])
+
+    expect(result).toMatchObject({
+      kind: 'results',
+      strategy: 'bounded-instr',
+      evidence: [expect.objectContaining({
+        snippet: expect.stringContaining('1. 不准迟到'),
+      })],
+    })
+  })
+
+  it('centres the provider snippet on the actual lexical match in a long chunk', async () => {
+    const memory = memoryKnowledgeStore()
+    seedSearchable(memory)
+    const answer = '核心验收日期为 2028-06-30'
+    memory.database.prepare(`
+      UPDATE kb_chunks SET body = ? WHERE id = 'chunk-0'
+    `).run(`${'无关背景'.repeat(1_200)}${answer}${'附录'.repeat(400)}`)
+
+    const result = await new LocalKnowledgeRetriever(memory.database)
+      .search('核心验收日期', ['base'])
+
+    expect(result).toMatchObject({
+      kind: 'results',
+      evidence: [expect.objectContaining({ snippet: expect.stringContaining(answer) })],
+    })
+  })
+
+  it('recalls a semantic paraphrase through the local embedding index and hybrid fusion', async () => {
+    const memory = memoryKnowledgeStore()
+    seedSearchable(memory)
+    memory.database.prepare("UPDATE kb_chunks SET body = '班级名称：高一三班' WHERE id = 'chunk-0'").run()
+    const embedder: LocalTextEmbedder = {
+      model: 'test-local-embedding',
+      dimensions: 2,
+      available: () => true,
+      dispose: async () => undefined,
+      embed: async texts => texts.map(text => (
+        /(?:班级名称|班叫什么)/u.test(text)
+          ? Float32Array.from([1, 0])
+          : Float32Array.from([0, 1])
+      )),
+    }
+    const semantic = new LocalSemanticIndex(memory.database, embedder)
+
+    const result = await new LocalKnowledgeRetriever(memory.database, semantic)
+      .search('这个班叫什么？', ['base'])
+
+    expect(result.kind).toBe('results')
+    if (result.kind !== 'results') throw new Error('Expected search results')
+    expect(result.strategy).toBe('hybrid')
+    expect(result.evidence[0]).toMatchObject({
+      id: 'evidence:chunk-0',
+      snippet: expect.stringContaining('高一三班'),
+    })
+    expect(memory.database.prepare(
+      "SELECT count(*) AS count FROM kb_chunk_embeddings WHERE model = 'test-local-embedding'",
+    ).get()).toEqual({ count: 8 })
+  })
+
+  it('keeps lexical retrieval available when the local embedding model cannot load', async () => {
+    const memory = memoryKnowledgeStore()
+    seedSearchable(memory)
+    const embed = vi.fn(async () => { throw new Error('model unavailable') })
+    const embedder: LocalTextEmbedder = {
+      model: 'unavailable-local-embedding',
+      dimensions: 2,
+      available: () => false,
+      dispose: async () => undefined,
+      embed,
+    }
+    const semantic = new LocalSemanticIndex(memory.database, embedder)
+
+    await expect(new LocalKnowledgeRetriever(
+      memory.database,
+      semantic,
+    ).search('合同条款', ['base'])).resolves.toMatchObject({
+      kind: 'results', strategy: 'trigram', evidence: expect.any(Array),
+    })
+    await semantic.drain()
+    expect(embed).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not persist late embedding results after the index owner is invalidated', async () => {
+    const memory = memoryKnowledgeStore()
+    seedSearchable(memory)
+    const started = deferred<void>()
+    const result = deferred<readonly Float32Array[]>()
+    const embedder: LocalTextEmbedder = {
+      model: 'cancelled-local-embedding',
+      dimensions: 2,
+      available: () => false,
+      dispose: async () => undefined,
+      embed: async () => {
+        started.resolve()
+        return result.promise
+      },
+    }
+    const semantic = new LocalSemanticIndex(memory.database, embedder)
+
+    const indexing = semantic.indexMissing()
+    await started.promise
+    semantic.invalidate()
+    result.resolve(Array.from({ length: 8 }, () => Float32Array.from([1, 0])))
+
+    await expect(indexing).rejects.toThrow('cancelled')
+    expect(memory.database.prepare(
+      "SELECT count(*) AS count FROM kb_chunk_embeddings WHERE model = 'cancelled-local-embedding'",
+    ).get()).toEqual({ count: 0 })
   })
 })

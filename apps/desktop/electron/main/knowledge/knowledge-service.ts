@@ -22,6 +22,7 @@ import { KnowledgeExportService } from './export-service.js'
 import { ImportJobRunner, type KnowledgeParserPort } from './import-job-runner.js'
 import { LocalKnowledgeRetriever } from './local-retriever.js'
 import type { LocalKnowledgeVersionScope } from './local-retriever.js'
+import type { LocalSemanticSearchPort } from './local-semantic-index.js'
 import { CloudKnowledgeRetriever, type CloudCandidate } from './cloud-retriever.js'
 import type {
   CloudKnowledgeChange,
@@ -60,6 +61,7 @@ export interface LocalKnowledgeServiceDependencies {
   openStore(ownerId: string): Promise<LocalKnowledgeStore>
   selectImportFiles(): Promise<SelectedKnowledgeFile[]>
   createParser(store: LocalKnowledgeStore): KnowledgeParserPort | Promise<KnowledgeParserPort>
+  createSemanticIndex?(store: LocalKnowledgeStore): LocalSemanticSearchPort
   saveExport(name: string, contents: Buffer): Promise<void>
   isMember(ownerId: string): boolean
   /** Main-owned verified projection. Renderer state is never consulted. */
@@ -88,6 +90,7 @@ interface Binding {
   store: LocalKnowledgeStore
   parser: KnowledgeParserPort
   runner: ImportJobRunner
+  semantic?: LocalSemanticSearchPort
   handles: Map<string, ImportHandleRecord>
   cloud: KnowledgeCloudLifecycle
   cloudOwnerInvalidated: boolean
@@ -1603,11 +1606,12 @@ export function createLocalKnowledgeService(
       return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
     }
     recoverDueCloudPublications(active)
-    const result = await new LocalKnowledgeRetriever(active.store.database).search(
+    const result = await new LocalKnowledgeRetriever(active.store.database, active.semantic).search(
       normalized,
       allowedBases,
       kept?.documentId ? [kept.documentId] : undefined,
       admittedScope?.entries,
+      signal,
     )
     if (signal?.aborted) fail('CANCELLED')
     const remote = productionCloudRemote(cloudRemote)
@@ -1774,6 +1778,7 @@ export function createLocalKnowledgeService(
       }
     } finally {
       current.runner.invalidate()
+      current.semantic?.invalidate()
     }
   }
 
@@ -1785,6 +1790,7 @@ export function createLocalKnowledgeService(
         : []
       failures.push(...await settle([
         () => current.runner.drain(),
+        () => current.semantic?.dispose(),
         () => current.cloud.drain(),
         () => Promise.allSettled([...current.cloudTasks]),
       ]))
@@ -1940,6 +1946,8 @@ export function createLocalKnowledgeService(
       }
       if (!parser) fail('SERVICE_UNAVAILABLE')
       const active = {} as Binding
+      let semantic: LocalSemanticSearchPort | undefined
+      try { semantic = dependencies.createSemanticIndex?.(store) } catch { /* lexical search remains available */ }
       const runner = new ImportJobRunner({
         database: store.database,
         objects: store.objects,
@@ -1947,10 +1955,11 @@ export function createLocalKnowledgeService(
         ownerEpoch: bindEpoch,
         isCurrentOwnerEpoch: candidate => binding === active && epoch === candidate,
         token: id,
+        ...(semantic ? { semantic } : {}),
         onDocumentChanged: documentId => emitDocument(active, documentId),
       })
       Object.assign(active, {
-        ownerId, epoch: bindEpoch, store, parser, runner, handles: new Map(),
+        ownerId, epoch: bindEpoch, store, parser, runner, semantic, handles: new Map(),
         cloud: createCloudLifecycle(store), cloudOwnerInvalidated: false,
         cloudOwnerInvalidationFailed: false,
         cloudTasks: new Set(), cloudPublications: new Map(),
@@ -2669,7 +2678,9 @@ export function createLocalKnowledgeService(
         encryption: { available: true },
         parser: { available: true },
         cloudbase: cloudbase ? { available: true } : { available: false, reason: 'cloudbase_unavailable' },
-        embedding: { available: false, reason: 'embedding_unavailable' },
+        embedding: active.semantic?.available()
+          ? { available: true }
+          : { available: false, reason: 'embedding_unavailable' },
         entitlement: verified ? { available: true } : { available: false, reason: 'entitlement_unavailable' },
         beta: beta ? { available: true } : { available: false, reason: 'beta_disabled' },
         cloud: cloud ? { available: true } : { available: false, reason: 'cloud_disabled' },

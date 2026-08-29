@@ -122,5 +122,18 @@
     { "id": "recall-termination", "queries": ["允许提前终止", "提前办理"], "relevantDocumentIds": ["doc-policy-a", "doc-policy-b"] },
     { "id": "recall-law", "queries": ["适用中国法律", "法律约束"], "relevantDocumentIds": ["doc-law-a", "doc-law-b"] }
   ],
+  "semanticRetrieval": {
+    "threshold": 0.8,
+    "cases": [
+      { "id": "semantic-effective", "query": "协议完成签章以后什么时候开始生效？", "relevantDocumentIds": ["doc-contract-a", "doc-contract-b", "doc-contract-c", "doc-contract-d"] },
+      { "id": "semantic-blue-shell", "query": "设备外壳应该刷成什么颜色？", "relevantDocumentIds": ["doc-device-a", "doc-device-b"] },
+      { "id": "semantic-payment", "query": "采购服务的账款最晚多少天付？", "relevantDocumentIds": ["doc-payment-c", "doc-payment-d"] },
+      { "id": "semantic-archive-location", "query": "存放档案的中心在哪个区？", "relevantDocumentIds": ["doc-location-c"] },
+      { "id": "semantic-product", "query": "项目最终需要交付什么东西？", "relevantDocumentIds": ["doc-product-a", "doc-product-b"] },
+      { "id": "semantic-termination", "query": "能不能在到期之前解除？", "relevantDocumentIds": ["doc-policy-a", "doc-policy-b"] },
+      { "id": "semantic-law", "query": "发生争议时按哪个国家的法律处理？", "relevantDocumentIds": ["doc-law-a", "doc-law-b"] },
+      { "id": "semantic-publisher", "query": "谁负责把白皮书对外发布？", "relevantDocumentIds": ["doc-publisher-a"] }
+    ]
+  },
   "supportedDocumentMatrix": { "samplesPerFormat": 20, "formats": ["pdf", "docx", "txt", "markdown", "html"] }
 }

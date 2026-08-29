@@ -116,6 +116,7 @@ export type KnowledgeAnswerValidation =
       generalKnowledge: boolean
       text: string
       claims: Array<{ text: string; citedEvidenceIds: string[]; supported: boolean }>
+      sourceText?: string
     }
   | { kind: 'repair'; invalidEvidenceIds: string[] }
   | { kind: 'insufficient'; reason: 'no-evidence' | 'uncited' | 'invalid-citation' | 'unsupported-claim' }
@@ -631,7 +632,11 @@ function clauseSupportsClaim(rawClaim: string, rawEvidence: string): boolean {
 }
 
 function factTupleSupports(claim: FactTuple, evidence: FactTuple): boolean {
-  return claim.subject === evidence.subject
+  const sameSubject = claim.subject === evidence.subject
+    || claim.relation === 'attribute' && evidence.relation === 'attribute'
+      && claim.subject.replace(/(?:名称|名字)$/u, '') === evidence.subject.replace(/(?:名称|名字)$/u, '')
+      && Array.from(claim.subject.replace(/(?:名称|名字)$/u, '')).length >= 2
+  return sameSubject
     && claim.relation === evidence.relation
     && (
       normalizedTupleObject(claim.object) === normalizedTupleObject(evidence.object)
@@ -680,9 +685,14 @@ function evidenceSupportsTupleGroup(rawGroup: string, evidence: KnowledgeEvidenc
 function supportingClauseIndexes(claim: string, evidence: KnowledgeEvidence): number[] {
   const rawClaim = claim.replace(KNOWLEDGE_MARKER, '').slice(0, 4_000)
   const rawEvidence = sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000)
-  return splitIndependentFacts(rawEvidence).flatMap((clause, index) => (
-    clauseSupportsClaim(rawClaim, clause) ? [index] : []
-  ))
+  const claimTuple = factTuple(rawClaim)
+  return splitIndependentFacts(rawEvidence).flatMap((clause, index) => {
+    const evidenceTuple = factTuple(clause)
+    return clauseSupportsClaim(rawClaim, clause)
+      || claimTuple !== undefined && evidenceTuple !== undefined && factTupleSupports(claimTuple, evidenceTuple)
+      ? [index]
+      : []
+  })
 }
 
 export function formatValidatedKnowledgeAnswer(
@@ -690,11 +700,29 @@ export function formatValidatedKnowledgeAnswer(
   mode: KnowledgeSelection['mode'],
   availableEvidenceIds = new Set(validation.citedEvidenceIds),
 ): string {
+  if (validation.sourceText !== undefined) {
+    const supportedEvidenceIds = new Set(validation.citedEvidenceIds)
+    return validation.sourceText
+      .replace(
+        /(^|[\n。！？.!?])([ \t]*(?:(?:[-+*]|\d+[.)])\s+)?)(?:(?:【(?:一般信息|知识库依据)】)\s*)+/gu,
+        '$1$2',
+      )
+      .replace(KNOWLEDGE_MARKER, (_marker, evidenceId: string) => (
+        mode === 'mixed'
+        && supportedEvidenceIds.has(evidenceId)
+        && !availableEvidenceIds.has(evidenceId)
+          ? '（原知识库来源当前不可用）'
+          : ''
+      ))
+      .replace(/[ \t]+(?=[\r\n]|$)/g, '')
+      .replace(/[ \t]+([。！？.!?，,；;：:])/gu, '$1')
+      .trim()
+  }
   return validation.claims.map((claim) => {
+    const text = claim.text.replace(/^(?:【(?:一般信息|知识库依据)】\s*)+/u, '')
     const current = claim.citedEvidenceIds.some(id => availableEvidenceIds.has(id))
-    if (mode !== 'mixed') return claim.text
-    if (claim.supported && current) return `【知识库依据】${claim.text}`
-    return `【一般信息】${claim.text}${claim.supported ? '（来源当前不可用）' : ''}`
+    if (mode !== 'mixed' || !claim.supported || current) return text
+    return `${text}（原知识库来源当前不可用）`
   }).join('\n')
 }
 
@@ -784,8 +812,12 @@ export function validateKnowledgeAnswer(
     generalKnowledge: claims.some(claim => !claim.supported),
     text: '',
     claims: claims.map(({ text, citedEvidenceIds: ids, supported }) => ({ text, citedEvidenceIds: ids, supported })),
+    sourceText: validatedAnswer,
   } satisfies Extract<KnowledgeAnswerValidation, { kind: 'valid' }>
-  Object.defineProperty(validated, 'claims', { enumerable: false })
+  Object.defineProperties(validated, {
+    claims: { enumerable: false },
+    sourceText: { enumerable: false },
+  })
   validated.text = formatValidatedKnowledgeAnswer(validated, mode)
   return validated
 }

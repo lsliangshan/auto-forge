@@ -231,7 +231,7 @@ const deterministicProvider: ApplicationModelProviderPort = {
       const toolContent = typeof rawToolContent === 'string' ? rawToolContent : ''
       const evidenceId = /"evidenceId":"([^"]+)"/u.exec(toolContent)?.[1]
       if (!evidenceId) throw new Error('E2E knowledge evidence ID is missing')
-      yield { type: 'text_delta' as const, choiceIndex: 0, text: `AutoForge knowledge smoke [[kb:${evidenceId}]]` }
+      yield { type: 'text_delta' as const, choiceIndex: 0, text: `班级名称是高一（3）班。[[kb:${evidenceId}]]` }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
       return
     }
@@ -244,9 +244,15 @@ const deterministicProvider: ApplicationModelProviderPort = {
       return
     }
     if (request.tools?.some(tool => tool.function.name === 'knowledge_search')) {
+      const asksForClassName = request.messages.some(message => (
+        message.role === 'user'
+        && typeof message.content === 'string'
+        && message.content.includes('班级名称')
+      ))
       yield {
         type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'e2e_knowledge_search',
-        name: 'knowledge_search', arguments: { query: 'AutoForge knowledge smoke' },
+        name: 'knowledge_search',
+        arguments: { query: asksForClassName ? '查询相关班级信息' : 'AutoForge knowledge smoke' },
       }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
       return
@@ -571,16 +577,16 @@ async function initialize(): Promise<void> {
     selectImportFiles: async () => [{
       name: 'e2e-guide.txt',
       mimeType: 'text/plain',
-      bytes: Buffer.from('AutoForge knowledge smoke'),
+      bytes: Buffer.from('AutoForge knowledge smoke\n班级名称：高一（3）班'),
     }],
     createParser: async () => ({
       parse: async () => ({
         mediaType: 'text/plain',
-        text: 'AutoForge knowledge smoke',
+        text: 'AutoForge knowledge smoke\n班级名称：高一（3）班',
         blocks: [{
           id: 'e2e-block-1',
-          text: 'AutoForge knowledge smoke',
-          coordinate: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 25 },
+          text: 'AutoForge knowledge smoke\n班级名称：高一（3）班',
+          coordinate: { kind: 'txt', lineStart: 1, lineEnd: 2, charStart: 0, charEnd: 37 },
         }],
       }),
       terminateAll: async () => undefined,

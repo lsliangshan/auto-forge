@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v14', () => {
+describe('knowledge schema v16', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(14)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(16)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -40,6 +40,7 @@ describe('knowledge schema v14', () => {
       'documents',
       'kb_chunks',
       'kb_chunks_fts',
+      'kb_chunk_embeddings',
       'knowledge_bases',
       'knowledge_blocks',
       'knowledge_cleanup_records',
@@ -69,7 +70,9 @@ describe('knowledge schema v14', () => {
       SELECT lifecycle_status, publication_generation, recycled_at
       FROM documents LIMIT 0
     `).all()).toEqual([])
-    expect(database.prepare('SELECT name, mime_type FROM document_versions LIMIT 0').all()).toEqual([])
+    expect(database.prepare(
+      'SELECT name, mime_type, chunking_revision FROM document_versions LIMIT 0',
+    ).all()).toEqual([])
     expect(database.prepare(
       'SELECT accepted_key_generation FROM knowledge_entitlement_projection LIMIT 0',
     ).all()).toEqual([])
@@ -142,6 +145,7 @@ describe('knowledge schema v14', () => {
     initializeKnowledgeSchema(database)
     database.prepare('DELETE FROM knowledge_schema_migrations WHERE version >= 3').run()
     database.exec(`
+      DROP TABLE kb_chunk_embeddings;
       DROP TABLE cloud_version_projections;
       DROP TABLE cloud_generation_projections;
       DROP TABLE cloud_document_projections;
@@ -164,6 +168,7 @@ describe('knowledge schema v14', () => {
       DROP TABLE sync_cursors;
     `)
     database.exec(`
+      ALTER TABLE document_versions DROP COLUMN chunking_revision;
       ALTER TABLE document_versions DROP COLUMN mime_type;
       ALTER TABLE document_versions DROP COLUMN name;
       INSERT INTO knowledge_bases(id, name, created_at, updated_at) VALUES ('base', 'Base', 1, 1);
@@ -183,8 +188,10 @@ describe('knowledge schema v14', () => {
   it('preserves upload lineage while upgrading a v13 database', () => {
     const database = testDatabase()
     initializeKnowledgeSchema(database)
-    database.prepare('DELETE FROM knowledge_schema_migrations WHERE version = 14').run()
+    database.prepare('DELETE FROM knowledge_schema_migrations WHERE version >= 14').run()
+    database.exec('DROP TABLE kb_chunk_embeddings')
     database.exec('ALTER TABLE cloud_pending_publications DROP COLUMN upload_retiring')
+    database.exec('ALTER TABLE document_versions DROP COLUMN chunking_revision')
 
     initializeKnowledgeSchema(database)
 
@@ -196,6 +203,9 @@ describe('knowledge schema v14', () => {
     expect(database.prepare(
       'SELECT version FROM knowledge_schema_migrations WHERE version = 14',
     ).get()).toEqual({ version: 14 })
+    expect(database.prepare(
+      'SELECT version FROM knowledge_schema_migrations WHERE version = 16',
+    ).get()).toEqual({ version: 16 })
   })
 
   it('keeps trigram FTS rows synchronized with external chunk content', () => {

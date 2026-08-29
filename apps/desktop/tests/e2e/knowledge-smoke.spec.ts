@@ -63,15 +63,16 @@ test('runs local knowledge, degradation, expiry, and Provider-switch paths throu
     await page.getByTestId('knowledge-selector').locator('summary').click()
     await page.getByTestId(/knowledge-select-/).check()
     await page.getByTestId('knowledge-selector').locator('summary').click()
-    await page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
+    await page.getByPlaceholder('描述你想完成的任务…').fill('班级名称是？')
     await page.getByTestId('send-message').click()
     await expect(page.getByTestId('knowledge-status').filter({
       hasText: '需要授权后才能发送依据',
     })).toBeVisible()
     await page.getByTestId('grant-knowledge-consent').click()
-    await page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
+    await page.getByPlaceholder('描述你想完成的任务…').fill('班级名称是？')
     await page.getByTestId('send-message').click()
     await expect(page.getByTestId('knowledge-citation')).toBeVisible()
+    await expect(page.getByText('班级名称是高一（3）班。', { exact: false })).toBeVisible()
     await expect(page.getByPlaceholder('描述你想完成的任务…')).toBeEditable()
     const revoked = await command<{
       provider: string

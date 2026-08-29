@@ -115,6 +115,9 @@ const messageErrorText = computed(() => props.block.type === 'error'
 .message-markdown :deep(h3) { font-size: 1.15em; }
 .message-markdown :deep(ul),
 .message-markdown :deep(ol) { margin: 8px 0; padding-left: 24px; }
+.message-markdown :deep(ul) { list-style: disc outside; }
+.message-markdown :deep(ol) { list-style: decimal outside; }
+.message-markdown :deep(li + li) { margin-top: 3px; }
 .message-markdown :deep(blockquote) { margin: 10px 0; border-left: 3px solid var(--af-border-strong); padding-left: 12px; color: var(--af-text-muted); }
 .message-markdown :deep(a) { color: var(--af-cobalt); }
 .message-markdown :deep(code) { border-radius: 4px; padding: 2px 5px; background: var(--af-surface-muted); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: .92em; }

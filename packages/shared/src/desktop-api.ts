@@ -166,7 +166,7 @@ export const knowledgeSearchResultSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('query-too-short') }).strict(),
   z.object({
     kind: z.literal('results'),
-    strategy: z.enum(['trigram', 'bounded-instr']),
+    strategy: z.enum(['trigram', 'bounded-instr', 'hybrid']),
     evidence: z.array(knowledgeEvidenceSchema).max(8),
   }).strict(),
 ])

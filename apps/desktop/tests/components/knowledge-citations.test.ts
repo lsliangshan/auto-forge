@@ -75,6 +75,29 @@ describe('knowledge grounding blocks', () => {
     expect(revokeConsent).toHaveBeenCalledWith('deepseek')
   })
 
+  it('presents Provider consent as a structured authorization panel', async () => {
+    window.autoForge = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, executions: {}, settings: {},
+      knowledge: {
+        getConsent: vi.fn().mockResolvedValue({ provider: 'deepseek', status: 'unknown' }),
+        setConsent: vi.fn(), revokeConsent: vi.fn(),
+      },
+    } as unknown as DesktopAPI
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message:status', type: 'knowledge_status', blockId: 'status', status: 'consent_required',
+        searchIndex: 1, searchLimit: 3, evidenceCount: 1, provider: 'deepseek',
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-consent-badge"]').text()).toBe('待授权')
+    expect(wrapper.get('[data-testid="knowledge-consent-panel"]').text()).toContain('DeepSeek')
+    expect(wrapper.get('[data-testid="grant-knowledge-consent"]').classes()).toContain('el-button--primary')
+    expect(wrapper.get('[data-testid="deny-knowledge-consent"]').classes()).toContain('el-button')
+  })
+
   it('restores Provider consent on remount, refreshes on switch, and exposes sanitized failures', async () => {
     const getConsent = vi.fn()
       .mockResolvedValueOnce({ provider: 'deepseek', status: 'granted' })

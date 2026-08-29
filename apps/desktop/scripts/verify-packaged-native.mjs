@@ -89,6 +89,15 @@ const workflowCompilerPackage = join(
   'node_modules',
   'esbuild',
 )
+const onnxRuntimePackage = join(appArchive, 'node_modules', 'onnxruntime-node')
+const transformersPackage = join(
+  appArchive,
+  'node_modules',
+  '@huggingface',
+  'transformers',
+  'dist',
+  'transformers.node.cjs',
+)
 
 const probe = [
   'const Database = require(process.argv[1])',
@@ -104,6 +113,10 @@ const probe = [
   'const transformed = transformSync("const answer: number = 42", { loader: "ts" })',
   'if (!transformed.code.includes("42")) throw new Error("Packaged workflow compiler output was invalid")',
   'const CipherDatabase = require(process.argv[5])',
+  'const onnxRuntime = require(process.argv[6])',
+  'const transformers = require(process.argv[7])',
+  'if (typeof onnxRuntime.InferenceSession?.create !== "function") throw new Error("Packaged ONNX runtime load failed")',
+  'if (typeof transformers.pipeline !== "function") throw new Error("Packaged Transformers.js load failed")',
   'const { randomBytes } = require("node:crypto")',
   'const { mkdtempSync, rmSync } = require("node:fs")',
   'const { tmpdir } = require("node:os")',
@@ -121,7 +134,7 @@ const probe = [
   'cipherDatabase.close()',
   'rmSync(cipherRoot, { recursive: true, force: true })',
   '}',
-  'console.log(`Packaged proxy agents, both SQLite bindings, and workflow compiler loaded under Electron ${process.versions.electron}`)',
+  'console.log(`Packaged proxy agents, SQLite bindings, workflow compiler, ONNX runtime, and Transformers.js loaded under Electron ${process.versions.electron}`)',
 ].join(';')
 
 const result = spawnSync(executable, [
@@ -132,6 +145,8 @@ const result = spawnSync(executable, [
   socksProxyAgentPackage,
   workflowCompilerPackage,
   cipherDatabasePackage,
+  onnxRuntimePackage,
+  transformersPackage,
 ], {
   env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   stdio: 'inherit',

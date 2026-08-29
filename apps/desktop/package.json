@@ -23,6 +23,7 @@
     "@autoforge/workflow-sdk": "workspace:*",
     "@cloudbase/js-sdk": "3.8.0",
     "@element-plus/icons-vue": "2.3.2",
+    "@huggingface/transformers": "3.8.1",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
     "better-sqlite3": "12.11.1",

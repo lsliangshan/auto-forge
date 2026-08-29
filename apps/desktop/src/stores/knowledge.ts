@@ -13,6 +13,7 @@ const releases = new WeakMap<object, () => void>()
 const timers = new WeakMap<object, ReturnType<typeof setTimeout>>()
 const disposeWrapped = new WeakSet<object>()
 const MAX_POLL_DELAY_MS = 15_000
+export const FREE_DOCUMENT_LIMIT_MESSAGE = '免费版仅支持 1 个有效文件，请使用“替换文件”更新现有文件'
 
 interface OwnerToken {
   readonly ownerId: string
@@ -58,6 +59,10 @@ export const useKnowledgeStore = defineStore('knowledge', {
       return state.entitlement?.localEnabled === true
         && state.availability?.encryption.available === true
         && state.availability?.parser.available === true
+    },
+    freeDocumentLimitReached(state): boolean {
+      return state.entitlement?.tier === 'free'
+        && state.documents.some(document => document.status !== 'deleted')
     },
   },
   actions: {
@@ -250,6 +255,10 @@ export const useKnowledgeStore = defineStore('knowledge', {
     async importDocuments() {
       const baseId = this.selectedBaseId
       if (!baseId) return
+      if (this.freeDocumentLimitReached) {
+        this.error = FREE_DOCUMENT_LIMIT_MESSAGE
+        return
+      }
       const operation = this.beginOperation()
       if (!operation) return
       try {
