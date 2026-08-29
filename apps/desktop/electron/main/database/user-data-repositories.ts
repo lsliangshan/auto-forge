@@ -988,6 +988,25 @@ function applyRemoteMutation(
       if (updatedConversation.changes !== 1) throw new UserDataConsistencyError()
       break
     }
+    case 'message.conversion_block_terminal': {
+      const existing = storedMessage(database, mutation.payload.messageId)
+      if (!existing || existing.id !== mutation.entityId) throw new UserDataConsistencyError()
+      const blocks = existing.blocks.map((block) => {
+        if (block.type !== 'conversion' || block.blockId !== mutation.payload.blockId
+          || block.executionId !== mutation.payload.executionId) return block
+        return block.state === 'terminal' ? block : { ...block, state: 'terminal' as const }
+      })
+      if (JSON.stringify(blocks) === JSON.stringify(existing.blocks)) break
+      const conversation = remoteConversation(database, ownerUserId, existing.conversationId)
+      if (!conversation || conversation.revision !== mutation.baseRevision) throw new UserDataConsistencyError()
+      database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({
+        id: existing.id, blocksJson: JSON.stringify(blocks),
+      })
+      database.prepare('UPDATE conversations SET revision = @revision, sync_state = \'synced\' WHERE id = @id').run({
+        id: existing.conversationId, revision,
+      })
+      break
+    }
     case 'privacy.consent':
       projectConsent(database, mutation.payload)
       break
@@ -1542,15 +1561,13 @@ export function createUserDataRepositories(
       if (parsed.type !== 'conversion' || parsed.state !== 'terminal') {
         return repositories.messages.replaceBlock(messageId, blockId, parsed)
       }
-      const blocks = existing.blocks.map((block) => (
-        typeof block === 'object'
-        && block !== null
-        && 'blockId' in block
-        && block.blockId === blockId
-          ? parsed
-          : block
-      ))
-      const mutation = messageMutation({ ...existing, blocks })
+      const summary = conversationSummary(existing.conversationId)
+      if (!summary) throw new UserDataConsistencyError()
+      const mutation: SyncMutation = {
+        id: randomUUID(), kind: 'message.conversion_block_terminal', entityId: messageId,
+        baseRevision: summary.revision, occurredAt: isoTimestamp(Date.now()),
+        payload: { messageId, blockId, executionId: parsed.executionId, state: 'terminal' },
+      }
       let updated: ReturnType<AppRepositories['messages']['replaceBlock']> | undefined
       recordMutation(mutation, () => {
         updated = repositories.messages.replaceBlock(messageId, blockId, parsed)

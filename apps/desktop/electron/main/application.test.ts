@@ -9619,7 +9619,7 @@ describe('createApplicationRuntime', () => {
       )
       const outbox = new UserDataStoreManager(join(root, 'user-caches'))
       const terminalMutation = outbox.open(session.user.id).outbox.list(100).find((mutation) => (
-        mutation.kind === 'message.append'
+        mutation.kind === 'message.conversion_block_terminal'
         && mutation.entityId === 'message_conversion_block_terminal'
         && JSON.stringify(mutation.payload).includes('"state":"terminal"')
       ))

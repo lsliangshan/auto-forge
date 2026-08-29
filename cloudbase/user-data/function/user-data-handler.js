@@ -610,6 +610,10 @@ function validateMutationPayload(kind, payload) {
       return hasStrictShape(payload, [])
     case 'message.append':
       return validateMessage(payload)
+    case 'message.conversion_block_terminal':
+      return hasStrictShape(payload, ['messageId', 'blockId', 'executionId', 'state'])
+        && identifier(payload.messageId) && identifier(payload.blockId)
+        && identifier(payload.executionId) && payload.state === 'terminal'
     case 'legacy.import':
       return validateLegacyConfirm(payload)
     case 'privacy.consent':
@@ -625,6 +629,7 @@ function validateMutationPayload(kind, payload) {
 
 function mutationEntityMatches(kind, entityId, payload) {
   if (['message.append', 'usage.record'].includes(kind)) return entityId === payload.id
+  if (kind === 'message.conversion_block_terminal') return entityId === payload.messageId
   if (kind === 'legacy.import') return entityId === payload.batchId
   if (kind === 'privacy.consent') return entityId === payload.documentVersion
   return true

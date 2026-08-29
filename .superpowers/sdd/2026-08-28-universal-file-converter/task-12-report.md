@@ -93,3 +93,9 @@ packages/shared/src/contracts.test.ts
 - Renderer list loads capture an execution-local observation generation. Every valid event advances it, so late local, unavailable, and rejected results cannot clear the event snapshot or reintroduce an error.
 - Same-epoch merges now union artifacts before resolving job lifecycle, retain immutable artifact identity fields, keep deleted absorbing, union icon representations, preserve richer metadata from lower-rank observations, and keep progress monotonic.
 - Focused GREEN: conversion card/store **21/21**; terminal Application lifecycle **1/1**; Agent persistence race **1/1**. The combined Main suite retains the two recorded baseline failures plus an intermittent isolated developer-draft conflict that passes when re-run alone.
+
+## Fix round 3 — narrow terminal sync operation
+
+- Replaced the second `message.append` with strict `message.conversion_block_terminal`: its payload is only `messageId`, `blockId`, `executionId`, and terminal state. Shared schemas, the local outbox/apply path, and Cloud handler validation reject additional payload details.
+- Valid conversion events now immediately clear loading, unavailable, and error state while invalidating all earlier list observations.
+- Same-epoch job merging now preserves the original job identity/core fields even when a contradictory later observation reports another target format or preset.

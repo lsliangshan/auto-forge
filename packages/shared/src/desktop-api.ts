@@ -453,6 +453,12 @@ export type MessagePage = Omit<z.infer<typeof messagePageSchema>, 'items'> & { i
 
 export const messageAppendMutationPayloadSchema = chatMessageSchema
 export type MessageAppendMutationPayload = z.infer<typeof messageAppendMutationPayloadSchema>
+export const messageConversionBlockTerminalMutationPayloadSchema = z.object({
+  messageId: identifierSchema,
+  blockId: identifierSchema,
+  executionId: identifierSchema,
+  state: z.literal('terminal'),
+}).strict()
 
 export const syncMutationKindSchema = z.enum([
   'conversation.create',
@@ -461,6 +467,7 @@ export const syncMutationKindSchema = z.enum([
   'conversation.delete',
   'conversation.restore',
   'message.append',
+  'message.conversion_block_terminal',
   'legacy.import',
   'privacy.consent',
   'preferences.update',
@@ -1090,6 +1097,11 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...syncMutationBaseShape,
+    kind: z.literal('message.conversion_block_terminal'),
+    payload: messageConversionBlockTerminalMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
     kind: z.literal('legacy.import'),
     payload: legacyImportConfirmRequestSchema,
   }).strict(),
@@ -1114,6 +1126,9 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
     case 'message.append':
     case 'usage.record':
       payloadEntityId = mutation.payload.id
+      break
+    case 'message.conversion_block_terminal':
+      payloadEntityId = mutation.payload.messageId
       break
     case 'legacy.import':
       payloadEntityId = mutation.payload.batchId
@@ -1179,6 +1194,11 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...pulledMutationBaseShape,
+    kind: z.literal('message.conversion_block_terminal'),
+    payload: messageConversionBlockTerminalMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
     kind: z.literal('legacy.import'),
     payload: storedLegacyImportReceiptPayloadSchema,
   }).strict(),
@@ -1203,6 +1223,9 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
     case 'message.append':
     case 'usage.record':
       payloadEntityId = mutation.payload.id
+      break
+    case 'message.conversion_block_terminal':
+      payloadEntityId = mutation.payload.messageId
       break
     case 'legacy.import':
       payloadEntityId = mutation.payload.batchId

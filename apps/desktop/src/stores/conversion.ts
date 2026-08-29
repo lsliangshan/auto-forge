@@ -84,10 +84,10 @@ function newerJob(current: ConversionJobView | undefined, candidate: ConversionJ
       : candidate.status
   return {
     ...current,
-    ...(status === candidate.status ? candidate : {}),
     status,
     progress: Math.max(current.progress, candidate.progress),
     artifacts,
+    ...(status === candidate.status && candidate.errorCode !== undefined ? { errorCode: candidate.errorCode } : {}),
   }
 }
 
@@ -192,6 +192,7 @@ export const useConversionStore = defineStore('conversion', {
     applyEvent(event: ConversionJobEvent) {
       const executionId = event.job.executionId
       this._observations[executionId] = (this._observations[executionId] ?? 0) + 1
+      this.loadingByExecution[executionId] = false
       delete this.errorsByExecution[executionId]
       delete this.unavailableByExecution[executionId]
       this.jobsByExecution[executionId] = mergeJobs(this.jobsForExecution(executionId), [event.job])
