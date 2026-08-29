@@ -93,6 +93,17 @@ describe('local conversion intent', () => {
     'Explain which formats are supported and convert this file to PDF',
     "don't convert this file, but save it as PDF",
     '不要转换这个附件，但是导出为 PDF',
+    'Convert the attachment from this conversation to PDF',
+    '把这段对话中的当前图片转换为WebP',
+    'convert the attached conversation.png to WebP',
+    'convert the conversation and this attachment to PDF',
+    'not .heif but .jxl',
+    'not JPEG2000 but JPEGXL',
+    'Please, not PNG but JPG',
+    'not PNG but JPG, please',
+    'Either explain which formats this tool can convert to or convert this file to PDF',
+    'You can explain which formats it can convert to or save this image as WebP',
+    'Explain which formats are supported, then convert this file to PDF',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -181,6 +192,19 @@ describe('local conversion intent', () => {
     ['将聊天记录导出为 PDF', attachments],
     ["don't convert this file, or save it as PDF", attachments],
     ['不要转换这个附件，或导出为 PDF', attachments],
+    ['Can this tool convert PNG or JPG?', attachments],
+    ['Could it convert PDF or DOCX?', attachments],
+    ['save this conversation with comments as PDF', attachments],
+    ['Explain how to convert and save this file', attachments],
+    ['Explain how to convert or export this file', attachments],
+    ['Just explain how to convert this file', attachments],
+    ["Don't explain how to convert or save this file", attachments],
+    ['说明如何转换并保存这个附件', attachments],
+    ['介绍怎么转换和导出这个文件', attachments],
+    ["don't convert this file, and save it as PDF", attachments],
+    ["don't convert this file; and export it as PDF", attachments],
+    ['不要转换这个附件，和保存为 PDF', attachments],
+    ['不要转换这个附件；并导出为 PDF', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)

@@ -8,8 +8,8 @@ export interface LocalAttachmentProjection {
 }
 
 const CHINESE_ATTACHMENT_REFERENCE = `(?:(?:(?:这|这个|该|当前|那|那个)?(?:张|个|份)?(?:附件|文件|图片|图像|照片|文档|视频|音频))|它们?)`
-const ENGLISH_ATTACHMENT_REFERENCE = `(?:(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:attachment|file|image|photo|picture|document|video|audio)|it|them)`
-const ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE = `(?:(?:this|the|that|current|my|your|an?)\\s+(?:attachment|file|image|photo|picture|document|video|audio)|it|them)`
+const ENGLISH_ATTACHMENT_REFERENCE = `\\b(?:(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:attachment|file|image|photo|picture|document|video|audio)|it|them)\\b`
+const ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE = `\\b(?:(?:this|the|that|current|my|your|an?)\\s+(?:attachment|file|image|photo|picture|document|video|audio)|it|them)\\b`
 const STRONG_CONVERSION_ACTION = [
   `(?<!万象)(?:转换|转成|转为)(?!率|器)`,
   `(?:另存(?:为)?|(?:保存|存|导出|输出|改|换)(?:成|为))`,
@@ -35,7 +35,8 @@ const OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION = /(?:解释|询问|问|总结|�
 const ACTION_EMBEDDING_OTHER_INTENT = /(?:解释|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:explain|summari[sz]e|describe|discuss|analy[sz]e|review|check|read)\b/giu
 const ACTION_PIVOT = /(?:直接|立即|马上|以及|并且|并|同时|然后|而是|或)|\b(?:just|and|or|then|but|instead)\b/iu
 const OPEN_INFORMATION_QUESTION = /(?:(?:(?:请问)?(?:万象转换|这个工具|它|你)?(?:支持|能否|能不能|能|可以|能够))[^，,；;。.!！？?]{0,32}(?:哪些|什么|何种)\s*格式|(?:哪些|什么|何种)\s*格式|(?:介绍|说明|了解)[^，,；;。.!！？?]{0,24}(?:万象转换|转换)|(?:万象转换|转换)[^，,；;。.!！？?]{0,24}(?:是什么|什么意思|含义|安全|隐私|上传|能做什么|如何工作|怎么用)|\b(?:what\s+is|what\s+does|how\s+does|tell\s+me\s+about|describe|explain)[^,;.!?]{0,32}(?:conversion|converter|it)\b|\b(?:conversion|converter|it)\b[^,;.!?]{0,24}\b(?:safe|privacy|upload|mean)\b)/giu
-const ENGLISH_OPEN_FORMAT_QUESTION = /\b(?:what|which)\s+formats?\b(?:(?!\b(?:and|but|then|while)\b|[,;.!?])[\s\S]){0,48}/giu
+const ENGLISH_OPEN_FORMAT_QUESTION = /\b(?:what|which)\s+formats?\b(?:(?!\b(?:and|or|but|then|while)\b|[,;.!?])[\s\S]){0,48}/giu
+const ENGLISH_CAPABILITY_QUESTION = /^\s*(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b[^,;.!?]{0,64}/giu
 const BARE_TARGET_PATTERN = `(?:${[
   ...CONVERSION_TARGET_FORMATS,
   'jpg', 'zip', 'tif', 'docx', 'word', 'heic', 'svg', 'csv', 'txt', 'rar', '7z', 'cur',
@@ -51,23 +52,30 @@ const BARE_CONVERSION_TARGET = new RegExp(
 const UPPERCASE_BARE_CONVERSION_TARGET = /^(?:(?:an?)\s+)?\.?[A-Z0-9]{2,10}(?:\s+(?:FORMAT|FILE))?(?:\s+(?:instead|rather))?$/u
 const CONTRASTIVE_TARGET = /\b(?:instead|rather)\b/iu
 const FORMAT_SHORTHAND = `\\.?${BARE_TARGET_PATTERN}`
+const GENERIC_FORMAT_TOKEN = `\\.?[A-Za-z0-9][A-Za-z0-9._+-]{1,14}`
+const KNOWN_FORMAT_TOKENS = new Set([
+  ...CONVERSION_TARGET_FORMATS,
+  'jpg', 'zip', 'tif', 'docx', 'word', 'heic', 'svg', 'csv', 'txt', 'rar', '7z', 'cur',
+].map((format) => format.toLowerCase()))
 const CHINESE_CONTRASTIVE_SHORTHAND = new RegExp(
   `(?:不要|不用|别)\\s*${FORMAT_SHORTHAND}\\s*(?:，|,|；|;)?\\s*(?:而是|改成|改为|换成|换为)\\s*${FORMAT_SHORTHAND}`,
   'iu',
 )
-const ENGLISH_CONTRASTIVE_SHORTHAND = new RegExp(
-  `^(?:not|do\\s+not\\s+use|don't\\s+use)\\s+${FORMAT_SHORTHAND}\\s*(?:(?:[,;.]\\s*(?:an?\\s+)?${FORMAT_SHORTHAND}\\s+instead)|(?:but\\s+(?:an?\\s+)?${FORMAT_SHORTHAND}))$`,
+const ENGLISH_CONTRASTIVE_COMMAND = new RegExp(
+  `^(?:please\\s*,?\\s*)?(?:not|do\\s+not\\s+use|don't\\s+use)\\s+(?<source>${GENERIC_FORMAT_TOKEN})\\s*(?:(?:[,;.]\\s*(?:an?\\s+)?(?<insteadTarget>${GENERIC_FORMAT_TOKEN})\\s+instead)|(?:but\\s+(?:an?\\s+)?(?<butTarget>${GENERIC_FORMAT_TOKEN})))(?:\\s*,?\\s*please)?[.!]?$`,
   'iu',
 )
-const CLAUSE_CONNECTOR = /(?:而是|但是|然后|并且|但)|\b(?:and\s+then|but|however|then)\b/giu
+const CLAUSE_CONNECTOR = /(?:而是|但是|但)|\b(?:but|however)\b/giu
 const CLAUSE_SEPARATOR = new RegExp(
-  `(?:[，,；;](?!\\s*(?:或|or\\b))|[。!！？?])|…+|\\.(?![A-Za-z0-9]{2,10}\\b)`,
+  `(?:[，,；;](?!\\s*(?:或|和|并|以及|or\\b|and\\b))|[。!！？?])|…+|\\.(?![A-Za-z0-9]{2,10}\\b)`,
   'giu',
 )
 const UPPERCASE_FORMAT_REFERENCE = /(?:^|[^\p{L}\p{N}])\.?[A-Z0-9]{2,10}(?=$|[^\p{L}\p{N}])/u
 const COORDINATED_ACTION_BRIDGE = /(?:或|和|及|以及|并|并且)\s*$|\b(?:or|and|nor)\s*$/iu
-const WEAK_CONTEXT_BOUNDARY = /(?:而是|但是|然后|并且|同时|以及|并|和|或|解释|询问|问|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:and|or|while|then|explain|ask|summari[sz]e|describe|discuss|analy[sz]e|review|check|read|tell)\b/giu
+const EMBEDDED_ACTION_BRIDGE = /(?:或|和|及|以及|并|并且|然后)\s*$|\b(?:or|and|nor|then)\s*$/iu
+const WEAK_CONTEXT_BOUNDARY = /(?:而是|但是|然后|解释|询问|问|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:while|then|explain|ask|summari[sz]e|describe|discuss|analy[sz]e|review|check|read|tell)\b/giu
 const NON_ATTACHMENT_OBJECT = /(?:对话|聊天记录|聊天历史)|\b(?:conversation|chat\s+history)\b/iu
+const ATTACHED_FILE_REFERENCE = /\b(?:attached|uploaded)\s+[\p{L}\p{N}][\p{L}\p{N}._+-]{0,63}\.[A-Za-z0-9]{1,12}\b/iu
 const RESERVED_SUMMARY_LABEL = /(?:附\s*件|目\s*标\s*格\s*式)/iu
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 
@@ -95,6 +103,23 @@ function actionIsEmbeddedInOtherIntent(clause: string, start: number, actionInde
   if (otherIntent?.index === undefined) return false
   const bridge = prefix.slice(otherIntent.index + otherIntent[0].length)
   return !ACTION_PIVOT.test(bridge)
+}
+
+function formatTokenLike(value: string): boolean {
+  const normalized = value.replace(/^\./u, '')
+  return value.startsWith('.')
+    || KNOWN_FORMAT_TOKENS.has(normalized.toLowerCase())
+    || /^[A-Z][A-Z0-9]{1,14}$/u.test(normalized)
+}
+
+function hasEnglishContrastiveCommand(text: string): boolean {
+  const match = ENGLISH_CONTRASTIVE_COMMAND.exec(text)
+  const source = match?.groups?.source
+  const target = match?.groups?.insteadTarget ?? match?.groups?.butTarget
+  return source !== undefined
+    && target !== undefined
+    && formatTokenLike(source)
+    && formatTokenLike(target)
 }
 
 function actionOperandContext(clause: string, actionIndex: number, actionEnd: number): string {
@@ -160,7 +185,7 @@ export function hasLocalConversionIntent(
   if (attachments.length === 0 || !text.trim()) return false
   const normalized = text.trim().normalize('NFKC').replace(/[‘’]/gu, "'")
   if (CHINESE_CONTRASTIVE_SHORTHAND.test(normalized)
-    || ENGLISH_CONTRASTIVE_SHORTHAND.test(normalized)) return true
+    || hasEnglishContrastiveCommand(normalized)) return true
   const clauses = normalized
     .replace(CLAUSE_CONNECTOR, ',')
     .split(CLAUSE_SEPARATOR)
@@ -168,15 +193,31 @@ export function hasLocalConversionIntent(
     .filter(Boolean)
   let sawNegatedConversion = false
   for (const clause of clauses) {
+    const restartableInformationRanges = [
+      ...clause.matchAll(ENGLISH_OPEN_FORMAT_QUESTION),
+      ...clause.matchAll(ENGLISH_CAPABILITY_QUESTION),
+    ]
     const informationRanges = [
       ...clause.matchAll(OPEN_INFORMATION_QUESTION),
-      ...clause.matchAll(ENGLISH_OPEN_FORMAT_QUESTION),
+      ...restartableInformationRanges,
     ]
     let previousActionEnd = 0
     let previousActionWasNegated = false
+    let previousActionWasEmbedded = false
     for (const action of clause.matchAll(CONVERSION_ACTION)) {
       const actionIndex = action.index
-      if (actionIsEmbeddedInOtherIntent(clause, previousActionEnd, actionIndex)) {
+      const actionBridge = clause.slice(previousActionEnd, actionIndex)
+      const informational = actionFallsInsideInformationQuestion(actionIndex, informationRanges)
+      const restartableInformation = actionFallsInsideInformationQuestion(
+        actionIndex,
+        restartableInformationRanges,
+      )
+      const embedded: boolean = !restartableInformation && (
+        actionIsEmbeddedInOtherIntent(clause, previousActionEnd, actionIndex)
+        || (previousActionWasEmbedded && EMBEDDED_ACTION_BRIDGE.test(actionBridge))
+      )
+      previousActionWasEmbedded = embedded
+      if (embedded) {
         previousActionEnd = actionIndex + action[0].length
         previousActionWasNegated = false
         continue
@@ -190,14 +231,16 @@ export function hasLocalConversionIntent(
       previousActionEnd = actionIndex + action[0].length
       previousActionWasNegated = negated
       const operandContext = actionOperandContext(clause, actionIndex, previousActionEnd)
-      if (NON_ATTACHMENT_OBJECT.test(operandContext)) continue
+      const explicitAttachment = ATTACHMENT_REFERENCE.test(operandContext)
+        || ATTACHED_FILE_REFERENCE.test(operandContext)
+      if (NON_ATTACHMENT_OBJECT.test(operandContext) && !explicitAttachment) continue
       const strong = action.groups?.strong !== undefined
       if (!strong && !weakActionHasConversionContext(operandContext)) continue
       if (negated) {
         sawNegatedConversion = true
         continue
       }
-      if (!actionFallsInsideInformationQuestion(actionIndex, informationRanges)) return true
+      if (!informational) return true
     }
     const bareTarget = BARE_CONVERSION_TARGET.test(clause)
       || UPPERCASE_BARE_CONVERSION_TARGET.test(clause)
