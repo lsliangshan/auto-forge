@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS app_sync_mutations (
   kind varchar(32) NOT NULL CHECK (kind IN (
     'conversation.create', 'conversation.rename', 'conversation.preferences',
     'conversation.delete', 'conversation.restore',
-    'message.append', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'
+    'message.append', 'message.conversion_block_terminal', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'
   )),
   entity_id varchar(128) NOT NULL CHECK (length(entity_id) BETWEEN 1 AND 128 AND entity_id = btrim(entity_id)),
   base_revision bigint NOT NULL CHECK (base_revision >= 0),
@@ -349,7 +349,7 @@ BEGIN
     IF mutation_kind NOT IN (
       'conversation.create', 'conversation.rename', 'conversation.preferences',
       'conversation.delete', 'conversation.restore',
-      'message.append', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'
+      'message.append', 'message.conversion_block_terminal', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'
     )
       OR mutation->>'baseRevision' !~ '^(0|[1-9][0-9]{0,18})$'
       OR (mutation->>'baseRevision')::numeric > 9223372036854775807
@@ -565,6 +565,28 @@ BEGIN
         WHERE owner_user_id = auth_user_id AND id = entity_id;
       END IF;
 
+    ELSIF mutation_kind = 'message.conversion_block_terminal' THEN
+      IF payload->>'messageId' IS DISTINCT FROM entity_id
+        OR payload->>'state' IS DISTINCT FROM 'terminal'
+        OR NOT (payload ?& ARRAY['messageId', 'blockId', 'executionId', 'state'])
+        OR jsonb_object_length(payload) <> 4 THEN
+        mutation_status := 'rejected'; mutation_error := 'INVALID_INPUT';
+      ELSE
+        UPDATE app_messages
+        SET blocks = (SELECT jsonb_agg(CASE
+          WHEN block->>'type' = 'conversion' AND block->>'blockId' = payload->>'blockId'
+            AND block->>'executionId' = payload->>'executionId' AND block->>'state' = 'active'
+          THEN jsonb_set(block, '{state}', '"terminal"'::jsonb) ELSE block END)
+          FROM jsonb_array_elements(blocks) block)
+        WHERE owner_user_id = auth_user_id AND id = entity_id
+          AND blocks @> jsonb_build_array(jsonb_build_object('type','conversion','blockId',payload->>'blockId','executionId',payload->>'executionId','state','active'));
+        IF FOUND THEN
+          result_revision_value := base_revision_value + 1;
+          mutation_status := 'applied';
+        ELSE
+          mutation_status := 'rejected'; mutation_error := 'INVALID_INPUT';
+        END IF;
+      END IF;
     ELSIF mutation_kind = 'message.append' THEN
       conversation_id := payload->>'conversationId';
       PERFORM autoforge_require_identifier(conversation_id, 128);

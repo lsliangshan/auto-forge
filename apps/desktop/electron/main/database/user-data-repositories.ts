@@ -532,6 +532,7 @@ function requireValidRemoteResult(mutation: MutationReceipt): number {
       case 'preferences.update':
         return result === mutation.baseRevision + 1
       case 'message.append':
+      case 'message.conversion_block_terminal':
         return result === mutation.baseRevision || result === mutation.baseRevision + 1
       case 'legacy.import':
       case 'privacy.consent':
@@ -708,6 +709,13 @@ function acknowledgeLocalMutation(
         throw new UserDataConsistencyError()
       }
       break
+    case 'message.conversion_block_terminal': {
+      const message = storedMessage(database, local.payload.messageId)
+      if (!message) throw new UserDataConsistencyError()
+      conversationId = message.conversationId
+      requireOwnedConversation(database, ownerUserId, conversationId)
+      break
+    }
     case 'privacy.consent':
       projectConsent(database, local.payload)
       break
@@ -1222,6 +1230,8 @@ function affectedConversationId(mutation: SyncMutation | RemoteMutation): string
       return mutation.entityId
     case 'message.append':
       return 'compacted' in mutation ? mutation.conversationId : mutation.payload.conversationId
+    case 'message.conversion_block_terminal':
+      return undefined
     default:
       return undefined
   }

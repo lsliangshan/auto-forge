@@ -99,3 +99,7 @@ packages/shared/src/contracts.test.ts
 - Replaced the second `message.append` with strict `message.conversion_block_terminal`: its payload is only `messageId`, `blockId`, `executionId`, and terminal state. Shared schemas, the local outbox/apply path, and Cloud handler validation reject additional payload details.
 - Valid conversion events now immediately clear loading, unavailable, and error state while invalidating all earlier list observations.
 - Same-epoch job merging now preserves the original job identity/core fields even when a contradictory later observation reports another target format or preset.
+
+## Fix round 4 — protocol foundation
+
+- Added the strict terminal mutation kind to both foundation SQL definitions and Cloud handler validation, with an additive deployment migration marker. Local apply and receipt ownership now recognize the mutation without carrying local conversion details.
