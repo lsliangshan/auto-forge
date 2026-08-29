@@ -224,4 +224,49 @@ describe('developer attachment drafts', () => {
     expect((await readdir(drafts)).filter((name) => name.endsWith('.input'))).toEqual(['draft_2.input'])
     expect(service.get('project_1', 'draft_1')).toBeUndefined()
   })
+
+  it('rejects a same-byte replacement before materializing a claimed draft', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-same-byte-source-'))
+    roots.push(root)
+    const source = join(root, 'source.bmp')
+    const bytes = bmp(4)
+    await writeFile(source, bytes)
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts: artifactRepository(), id: () => 'draft_1',
+    })
+    await service.recover()
+    const [draft] = await service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: [source] })
+    const input = join(resolveUserConversionRoot(root, 'user_1'), '.developer-drafts', `${draft!.id}.input`)
+    await unlink(input)
+    await writeFile(input, bytes)
+    service.claim('project_1', 'execution_1', [draft!.id])
+
+    await expect(service.materialize('execution_1', [draft!.id]))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    expect(await readFile(input)).toEqual(bytes)
+  })
+
+  it('rejects a same-byte replacement of a materialized input during release', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-same-byte-release-'))
+    roots.push(root)
+    const source = join(root, 'source.bmp')
+    const bytes = bmp(5)
+    await writeFile(source, bytes)
+    const artifacts = artifactRepository()
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts, id: () => 'draft_1',
+    })
+    await service.recover()
+    const [draft] = await service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: [source] })
+    service.claim('project_1', 'execution_1', [draft!.id])
+    await service.materialize('execution_1', [draft!.id])
+    const input = join(resolveUserConversionRoot(root, 'user_1'), 'inputs', `${draft!.id}.input`)
+    await unlink(input)
+    await writeFile(input, bytes)
+
+    await expect(service.releaseExecution('execution_1', new Set()))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    expect(await readFile(input)).toEqual(bytes)
+    expect(artifacts.records.get('draft_1')).toMatchObject({ status: 'ready' })
+  })
 })

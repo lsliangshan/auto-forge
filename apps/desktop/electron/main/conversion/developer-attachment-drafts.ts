@@ -98,6 +98,16 @@ async function removeExact(path: string, expected: NodeIdentity, allowedLinks = 
   if (remaining) throw failure('CONVERSION_INPUT_INVALID')
 }
 
+async function removeCreated(path: string, expected: NodeIdentity, allowedLinks: number[]): Promise<void> {
+  const current = await lstat(path)
+  if (current.isSymbolicLink() || !current.isFile()
+    || current.dev !== expected.dev || current.ino !== expected.ino
+    || !allowedLinks.includes(current.nlink)) throw failure('CONVERSION_INPUT_INVALID')
+  await removeExact(path, {
+    dev: current.dev, ino: current.ino, size: current.size, nlink: current.nlink,
+  }, allowedLinks)
+}
+
 async function ensureDirectory(path: string): Promise<string> {
   await mkdir(path, { recursive: true, mode: 0o700 })
   const metadata = await lstat(path)
@@ -113,7 +123,7 @@ export function createDeveloperAttachmentDraftService(
   options: CreateDeveloperAttachmentDraftServiceOptions,
 ): DeveloperAttachmentDraftService {
   const records = new Map<string, DeveloperDraftRecord>()
-  const claims = new Map<string, { executionId: string; materialized: boolean }>()
+  const claims = new Map<string, { executionId: string; materialized: boolean; materializedIdentity?: NodeIdentity }>()
   const projectTails = new Map<string, Promise<void>>()
   const makeId = options.id ?? randomUUID
   const root = resolveUserConversionRoot(options.dataRoot, options.ownerUserId)
@@ -231,6 +241,12 @@ export function createDeveloperAttachmentDraftService(
           const final = join(drafts, `${id}.input`)
           staged.push({ temporary, final })
           const destination = await open(temporary, 'wx', 0o600)
+          const temporaryOpened = await destination.stat()
+          const temporaryIdentity: NodeIdentity = {
+            dev: temporaryOpened.dev, ino: temporaryOpened.ino,
+            size: temporaryOpened.size, nlink: temporaryOpened.nlink,
+          }
+          staged[staged.length - 1]!.temporaryIdentity = temporaryIdentity
           try {
             await destination.writeFile(bytes)
             await destination.sync()
@@ -242,10 +258,11 @@ export function createDeveloperAttachmentDraftService(
             || temporaryMetadata.nlink !== 1 || temporaryMetadata.size !== bytes.byteLength) {
             throw failure('CONVERSION_INPUT_INVALID')
           }
-          const temporaryIdentity: NodeIdentity = {
+          const completedIdentity: NodeIdentity = {
             dev: temporaryMetadata.dev, ino: temporaryMetadata.ino,
             size: temporaryMetadata.size, nlink: temporaryMetadata.nlink,
           }
+          staged[staged.length - 1]!.temporaryIdentity = completedIdentity
           const record: DeveloperDraftRecord = Object.freeze({
             id,
             ownerUserId: options.ownerUserId,
@@ -257,9 +274,8 @@ export function createDeveloperAttachmentDraftService(
             sha256: createHash('sha256').update(bytes).digest('hex'),
             relativePath: `.developer-drafts/${id}.input`,
             probe,
-            draftIdentity: temporaryIdentity,
+            draftIdentity: completedIdentity,
           })
-          staged[staged.length - 1]!.temporaryIdentity = temporaryIdentity
           staged[staged.length - 1]!.record = record
         }
         assertProjectLimits(input.projectId, staged.map(({ record }) => record!.probe))
@@ -283,7 +299,7 @@ export function createDeveloperAttachmentDraftService(
         } catch (error) {
           for (const item of staged) {
             if (item.temporaryIdentity) {
-              await removeExact(item.temporary, { ...item.temporaryIdentity, nlink: 2 }, [1, 2]).catch(() => undefined)
+              await removeCreated(item.temporary, { ...item.temporaryIdentity, nlink: 2 }, [1, 2]).catch(() => undefined)
             }
             if (item.finalIdentity) await removeExact(item.final, item.finalIdentity).catch(() => undefined)
           }
@@ -370,6 +386,9 @@ export function createDeveloperAttachmentDraftService(
         if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size !== record.byteSize) {
           throw failure('CONVERSION_INPUT_INVALID')
         }
+        if (!sameNode(record.draftIdentity, {
+          dev: before.dev, ino: before.ino, size: before.size, nlink: before.nlink,
+        })) throw failure('CONVERSION_INPUT_INVALID')
         const handle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW)
         let destinationHandle: Awaited<ReturnType<typeof open>> | undefined
         let destinationIdentity: NodeIdentity | undefined
@@ -435,6 +454,7 @@ export function createDeveloperAttachmentDraftService(
           )
           if (sourceReappeared) throw failure('CONVERSION_INPUT_INVALID')
           sourceRemoved = true
+          if (!destinationIdentity) throw failure('CONVERSION_INPUT_INVALID')
           options.artifacts.create({
             id,
             ownerUserId: options.ownerUserId,
@@ -448,6 +468,7 @@ export function createDeveloperAttachmentDraftService(
             relativePath: `inputs/${id}.input`,
           })
           claim.materialized = true
+          claim.materializedIdentity = destinationIdentity
         } catch (error) {
           if (sourceRemoved && materializedBytes) {
             const restored = await open(
@@ -470,7 +491,7 @@ export function createDeveloperAttachmentDraftService(
           if (destinationIdentity) {
             const current = await lstat(destination).catch(() => undefined)
             if (current && !current.isSymbolicLink() && sameInode(destinationIdentity, current)) {
-              await removeExact(destination, destinationIdentity).catch(() => undefined)
+              await removeCreated(destination, destinationIdentity, [1]).catch(() => undefined)
             }
           }
           throw error
@@ -511,6 +532,10 @@ export function createDeveloperAttachmentDraftService(
         const sourceHandle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW)
         try {
           const sourceIdentity = await sourceHandle.stat()
+          if (!claim.materializedIdentity || !sameNode(claim.materializedIdentity, {
+            dev: sourceIdentity.dev, ino: sourceIdentity.ino,
+            size: sourceIdentity.size, nlink: sourceIdentity.nlink,
+          })) throw failure('CONVERSION_INPUT_INVALID')
           if (!sourceIdentity.isFile() || sourceIdentity.nlink !== 1 || sourceIdentity.size !== artifact.byteSize) {
             throw failure('CONVERSION_INPUT_INVALID')
           }

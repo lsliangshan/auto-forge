@@ -36,6 +36,24 @@ interface DeveloperRuntime {
 }
 
 const runtimeKey = Symbol.for('autoforge.developer.runtime')
+const retryableCleanupKey = Symbol.for('autoforge.developer.retryable-cleanup')
+
+function retryableCleanupRegistry(): Map<string, Set<string>> {
+  const global = globalThis as unknown as Record<PropertyKey, unknown>
+  const existing = global[retryableCleanupKey]
+  if (existing instanceof Map) return existing as Map<string, Set<string>>
+  const created = new Map<string, Set<string>>()
+  global[retryableCleanupKey] = created
+  return created
+}
+
+function rememberCleanup(projectId: string, ids: readonly string[]): void {
+  if (!projectId || !ids.length) return
+  const registry = retryableCleanupRegistry()
+  const pending = registry.get(projectId) ?? new Set<string>()
+  ids.forEach((id) => pending.add(id))
+  registry.set(projectId, pending)
+}
 
 function runtime(store: object): DeveloperRuntime {
   const existing = Reflect.get(store, runtimeKey) as DeveloperRuntime | undefined
@@ -146,6 +164,7 @@ export const useDeveloperStore = defineStore('developer', {
       this.$dispose = () => {
         state.disposed = true
         state.pickerGeneration += 1
+        rememberCleanup(this.selectedProjectId, this.developerAttachments.map(({ id }) => id))
         void this.flushPendingSaves()
         void this._clearDeveloperAttachments()
         for (const timer of state.timers.values()) clearTimeout(timer)
@@ -197,6 +216,7 @@ export const useDeveloperStore = defineStore('developer', {
       const project = this.projects.find(({ id }) => id === projectId)
       if (!project) return
       if (this.selectedProjectId && this.selectedProjectId !== projectId) {
+        rememberCleanup(this.selectedProjectId, this.developerAttachments.map(({ id }) => id))
         runtime(this).pickerGeneration += 1
         const cleared = await this._clearDeveloperAttachments(this.selectedProjectId)
         if (!cleared) return
@@ -480,6 +500,7 @@ export const useDeveloperStore = defineStore('developer', {
       this._ensureLifecycle()
       runtime(this).pickerGeneration += 1
       if (this.developerAttachmentField || this.developerAttachments.length > 0) {
+        rememberCleanup(this.selectedProjectId, this.developerAttachments.map(({ id }) => id))
         const previous = [...this.developerAttachments]
         void this._clearDeveloperAttachments().then((cleared) => {
           if (!cleared && this.developerAttachmentField === name && this.developerAttachments.length === 0) {
@@ -499,7 +520,7 @@ export const useDeveloperStore = defineStore('developer', {
     },
     async pickDeveloperAttachments() {
       this._ensureLifecycle()
-      await this._retryDeveloperAttachmentCleanup()
+      if (!await this._retryDeveloperAttachmentCleanup()) return
       const projectId = this.selectedProjectId
       const field = this.developerAttachmentField
       if (!projectId || !field || this.developerAttachments.length >= 5) return
@@ -548,6 +569,7 @@ export const useDeveloperStore = defineStore('developer', {
       try {
         await getDesktopApi().developer.clearAttachments({ projectId })
         runtime(this).retryableCleanup.delete(projectId)
+        retryableCleanupRegistry().delete(projectId)
         if (shouldReset) {
           this.developerAttachments = []
           this._syncDeveloperAttachmentInput()
@@ -562,6 +584,7 @@ export const useDeveloperStore = defineStore('developer', {
       const state = runtime(this)
       const pending = new Set(ids)
       state.retryableCleanup.get(projectId)?.forEach((id) => pending.add(id))
+      retryableCleanupRegistry().get(projectId)?.forEach((id) => pending.add(id))
       if (!pending.size) return true
       const results = await Promise.allSettled([...pending].map((id) => getDesktopApi().developer.removeAttachment({
         projectId, attachmentId: id,
@@ -569,23 +592,32 @@ export const useDeveloperStore = defineStore('developer', {
       const failed = results.some(({ status }) => status === 'rejected')
       if (!failed) {
         state.retryableCleanup.delete(projectId)
+        retryableCleanupRegistry().delete(projectId)
         return true
       }
       try {
         await getDesktopApi().developer.clearAttachments({ projectId })
         state.retryableCleanup.delete(projectId)
+        retryableCleanupRegistry().delete(projectId)
         return true
       } catch (error) {
         state.retryableCleanup.set(projectId, pending)
+        retryableCleanupRegistry().set(projectId, new Set(pending))
         this.debugError = displayError(error, '文件清理失败，请重试')
         return false
       }
     },
     async _retryDeveloperAttachmentCleanup() {
       const state = runtime(this)
-      for (const [projectId, ids] of [...state.retryableCleanup]) {
-        await this._cleanupStaleDeveloperAttachments(projectId, [...ids])
+      const registry = retryableCleanupRegistry()
+      for (const [projectId, ids] of registry) {
+        state.retryableCleanup.set(projectId, new Set(ids))
       }
+      let clean = true
+      for (const [projectId, ids] of [...state.retryableCleanup]) {
+        if (!await this._cleanupStaleDeveloperAttachments(projectId, [...ids])) clean = false
+      }
+      return clean
     },
     ensureExecutionSubscription() { this._ensureLifecycle() },
     async runDebug() {

@@ -157,4 +157,33 @@ describe('developer store hot updates', () => {
     expect(store.developerAttachments).toEqual([])
     expect(removeAttachment).toHaveBeenCalledWith({ projectId: 'project_1', attachmentId: 'disposed' })
   })
+
+  it('reconciles cleanup left by a disposed store in a later store instance', async () => {
+    const clearAttachments = vi.fn().mockRejectedValueOnce(new Error('main unavailable'))
+    const api = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments, pickFiles: vi.fn().mockResolvedValue([]), removeAttachment: vi.fn().mockRejectedValue(new Error('remove unavailable')) },
+      executions: { onEvent: () => () => undefined },
+    }
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    vi.resetModules()
+    const { useDeveloperStore } = await import('../../src/stores/developer')
+    const first = useDeveloperStore()
+    first.selectedProjectId = 'project_1'
+    first.developerAttachments = [{ id: 'pending', name: 'pending.png', mimeType: 'image/png', byteSize: 1 }]
+    first.ensureExecutionSubscription()
+    first.$dispose()
+    await vi.waitFor(() => expect(clearAttachments).toHaveBeenCalledTimes(1))
+
+    clearAttachments.mockResolvedValue(undefined)
+    const { createPinia, setActivePinia } = await import('pinia')
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const second = useDeveloperStore(pinia)
+    await second.pickDeveloperAttachments()
+
+    expect(clearAttachments).toHaveBeenCalledTimes(2)
+    expect(second.developerAttachments).toEqual([])
+    second.$dispose()
+  })
 })
