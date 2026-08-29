@@ -74,8 +74,6 @@ export function reconcileConversionBlockBinding(input: {
   if (!binding || binding.consumedAt !== undefined || binding.retiredAt !== undefined) {
     return undefined
   }
-  if (binding.finalizedAt === undefined) return undefined
-
   const execution = input.repositories.durable.executions.getForUser(
     input.executionId,
     input.ownerUserId,
@@ -84,6 +82,7 @@ export function reconcileConversionBlockBinding(input: {
     retire(input.repositories, binding, 'missing_execution')
     return undefined
   }
+  if (binding.finalizedAt === undefined) return undefined
   if (!terminalExecutionStatuses.has(execution.status)) return undefined
   if (!execution.chatRunId) retireInvalid(input.repositories, binding)
 

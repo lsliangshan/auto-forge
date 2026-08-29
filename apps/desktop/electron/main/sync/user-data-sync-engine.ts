@@ -170,19 +170,19 @@ export class UserDataSyncEngine {
     })
   }
 
-  /** Drains crash-recovered ready rows after an authenticated bind without an empty push. */
-  async drainReadyOutbox(): Promise<boolean> {
+  /** Runs one authenticated bootstrap cycle: all ready pushes followed by exactly one pull. */
+  async bootstrapSync(): Promise<void> {
     const binding = this.#binding
     if (!binding || this.#status.state === 'paused' || this.#status.state === 'quarantined') {
-      return false
-    }
-    if (binding.store.outbox.listReady(this.#dependencies.now(), 1).length === 0) {
-      return false
+      return
     }
     this.#refreshWarning(binding)
-    this.#flushRequested = true
+    if (binding.store.outbox.listReady(this.#dependencies.now(), 1).length > 0) {
+      this.#flushRequested = true
+    } else {
+      this.#pullRequested = true
+    }
     await this.#ensureDrain(binding)
-    return true
   }
 
   flush(): Promise<void> {
@@ -366,6 +366,7 @@ export class UserDataSyncEngine {
     let quarantineCode: AppErrorCode | undefined
 
     while (this.#isCurrent(binding)) {
+      this.#flushRequested = false
       const ready = binding.store.outbox.listReady(this.#dependencies.now(), BATCH_LIMIT)
       if (ready.length === 0) break
       const candidates = ready.map((item): SyncMutation => ({

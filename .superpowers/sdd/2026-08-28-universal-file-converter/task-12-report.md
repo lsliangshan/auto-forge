@@ -242,3 +242,46 @@ tests/cloudbase/user-data-migration.test.ts
 - Deploy the v1-safe/v2 Cloud handler and additive SQL migration before enabling Desktop v2 writers.
 - Execute the functions against staging PostgreSQL/CloudBase to verify syntax, grants, RLS, request-hash parity, real lock ordering/deadlock behavior, tombstone purge, and cross-device convergence. No real CloudBase environment was accessed or modified in this round.
 - Signing, notarization, packaged multi-platform acceptance, and formal release/corpus gates remain outside local Task 12 evidence.
+
+## Whole-task recovery round 2 — visible pagination and bootstrap barrier
+
+This round starts from recovery-round-1 HEAD `1fd607a18bc66880b44b0d0687669ac61da33064` and closes only the three remaining Important findings recorded in the Task 12 progress rulings. The identifier-length Minor remains deferred, as do the two visual Minors and Task 13.
+
+### Finding closure
+
+1. **Visibility-first v1 pagination.** Both byte-identical foundations and the additive deployed `autoforge_sync_pull` now derive the complete ordered candidate set, apply protocol visibility/projection, and only then take the first `p_limit` visible mutations. A full visible page stops at its last returned row so it cannot skip later visible work; a short or empty page advances to the final raw candidate so a hidden-only tail cannot be rescanned forever. Adversarial coverage includes 100 hidden duplicate-at-base terminal receipts before a rename, interleaved hidden rows with 125 visible rows, 99-visible and 100-visible hidden tails, a later rename from the saved tail cursor, an applied terminal compatibility anchor, and explicit unchanged v2 raw ordering.
+2. **Missing-execution retirement before finalization.** The coordinator now resolves the durable execution before checking `finalizedAt`. An unfinalized binding whose execution disappeared is retired as `missing_execution`, leaves no terminal mutation, disappears from recovery enumeration, and remains absent on repeated reconciliation.
+3. **One bootstrap sync barrier.** Startup/rebind conversion reconciliation and durable job replay suppress their individual sync callbacks. After all bindings and jobs are reconciled, `bootstrapSync()` runs one consolidated ready-row drain with one trailing pull, or one pull when no row is ready. Runtime job, execution, finalization, retry, and artifact signals retain immediate scheduling. The real Application fixture recovers two finalized bindings into one push batch followed by one pull and empties the ready outbox. A held-push RED additionally exposed a live-flush race that produced `push, push, pull, pull`; consuming the flush request when the internal loop takes its next ready snapshot now produces exactly `push, push, pull` while preserving a new cycle for work arriving during the pull.
+
+### RED / GREEN evidence
+
+- RED: the new missing-execution coordinator test failed before lookup ordering changed; two bootstrap tests failed because the consolidated API did not exist; the SQL structure test found the raw `LIMIT p_limit` before v1 visibility; and the held-push race test observed four calls instead of the required three.
+- GREEN: coordinator **9/9**; bootstrap/sync engine **53/53**; user-data repository plus sync engine **140/140**; migration pagination/parity **24/24**; Cloud handler plus migration **58/58**; shared contracts plus Cloud **161/161**.
+- The real multi-binding Application bootstrap fixture is **1/1** with exactly `syncPush, syncPull`, two terminal mutations in the single push, and an empty outbox. Full coordinator + Agent + Application is **395 passed / 2 recorded baseline failures** out of **397**: the legacy-import temporary-root `ENOTEMPTY` cleanup race and the existing context-summary `CONTEXT_LIMIT_EXCEEDED` expectation.
+
+### Final local gates
+
+- `@autoforge/shared` build, Desktop production build, scoped ESLint, handler syntax check, and `git diff --check` pass.
+- Node typecheck reports only the two recorded unrelated baselines: the Cloud sync E2E browser stub lacks `capturePageScreenshot`, and browser visual-evidence tracking lacks `purpose`.
+- Renderer typecheck reports only the three recorded unrelated InspectorPanel/developer/Settings capability diagnostics. No round-2 implementation or test file is named by either typecheck.
+
+### Round-2 files
+
+```text
+apps/desktop/electron/main/application.ts
+apps/desktop/electron/main/application.test.ts
+apps/desktop/electron/main/conversion/conversion-block-coordinator.ts
+apps/desktop/electron/main/conversion/conversion-block-coordinator.test.ts
+apps/desktop/electron/main/sync/user-data-sync-engine.ts
+apps/desktop/electron/main/sync/user-data-sync-engine.test.ts
+cloudbase/migrations/20260824090000_user_data_foundation.sql
+cloudbase/migrations/20260829000000_conversion_block_terminal.sql
+cloudbase/user-data/migrations/0001_user_data_foundation.sql
+tests/cloudbase/user-data-migration.test.ts
+```
+
+### External gates
+
+- Preserve the reader-first release order: deploy the v1-safe/v2 Cloud handler and additive SQL functions before enabling Desktop v2 writers.
+- Execute the pagination functions and migrations on staging PostgreSQL/CloudBase to verify real syntax, query plans, grants, RLS, cursor behavior, locks, and cross-device convergence. No real CloudBase environment was accessed or modified.
+- Signing, notarization, packaged multi-platform acceptance, and formal release/corpus gates remain external.

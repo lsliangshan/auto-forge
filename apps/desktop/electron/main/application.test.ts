@@ -8412,7 +8412,11 @@ describe('createApplicationRuntime', () => {
                 results: input.mutations.map((mutation) => ({
                   id: mutation.id,
                   status: 'applied' as const,
-                  revision: mutation.baseRevision + 1,
+                  revision: mutation.kind === 'privacy.consent'
+                    || mutation.kind === 'usage.record'
+                    || mutation.kind === 'legacy.import'
+                    ? 0
+                    : mutation.baseRevision + 1,
                 })),
                 cursor: 'ready_outbox_restart_push',
               },
@@ -9952,7 +9956,7 @@ describe('createApplicationRuntime', () => {
     }
   })
 
-  it('rebinds and reconciles a persisted finalized active conversion after restart', async () => {
+  it('rebinds multiple finalized conversions into one bootstrap push and trailing pull', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-block-rebind-'))
     directories.push(root)
     const authService = createTestAuthService()
@@ -9985,12 +9989,18 @@ describe('createApplicationRuntime', () => {
         executionId: 'execution_conversion_block_rebind',
         state: 'active' as const,
       } as const
-      store.messages.update('message_conversion_block_rebind', { blocks: [active] })
+      const secondActive = {
+        type: 'conversion',
+        blockId: 'block_conversion_block_rebind_second',
+        executionId: 'execution_conversion_block_rebind_second',
+        state: 'active' as const,
+      } as const
+      store.messages.update('message_conversion_block_rebind', { blocks: [active, secondActive] })
       store.chatRuns.finalizeWithMessage(
         'run_conversion_block_rebind',
         'message_conversion_block_rebind',
         'request_conversion_block_rebind',
-        { blocks: [active], status: 'completed', endedAt: 3 },
+        { blocks: [active, secondActive], status: 'completed', endedAt: 3 },
       )
     })
     const database = openAppDatabase(join(root, 'autoforge.sqlite'))
@@ -10013,31 +10023,96 @@ describe('createApplicationRuntime', () => {
       status: 'completed',
       progress: 100,
     })
+    database.executions.insert({
+      id: 'execution_conversion_block_rebind_second',
+      ownerUserId: session.user.id,
+      workflowId: 'file.convert.universal',
+      workflowVersion: '0.1.0',
+      chatRunId: 'run_conversion_block_rebind',
+      status: 'completed',
+      input: {},
+    })
+    database.conversionJobs.create({
+      id: 'job_conversion_block_rebind_second',
+      ownerUserId: session.user.id,
+      executionId: 'execution_conversion_block_rebind_second',
+      sourceKind: 'media',
+      sourceId: 'source_conversion_block_rebind_second',
+      targetFormat: 'pdf',
+      status: 'completed',
+      progress: 100,
+    })
     database.close()
 
     const emitChat = vi.fn()
-    const restarted = createApplicationRuntime(options(root, { authService, emitChat }))
+    const syncCalls: CloudBaseUserDataCall[] = []
+    const restarted = createApplicationRuntime(options(root, {
+      authService,
+      emitChat,
+      userDataSyncPort: {
+        call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+          syncCalls.push(structuredClone(input))
+          if (input.action === 'syncPush') {
+            return {
+              ok: true,
+              data: {
+                results: input.mutations.map((mutation) => ({
+                  id: mutation.id,
+                  status: 'applied' as const,
+                  revision: mutation.kind === 'privacy.consent'
+                    || mutation.kind === 'usage.record'
+                    || mutation.kind === 'legacy.import'
+                    ? 0
+                    : mutation.baseRevision + 1,
+                })),
+                cursor: 'conversion_block_rebind_push',
+              },
+            }
+          }
+          if (input.action === 'syncPull') {
+            return {
+              ok: true,
+              data: { mutations: [], cursor: 'conversion_block_rebind_pull' },
+            }
+          }
+          throw new Error(`Unexpected ${input.action}`)
+        }),
+      },
+    }))
     try {
       await restarted.services.auth.getSession()
-      await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'block_update',
-        conversationId: conversation.id,
-        messageId: 'message_conversion_block_rebind',
-        blockId: 'block_conversion_block_rebind',
-        block: {
-          type: 'conversion',
-          blockId: 'block_conversion_block_rebind',
-          executionId: 'execution_conversion_block_rebind',
-          state: 'terminal',
-        },
-      })))
+      await vi.waitFor(() => {
+        for (const suffix of ['', '_second']) {
+          expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'block_update',
+            conversationId: conversation.id,
+            messageId: 'message_conversion_block_rebind',
+            blockId: `block_conversion_block_rebind${suffix}`,
+            block: {
+              type: 'conversion',
+              blockId: `block_conversion_block_rebind${suffix}`,
+              executionId: `execution_conversion_block_rebind${suffix}`,
+              state: 'terminal',
+            },
+          }))
+        }
+      })
+      await vi.waitFor(() => expect(syncCalls.map(({ action }) => action))
+        .toEqual(['syncPush', 'syncPull']))
+      const pushCalls = syncCalls.filter((call) => call.action === 'syncPush')
+      expect(pushCalls).toHaveLength(1)
+      expect(pushCalls[0]?.mutations.filter((mutation) => (
+        mutation.kind === 'message.conversion_block_terminal'
+      ))).toHaveLength(2)
       expect(withUserData(root, session.user.id, (store) => store.outbox.list(100).filter((mutation) => (
         mutation.kind === 'message.conversion_block_terminal'
-      )))).toHaveLength(1)
+      )))).toHaveLength(0)
+      expect(withUserData(root, session.user.id, (store) => store.outbox.list(100))).toEqual([])
       await restarted.services.auth.getSession()
+      expect(syncCalls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
       expect(withUserData(root, session.user.id, (store) => store.outbox.list(100).filter((mutation) => (
         mutation.kind === 'message.conversion_block_terminal'
-      )))).toHaveLength(1)
+      )))).toHaveLength(0)
     } finally {
       await restarted.close()
     }

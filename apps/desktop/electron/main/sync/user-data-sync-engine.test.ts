@@ -249,7 +249,7 @@ afterEach(() => {
 })
 
 describe('UserDataSyncEngine', () => {
-  it('drains ready crash-recovered outbox work once during authenticated v2 bind', async () => {
+  it('runs one consolidated bootstrap push cycle with exactly one trailing pull', async () => {
     const manager = createManager()
     const store = manager.open('alice')
     const pending = createMutation(200)
@@ -270,10 +270,8 @@ describe('UserDataSyncEngine', () => {
     })
 
     await engine.start('alice', 'device-a')
-    const drained = await engine.drainReadyOutbox()
-    if (!drained) await engine.pull()
+    await engine.bootstrapSync()
 
-    expect(drained).toBe(true)
     expect(calls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
     expect(calls.filter((call) => call.action === 'syncPush' || call.action === 'syncPull')
       .every(({ protocolVersion }) => protocolVersion === 2)).toBe(true)
@@ -283,8 +281,63 @@ describe('UserDataSyncEngine', () => {
       protocolVersion: 2,
       remoteCursor: 'cursor_bind_drain_pull',
     })
-    await expect(engine.drainReadyOutbox()).resolves.toBe(false)
-    expect(calls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
+  })
+
+  it('runs exactly one bootstrap pull when no ready outbox work exists', async () => {
+    const manager = createManager()
+    const calls: CloudBaseUserDataCall[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      calls.push(input)
+      if (input.action !== 'syncPull') throw new Error(`Unexpected ${input.action}`)
+      return success({ mutations: [], cursor: 'cursor_bind_pull_only' })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.bootstrapSync()
+
+    expect(calls.map(({ action }) => action)).toEqual(['syncPull'])
+    expect(engine.status()).toEqual({ state: 'idle' })
+  })
+
+  it('absorbs a live flush during bootstrap push without scheduling a duplicate pull', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const recovered = createMutation(202)
+    const live = createMutation(203)
+    store.outbox.recordWithConversation(recovered)
+    const actions: CloudBaseUserDataCall['action'][] = []
+    let firstPushStarted!: () => void
+    const started = new Promise<void>((resolve) => { firstPushStarted = resolve })
+    let releaseFirstPush!: () => void
+    const held = new Promise<void>((resolve) => { releaseFirstPush = resolve })
+    let pushCount = 0
+    const { engine } = createEngine(manager, async (input) => {
+      actions.push(input.action)
+      if (input.action === 'syncPush') {
+        pushCount += 1
+        if (pushCount === 1) {
+          firstPushStarted()
+          await held
+        }
+        return success({
+          results: input.mutations.map(({ id }) => ({ id, status: 'applied', revision: 1 })),
+          cursor: `cursor_bootstrap_push_${pushCount}`,
+        })
+      }
+      return success({ mutations: [], cursor: 'cursor_bootstrap_pull' })
+    })
+
+    await engine.start('alice', 'device-a')
+    const bootstrap = engine.bootstrapSync()
+    await started
+    store.outbox.recordWithConversation(live)
+    const runtimeFlush = engine.flush()
+    releaseFirstPush()
+    await Promise.all([bootstrap, runtimeFlush])
+
+    expect(actions).toEqual(['syncPush', 'syncPush', 'syncPull'])
+    expect(store.outbox.list(100)).toEqual([])
+    expect(engine.status()).toEqual({ state: 'idle' })
   })
 
   it('continues a duplicate-at-base conversion chain through rebased push and pull', async () => {
@@ -334,7 +387,7 @@ describe('UserDataSyncEngine', () => {
     })
 
     await engine.start('alice', 'device-a')
-    await engine.drainReadyOutbox()
+    await engine.bootstrapSync()
 
     expect(pushes).toHaveLength(2)
     expect(pushes[0]?.map(({ id }) => id)).toEqual([seeded.mutation.id, later.id])

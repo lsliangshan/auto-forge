@@ -1203,13 +1203,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await userDataSync.start(session.user.id, deviceId)
       await bindUserMedia(session)
       await bindUserConversion(session)
-      const drainedReadyOutbox = await userDataSync.drainReadyOutbox()
+      await userDataSync.bootstrapSync()
       boundUserId = session.user.id
       const warningSince = userDataSync.status().warningSince
       if (warningSince !== undefined) {
         notifySyncWarning(userDataSync.captureBinding(session.user.id), warningSince)
       }
-      if (!drainedReadyOutbox) await userDataSync.pull()
       activateUserReconciliation(runtimeRecovered)
       await activateVideoJobs(runtimeRecovered)
     })
@@ -1515,7 +1514,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       else waiter.reject(failure('NOT_FOUND'))
     }
   }
-  const reconcileConversionBlocks = (lifecycle: BoundConversionLifecycle, executionId: string): void => {
+  const reconcileConversionBlocks = (
+    lifecycle: BoundConversionLifecycle,
+    executionId: string,
+    reconcileOptions: { scheduleSync?: boolean } = {},
+  ): void => {
     const store = currentUserData()
     const transition = reconcileConversionBlockBinding({
       repositories: {
@@ -1530,7 +1533,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       executionId,
     })
     if (!transition) return
-    queueUserDataFlush()
+    if (reconcileOptions.scheduleSync !== false) queueUserDataFlush()
     options.emitChat({
       type: 'block_update',
       conversationId: transition.conversationId,
@@ -1539,13 +1542,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       block: transition.block,
     })
   }
-  const emitConversionJob = (lifecycle: BoundConversionLifecycle, job: ConversionJob): void => {
+  const emitConversionJob = (
+    lifecycle: BoundConversionLifecycle,
+    job: ConversionJob,
+    reconcileOptions: { scheduleSync?: boolean } = {},
+  ): void => {
     if (boundConversion !== lifecycle
       || job.ownerUserId !== lifecycle.ownerUserId
       || !auth.isAuthenticated()
       || auth.currentUserId() !== job.ownerUserId) return
     settleConversionWaiters(job)
-    reconcileConversionBlocks(lifecycle, job.executionId)
+    reconcileConversionBlocks(lifecycle, job.executionId, reconcileOptions)
     let event: DesktopConversionJobEvent
     try {
       event = { type: 'job_updated', job: conversionJobView(database, job) }
@@ -1660,11 +1667,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     boundConversion = lifecycle
     runner.start()
     for (const binding of currentUserData().conversionBlockBindings.listRecoverable(session.user.id)) {
-      reconcileConversionBlocks(lifecycle, binding.executionId)
+      reconcileConversionBlocks(lifecycle, binding.executionId, { scheduleSync: false })
     }
     for (const execution of database.executions.listForUser(session.user.id)) {
       for (const job of database.conversionJobs.listForExecution(execution.id, session.user.id)) {
-        emitConversionJob(lifecycle, job)
+        emitConversionJob(lifecycle, job, { scheduleSync: false })
       }
     }
   }

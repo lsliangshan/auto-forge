@@ -699,7 +699,7 @@ BEGIN
     END IF;
   END IF;
 
-  WITH page AS (
+  WITH candidates AS (
     SELECT mutation.*,
            CASE WHEN mutation.kind = 'message.conversion_block_terminal' THEN COALESCE(
              mutation.mutation_payload->>'conversationId',
@@ -712,15 +712,18 @@ BEGIN
     WHERE mutation.owner_user_id = auth_user_id
       AND mutation.server_sequence > after_sequence
       AND mutation.status IN ('applied', 'duplicate')
-    ORDER BY mutation.server_sequence
-    LIMIT p_limit
-  ), visible_page AS (
-    SELECT page.*
-    FROM page
+  ), visible_candidates AS (
+    SELECT candidate.*
+    FROM candidates candidate
     WHERE p_protocol_version = 2
-      OR page.kind <> 'message.conversion_block_terminal'
-      OR (page.result_revision = page.base_revision + 1
-        AND page.terminal_conversation_id IS NOT NULL)
+      OR candidate.kind <> 'message.conversion_block_terminal'
+      OR (candidate.result_revision = candidate.base_revision + 1
+        AND candidate.terminal_conversation_id IS NOT NULL)
+  ), visible_page AS (
+    SELECT candidate.*
+    FROM visible_candidates candidate
+    ORDER BY candidate.server_sequence
+    LIMIT p_limit
   )
   SELECT jsonb_build_object(
     'mutations', COALESCE((SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
@@ -759,10 +762,16 @@ BEGIN
         THEN page.mutation_payload->'conversationId' ELSE NULL END,
       'receivedAt', autoforge_iso_timestamp(page.received_at)
     )) ORDER BY page.server_sequence) FROM visible_page page), '[]'::jsonb),
-    'cursor', COALESCE((SELECT page.cursor_token::text
-      FROM page
-      ORDER BY page.server_sequence DESC
-      LIMIT 1), next_cursor)
+    'cursor', COALESCE(CASE WHEN (SELECT count(*) FROM visible_page) = p_limit
+      THEN (SELECT page.cursor_token::text
+        FROM visible_page page
+        ORDER BY page.server_sequence DESC
+        LIMIT 1)
+      ELSE (SELECT candidate.cursor_token::text
+        FROM candidates candidate
+        ORDER BY candidate.server_sequence DESC
+        LIMIT 1)
+      END, next_cursor)
   ) INTO result;
 
   UPDATE app_sync_devices SET last_pull_at = clock_timestamp()

@@ -258,6 +258,31 @@ describe('conversion block coordinator', () => {
     }
   })
 
+  it('retires an unfinalized binding whose execution disappeared and does not rescan it', async () => {
+    const fixture = await seeded({ finalized: false, executionTerminal: true, jobsTerminal: true })
+    try {
+      fixture.durable.clearLocalData('executions')
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        expect(reconcileConversionBlockBinding({
+          repositories: fixture.repositories,
+          ownerUserId,
+          executionId,
+        })).toBeUndefined()
+      }
+      const retired = fixture.chat.conversionBlockBindings.get(ownerUserId, executionId)
+      expect(retired).not.toHaveProperty('finalizedAt')
+      expect(retired).toMatchObject({
+        retirementReason: 'missing_execution',
+        retiredAt: expect.any(Number),
+      })
+      expect(fixture.chat.conversionBlockBindings.listRecoverable(ownerUserId)).toEqual([])
+      expect(terminalMutations(fixture.chat)).toHaveLength(0)
+    } finally {
+      fixture.stores.close()
+      fixture.durable.close()
+    }
+  })
+
   it.each([
     { label: 'duplicate target block', blocks: [activeBlock, { ...activeBlock }] },
     {

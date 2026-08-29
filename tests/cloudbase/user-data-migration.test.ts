@@ -484,8 +484,11 @@ describe('CloudBase user data migration', () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
     const syncPull = extractFunction(canonical, 'autoforge_sync_pull')
 
+    expect(syncPull).toContain('WITH candidates AS (')
+    expect(syncPull).toContain('visible_candidates AS (')
+    expect(syncPull).toContain('visible_page AS (')
     expect(syncPull).toMatch(
-      /p_protocol_version = 2\s+OR page\.kind <> 'message\.conversion_block_terminal'\s+OR \(page\.result_revision = page\.base_revision \+ 1/,
+      /p_protocol_version = 2\s+OR candidate\.kind <> 'message\.conversion_block_terminal'\s+OR \(candidate\.result_revision = candidate\.base_revision \+ 1/,
     )
     expect(syncPull).toContain("THEN 'conversation.preferences'")
     expect(syncPull).toContain('THEN page.terminal_conversation_id')
@@ -499,11 +502,145 @@ describe('CloudBase user data migration', () => {
       /jsonb_array_elements\(page\.mutation_payload->'payload'->'blocks'\)\s+WITH ORDINALITY/,
     )
     expect(syncPull).toMatch(
-      /'cursor',[\s\S]+?SELECT page\.cursor_token::text[\s\S]+?FROM page[\s\S]+?ORDER BY page\.server_sequence DESC/,
+      /CASE WHEN \(SELECT count\(\*\) FROM visible_page\) = p_limit[\s\S]+?FROM visible_page[\s\S]+?FROM candidates/,
     )
-    expect(syncPull.indexOf('LIMIT p_limit')).toBeLessThan(
-      syncPull.indexOf("page.kind <> 'message.conversion_block_terminal'"),
+    expect(syncPull.indexOf("candidate.kind <> 'message.conversion_block_terminal'"))
+      .toBeLessThan(syncPull.indexOf('LIMIT p_limit'))
+  })
+
+  it('paginates by 100 visible v1 mutations while advancing across every hidden-tail shape', () => {
+    type Row = {
+      id: string
+      cursor: string
+      kind: 'conversation.rename' | 'message.conversion_block_terminal'
+      baseRevision: number
+      resultRevision: number
+      conversationId?: string
+    }
+    const rename = (id: string, revision: number): Row => ({
+      id,
+      cursor: `cursor_${id}`,
+      kind: 'conversation.rename',
+      baseRevision: revision,
+      resultRevision: revision + 1,
+    })
+    const duplicateTerminal = (id: string, revision: number): Row => ({
+      id,
+      cursor: `cursor_${id}`,
+      kind: 'message.conversion_block_terminal',
+      baseRevision: revision,
+      resultRevision: revision,
+      conversationId: 'conversation_visible_projection',
+    })
+    const appliedTerminal = (id: string, revision: number): Row => ({
+      id,
+      cursor: `cursor_${id}`,
+      kind: 'message.conversion_block_terminal',
+      baseRevision: revision,
+      resultRevision: revision + 1,
+      conversationId: 'conversation_visible_projection',
+    })
+    const page = (
+      rows: readonly Row[],
+      cursor: string | undefined,
+      protocolVersion: 1 | 2,
+      limit = 100,
+    ) => {
+      const afterIndex = cursor === undefined ? -1 : rows.findIndex((item) => item.cursor === cursor)
+      const candidates = rows.slice(afterIndex + 1)
+      const visible = candidates.filter((item) => (
+        protocolVersion === 2
+        || item.kind !== 'message.conversion_block_terminal'
+        || (item.resultRevision === item.baseRevision + 1 && item.conversationId !== undefined)
+      )).slice(0, limit)
+      const nextCursor = visible.length === limit
+        ? visible.at(-1)?.cursor
+        : candidates.at(-1)?.cursor ?? cursor
+      return { mutations: visible, cursor: nextCursor }
+    }
+    const drainLikeStrictV1 = (rows: readonly Row[]) => {
+      const received: Row[] = []
+      const cursors: Array<string | undefined> = []
+      const pageSizes: number[] = []
+      let cursor: string | undefined
+      for (let request = 0; request < 10; request += 1) {
+        const current = page(rows, cursor, 1)
+        received.push(...current.mutations)
+        cursors.push(current.cursor)
+        pageSizes.push(current.mutations.length)
+        cursor = current.cursor
+        if (current.mutations.length < 100) return { received, cursors, pageSizes }
+      }
+      throw new Error('strict v1 loop did not terminate')
+    }
+
+    const hiddenThenRename = [
+      ...Array.from({ length: 100 }, (_, index) => duplicateTerminal(`hidden_${index}`, 1)),
+      rename('rename_after_hidden', 1),
+    ]
+    const hiddenThenRenameDrain = drainLikeStrictV1(hiddenThenRename)
+    expect(hiddenThenRenameDrain).toEqual({
+      received: [rename('rename_after_hidden', 1)],
+      cursors: ['cursor_rename_after_hidden'],
+      pageSizes: [1],
+    })
+
+    const mixed = [
+      ...Array.from({ length: 60 }, (_, index) => rename(`visible_first_${index}`, index)),
+      ...Array.from({ length: 140 }, (_, index) => duplicateTerminal(`hidden_middle_${index}`, 60)),
+      appliedTerminal('visible_terminal', 60),
+      ...Array.from({ length: 64 }, (_, index) => rename(`visible_last_${index}`, 61 + index)),
+    ]
+    const mixedDrain = drainLikeStrictV1(mixed)
+    expect(mixedDrain.received).toHaveLength(125)
+    expect(mixedDrain.received.map(({ id }) => id)).toEqual([
+      ...Array.from({ length: 60 }, (_, index) => `visible_first_${index}`),
+      'visible_terminal',
+      ...Array.from({ length: 64 }, (_, index) => `visible_last_${index}`),
+    ])
+    expect(mixedDrain.cursors).toEqual([
+      'cursor_visible_last_38',
+      'cursor_visible_last_63',
+    ])
+    expect(mixedDrain.pageSizes).toEqual([100, 25])
+
+    const shortWithHiddenTail = [
+      ...Array.from({ length: 99 }, (_, index) => rename(`short_visible_${index}`, index)),
+      ...Array.from({ length: 100 }, (_, index) => duplicateTerminal(`short_tail_${index}`, 99)),
+    ]
+    const shortTailDrain = drainLikeStrictV1(shortWithHiddenTail)
+    expect(shortTailDrain.received).toHaveLength(99)
+    expect(shortTailDrain.cursors).toEqual(['cursor_short_tail_99'])
+    expect(shortTailDrain.pageSizes).toEqual([99])
+    expect(page([
+      ...shortWithHiddenTail,
+      rename('rename_after_hidden_tail', 99),
+    ], shortTailDrain.cursors.at(-1), 1)).toMatchObject({
+      mutations: [expect.objectContaining({ id: 'rename_after_hidden_tail' })],
+      cursor: 'cursor_rename_after_hidden_tail',
+    })
+
+    const fullWithHiddenTail = [
+      ...Array.from({ length: 100 }, (_, index) => rename(`full_visible_${index}`, index)),
+      ...Array.from({ length: 100 }, (_, index) => duplicateTerminal(`full_tail_${index}`, 100)),
+    ]
+    const fullTailDrain = drainLikeStrictV1(fullWithHiddenTail)
+    expect(fullTailDrain.received.map(({ id }) => id)).toEqual(
+      Array.from({ length: 100 }, (_, index) => `full_visible_${index}`),
     )
+    expect(fullTailDrain.cursors).toEqual([
+      'cursor_full_visible_99',
+      'cursor_full_tail_99',
+    ])
+    expect(fullTailDrain.pageSizes).toEqual([100, 0])
+
+    const v2FirstPage = page(hiddenThenRename, undefined, 2)
+    expect(v2FirstPage.mutations.map(({ id }) => id)).toEqual(
+      Array.from({ length: 100 }, (_, index) => `hidden_${index}`),
+    )
+    expect(v2FirstPage.cursor).toBe('cursor_hidden_99')
+    expect(page(hiddenThenRename, v2FirstPage.cursor, 2).mutations.map(({ id }) => id))
+      .toEqual(['rename_after_hidden'])
   })
 
   it('keeps strict v1 readers OCC-continuous across an active append, hidden terminal, and later write', () => {
