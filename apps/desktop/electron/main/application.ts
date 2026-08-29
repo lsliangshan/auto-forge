@@ -2189,7 +2189,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const conversationContext = createConversationContextManager(chatDatabase)
   const agent = new AgentOrchestrator({
     workflows: registry,
-    persistence: createAgentPersistence(chatDatabase),
+    persistence: createAgentPersistence(chatDatabase, (messageId, blocks) => {
+      const conversion = blocks.find((block): block is Extract<ChatBlock, { type: 'conversion' }> => block.type === 'conversion' && block.state === 'active')
+      const message = chatDatabase.messages.get(messageId)
+      const ownerUserId = auth.currentUserId()
+      if (!conversion || !message || !ownerUserId) return
+      const existing = database.conversionBlockBindings.get(ownerUserId, conversion.executionId)
+      if (existing) {
+        if (existing.messageId !== messageId || existing.blockId !== conversion.blockId) throw failure('CONFLICT')
+        return
+      }
+      database.conversionBlockBindings.create({ ownerUserId, conversationId: message.conversationId, messageId, blockId: conversion.blockId, executionId: conversion.executionId })
+    }),
     history: conversationContext,
     policy,
     executions,
