@@ -103,3 +103,7 @@ packages/shared/src/contracts.test.ts
 ## Fix round 4 — protocol foundation
 
 - Added the strict terminal mutation kind to both foundation SQL definitions and Cloud handler validation, with an additive deployment migration marker. Local apply and receipt ownership now recognize the mutation without carrying local conversion details.
+
+### Round-4 follow-up
+
+- Main now uses one exact active-block reconciler for job signals and startup/rebind scans. It requires terminal execution, nonempty all-terminal jobs, and finds the owner/run/conversation/message/block by exact persisted identifiers; terminal replay is naturally no-op after the active state is consumed.
