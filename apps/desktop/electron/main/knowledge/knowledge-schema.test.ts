@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v13', () => {
+describe('knowledge schema v14', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(13)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(14)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -86,6 +86,7 @@ describe('knowledge schema v13', () => {
       'next_retry_at', 'last_error_code', 'upload_attempt', 'upload_request_id',
       'upload_ticket', 'storage_reference', 'upload_authorization_json',
       'upload_authorization_expires_at', 'upload_put_completed', 'upload_verified',
+      'upload_retiring',
     ])
     expect((database.prepare(
       'PRAGMA table_info(cloud_version_projections)',
@@ -177,6 +178,24 @@ describe('knowledge schema v13', () => {
     expect(database.prepare('SELECT name, mime_type FROM document_versions').get()).toEqual({
       name: '旧合同.txt', mime_type: 'text/plain',
     })
+  })
+
+  it('preserves upload lineage while upgrading a v13 database', () => {
+    const database = testDatabase()
+    initializeKnowledgeSchema(database)
+    database.prepare('DELETE FROM knowledge_schema_migrations WHERE version = 14').run()
+    database.exec('ALTER TABLE cloud_pending_publications DROP COLUMN upload_retiring')
+
+    initializeKnowledgeSchema(database)
+
+    expect(database.prepare(`
+      SELECT dflt_value AS defaultValue
+      FROM pragma_table_info('cloud_pending_publications')
+      WHERE name = 'upload_retiring'
+    `).get()).toEqual({ defaultValue: '0' })
+    expect(database.prepare(
+      'SELECT version FROM knowledge_schema_migrations WHERE version = 14',
+    ).get()).toEqual({ version: 14 })
   })
 
   it('keeps trigram FTS rows synchronized with external chunk content', () => {

@@ -1336,17 +1336,24 @@ describe('local knowledge service', () => {
     expect(fixture.memory.database.prepare(`
       SELECT upload_attempt AS uploadAttempt, upload_ticket AS uploadTicket,
         upload_job_id AS uploadJobId, storage_reference AS storageReference,
-        upload_verified AS uploadVerified
+        upload_verified AS uploadVerified, upload_retiring AS uploadRetiring
       FROM cloud_pending_publications WHERE knowledge_base_id = 'base_recovery'
     `).get()).toEqual({
-      uploadAttempt: 1, uploadTicket: null, uploadJobId: null,
-      storageReference: null, uploadVerified: 0,
+      uploadAttempt: 1, uploadTicket: authorization.uploadTicket, uploadJobId: authorization.jobId,
+      storageReference: authorization.storageReference, uploadVerified: 0, uploadRetiring: 1,
     })
     await fixture.service.list({ userId: 'alice' })
     await vi.waitFor(() => expect(cleanupOrphans).toHaveBeenCalledTimes(2))
     expect(fixture.memory.database.prepare(
       'SELECT count(*) AS count FROM cloud_sync_orphans',
     ).get()).toEqual({ count: 0 })
+    expect(fixture.memory.database.prepare(`
+      SELECT upload_ticket AS uploadTicket, upload_job_id AS uploadJobId,
+        storage_reference AS storageReference, upload_retiring AS uploadRetiring
+      FROM cloud_pending_publications WHERE knowledge_base_id = 'base_recovery'
+    `).get()).toEqual({
+      uploadTicket: null, uploadJobId: null, storageReference: null, uploadRetiring: 0,
+    })
     expect(uploadDocument).toHaveBeenCalledOnce()
   })
 

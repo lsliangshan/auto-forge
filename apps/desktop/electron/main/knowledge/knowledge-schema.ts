@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 13
+export const KNOWLEDGE_SCHEMA_VERSION = 14
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -440,6 +440,12 @@ const KNOWLEDGE_SCHEMA_V13 = `
   WHERE upload_job_id IS NOT NULL;
 `
 
+const KNOWLEDGE_SCHEMA_V14 = `
+  ALTER TABLE cloud_pending_publications
+    ADD COLUMN upload_retiring INTEGER NOT NULL DEFAULT 0
+      CHECK (upload_retiring IN (0, 1));
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
@@ -454,6 +460,7 @@ const migrations = new Map<number, string>([
   [11, KNOWLEDGE_SCHEMA_V11],
   [12, KNOWLEDGE_SCHEMA_V12],
   [13, KNOWLEDGE_SCHEMA_V13],
+  [14, KNOWLEDGE_SCHEMA_V14],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {

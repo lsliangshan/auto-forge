@@ -909,7 +909,7 @@ export function createLocalKnowledgeService(
       LEFT JOIN documents AS document
         ON document.knowledge_base_id = base.id AND document.recycled_at IS NULL
       WHERE base.recycled_at IS NULL
-      ORDER BY base.created_at, base.id, document.created_at, document.id
+      ORDER BY base.created_at, base.rowid, document.created_at, document.rowid
       LIMIT 1
     `).get() as { baseId: string; documentId: string | null } | undefined
     const normalized = selected
@@ -989,6 +989,7 @@ export function createLocalKnowledgeService(
     uploadAuthorizationExpiresAt: number | null
     uploadPutCompleted: number
     uploadVerified: number
+    uploadRetiring: number
   }
 
   const pendingCloudPublication = (
@@ -1009,6 +1010,7 @@ export function createLocalKnowledgeService(
       pending.upload_authorization_expires_at AS uploadAuthorizationExpiresAt,
       pending.upload_put_completed AS uploadPutCompleted,
       pending.upload_verified AS uploadVerified,
+      pending.upload_retiring AS uploadRetiring,
       base.name AS baseName, document.name AS documentName, version.mime_type AS mimeType,
       version.version_number AS versionNumber, version.content_hash AS contentHash,
       version.created_at AS createdAt
@@ -1048,6 +1050,21 @@ export function createLocalKnowledgeService(
     }
   }
 
+  const finalizeRetiredCloudPublication = (active: Binding, knowledgeBaseId: string): void => {
+    active.store.database.prepare(`
+      UPDATE cloud_pending_publications
+      SET upload_request_id = NULL, upload_ticket = NULL, upload_job_id = NULL,
+        storage_reference = NULL, upload_authorization_json = NULL,
+        upload_authorization_expires_at = NULL, upload_put_completed = 0,
+        upload_retiring = 0, updated_at = ?
+      WHERE knowledge_base_id = ? AND upload_verified = 0 AND upload_retiring = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM cloud_sync_orphans orphan
+          WHERE orphan.storage_reference = cloud_pending_publications.storage_reference
+        )
+    `).run(now(), knowledgeBaseId)
+  }
+
   const processCloudPublication = async (
     active: Binding,
     knowledgeBaseId: string,
@@ -1060,6 +1077,7 @@ export function createLocalKnowledgeService(
     const initialPending = pendingCloudPublication(active, knowledgeBaseId)
     if (!initialPending) return
     let pending: PendingCloudPublication = initialPending
+    if (pending.uploadRetiring === 1) return
     const reloadPending = (): PendingCloudPublication => {
       const reloaded = pendingCloudPublication(active, knowledgeBaseId)
       if (!reloaded) fail('CONFLICT')
@@ -1214,20 +1232,14 @@ export function createLocalKnowledgeService(
           pending!.knowledgeBaseId, recovery.authorization.storageReference,
         )
         const retired = active.store.database.prepare(`
-          UPDATE cloud_pending_publications
-          SET upload_request_id = NULL, upload_ticket = NULL, upload_job_id = NULL,
-            storage_reference = NULL, upload_authorization_json = NULL,
-            upload_authorization_expires_at = NULL, upload_put_completed = 0,
-            updated_at = ?
+          UPDATE cloud_pending_publications SET upload_retiring = 1, updated_at = ?
           WHERE knowledge_base_id = ? AND generation_id = ?
-            AND upload_verified = 0 AND upload_ticket = ?
-        `).run(
-          now(), pending!.knowledgeBaseId, pending!.generationId,
-          recovery.authorization.uploadTicket,
-        )
+            AND upload_verified = 0 AND upload_ticket = ? AND upload_retiring = 0
+        `).run(now(), pending!.knowledgeBaseId, pending!.generationId, recovery.authorization.uploadTicket)
         if (retired.changes !== 1) fail('CONFLICT')
         await active.cloud.cleanupOrphans(pending!.knowledgeBaseId)
         assertCurrentBinding(active)
+        finalizeRetiredCloudPublication(active, pending!.knowledgeBaseId)
         if (!cloudAllowed()) return
         pending = reloadPending()
         recovery = undefined
@@ -1454,6 +1466,7 @@ export function createLocalKnowledgeService(
       const cleanup = serialCloudTask(active, row.knowledgeBaseId, async () => {
         await active.cloud.cleanupOrphans(row.knowledgeBaseId)
         assertCurrentBinding(active)
+        finalizeRetiredCloudPublication(active, row.knowledgeBaseId)
       })
       void cleanup.catch(() => undefined)
     }
