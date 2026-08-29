@@ -85,6 +85,7 @@ function affectedConversationIds(
     payload?: unknown
     conversationId?: string
   }[],
+  store?: UserDataStore,
 ): string[] {
   const ids = new Set<string>()
   for (const mutation of mutations) {
@@ -97,6 +98,10 @@ function affectedConversationIds(
       && 'conversationId' in mutation.payload
       && typeof mutation.payload.conversationId === 'string') {
       ids.add(mutation.payload.conversationId)
+    }
+    if (mutation.kind === 'message.conversion_block_terminal') {
+      const conversationId = store?.messages.get(mutation.entityId)?.conversationId
+      if (conversationId) ids.add(conversationId)
     }
   }
   return [...ids]
@@ -362,7 +367,7 @@ export class UserDataSyncEngine {
       }
       if (batchLength === 0) {
         binding.store.outbox.markFailed(ready[0]!.id, 'OUTBOX_LIMIT_EXCEEDED')
-        this.#notify(binding, affectedConversationIds([ready[0]!]))
+        this.#notify(binding, affectedConversationIds([ready[0]!], binding.store))
         quarantineCode ??= 'OUTBOX_LIMIT_EXCEEDED'
         continue
       }
@@ -371,7 +376,7 @@ export class UserDataSyncEngine {
       const ids = batch.map(({ id }) => id)
       binding.store.outbox.markSyncing(ids)
       this.#trackSyncing(binding, ids)
-      const conversationIds = affectedConversationIds(batch)
+      const conversationIds = affectedConversationIds(batch, binding.store)
       this.#notify(binding, conversationIds)
 
       let response: UserDataFunctionResponse
@@ -534,7 +539,7 @@ export class UserDataSyncEngine {
           cursor: data.cursor,
         }, this.#dependencies.now())
         this.#pruneSyncing(binding)
-        this.#notify(binding, affectedConversationIds(data.mutations))
+        this.#notify(binding, affectedConversationIds(data.mutations, binding.store))
       } catch {
         this.#quarantine('INTERNAL_ERROR')
         return 'stopped'
@@ -566,7 +571,7 @@ export class UserDataSyncEngine {
     const nextRetryAt = this.#dependencies.now() + delay
     for (const { id } of batch) binding.store.outbox.markPending(id, nextRetryAt)
     this.#untrackSyncing(binding, batch.map(({ id }) => id))
-    this.#notify(binding, affectedConversationIds(batch))
+    this.#notify(binding, affectedConversationIds(batch, binding.store))
     this.#scheduleRetry(binding, attempt, delay)
   }
 

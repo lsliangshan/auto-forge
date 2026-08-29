@@ -57,6 +57,21 @@ function appendMessageMutation(
   }
 }
 
+function conversionTerminalMutation(
+  id: string,
+  messageId: string,
+  baseRevision: number,
+): Extract<SyncMutation, { kind: 'message.conversion_block_terminal' }> {
+  return {
+    id,
+    kind: 'message.conversion_block_terminal',
+    entityId: messageId,
+    baseRevision,
+    occurredAt: '2026-08-24T00:02:00.000Z',
+    payload: { messageId, blockId: 'conversion_block', executionId: 'conversion_execution', state: 'terminal' },
+  }
+}
+
 function renameConversationMutation(
   id: string,
   conversationId: string,
@@ -963,7 +978,7 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
-  it('acknowledges duplicate push results but retains applied evidence for pull', () => {
+  it('acknowledges applied and duplicate push results into durable receipt evidence', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open('cloud-alice')
     const first = createConversationMutation('push_ack_first', 'push_ack_conversation_first')
@@ -977,10 +992,10 @@ describe('UserDataStoreManager', () => {
       { id: second.id, status: 'duplicate', revision: 1 },
     ])
 
-    expect(store.outbox.find(first.id)).toMatchObject({ state: 'syncing' })
+    expect(store.outbox.find(first.id)).toBeUndefined()
     expect(store.outbox.find(second.id)).toBeUndefined()
     expect(store.conversations.listPage({ limit: 50 }).items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: first.entityId, revision: 1, syncState: 'syncing' }),
+      expect.objectContaining({ id: first.entityId, revision: 1, syncState: 'synced' }),
       expect.objectContaining({ id: second.entityId, revision: 1, syncState: 'synced' }),
     ]))
     manager.close()
@@ -1519,6 +1534,70 @@ describe('UserDataStoreManager', () => {
       .toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
     expect(() => store.mediaGenerationJobs.get('bob_media_job'))
       .toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    manager.close()
+  })
+
+  it('applies and acknowledges the strict conversion terminal mutation without exposing local job data', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('terminal_create', 'terminal_conversation')
+    const append = appendMessageMutation('terminal_append', create.entityId, 'terminal_message')
+    append.payload = {
+      ...append.payload,
+      role: 'assistant',
+      executionId: 'conversion_execution',
+      blocks: [{
+        type: 'conversion', blockId: 'conversion_block', executionId: 'conversion_execution', state: 'active',
+      }],
+    }
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_create_cursor', mutations: [pulledMutation(create, 1)],
+    }, 1)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_append_cursor', mutations: [pulledMutation(append, 2)],
+    }, 2)
+    store.messages.replaceBlock(append.entityId, 'conversion_block', {
+      type: 'conversion', blockId: 'conversion_block', executionId: 'conversion_execution', state: 'terminal',
+    })
+    const terminal = store.outbox.listReady(Number.MAX_SAFE_INTEGER, 10).find((mutation) => (
+      mutation.kind === 'message.conversion_block_terminal'
+    ))
+    expect(terminal).toMatchObject({
+      entityId: append.entityId,
+      payload: { messageId: append.entityId, blockId: 'conversion_block', executionId: 'conversion_execution', state: 'terminal' },
+    })
+    if (!terminal || terminal.kind !== 'message.conversion_block_terminal') throw new Error('missing terminal mutation')
+    const terminalMutation: Extract<SyncMutation, { kind: 'message.conversion_block_terminal' }> = {
+      id: terminal.id, kind: terminal.kind, entityId: terminal.entityId,
+      baseRevision: terminal.baseRevision, payload: terminal.payload, occurredAt: terminal.occurredAt,
+    }
+    store.outbox.markSyncing([terminal.id])
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_receipt_cursor', mutations: [pulledMutation(terminalMutation, 3)],
+    }, 3)
+
+    expect(store.outbox.find(terminal.id)).toBeUndefined()
+    expect(store.messages.get(append.entityId)?.blocks).toEqual([{
+      type: 'conversion', blockId: 'conversion_block', executionId: 'conversion_execution', state: 'terminal',
+    }])
+    expect(store.conversations.getSummary(create.entityId)).toMatchObject({ revision: 3, syncState: 'synced' })
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_replay_cursor', mutations: [pulledMutation(terminalMutation, 3)],
+    }, 3)
+    expect(store.conversations.getSummary(create.entityId)?.revision).toBe(3)
+
+    const mismatched = {
+      ...terminalMutation,
+      id: 'terminal_wrong_execution',
+      baseRevision: 3,
+      payload: { ...terminalMutation.payload, executionId: 'wrong_execution' },
+    }
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_mismatch_cursor', mutations: [pulledMutation(mismatched, 4)],
+    }, 4)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('terminal_replay_cursor')
     manager.close()
   })
 

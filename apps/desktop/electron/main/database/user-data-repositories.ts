@@ -660,10 +660,12 @@ function recomputeConversationSyncState(
              AS hasTerminalFailure,
            MAX(CASE WHEN state = 'syncing' THEN 1 ELSE 0 END) AS hasSyncing
     FROM outbox_mutations
-    WHERE (
+      WHERE (
         (entity_id = @conversationId AND kind LIKE 'conversation.%')
         OR (kind = 'message.append'
           AND json_extract(payload_json, '$.conversationId') = @conversationId)
+        OR (kind = 'message.conversion_block_terminal'
+          AND entity_id IN (SELECT id FROM messages WHERE conversation_id = @conversationId))
       )
   `).get({ conversationId }) as {
     total: number
@@ -999,17 +1001,26 @@ function applyRemoteMutation(
     case 'message.conversion_block_terminal': {
       const existing = storedMessage(database, mutation.payload.messageId)
       if (!existing || existing.id !== mutation.entityId) throw new UserDataConsistencyError()
+      const matching = existing.blocks.filter((block) => block.type === 'conversion'
+        && block.blockId === mutation.payload.blockId
+        && block.executionId === mutation.payload.executionId)
+      if (matching.length !== 1) throw new UserDataConsistencyError()
+      const matched = matching[0]
+      if (!matched || matched.type !== 'conversion') throw new UserDataConsistencyError()
+      const conversation = remoteConversation(database, ownerUserId, existing.conversationId)
+      if (!conversation) throw new UserDataConsistencyError()
+      if (matched.state === 'terminal' && conversation.revision >= revision) break
+      if (conversation.revision !== mutation.baseRevision) throw new UserDataConsistencyError()
       const blocks = existing.blocks.map((block) => {
         if (block.type !== 'conversion' || block.blockId !== mutation.payload.blockId
           || block.executionId !== mutation.payload.executionId) return block
         return block.state === 'terminal' ? block : { ...block, state: 'terminal' as const }
       })
-      if (JSON.stringify(blocks) === JSON.stringify(existing.blocks)) break
-      const conversation = remoteConversation(database, ownerUserId, existing.conversationId)
-      if (!conversation || conversation.revision !== mutation.baseRevision) throw new UserDataConsistencyError()
-      database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({
-        id: existing.id, blocksJson: JSON.stringify(blocks),
-      })
+      if (JSON.stringify(blocks) !== JSON.stringify(existing.blocks)) {
+        database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({
+          id: existing.id, blocksJson: JSON.stringify(blocks),
+        })
+      }
       database.prepare('UPDATE conversations SET revision = @revision, sync_state = \'synced\' WHERE id = @id').run({
         id: existing.conversationId, revision,
       })
@@ -1131,6 +1142,8 @@ function conversationSyncWarning(database: SqliteDatabase, conversationId: strin
       AND (
         (kind LIKE 'conversation.%' AND entity_id = @conversationId)
         OR (kind = 'message.append' AND json_extract(payload_json, '$.conversationId') = @conversationId)
+        OR (kind = 'message.conversion_block_terminal'
+          AND entity_id IN (SELECT id FROM messages WHERE conversation_id = @conversationId))
       )
   `).get({ conversationId }) as { oldest: number | null }
   return result.oldest !== null && Date.now() - result.oldest >= SYNC_WARNING_AGE_MS
@@ -1220,7 +1233,10 @@ function findOutboxMutation(database: SqliteDatabase, id: string): OutboxMutatio
   return row === undefined ? undefined : outboxFromRow(row)
 }
 
-function affectedConversationId(mutation: SyncMutation | RemoteMutation): string | undefined {
+function affectedConversationId(
+  mutation: SyncMutation | RemoteMutation,
+  database?: SqliteDatabase,
+): string | undefined {
   switch (mutation.kind) {
     case 'conversation.create':
     case 'conversation.rename':
@@ -1231,7 +1247,7 @@ function affectedConversationId(mutation: SyncMutation | RemoteMutation): string
     case 'message.append':
       return 'compacted' in mutation ? mutation.conversationId : mutation.payload.conversationId
     case 'message.conversion_block_terminal':
-      return undefined
+      return database === undefined ? undefined : storedMessage(database, mutation.entityId)?.conversationId
     default:
       return undefined
   }
@@ -1242,7 +1258,7 @@ function recomputeAffectedConversations(
   ownerUserId: string,
   mutations: readonly SyncMutation[],
 ): void {
-  const conversationIds = new Set(mutations.map(affectedConversationId).filter(
+  const conversationIds = new Set(mutations.map((mutation) => affectedConversationId(mutation, database)).filter(
     (conversationId): conversationId is string => conversationId !== undefined,
   ))
   for (const conversationId of conversationIds) {
@@ -1317,9 +1333,7 @@ function acknowledgePushResults(
       } as OrdinaryRemoteMutation
       const local = validateOutboxReceipt(database, receipt, false)
       if (local?.state !== 'syncing') throw new UserDataConsistencyError()
-      if (result.status === 'applied') {
-        requireValidRemoteResult(receipt)
-      } else if (result.status === 'duplicate') {
+      if (result.status === 'applied' || result.status === 'duplicate') {
         requireValidRemoteResult(receipt)
         preserveReceiptEvidence(database, local)
         acknowledgeLocalMutation(database, ownerUserId, local, receipt)
@@ -1571,9 +1585,10 @@ export function createUserDataRepositories(
       if (parsed.type !== 'conversion' || parsed.state !== 'terminal') {
         return repositories.messages.replaceBlock(messageId, blockId, parsed)
       }
-      const current = existing.blocks.find((block) => (
+      const currentRaw = existing.blocks.find((block) => (
         typeof block === 'object' && block !== null && 'blockId' in block && block.blockId === blockId
       ))
+      const current = chatBlockSchema.safeParse(currentRaw).data
       if (current?.type !== 'conversion' || current.executionId !== parsed.executionId) {
         throw new UserDataConsistencyError()
       }

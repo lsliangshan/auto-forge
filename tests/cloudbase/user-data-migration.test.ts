@@ -13,6 +13,10 @@ const rollbackUrl = new URL(
   '../../cloudbase/user-data/migrations/0001_user_data_foundation.rollback.sql',
   import.meta.url,
 )
+const conversionAdditiveUrl = new URL(
+  '../../cloudbase/migrations/20260829000000_conversion_block_terminal.sql',
+  import.meta.url,
+)
 
 const tableNames = [
   'app_conversations',
@@ -132,6 +136,28 @@ describe('CloudBase user data migration', () => {
     const syncPush = extractFunction(canonical, 'autoforge_sync_push')
 
     expect(syncPush).toContain('#variable_conflict use_variable')
+  })
+
+  it('ships an executable deployed-database replacement for the strict conversion terminal transition', async () => {
+    const [canonical, additive] = await Promise.all([
+      readFile(canonicalUrl, 'utf8'),
+      readFile(conversionAdditiveUrl, 'utf8'),
+    ])
+    const canonicalPush = extractFunction(canonical, 'autoforge_sync_push')
+    const additivePush = extractFunction(additive, 'autoforge_sync_push')
+
+    expect(additive).toContain('CREATE OR REPLACE FUNCTION autoforge_sync_push(')
+    expect(additivePush).toBe(canonicalPush)
+    const terminalBranch = additivePush.slice(
+      additivePush.indexOf("ELSIF mutation_kind = 'message.conversion_block_terminal'"),
+      additivePush.indexOf("ELSIF mutation_kind = 'message.append'"),
+    )
+    expect(terminalBranch).toContain("jsonb_object_length(payload) <> 4")
+    expect(terminalBranch).toContain("existing_message.execution_id IS DISTINCT FROM payload->>'executionId'")
+    expect(terminalBranch).toContain("existing_block->>'state' = 'terminal'")
+    expect(terminalBranch).toContain("mutation_status := 'duplicate'")
+    expect(terminalBranch).toContain('conversation_row.revision <> base_revision_value')
+    expect(terminalBranch).toContain('UPDATE app_conversations SET revision = result_revision_value')
   })
 
   it('rejects a duplicate message id unless every immutable field matches', async () => {

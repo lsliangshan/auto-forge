@@ -243,6 +243,54 @@ describe('UserDataSyncEngine', () => {
     }
   })
 
+  it('pushes the terminal conversion transition as a normal receipt and notifies its owning conversation', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const create = createMutation(41)
+    const append = conversionMessageMutation('terminal_sync', create.entityId, 1)
+    append.payload = {
+      ...append.payload,
+      blocks: [{ type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'active' }],
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_sync_create', mutations: [remoteReceipt(create, 1)],
+    }, 1)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_sync_append', mutations: [remoteReceipt(append, 2)],
+    }, 2)
+    store.messages.replaceBlock(append.entityId, 'conversion_block_1', {
+      type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal',
+    })
+    const changes: string[][] = []
+    const pushed: SyncMutation[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        pushed.push(...input.mutations)
+        return success({
+          results: input.mutations.map((mutation) => ({
+            id: mutation.id, status: 'applied' as const, revision: mutation.baseRevision + 1,
+          })),
+          cursor: 'terminal_sync_push',
+        })
+      }
+      return success({ mutations: [], cursor: 'terminal_sync_pull' })
+    }, new FakeClock(), (ids) => changes.push([...ids]))
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(pushed).toHaveLength(1)
+    expect(pushed[0]).toMatchObject({
+      kind: 'message.conversion_block_terminal', entityId: append.entityId,
+      payload: { messageId: append.entityId, blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal' },
+    })
+    expect(JSON.stringify(pushed[0]?.payload)).not.toMatch(/jobId|artifactId|path|bytes|sha256/i)
+    expect(engine.status()).toEqual({ state: 'idle' })
+    expect(store.outbox.find(pushed[0]!.id)).toBeUndefined()
+    expect(store.conversations.getSummary(create.entityId)).toMatchObject({ revision: 3, syncState: 'synced' })
+    expect(changes.flat()).toContain(create.entityId)
+  })
+
   it('reports a 24-hour warning from durable outbox age and clears after recovery', async () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
     const manager = createManager()
