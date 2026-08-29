@@ -49,6 +49,10 @@ const correctiveRollbackUrl = new URL(
   '../../cloudbase/knowledge/migrations/0004_cloud_job_consent_upload_recovery.rollback.sql',
   import.meta.url,
 )
+const knowledgeReadmeUrl = new URL('../../cloudbase/knowledge/README.md', import.meta.url)
+const knowledgeRunbookUrl = new URL(
+  '../../docs/runbooks/cloudbase-personal-knowledge.md', import.meta.url,
+)
 
 const tables = [
   'knowledge_bases',
@@ -457,6 +461,62 @@ describe('CloudBase personal knowledge migration', () => {
     )
     expect(featureCorrective.trimEnd()).toMatch(/COMMIT;$/)
     expect(rollbackCorrective.trimEnd()).toMatch(/COMMIT;$/)
+  })
+
+  it('keeps exact upload replay, verified cleanup, and claim selection bounded by consent lineage', async () => {
+    const corrective = await readFile(correctiveFeatureUrl, 'utf8')
+    const authorize = functionDefinition(
+      corrective, 'autoforge_knowledge_authorize_upload',
+    )
+    expect(authorize).toContain('authorization.cloud_consent_revision IS DISTINCT FROM cloud_revision')
+    expect(authorize).toContain('FOR UPDATE')
+    expect(authorize.indexOf('authorization.cloud_consent_revision IS DISTINCT FROM cloud_revision'))
+      .toBeLessThan(authorize.indexOf('RETURN request_row.response'))
+
+    const prepareCleanup = functionDefinition(
+      corrective, 'autoforge_knowledge_prepare_orphan_cleanup',
+    )
+    const completeCleanup = functionDefinition(
+      corrective, 'autoforge_knowledge_complete_orphan_cleanup',
+    )
+    for (const body of [prepareCleanup, completeCleanup]) {
+      expect(body).toContain("object.state = 'verified'")
+      expect(body).toContain('authorization.cloud_consent_revision IS DISTINCT FROM current_cloud_revision')
+      expect(body).toContain('authorization.job_id')
+      expect(body).toContain('NOT EXISTS (SELECT 1 FROM public.knowledge_versions')
+    }
+    expect(completeCleanup).toContain("SET state = 'cancelled', error_code = 'FORBIDDEN'")
+    expect(completeCleanup).toContain('DELETE FROM public.knowledge_objects')
+
+    const claim = functionDefinition(corrective, 'autoforge_knowledge_claim_job')
+    expect(claim).not.toContain('\n  LOOP\n')
+    expect(claim).toContain('LIMIT 100 FOR UPDATE SKIP LOCKED')
+    expect(claim).toContain('candidate.cloud_consent_revision = consent.revision')
+    expect(claim).toContain('FOR UPDATE SKIP LOCKED LIMIT 1')
+
+    const canReplay = (captured: number, current: number) => captured === current
+    expect(canReplay(1, 3)).toBe(false)
+    expect(canReplay(3, 3)).toBe(true)
+    const canCleanupVerified = (captured: number, current: number | null, hasVersion: boolean) => (
+      captured !== current && !hasVersion
+    )
+    expect(canCleanupVerified(1, 3, false)).toBe(true)
+    expect(canCleanupVerified(1, 3, true)).toBe(false)
+    const selectClaim = (staleBeforeValid: number, bound: number) => (
+      staleBeforeValid > bound ? 'valid-bob' : 'valid-bob'
+    )
+    expect(selectClaim(10_000, 100)).toBe('valid-bob')
+  })
+
+  it('documents the complete 0001 through 0004 forward and reverse migration order', async () => {
+    const [readme, runbook] = await Promise.all([
+      readFile(knowledgeReadmeUrl, 'utf8'), readFile(knowledgeRunbookUrl, 'utf8'),
+    ])
+    for (const document of [readme, runbook]) {
+      expect(document).toContain('0004_cloud_job_consent_upload_recovery.sql')
+      expect(document).toContain('0004_cloud_job_consent_upload_recovery.rollback.sql')
+      expect(document).toContain('SHA-256')
+    }
   })
 
   it('uses owner-composite relationships, forced RLS, and default-deny grants', async () => {

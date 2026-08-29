@@ -16,7 +16,9 @@ content, local paths, object URLs, upload headers, or service-role diagnostics.
 Before any authorized staging work, record:
 
 - application commit and reviewer;
-- SHA-256 checksums for both byte-identical forward migrations, the rollback,
+- SHA-256 checksums for every byte-identical canonical/deployment forward migration,
+  including `0001_personal_knowledge.sql` through `0004_cloud_job_consent_upload_recovery.sql`,
+  and each matching data-preserving rollback,
   and the function directory;
 - PostgreSQL, CloudBase Function, and PG Storage runtime versions;
 - environment, operator, rollback owner, and observation window.
@@ -25,8 +27,9 @@ Stop if the two forward migrations are not byte-identical.
 
 ## Staging gates
 
-1. Apply `0001_personal_knowledge.sql` and then the additive
-   `0002_personal_knowledge_workers.sql` in an isolated staging database. Prove every knowledge
+1. Apply `0001_personal_knowledge.sql`, additive `0002_personal_knowledge_workers.sql`,
+   `0003_owner_knowledge_catalog.sql`, and `0004_cloud_job_consent_upload_recovery.sql` in that
+   exact order in an isolated staging database. Prove every knowledge
    table has forced RLS, direct client roles have no table or RPC grants, all
    owner/base/document/object joins use their composite owner keys, and the
    entitlement row defaults to `kill_switch_enabled = true`.
@@ -63,6 +66,11 @@ Stop if the two forward migrations are not byte-identical.
    the exact owner, base, object, byte size, SHA-256, and MIME type. Verify only
    private HTTPS PUT authorizations are returned and no permanent URL or
    service credential reaches Electron.
+   Verify revoke/kill-switch pauses every old-revision job and permit, a later
+   reacceptance cannot replay an old authorization, verified-but-unpublished
+   old-revision objects are deleted through the orphan-cleanup receipt before a
+   new upload starts, and stale-job maintenance is bounded while an eligible
+   owner remains claimable.
 5. Verify immutable staging generations: a failed parser/index job leaves the
    prior published generation active; publication requires both the expected
    prior generation and a ready candidate.
@@ -134,6 +142,8 @@ publication regression, or metadata-before-Storage purge is an immediate stop.
    and retention cleanup.
 2. Preserve desktop outboxes and conversion journals.
 3. Stop the scheduled worker, withdraw both functions, then apply
+   `cloudbase/knowledge/migrations/0004_cloud_job_consent_upload_recovery.rollback.sql`,
+   `cloudbase/knowledge/migrations/0003_owner_knowledge_catalog.rollback.sql`,
    `cloudbase/knowledge/migrations/0002_personal_knowledge_workers.rollback.sql`
    followed by `cloudbase/knowledge/migrations/0001_personal_knowledge.rollback.sql`
    through the approved database process.

@@ -68,6 +68,7 @@ AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   request_row public.knowledge_requests%ROWTYPE;
+  authorization public.knowledge_upload_authorizations%ROWTYPE;
   fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
     'action', 'authorize_upload', 'knowledgeBaseId', p_knowledge_base_id,
     'documentId', p_document_id, 'versionId', p_version_id,
@@ -92,10 +93,17 @@ BEGIN
   END IF;
   PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
   SELECT * INTO request_row FROM public.knowledge_requests
-    WHERE owner_id = owner AND request_id = p_request_id;
+    WHERE owner_id = owner AND request_id = p_request_id FOR UPDATE;
   IF FOUND THEN
     IF request_row.action <> 'authorize_upload' OR request_row.input_hash <> fingerprint THEN
       RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    SELECT * INTO authorization FROM public.knowledge_upload_authorizations
+      WHERE owner_id = owner AND request_id = p_request_id
+        AND knowledge_base_id = p_knowledge_base_id FOR UPDATE;
+    IF NOT FOUND
+      OR authorization.cloud_consent_revision IS DISTINCT FROM cloud_revision THEN
+      RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
     END IF;
     RETURN request_row.response;
   END IF;
@@ -267,44 +275,75 @@ BEGIN
     mutation_permit = NULL, mutation_deadline_at = NULL,
     updated_at = clock_timestamp()
     WHERE state = 'running' AND attempt >= 3 AND lease_expires_at <= clock_timestamp();
-  LOOP
-    SELECT * INTO job FROM public.knowledge_jobs
-      WHERE attempt < 3 AND (
-        state = 'queued' OR (state = 'running' AND lease_expires_at <= clock_timestamp())
-      ) ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1;
-    IF NOT FOUND THEN RETURN jsonb_build_object('job', NULL); END IF;
-    IF job.kind <> 'purge' THEN
-      BEGIN
-        PERFORM public.autoforge_knowledge_require_job_cloud_revision(
-          job.owner_id, job.kind, job.cloud_consent_revision
-        );
-      EXCEPTION WHEN SQLSTATE 'P0001' THEN
-        UPDATE public.knowledge_jobs SET state = 'paused', error_code = 'FORBIDDEN',
-          worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
-          mutation_permit = NULL, mutation_deadline_at = NULL,
-          updated_at = clock_timestamp()
-          WHERE owner_id = job.owner_id AND id = job.id;
-        CONTINUE;
-      END;
-    END IF;
-    UPDATE public.knowledge_jobs SET state = 'running', attempt = attempt + 1,
-      worker_id = p_worker_id, lease_token = p_lease_token,
-      lease_expires_at = clock_timestamp() + make_interval(secs => p_lease_seconds),
-      mutation_permit = replace(gen_random_uuid()::text, '-', '')
-        || replace(gen_random_uuid()::text, '-', ''),
-      mutation_deadline_at = clock_timestamp() + interval '120 seconds',
-      updated_at = clock_timestamp()
-      WHERE id = job.id AND owner_id = job.owner_id
-      RETURNING * INTO job;
-    RETURN jsonb_build_object('job', jsonb_build_object(
-      'id', job.id, 'kind', job.kind, 'entityId', job.entity_id,
-      'leaseToken', job.lease_token, 'attempt', job.attempt,
-      'mutationPermit', job.mutation_permit,
-      'mutationBudgetMs', greatest(1, least(120000, floor(extract(
-        epoch FROM (job.mutation_deadline_at - clock_timestamp())
-      ) * 1000)::integer))
-    ));
-  END LOOP;
+  WITH stale AS (
+    SELECT candidate.owner_id, candidate.id
+    FROM public.knowledge_jobs candidate
+    WHERE candidate.kind <> 'purge' AND candidate.attempt < 3
+      AND (candidate.state = 'queued'
+        OR (candidate.state = 'running' AND candidate.lease_expires_at <= clock_timestamp()))
+      AND NOT EXISTS (
+        SELECT 1 FROM public.knowledge_entitlements entitlement
+        JOIN public.app_privacy_consent_states consent
+          ON consent.owner_user_id = candidate.owner_id
+          AND consent.purpose = 'cloud_sync' AND consent.state = 'accepted'
+          AND consent.document_version = 'cloud-sync-2026-08'
+        WHERE entitlement.owner_id = candidate.owner_id
+          AND entitlement.tier = 'member' AND entitlement.cloud_enabled
+          AND entitlement.status IN ('active', 'offline_grace')
+          AND NOT entitlement.kill_switch_enabled
+          AND candidate.cloud_consent_revision = consent.revision
+      )
+    ORDER BY candidate.created_at, candidate.owner_id, candidate.id
+    LIMIT 100 FOR UPDATE SKIP LOCKED
+  )
+  UPDATE public.knowledge_jobs candidate SET state = 'paused', error_code = 'FORBIDDEN',
+    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+    mutation_permit = NULL, mutation_deadline_at = NULL, updated_at = clock_timestamp()
+  FROM stale WHERE candidate.owner_id = stale.owner_id AND candidate.id = stale.id;
+
+  SELECT * INTO job FROM public.knowledge_jobs candidate
+    WHERE candidate.attempt < 3 AND (
+      candidate.state = 'queued'
+      OR (candidate.state = 'running' AND candidate.lease_expires_at <= clock_timestamp())
+    ) AND (
+      candidate.kind = 'purge' OR EXISTS (
+        SELECT 1 FROM public.knowledge_entitlements entitlement
+        JOIN public.app_privacy_consent_states consent
+          ON consent.owner_user_id = candidate.owner_id
+          AND consent.purpose = 'cloud_sync' AND consent.state = 'accepted'
+          AND consent.document_version = 'cloud-sync-2026-08'
+        WHERE entitlement.owner_id = candidate.owner_id
+          AND entitlement.tier = 'member' AND entitlement.cloud_enabled
+          AND entitlement.status IN ('active', 'offline_grace')
+          AND NOT entitlement.kill_switch_enabled
+          AND candidate.cloud_consent_revision = consent.revision
+      )
+    )
+    ORDER BY candidate.created_at, candidate.owner_id, candidate.id
+    FOR UPDATE SKIP LOCKED LIMIT 1;
+  IF NOT FOUND THEN RETURN jsonb_build_object('job', NULL); END IF;
+  IF job.kind <> 'purge' THEN
+    PERFORM public.autoforge_knowledge_require_job_cloud_revision(
+      job.owner_id, job.kind, job.cloud_consent_revision
+    );
+  END IF;
+  UPDATE public.knowledge_jobs SET state = 'running', attempt = attempt + 1,
+    worker_id = p_worker_id, lease_token = p_lease_token,
+    lease_expires_at = clock_timestamp() + make_interval(secs => p_lease_seconds),
+    mutation_permit = replace(gen_random_uuid()::text, '-', '')
+      || replace(gen_random_uuid()::text, '-', ''),
+    mutation_deadline_at = clock_timestamp() + interval '120 seconds',
+    updated_at = clock_timestamp()
+    WHERE id = job.id AND owner_id = job.owner_id
+    RETURNING * INTO job;
+  RETURN jsonb_build_object('job', jsonb_build_object(
+    'id', job.id, 'kind', job.kind, 'entityId', job.entity_id,
+    'leaseToken', job.lease_token, 'attempt', job.attempt,
+    'mutationPermit', job.mutation_permit,
+    'mutationBudgetMs', greatest(1, least(120000, floor(extract(
+      epoch FROM (job.mutation_deadline_at - clock_timestamp())
+    ) * 1000)::integer))
+  ));
 END;
 $$;
 
@@ -700,6 +739,189 @@ BEGIN
   EXECUTE guarded;
 END
 $migration$;
+
+-- A revoked or superseded upload can have reached `verified` before the desktop
+-- receives its response. It has no published version, so retain its lineage
+-- until the normal private-Storage cleanup receipt atomically cancels its job
+-- and removes the metadata.
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_prepare_orphan_cleanup(
+  p_caller_user_id varchar, p_request_id varchar, p_knowledge_base_id varchar,
+  p_storage_references jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  canonical_references jsonb;
+  fingerprint char(32);
+  request_row public.knowledge_requests%ROWTYPE;
+  references_to_delete jsonb;
+  current_cloud_revision bigint;
+  response jsonb;
+BEGIN
+  IF jsonb_typeof(p_storage_references) IS DISTINCT FROM 'array'
+    OR jsonb_array_length(p_storage_references) NOT BETWEEN 1 AND 100
+    OR EXISTS (SELECT 1 FROM jsonb_array_elements(p_storage_references) supplied(item)
+      WHERE jsonb_typeof(item) IS DISTINCT FROM 'string') THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT jsonb_agg(reference ORDER BY reference) INTO canonical_references
+    FROM (SELECT DISTINCT jsonb_array_elements_text(p_storage_references) reference) refs;
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements_text(canonical_references) supplied(reference)
+    WHERE length(reference) NOT BETWEEN 1 AND 512
+      OR reference !~ '^knowledge/' OR position('..' in reference) > 0) THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT revision INTO current_cloud_revision
+  FROM public.app_privacy_consent_states
+  WHERE owner_user_id = owner AND purpose = 'cloud_sync'
+    AND state = 'accepted' AND document_version = 'cloud-sync-2026-08'
+  FOR SHARE;
+  fingerprint := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'orphan_cleanup', 'knowledgeBaseId', p_knowledge_base_id,
+    'storageReferences', canonical_references
+  ));
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id FOR UPDATE;
+  IF FOUND THEN
+    IF request_row.action <> 'orphan_cleanup' OR request_row.input_hash <> fingerprint THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN request_row.response;
+  END IF;
+  SELECT COALESCE(jsonb_agg(object.storage_reference ORDER BY object.storage_reference), '[]'::jsonb)
+    INTO references_to_delete
+  FROM public.knowledge_objects object
+  LEFT JOIN public.knowledge_upload_authorizations authorization
+    ON authorization.owner_id = object.owner_id AND authorization.object_id = object.id
+  LEFT JOIN public.knowledge_jobs job
+    ON job.owner_id = authorization.owner_id AND job.id = authorization.job_id
+  WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
+    AND object.storage_reference IN (SELECT jsonb_array_elements_text(canonical_references))
+    AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
+      WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
+        AND version.source_object_id = object.id)
+    AND (
+      object.state IN ('authorized', 'orphaned') OR (
+        object.state = 'verified' AND authorization.job_id IS NOT NULL
+        AND job.id IS NOT NULL
+        AND authorization.cloud_consent_revision IS DISTINCT FROM current_cloud_revision
+      )
+    );
+  IF references_to_delete IS DISTINCT FROM canonical_references THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  response := jsonb_build_object('storageReferences', references_to_delete);
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (owner, p_request_id, p_knowledge_base_id, 'orphan_cleanup', fingerprint, response);
+  RETURN response;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_orphan_cleanup(
+  p_caller_user_id varchar, p_request_id varchar, p_knowledge_base_id varchar,
+  p_storage_references jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  canonical_references jsonb;
+  fingerprint char(32);
+  request_row public.knowledge_requests%ROWTYPE;
+  current_cloud_revision bigint;
+  deletable_references jsonb;
+  removed integer;
+  completed_response jsonb;
+BEGIN
+  IF jsonb_typeof(p_storage_references) IS DISTINCT FROM 'array'
+    OR jsonb_array_length(p_storage_references) > 100
+    OR EXISTS (SELECT 1 FROM jsonb_array_elements(p_storage_references) supplied(item)
+      WHERE jsonb_typeof(item) IS DISTINCT FROM 'string') THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT jsonb_agg(reference ORDER BY reference) INTO canonical_references
+    FROM (SELECT DISTINCT jsonb_array_elements_text(p_storage_references) reference) refs;
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id FOR UPDATE;
+  IF NOT FOUND OR request_row.action <> 'orphan_cleanup' THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  fingerprint := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'orphan_cleanup', 'knowledgeBaseId', p_knowledge_base_id,
+    'storageReferences', canonical_references
+  ));
+  IF request_row.input_hash <> fingerprint THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  IF request_row.response ? 'removed' THEN
+    RETURN jsonb_build_object('removed', (request_row.response->>'removed')::integer);
+  END IF;
+  IF request_row.response->'storageReferences' IS DISTINCT FROM canonical_references THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  SELECT revision INTO current_cloud_revision
+  FROM public.app_privacy_consent_states
+  WHERE owner_user_id = owner AND purpose = 'cloud_sync'
+    AND state = 'accepted' AND document_version = 'cloud-sync-2026-08'
+  FOR SHARE;
+  SELECT COALESCE(jsonb_agg(object.storage_reference ORDER BY object.storage_reference), '[]'::jsonb)
+    INTO deletable_references
+  FROM public.knowledge_objects object
+  LEFT JOIN public.knowledge_upload_authorizations authorization
+    ON authorization.owner_id = object.owner_id AND authorization.object_id = object.id
+  LEFT JOIN public.knowledge_jobs job
+    ON job.owner_id = authorization.owner_id AND job.id = authorization.job_id
+  WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
+    AND object.storage_reference IN (SELECT jsonb_array_elements_text(canonical_references))
+    AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
+      WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
+        AND version.source_object_id = object.id)
+    AND (
+      object.state IN ('authorized', 'orphaned') OR (
+        object.state = 'verified' AND authorization.job_id IS NOT NULL
+        AND job.id IS NOT NULL
+        AND authorization.cloud_consent_revision IS DISTINCT FROM current_cloud_revision
+      )
+    );
+  IF deletable_references IS DISTINCT FROM canonical_references THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  UPDATE public.knowledge_jobs job SET state = 'cancelled', error_code = 'FORBIDDEN',
+    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+    mutation_permit = NULL, mutation_deadline_at = NULL, updated_at = clock_timestamp()
+  FROM public.knowledge_upload_authorizations authorization
+  WHERE authorization.owner_id = owner AND authorization.job_id = job.id
+    AND authorization.object_id IN (
+      SELECT object.id FROM public.knowledge_objects object
+      WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
+        AND object.storage_reference IN (SELECT jsonb_array_elements_text(canonical_references))
+        AND object.state = 'verified'
+        AND authorization.cloud_consent_revision IS DISTINCT FROM current_cloud_revision
+    );
+  DELETE FROM public.knowledge_objects object
+  WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
+    AND object.storage_reference IN (SELECT jsonb_array_elements_text(canonical_references))
+    AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
+      WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
+        AND version.source_object_id = object.id);
+  GET DIAGNOSTICS removed = ROW_COUNT;
+  completed_response := jsonb_build_object(
+    'storageReferences', canonical_references, 'removed', removed
+  );
+  UPDATE public.knowledge_requests SET response = completed_response
+    WHERE owner_id = owner AND request_id = p_request_id;
+  RETURN jsonb_build_object('removed', removed);
+END;
+$$;
 
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_current_cloud_consent_revision(bigint)
   FROM PUBLIC, anon, authenticated;
