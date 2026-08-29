@@ -744,6 +744,34 @@ describe('ExecutionService', () => {
     expect(harness.repositories.records.get(reservation.executionId)?.status).toBe('cancelled')
   })
 
+  it('prepares Main-only attachment bindings after persistence and before worker spawn', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    const harness = createHarness()
+    const reservation = harness.service.reserve()
+    const prepareAttachmentBindings = vi.fn(async (executionId: string) => {
+      expect(harness.repositories.records.get(executionId)?.status).toBe('queued')
+      await gate
+    })
+    const starting = harness.service.startReserved(reservation, {
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: harness.sourceSelector,
+      attachmentBindings: [attachmentBinding()],
+      prepareAttachmentBindings,
+    })
+    await turn()
+
+    expect(prepareAttachmentBindings).toHaveBeenCalledWith(
+      reservation.executionId,
+      [expect.objectContaining({ attachmentIndex: 0 })],
+    )
+    expect(harness.workerFactory.workers.size).toBe(0)
+    release()
+    const started = await starting
+    expect(harness.workerFactory.workers.has(started.id)).toBe(true)
+    await harness.service.cancel(started.id)
+  })
+
   it('kills a timed-out worker and stores a terminal failure', async () => {
     const harness = createHarness({ timeoutMs: 20 })
     const execution = await harness.start()

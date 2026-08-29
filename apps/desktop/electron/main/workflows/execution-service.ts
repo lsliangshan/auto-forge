@@ -166,6 +166,11 @@ export interface ExecutionStartInput {
   agentAuthorization?: AgentExecutionAuthorization
   /** Ordered Main-only bindings. They are never serialized into the Worker start message. */
   attachmentBindings?: readonly ExecutionAttachmentBinding[]
+  /** Main-only materialization after the execution row exists and before the Worker is spawned. */
+  prepareAttachmentBindings?: (
+    executionId: string,
+    bindings: readonly ExecutionAttachmentBinding[],
+  ) => Promise<void>
   /** One-run Main authorization for exact attachment fingerprints and target formats. */
   fileConvertAuthorization?: FileConvertAuthorization
 }
@@ -705,6 +710,8 @@ export class ExecutionService {
     let worker: WorkflowWorker | undefined
     let workflow: WorkflowDetail
     try {
+      checkCancelled()
+      await input.prepareAttachmentBindings?.(id, input.attachmentBindings ?? [])
       checkCancelled()
       const source = await this.dependencies.sourceResolver.resolve(
         input.workflowId,

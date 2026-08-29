@@ -93,7 +93,8 @@ function services(): DesktopIpcServices {
     developer: {
       listProjects: vi.fn(), createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
       createEntry: vi.fn(), renameEntry: vi.fn(), deleteEntry: vi.fn(),
-      build: vi.fn(), validate: vi.fn(), run: vi.fn(),
+      build: vi.fn(), validate: vi.fn(), run: vi.fn(), pickFiles: vi.fn().mockResolvedValue([]),
+      removeAttachment: vi.fn().mockResolvedValue(undefined), clearAttachments: vi.fn().mockResolvedValue(undefined),
     },
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn() },
     conversion: {
@@ -188,6 +189,30 @@ function harness(
 }
 
 describe('registerDesktopIpc', () => {
+  it('authenticates strict developer draft commands without accepting a path', async () => {
+    const app = harness()
+
+    expect(app.handlers.has(ipcChannels.developerPickFiles)).toBe(true)
+    expect(app.handlers.has(ipcChannels.developerRemoveAttachment)).toBe(true)
+    expect(app.handlers.has(ipcChannels.developerClearAttachments)).toBe(true)
+    await expect(app.invoke(ipcChannels.developerPickFiles, {
+      projectId: 'project_1', existingAttachmentIds: [],
+    })).resolves.toEqual([])
+    await expect(app.invoke(ipcChannels.developerRemoveAttachment, {
+      projectId: 'project_1', attachmentId: 'draft_1',
+    })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.developerClearAttachments, {
+      projectId: 'project_1',
+    })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.developerPickFiles, {
+      projectId: 'project_1', existingAttachmentIds: [], path: '/private/source.png',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(app.dependencies.developer.pickFiles).toHaveBeenCalledWith({
+      projectId: 'project_1', existingAttachmentIds: [],
+    })
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalledTimes(3)
+  })
+
   it('accepts only fixed opaque conversion IDs and requires an authenticated trusted sender', async () => {
     const app = harness()
 

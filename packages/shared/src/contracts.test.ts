@@ -1935,6 +1935,27 @@ describe('cross-process contracts', () => {
     expect(ipcResponseSchemas[ipcChannels.developerRun].safeParse(result).success).toBe(true)
   })
 
+  it('keeps developer file drafts opaque and attachment ids out of workflow input', () => {
+    const draft = { id: 'draft_1', name: 'same.png', mimeType: 'image/png', byteSize: 123 }
+    const channel = ipcChannels.developerPickFiles
+    expect(channel).toBe('developer:pick-files')
+    const responseSchema = ipcResponseSchemas[channel]
+    expect(responseSchema).toBeDefined()
+    expect(responseSchema!.parse([draft])).toEqual([draft])
+    expect(() => responseSchema!.parse([
+      { ...draft, path: '/private/source.png' },
+    ])).toThrow()
+    expect(ipcRequestSchemas[ipcChannels.developerRun].parse({
+      projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'],
+    })).toEqual({ projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'] })
+    expect(() => ipcRequestSchemas[ipcChannels.developerRun].parse({
+      projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'], path: '/private/source.png',
+    })).toThrow()
+    expect(() => ipcRequestSchemas[ipcChannels.developerRun].parse({
+      projectId: 'project_1', input: { files: [0, 1] }, attachmentIds: ['draft_1', 'draft_1'],
+    })).toThrow()
+  })
+
   it('accepts a semantic developer input validation result', () => {
     const result = { validationError: '搜索关键词不能为空' }
 

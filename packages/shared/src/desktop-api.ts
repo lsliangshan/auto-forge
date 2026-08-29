@@ -750,9 +750,21 @@ export const developerProjectSchema = z.object({
 
 export type DeveloperProject = z.infer<typeof developerProjectSchema>
 
+export const developerAttachmentDraftSchema = z.object({
+  id: identifierSchema,
+  name: nonEmptyStringSchema.max(255).refine((value) => !/[\\/\0]/.test(value)),
+  mimeType: nonEmptyStringSchema.max(255),
+  byteSize: z.number().int().positive(),
+}).strict()
+
+export type DeveloperAttachmentDraft = z.infer<typeof developerAttachmentDraftSchema>
+
 export const developerRunInputSchema = z.object({
   projectId: identifierSchema,
   input: z.unknown(),
+  attachmentIds: z.array(identifierSchema).min(1).max(5)
+    .refine((values) => new Set(values).size === values.length, 'Attachment ids must be unique')
+    .optional(),
 }).strict()
 
 export type DeveloperRunInput = z.infer<typeof developerRunInputSchema>
@@ -1505,6 +1517,9 @@ export const ipcChannels = {
   developerDeleteEntry: 'developer:delete-entry',
   developerBuildProject: 'developer:build-project',
   developerValidate: 'developer:validate',
+  developerPickFiles: 'developer:pick-files',
+  developerRemoveAttachment: 'developer:remove-attachment',
+  developerClearAttachments: 'developer:clear-attachments',
   developerRun: 'developer:run',
   executionsList: 'executions:list',
   executionsGet: 'executions:get',
@@ -1609,6 +1624,15 @@ export const deleteEntryRequestSchema = z.object({
   relativePath: nonEmptyStringSchema,
 }).strict()
 export const validateProjectRequestSchema = z.object({ projectId: identifierSchema }).strict()
+export const developerPickFilesRequestSchema = z.object({
+  projectId: identifierSchema,
+  existingAttachmentIds: z.array(identifierSchema).max(5)
+    .refine((values) => new Set(values).size === values.length, 'Attachment ids must be unique'),
+}).strict()
+export const developerAttachmentRequestSchema = z.object({
+  projectId: identifierSchema,
+  attachmentId: identifierSchema,
+}).strict()
 export const executionListRequestSchema = executionQuerySchema.optional()
 export const getExecutionRequestSchema = z.object({ executionId: identifierSchema }).strict()
 export const cancelExecutionRequestSchema = z.object({ executionId: identifierSchema }).strict()
@@ -1691,6 +1715,9 @@ export const ipcRequestSchemas = {
   [ipcChannels.developerDeleteEntry]: deleteEntryRequestSchema,
   [ipcChannels.developerBuildProject]: validateProjectRequestSchema,
   [ipcChannels.developerValidate]: validateProjectRequestSchema,
+  [ipcChannels.developerPickFiles]: developerPickFilesRequestSchema,
+  [ipcChannels.developerRemoveAttachment]: developerAttachmentRequestSchema,
+  [ipcChannels.developerClearAttachments]: validateProjectRequestSchema,
   [ipcChannels.developerRun]: developerRunInputSchema,
   [ipcChannels.executionsList]: executionListRequestSchema,
   [ipcChannels.executionsGet]: getExecutionRequestSchema,
@@ -1776,6 +1803,9 @@ export const ipcResponseSchemas = {
   [ipcChannels.developerDeleteEntry]: developerProjectSchema,
   [ipcChannels.developerBuildProject]: developerProjectSchema,
   [ipcChannels.developerValidate]: validationResultSchema,
+  [ipcChannels.developerPickFiles]: z.array(developerAttachmentDraftSchema).max(5),
+  [ipcChannels.developerRemoveAttachment]: voidResponseSchema,
+  [ipcChannels.developerClearAttachments]: voidResponseSchema,
   [ipcChannels.developerRun]: developerRunResultSchema,
   [ipcChannels.executionsList]: z.array(executionSummarySchema),
   [ipcChannels.executionsGet]: executionDetailSchema,
@@ -1875,6 +1905,9 @@ export interface DesktopAPI {
     deleteEntry(projectId: string, relativePath: string): Promise<DeveloperProject>
     build(projectId: string): Promise<DeveloperProject>
     validate(projectId: string): Promise<ValidationResult>
+    pickFiles(input: { projectId: string; existingAttachmentIds: string[] }): Promise<DeveloperAttachmentDraft[]>
+    removeAttachment(input: { projectId: string; attachmentId: string }): Promise<void>
+    clearAttachments(input: { projectId: string }): Promise<void>
     run(input: DeveloperRunInput): Promise<DeveloperRunResult>
   }
   executions: {

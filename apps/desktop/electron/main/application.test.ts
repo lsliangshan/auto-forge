@@ -6930,6 +6930,165 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('imports developer files as opaque owner-project drafts and rejects forged reuse', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-developer-drafts-'))
+    directories.push(root)
+    const firstPath = join(root, 'first', 'same.bmp')
+    const secondPath = join(root, 'second', 'same.bmp')
+    await mkdir(dirname(firstPath), { recursive: true })
+    await mkdir(dirname(secondPath), { recursive: true })
+    const imageBytes = Buffer.alloc(58)
+    imageBytes.write('BM')
+    imageBytes.writeUInt32LE(imageBytes.byteLength, 2)
+    imageBytes.writeUInt32LE(54, 10)
+    imageBytes.writeUInt32LE(40, 14)
+    imageBytes.writeInt32LE(1, 18)
+    imageBytes.writeInt32LE(1, 22)
+    imageBytes.writeUInt16LE(1, 26)
+    imageBytes.writeUInt16LE(24, 28)
+    imageBytes.writeUInt32LE(4, 34)
+    await writeFile(firstPath, imageBytes)
+    await writeFile(secondPath, imageBytes)
+    const chooseMediaFiles = vi.fn().mockResolvedValue([firstPath, secondPath])
+    const runtime = createApplicationRuntime(options(root, { chooseMediaFiles }))
+    await authenticate(runtime, 'Alice')
+    const firstProject = await runtime.services.developer.createProject('First')
+    const secondProject = await runtime.services.developer.createProject('Second')
+    const developer = runtime.services.developer as typeof runtime.services.developer & {
+      pickFiles(input: { projectId: string; existingAttachmentIds: string[] }): Promise<Array<{
+        id: string; name: string; mimeType: string; byteSize: number
+      }>>
+      removeAttachment(input: { projectId: string; attachmentId: string }): Promise<void>
+      clearAttachments(input: { projectId: string }): Promise<void>
+    }
+
+    expect(developer.pickFiles).toBeTypeOf('function')
+    const drafts = await developer.pickFiles({ projectId: firstProject.id, existingAttachmentIds: [] })
+    expect(drafts).toHaveLength(2)
+    expect(drafts[0]).toEqual({
+      id: expect.any(String), name: 'same.bmp', mimeType: 'image/bmp', byteSize: imageBytes.byteLength,
+    })
+    expect(drafts[1]).toEqual({
+      id: expect.any(String), name: 'same.bmp', mimeType: 'image/bmp', byteSize: imageBytes.byteLength,
+    })
+    expect(drafts[0]!.id).not.toBe(drafts[1]!.id)
+    expect(JSON.stringify(drafts)).not.toMatch(/first|second|private|Users|path|relativePath/)
+    await expect(developer.removeAttachment({
+      projectId: secondProject.id, attachmentId: drafts[0]!.id,
+    })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(developer.pickFiles({
+      projectId: firstProject.id, existingAttachmentIds: ['forged_draft'],
+    })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+
+    await runtime.close()
+  })
+
+  it('binds annotated developer drafts before Worker start without persisting ids or paths', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-developer-run-drafts-'))
+    directories.push(root)
+    const sourcePath = join(root, 'chosen', 'source.bmp')
+    await mkdir(dirname(sourcePath), { recursive: true })
+    const imageBytes = Buffer.alloc(58)
+    imageBytes.write('BM')
+    imageBytes.writeUInt32LE(imageBytes.byteLength, 2)
+    imageBytes.writeUInt32LE(54, 10)
+    imageBytes.writeUInt32LE(40, 14)
+    imageBytes.writeInt32LE(1, 18)
+    imageBytes.writeInt32LE(1, 22)
+    imageBytes.writeUInt16LE(1, 26)
+    imageBytes.writeUInt16LE(24, 28)
+    imageBytes.writeUInt32LE(4, 34)
+    await writeFile(sourcePath, imageBytes)
+    const baseOptions = options(root, { chooseMediaFiles: async () => [sourcePath] })
+    const runtime = createApplicationRuntime({
+      ...baseOptions,
+      paths: { ...baseOptions.paths, workflowRunner: join(import.meta.dirname, '../workers/workflow-runner.ts') },
+    } as RuntimeOptions)
+    await authenticate(runtime, 'Alice')
+    const project = await runtime.services.developer.createProject('Draft Run')
+    const manifest = JSON.parse(await runtime.services.developer.readFile(project.id, 'workflow.json')) as Record<string, unknown>
+    manifest.permissions = [{ capability: 'file.convert', scope: { formats: ['png'] } }]
+    manifest.inputSchema = {
+      type: 'object', additionalProperties: false, required: ['files', 'targetFormat'], properties: {
+        files: {
+          type: 'array', items: { type: 'integer', minimum: 0 }, minItems: 1, maxItems: 5,
+          uniqueItems: true, 'x-autoforge-control': 'file-picker',
+        },
+        targetFormat: { type: 'string', enum: ['png'] },
+      },
+    }
+    await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+    await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+      "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+      "export default defineWorkflow({ async run(ctx, input) { await ctx.converter.submit({ attachmentIndex: input.files[0], targetFormat: input.targetFormat }); return { accepted: true } } })",
+    ].join('\n'))
+    const [draft] = await runtime.services.developer.pickFiles({ projectId: project.id, existingAttachmentIds: [] })
+
+    const result = await runtime.services.developer.run({
+      projectId: project.id,
+      input: { files: [0], targetFormat: 'png' },
+      attachmentIds: [draft!.id],
+    })
+    if (!('executionId' in result)) throw new Error(result.validationError)
+    await vi.waitFor(async () => {
+      expect(await runtime.services.executions.get(result.executionId)).toMatchObject({ status: 'completed' })
+    })
+    const jobs = await runtime.services.conversion.listForExecution({ executionId: result.executionId })
+    expect(jobs).toHaveLength(1)
+    await runtime.close()
+
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    const execution = database.executions.get(result.executionId)!
+    expect(execution.input).toEqual({ files: [0], targetFormat: 'png' })
+    const job = database.conversionJobs.listForExecution(result.executionId, execution.ownerUserId!)[0]!
+    expect(job.sourceKind).toBe('artifact')
+    const artifact = database.conversionArtifacts.getOwned(job.sourceId, execution.ownerUserId!)!
+    expect(artifact).toMatchObject({
+      role: 'input', displayName: 'source.bmp', detectedFormat: 'bmp', mimeType: 'image/bmp',
+    })
+    expect(JSON.stringify({ execution, job, artifact })).not.toContain(sourcePath)
+    expect(await readFile(join(resolveUserConversionRoot(root, execution.ownerUserId!), artifact.relativePath))).toEqual(imageBytes)
+    database.close()
+  })
+
+  it('rejects attachment ids without an annotated field and clears unsubmitted drafts on logout', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-developer-draft-auth-'))
+    directories.push(root)
+    const sourcePath = join(root, 'source.bmp')
+    const imageBytes = Buffer.alloc(58)
+    imageBytes.write('BM')
+    imageBytes.writeUInt32LE(imageBytes.byteLength, 2)
+    imageBytes.writeUInt32LE(54, 10)
+    imageBytes.writeUInt32LE(40, 14)
+    imageBytes.writeInt32LE(1, 18)
+    imageBytes.writeInt32LE(1, 22)
+    imageBytes.writeUInt16LE(1, 26)
+    imageBytes.writeUInt16LE(24, 28)
+    imageBytes.writeUInt32LE(4, 34)
+    await writeFile(sourcePath, imageBytes)
+    const runtime = createApplicationRuntime(options(root, { chooseMediaFiles: async () => [sourcePath] }))
+    await authenticate(runtime, 'Alice')
+    const project = await runtime.services.developer.createProject('Ordinary Array')
+    const manifest = JSON.parse(await runtime.services.developer.readFile(project.id, 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', properties: { files: { type: 'array', items: { type: 'integer' } } },
+    }
+    await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+    const [draft] = await runtime.services.developer.pickFiles({ projectId: project.id, existingAttachmentIds: [] })
+
+    await expect(runtime.services.developer.run({
+      projectId: project.id, input: { files: [0] }, attachmentIds: [draft!.id],
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    const stagedPath = join(resolveUserConversionRoot(root, (await runtime.services.auth.getSession())!.user.id), '.developer-drafts', `${draft!.id}.input`)
+    await expect(access(stagedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    const [logoutDraft] = await runtime.services.developer.pickFiles({ projectId: project.id, existingAttachmentIds: [] })
+    const logoutStagedPath = join(resolveUserConversionRoot(root, (await runtime.services.auth.getSession())!.user.id), '.developer-drafts', `${logoutDraft!.id}.input`)
+    expect(await readFile(logoutStagedPath)).toEqual(imageBytes)
+    await runtime.services.auth.logout({ discardPending: true })
+    await expect(access(logoutStagedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await runtime.close()
+  })
+
   it('composes real persistence-backed DesktopAPI services and recovers before use', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
     directories.push(root)

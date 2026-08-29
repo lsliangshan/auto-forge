@@ -218,6 +218,9 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       deleteEntry: (projectId, relativePath) => invoke(ipcRenderer, ipcChannels.developerDeleteEntry, { projectId, relativePath }),
       build: (projectId) => invoke(ipcRenderer, ipcChannels.developerBuildProject, { projectId }),
       validate: (projectId) => invoke(ipcRenderer, ipcChannels.developerValidate, { projectId }),
+      pickFiles: (input) => invoke(ipcRenderer, ipcChannels.developerPickFiles, input),
+      removeAttachment: (input) => invoke(ipcRenderer, ipcChannels.developerRemoveAttachment, input),
+      clearAttachments: (input) => invoke(ipcRenderer, ipcChannels.developerClearAttachments, input),
       run: (input) => invoke(ipcRenderer, ipcChannels.developerRun, input),
     },
     executions: {

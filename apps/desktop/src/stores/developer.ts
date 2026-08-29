@@ -1,6 +1,7 @@
 import { acceptHMRUpdate, defineStore } from 'pinia'
 import type {
   ApprovalDecision,
+  DeveloperAttachmentDraft,
   DeveloperProject,
   ExecutionDetail,
   ExecutionEvent,
@@ -93,6 +94,8 @@ export const useDeveloperStore = defineStore('developer', {
     debugInput: {} as unknown,
     debugDraftValid: true,
     debugDraftError: '',
+    developerAttachmentField: '',
+    developerAttachments: [] as DeveloperAttachmentDraft[],
     debugEvents: [] as ExecutionEvent[],
     debugDetail: undefined as ExecutionDetail | undefined,
     debugExecutionId: '',
@@ -138,6 +141,7 @@ export const useDeveloperStore = defineStore('developer', {
       const dispose = this.$dispose.bind(this)
       this.$dispose = () => {
         void this.flushPendingSaves()
+        void this._clearDeveloperAttachments()
         for (const timer of state.timers.values()) clearTimeout(timer)
         state.timers.clear()
         state.unsubscribe?.()
@@ -186,6 +190,9 @@ export const useDeveloperStore = defineStore('developer', {
     async selectProject(projectId: string) {
       const project = this.projects.find(({ id }) => id === projectId)
       if (!project) return
+      if (this.selectedProjectId && this.selectedProjectId !== projectId) {
+        await this._clearDeveloperAttachments(this.selectedProjectId)
+      }
       this._selectionGeneration += 1
       this._runToken += 1
       this.selectedProjectId = projectId
@@ -194,6 +201,8 @@ export const useDeveloperStore = defineStore('developer', {
       this.debugInput = {}
       this.debugDraftValid = true
       this.debugDraftError = ''
+      this.developerAttachmentField = ''
+      this.developerAttachments = []
       this.resetDebug()
       const preferred = project.files.includes('src/index.ts') ? 'src/index.ts' : project.files[0]
       this.selectedPath = ''
@@ -458,6 +467,75 @@ export const useDeveloperStore = defineStore('developer', {
       this.debugDraftValid = valid
       this.debugDraftError = valid ? '' : error
     },
+    configureDeveloperAttachmentField(name: string) {
+      if (this.developerAttachmentField === name) return
+      if (this.developerAttachmentField || this.developerAttachments.length > 0) {
+        void this._clearDeveloperAttachments()
+      }
+      this.developerAttachmentField = name
+      this.developerAttachments = []
+      this._syncDeveloperAttachmentInput()
+    },
+    _syncDeveloperAttachmentInput() {
+      const name = this.developerAttachmentField
+      if (!name || !this.debugInput || typeof this.debugInput !== 'object' || Array.isArray(this.debugInput)) return
+      ;(this.debugInput as Record<string, unknown>)[name] = this.developerAttachments.map((_draft, index) => index)
+    },
+    async pickDeveloperAttachments() {
+      const projectId = this.selectedProjectId
+      const field = this.developerAttachmentField
+      if (!projectId || !field || this.developerAttachments.length >= 5) return
+      const existingIds = this.developerAttachments.map(({ id }) => id)
+      try {
+        const selected = await getDesktopApi().developer.pickFiles({
+          projectId,
+          existingAttachmentIds: existingIds,
+        })
+        if (this.selectedProjectId !== projectId || this.developerAttachmentField !== field) {
+          await Promise.allSettled(selected.map(({ id }) => getDesktopApi().developer.removeAttachment({
+            projectId, attachmentId: id,
+          })))
+          return
+        }
+        const known = new Set(existingIds)
+        const accepted = selected.filter(({ id }) => !known.has(id)).slice(0, 5 - existingIds.length)
+        const rejected = selected.filter(({ id }) => !accepted.some((draft) => draft.id === id))
+        if (rejected.length) {
+          await Promise.allSettled(rejected.map(({ id }) => getDesktopApi().developer.removeAttachment({
+            projectId, attachmentId: id,
+          })))
+        }
+        this.developerAttachments = [...this.developerAttachments, ...accepted]
+        this._syncDeveloperAttachmentInput()
+      } catch (error) {
+        if (this.selectedProjectId === projectId) this.debugError = displayError(error, '文件导入失败')
+      }
+    },
+    async removeDeveloperAttachment(attachmentId: string) {
+      const projectId = this.selectedProjectId
+      if (!projectId || !this.developerAttachments.some(({ id }) => id === attachmentId)) return
+      try {
+        await getDesktopApi().developer.removeAttachment({ projectId, attachmentId })
+        if (this.selectedProjectId !== projectId) return
+        this.developerAttachments = this.developerAttachments.filter(({ id }) => id !== attachmentId)
+        this._syncDeveloperAttachmentInput()
+      } catch (error) {
+        if (this.selectedProjectId === projectId) this.debugError = displayError(error, '文件移除失败')
+      }
+    },
+    async _clearDeveloperAttachments(projectId = this.selectedProjectId) {
+      if (!projectId) return
+      const shouldReset = projectId === this.selectedProjectId
+      if (shouldReset) {
+        this.developerAttachments = []
+        this._syncDeveloperAttachmentInput()
+      }
+      try {
+        await getDesktopApi().developer.clearAttachments({ projectId })
+      } catch {
+        // Main also clears unsubmitted drafts on logout and owner lifecycle disposal.
+      }
+    },
     ensureExecutionSubscription() { this._ensureLifecycle() },
     async runDebug() {
       const projectId = this.selectedProjectId
@@ -490,6 +568,7 @@ export const useDeveloperStore = defineStore('developer', {
         if (Object.values(this.files).some((file) => file.projectId === projectId && ['dirty', 'saving', 'error'].includes(file.saveState))) {
           this.debugStatus = 'failed'
           this.debugError = '存在未保存文件，请修复保存问题后重试。'
+          if (this.developerAttachments.length) await this._clearDeveloperAttachments(projectId)
           return
         }
         const built = await getDesktopApi().developer.build(projectId)
@@ -499,8 +578,22 @@ export const useDeveloperStore = defineStore('developer', {
         const validation = await getDesktopApi().developer.validate(projectId)
         if (!isCurrent()) return
         this._applyValidation(validation)
-        if (!validation.valid) { this.debugStatus = 'idle'; this.debugError = '项目校验未通过。'; return }
-        const runResult = await getDesktopApi().developer.run({ projectId, input })
+        if (!validation.valid) {
+          this.debugStatus = 'idle'
+          this.debugError = '项目校验未通过。'
+          if (this.developerAttachments.length) await this._clearDeveloperAttachments(projectId)
+          return
+        }
+        const attachmentIds = this.developerAttachments.map(({ id }) => id)
+        const runResult = await getDesktopApi().developer.run({
+          projectId,
+          input,
+          ...(attachmentIds.length ? { attachmentIds } : {}),
+        })
+        if (attachmentIds.length && isCurrent()) {
+          this.developerAttachments = []
+          this._syncDeveloperAttachmentInput()
+        }
         if (!isCurrent()) {
           if ('executionId' in runResult) {
             try { await getDesktopApi().executions.cancel(runResult.executionId) } catch { /* A stale execution may already be terminal. */ }
@@ -518,6 +611,7 @@ export const useDeveloperStore = defineStore('developer', {
         for (const event of state.pendingEvents) if (event.executionId === executionId) this._applyExecutionEvent(event)
       } catch (error) {
         if (!isCurrent()) return
+        if (this.developerAttachments.length) await this._clearDeveloperAttachments(projectId)
         this.debugStatus = 'failed'
         this.debugError = displayError(error, '调试运行失败')
       } finally { if (isCurrent()) state.pendingEvents = [] }

@@ -12,6 +12,7 @@ describe('developer store hot updates', () => {
     const listeners = new Set<(event: ExecutionEvent) => void>()
     const api = {
       auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments: vi.fn().mockResolvedValue(undefined) },
       executions: {
         onEvent(listener: (event: ExecutionEvent) => void) {
           listeners.add(listener)
@@ -41,6 +42,32 @@ describe('developer store hot updates', () => {
     for (const listener of listeners) listener(event)
 
     expect(store.debugEvents).toEqual([event])
+    store.selectedProjectId = 'project_1'
+    ;(store as unknown as { developerAttachments: unknown[] }).developerAttachments = [{
+      id: 'draft_hmr', name: 'source.png', mimeType: 'image/png', byteSize: 10,
+    }]
+    store.$dispose()
+    expect(api.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' })
+  })
+
+  it('clears Main-owned drafts when HMR removes the picker annotation', async () => {
+    const clearAttachments = vi.fn().mockResolvedValue(undefined)
+    const api = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments },
+      executions: { onEvent: () => () => undefined },
+    }
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    vi.resetModules()
+    const { useDeveloperStore } = await import('../../src/stores/developer')
+    const store = useDeveloperStore()
+    store.selectedProjectId = 'project_1'
+    store.configureDeveloperAttachmentField('files')
+    store.developerAttachments = [{ id: 'draft_1', name: 'source.png', mimeType: 'image/png', byteSize: 1 }]
+
+    store.configureDeveloperAttachmentField('')
+
+    await vi.waitFor(() => expect(clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' }))
     store.$dispose()
   })
 })

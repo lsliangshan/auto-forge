@@ -119,6 +119,8 @@ function createApi() {
     chat: {}, workflows: {}, permissions: {}, settings: {}, system: {},
     developer: {
       listProjects: vi.fn().mockResolvedValue([project]), createProject: vi.fn(), registerProject: vi.fn(),
+      pickFiles: vi.fn().mockResolvedValue([]), removeAttachment: vi.fn().mockResolvedValue(undefined),
+      clearAttachments: vi.fn().mockResolvedValue(undefined),
       readFile: vi.fn(async (_projectId: string, path: string) => path === 'workflow.json'
         ? JSON.stringify({
             id: 'browser.search.baidu', version: '1.0.0', name: 'Baidu', description: '', author: 'AutoForge', category: 'browser',
@@ -648,6 +650,134 @@ describe('developer workbench', () => {
     expect(wrapper.get('[data-testid="debug-field-filters-json"]').text()).toContain('JSON')
     expect(wrapper.text()).toContain('browser.open')
     expect(wrapper.text()).not.toContain('filesystem.read')
+  })
+
+  it('renders a native picker only for an annotated array and keeps ordinary arrays as JSON', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', required: ['files'], properties: {
+        files: {
+          type: 'array', title: '附件', items: { type: 'integer' }, minItems: 1, maxItems: 5,
+          'x-autoforge-control': 'file-picker',
+        },
+        tags: { type: 'array', title: '标签', items: { type: 'string' } },
+      },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    expect(wrapper.get('[data-testid="debug-file-picker-files"]')).toBeTruthy()
+    expect(wrapper.find('[data-testid="debug-field-files-json"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="debug-field-tags-json"]').text()).toContain('JSON')
+  })
+
+  it('keeps same-name drafts distinct and submits contiguous indexes without paths after removal', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', required: ['files', 'targetFormat'], properties: {
+        files: {
+          type: 'array', title: '附件', items: { type: 'integer' }, minItems: 1, maxItems: 5,
+          'x-autoforge-control': 'file-picker',
+        },
+        targetFormat: { type: 'string', enum: ['png'] },
+      },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    raw.developer.pickFiles.mockResolvedValueOnce([
+      { id: 'draft_first', name: 'same.png', mimeType: 'image/png', byteSize: 101 },
+      { id: 'draft_second', name: 'middle.png', mimeType: 'image/png', byteSize: 102 },
+      { id: 'draft_third', name: 'same.png', mimeType: 'image/png', byteSize: 103 },
+    ])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="debug-pick-files-files"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.findAll('[data-testid^="debug-file-files-"]')).toHaveLength(3))
+    expect(wrapper.text().match(/same\.png/g)).toHaveLength(2)
+    await wrapper.get('[data-testid="debug-remove-file-draft_second"]').trigger('click')
+    await vi.waitFor(() => expect(raw.developer.removeAttachment).toHaveBeenCalledWith({
+      projectId: 'project_1', attachmentId: 'draft_second',
+    }))
+    await wrapper.get('[data-testid="debug-field-targetFormat"]').setValue('0')
+    await store.runDebug()
+
+    expect(raw.developer.run).toHaveBeenCalledWith({
+      projectId: 'project_1',
+      input: { files: [0, 1], targetFormat: 'png' },
+      attachmentIds: ['draft_first', 'draft_third'],
+    })
+    const serialized = JSON.stringify(raw.developer.run.mock.calls)
+    expect(serialized).not.toMatch(/private|Users|path|relativePath/)
+  })
+
+  it('enforces five selected drafts and clears them on project switch and dispose', async () => {
+    const { api, raw } = createApi()
+    const second = { ...project, id: 'project_2', name: 'Second', rootPath: '/private/second' }
+    raw.developer.listProjects.mockResolvedValue([project, second])
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', properties: {
+        files: { type: 'array', items: { type: 'integer' }, 'x-autoforge-control': 'file-picker' },
+      },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    raw.developer.pickFiles.mockResolvedValueOnce(Array.from({ length: 5 }, (_, index) => ({
+      id: `draft_${index}`, name: `${index}.png`, mimeType: 'image/png', byteSize: index + 1,
+    })))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="debug-pick-files-files"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.findAll('[data-testid^="debug-file-files-"]')).toHaveLength(5))
+    expect(wrapper.get('[data-testid="debug-pick-files-files"]').attributes('disabled')).toBeDefined()
+    await store.selectProject('project_2')
+    expect(raw.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' })
+    store.$dispose()
+    expect(raw.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_2' })
+  })
+
+  it('drops selected drafts when debug preflight fails before Main can consume them', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', properties: {
+        files: { type: 'array', items: { type: 'integer' }, 'x-autoforge-control': 'file-picker' },
+      },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    raw.developer.pickFiles.mockResolvedValueOnce([
+      { id: 'draft_failed', name: 'failed.png', mimeType: 'image/png', byteSize: 10 },
+    ])
+    raw.developer.build.mockRejectedValueOnce(Object.assign(new Error('redacted'), { code: 'INTERNAL_ERROR' }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+    await wrapper.get('[data-testid="debug-pick-files-files"]').trigger('click')
+    await vi.waitFor(() => expect(store.developerAttachments).toHaveLength(1))
+
+    await store.runDebug()
+
+    expect(raw.developer.run).not.toHaveBeenCalled()
+    expect(raw.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' })
+    expect(store.developerAttachments).toEqual([])
   })
 
   it('keeps invalid complex JSON as a visible draft and blocks execution', async () => {

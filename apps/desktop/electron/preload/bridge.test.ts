@@ -228,6 +228,34 @@ describe('preload desktop bridge', () => {
     })
   })
 
+  it('maps developer draft operations and run attachments to fixed path-free channels', async () => {
+    const app = harness()
+
+    expect(app.api.developer.pickFiles).toBeTypeOf('function')
+    expect(app.api.developer.removeAttachment).toBeTypeOf('function')
+    expect(app.api.developer.clearAttachments).toBeTypeOf('function')
+    await app.api.developer.pickFiles({ projectId: 'project_1', existingAttachmentIds: ['draft_1'] })
+    await app.api.developer.removeAttachment({ projectId: 'project_1', attachmentId: 'draft_1' })
+    await app.api.developer.clearAttachments({ projectId: 'project_1' })
+    await app.api.developer.run({
+      projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'],
+    })
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.developerPickFiles, {
+      projectId: 'project_1', existingAttachmentIds: ['draft_1'],
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.developerRemoveAttachment, {
+      projectId: 'project_1', attachmentId: 'draft_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.developerClearAttachments, {
+      projectId: 'project_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.developerRun, {
+      projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'],
+    })
+    expect(JSON.stringify(vi.mocked(app.ipcRenderer.invoke).mock.calls)).not.toContain('/private/')
+  })
+
   it('resolves dropped-file paths only in preload, filters blanks, and uses a fixed channel', async () => {
     const getPathForFile = vi.fn()
       .mockReturnValueOnce('/private/photo.png')

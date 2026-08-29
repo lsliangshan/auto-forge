@@ -21,6 +21,7 @@ import {
   chatFileSupport,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  conversionTargetFormatSchema,
   conversionJobViewSchema,
   legacyImportRequestSchema,
   openExternalRequestSchema,
@@ -151,6 +152,10 @@ import {
   createConversionArtifactService,
   type ConversionArtifactService,
 } from './conversion/conversion-artifact-service.js'
+import {
+  createDeveloperAttachmentDraftService,
+  type DeveloperAttachmentDraftService,
+} from './conversion/developer-attachment-drafts.js'
 import {
   createConversionJobRunner,
   type ConversionJobEvent as RunnerConversionJobEvent,
@@ -1451,6 +1456,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     generation: number
     ownerUserId: string
     artifacts: ConversionArtifactService
+    developerDrafts: DeveloperAttachmentDraftService
     packManager: ConverterPackManager
     runner: ConversionJobRunner
   }
@@ -1555,9 +1561,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     if (!lifecycle) return
     let stopFailure: unknown
     try {
-      await lifecycle.runner.stop()
+      await lifecycle.developerDrafts.clearOwner()
     } catch (error) {
       stopFailure = error
+    }
+    try {
+      await lifecycle.runner.stop()
+    } catch (error) {
+      stopFailure ??= error
     }
     try {
       await lifecycle.runner.idle()
@@ -1576,11 +1587,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       dataRoot: options.paths.data,
       database: chatDatabase,
     })
+    const developerDrafts = createDeveloperAttachmentDraftService({
+      dataRoot: options.paths.data,
+      ownerUserId: session.user.id,
+      artifacts: database.conversionArtifacts,
+    })
     const packManager = new ConverterPackManager({
       packsRoot: join(options.paths.data, 'converter-packs'),
     })
     await packManager.initialize()
     await recoverOwnerConversionStorage(options.paths.data, session.user.id, database)
+    await developerDrafts.recover()
     const generation = ++conversionGeneration
     const runner = createConversionJobRunner({
       ownerUserId: session.user.id,
@@ -1592,6 +1609,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       generation,
       ownerUserId: session.user.id,
       artifacts,
+      developerDrafts,
       packManager,
       runner,
     }
@@ -1623,6 +1641,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }
     }
   }
+  const conversionSourceFingerprintValue = (ownerUserId: string, sourceId: string, sha256: string): string => createHash('sha256')
+    .update('autoforge-file-conversion-source-v1\0')
+    .update(ownerUserId)
+    .update('\0')
+    .update(sourceId)
+    .update('\0')
+    .update(sha256)
+    .digest('hex')
   const conversionSourceFingerprint = (binding: ExecutionAttachmentBinding): string => {
     let sourceId: string
     let sha256: string | undefined
@@ -1643,14 +1669,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       sha256 = record.sha256
     }
     if (!sha256 || !/^[a-f0-9]{64}$/u.test(sha256)) throw failure('CONVERSION_INPUT_INVALID')
-    return createHash('sha256')
-      .update('autoforge-file-conversion-source-v1\0')
-      .update(binding.ownerUserId)
-      .update('\0')
-      .update(sourceId)
-      .update('\0')
-      .update(sha256)
-      .digest('hex')
+    return conversionSourceFingerprintValue(binding.ownerUserId, sourceId, sha256)
   }
   const fileConversion: FileConversionPort = {
     async inspectAttachment(binding) {
@@ -2895,10 +2914,45 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         }
       },
       validate: (projectId) => projects.validate(projectId),
-      run: async ({ projectId, input }) => {
+      pickFiles: async ({ projectId, existingAttachmentIds }) => {
+        const session = await requireAuthenticatedSession()
+        if (!database.workflowProjects.get(projectId)) throw failure('NOT_FOUND')
+        const remainingSlots = 5 - existingAttachmentIds.length
+        if (remainingSlots <= 0) return []
+        const paths = (await options.chooseMediaFiles(remainingSlots)).filter(Boolean)
+        return currentConversion(session.user.id).developerDrafts.importPaths({
+          projectId,
+          existingAttachmentIds,
+          paths,
+        })
+      },
+      removeAttachment: async ({ projectId, attachmentId }) => {
+        const session = await requireAuthenticatedSession()
+        if (!database.workflowProjects.get(projectId)) throw failure('NOT_FOUND')
+        await currentConversion(session.user.id).developerDrafts.remove(projectId, attachmentId)
+      },
+      clearAttachments: async ({ projectId }) => {
+        const session = await requireAuthenticatedSession()
+        if (!database.workflowProjects.get(projectId)) throw failure('NOT_FOUND')
+        await currentConversion(session.user.id).developerDrafts.clearProject(projectId)
+      },
+      run: async ({ projectId, input, attachmentIds }) => {
         const releaseStart = maintenance.beginStart()
+        let draftService: DeveloperAttachmentDraftService | undefined
+        let claimedExecutionId: string | undefined
+        const selectedAttachmentIds = attachmentIds ?? []
+        const clearUnclaimedDrafts = async () => {
+          if (!draftService) return
+          await Promise.allSettled(selectedAttachmentIds.map((attachmentId) => (
+            draftService!.remove(projectId, attachmentId)
+          )))
+        }
         try {
-          const session = await auth.requireSession()
+          const session = await requireAuthenticatedSession()
+          draftService = currentConversion(session.user.id).developerDrafts
+          for (const attachmentId of selectedAttachmentIds) {
+            if (!draftService.get(projectId, attachmentId)) throw failure('NOT_FOUND')
+          }
           await beginDevelopmentRebuild(projectId)
           let built: WorkflowProject
           try {
@@ -2907,24 +2961,108 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             finishDevelopmentRebuild(projectId)
           }
           const manifest = built.manifest as WorkflowManifest
+          const schema = manifest.inputSchema as {
+            type?: unknown
+            properties?: Record<string, { type?: unknown; 'x-autoforge-control'?: unknown }>
+          }
+          const pickerFields = schema?.type === 'object' && schema.properties
+            ? Object.entries(schema.properties).filter(([, field]) => (
+                field.type === 'array' && field['x-autoforge-control'] === 'file-picker'
+              )).map(([name]) => name)
+            : []
+          const inputObject = input && typeof input === 'object' && !Array.isArray(input)
+            ? input as Record<string, unknown>
+            : undefined
+          if (selectedAttachmentIds.length > 0) {
+            const field = pickerFields.length === 1 ? pickerFields[0] : undefined
+            const indexes = field && inputObject ? inputObject[field] : undefined
+            if (!field
+              || !Array.isArray(indexes)
+              || indexes.length !== selectedAttachmentIds.length
+              || !indexes.every((value, index) => value === index)) {
+              await clearUnclaimedDrafts()
+              throw failure('INVALID_INPUT')
+            }
+          } else if (pickerFields.some((field) => (
+            Array.isArray(inputObject?.[field]) && (inputObject![field] as unknown[]).length > 0
+          ))) {
+            throw failure('INVALID_INPUT')
+          }
           try {
             const inputValidation = validateWorkflowInput(manifest.inputSchema, input)
-            if (!inputValidation.valid) return { validationError: inputValidation.message }
+            if (!inputValidation.valid) {
+              await clearUnclaimedDrafts()
+              return { validationError: inputValidation.message }
+            }
           } catch (error) {
             if (typeof error === 'object' && error !== null && 'code' in error) throw error
             throw failure('INVALID_INPUT')
           }
           const workflow = await registry.getDevelopmentProject(projectId)
           if (!workflow) throw failure('WORKFLOW_INTEGRITY_FAILED')
-          const started = await executions.start({
-            userId: session.user.id,
-            workflowId: manifest.id,
-            workflowVersion: manifest.version,
-            input,
-            sourceSelector: sourceSelectorVault.create(workflow),
-          })
+          let started: Awaited<ReturnType<ExecutionService['start']>>
+          if (selectedAttachmentIds.length === 0) {
+            started = await executions.start({
+              userId: session.user.id,
+              workflowId: manifest.id,
+              workflowVersion: manifest.version,
+              input,
+              sourceSelector: sourceSelectorVault.create(workflow),
+            })
+          } else {
+            const targetFormat = conversionTargetFormatSchema.safeParse(inputObject?.targetFormat)
+            if (!targetFormat.success) {
+              await clearUnclaimedDrafts()
+              throw failure('INVALID_INPUT')
+            }
+            const reservation = executions.reserve()
+            claimedExecutionId = reservation.executionId
+            const drafts = draftService.claim(projectId, reservation.executionId, selectedAttachmentIds)
+            const attachmentBindings: ExecutionAttachmentBinding[] = drafts.map((draft, attachmentIndex) => ({
+              attachmentIndex,
+              ownerUserId: session.user.id,
+              displayName: draft.name,
+              mimeType: draft.mimeType,
+              byteSize: draft.byteSize,
+              source: { kind: 'artifact', artifactId: draft.id },
+              sourceFingerprint: conversionSourceFingerprintValue(session.user.id, draft.id, draft.sha256),
+            }))
+            started = await executions.startReserved(reservation, {
+              userId: session.user.id,
+              workflowId: manifest.id,
+              workflowVersion: manifest.version,
+              input,
+              sourceSelector: sourceSelectorVault.create(workflow),
+              attachmentBindings,
+              prepareAttachmentBindings: (executionId) => draftService!.materialize(
+                executionId,
+                selectedAttachmentIds,
+              ),
+              fileConvertAuthorization: {
+                executionId: reservation.executionId,
+                capability: 'file.convert',
+                decision: 'once',
+                attachments: attachmentBindings.map((binding) => ({
+                  index: binding.attachmentIndex,
+                  sourceFingerprint: binding.sourceFingerprint,
+                })),
+                formats: [targetFormat.data],
+              },
+            })
+            void started.finished.then(async () => {
+              const referenced = new Set(database.conversionJobs
+                .listForExecution(started.id, session.user.id)
+                .filter((job) => job.sourceKind === 'artifact')
+                .map((job) => job.sourceId))
+              await draftService!.releaseExecution(started.id, referenced)
+            }).catch((error) => { recordFailure(error, 'conversion-stop') })
+          }
           void started.finished.catch(() => undefined)
           return { executionId: started.id }
+        } catch (error) {
+          if (!claimedExecutionId) await clearUnclaimedDrafts()
+          else if (draftService) await draftService.releaseExecution(claimedExecutionId, new Set()).catch(() => undefined)
+          throw error
         } finally {
           releaseStart()
         }
