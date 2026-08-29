@@ -343,7 +343,15 @@ function riffProbe(bytes: Uint8Array): StructuralProbe | undefined {
   return undefined
 }
 
-interface ZipEntry { name: string; compressedSize: number; uncompressedSize: number; method: number; localOffset: number; data?: Uint8Array }
+interface ZipEntry {
+  name: string
+  compressedSize: number
+  uncompressedSize: number
+  method: number
+  localOffset: number
+  recordEnd: number
+  data?: Uint8Array
+}
 
 function zipEntries(bytes: Uint8Array): ZipEntry[] | undefined {
   if (bytes.length < 22) return undefined
@@ -374,7 +382,7 @@ function zipEntries(bytes: Uint8Array): ZipEntry[] | undefined {
     const commentLength = buffer.readUInt16LE(offset + 32)
     const localOffset = buffer.readUInt32LE(offset + 42)
     const entryEnd = offset + 46 + nameLength + extraLength + commentLength
-    if ((flags & 0x09) !== 0 || ![0, 8].includes(method) || entryEnd > endOffset) return undefined
+    if ((flags & ~0x0808) !== 0 || ![0, 8].includes(method) || entryEnd > endOffset) return undefined
     const name = Buffer.from(bytes.subarray(offset + 46, offset + 46 + nameLength)).toString('utf8')
     if (!name || name.includes('\\') || name.startsWith('/') || name.split('/').includes('..')) return undefined
     totalUncompressed += uncompressedSize
@@ -386,13 +394,41 @@ function zipEntries(bytes: Uint8Array): ZipEntry[] | undefined {
     const dataOffset = localOffset + 30 + localNameLength + localExtraLength
     if (dataOffset + compressedSize > centralOffset) return undefined
     if (Buffer.from(bytes.subarray(localOffset + 30, localOffset + 30 + localNameLength)).toString('utf8') !== name) return undefined
-    if (buffer.readUInt16LE(localOffset + 8) !== method) return undefined
+    if (buffer.readUInt16LE(localOffset + 6) !== flags || buffer.readUInt16LE(localOffset + 8) !== method) return undefined
     const data = bytes.subarray(dataOffset, dataOffset + compressedSize)
-    if (method === 0 && (compressedSize !== uncompressedSize || crc32(data) !== buffer.readUInt32LE(offset + 16))) return undefined
-    entries.push({ name, compressedSize, uncompressedSize, method, localOffset, ...(method === 0 ? { data } : {}) })
+    let recordEnd = dataOffset + compressedSize
+    const centralCrc = buffer.readUInt32LE(offset + 16)
+    if ((flags & 0x0008) !== 0) {
+      if (
+        buffer.readUInt32LE(localOffset + 14) !== 0
+        || buffer.readUInt32LE(localOffset + 18) !== 0
+        || buffer.readUInt32LE(localOffset + 22) !== 0
+      ) return undefined
+      if (recordEnd + 12 > centralOffset) return undefined
+      if (buffer.readUInt32LE(recordEnd) === 0x08074b50) recordEnd += 4
+      if (
+        recordEnd + 12 > centralOffset
+        || buffer.readUInt32LE(recordEnd) !== centralCrc
+        || buffer.readUInt32LE(recordEnd + 4) !== compressedSize
+        || buffer.readUInt32LE(recordEnd + 8) !== uncompressedSize
+      ) return undefined
+      recordEnd += 12
+    } else if (
+      buffer.readUInt32LE(localOffset + 14) !== centralCrc
+      || buffer.readUInt32LE(localOffset + 18) !== compressedSize
+      || buffer.readUInt32LE(localOffset + 22) !== uncompressedSize
+    ) return undefined
+    if (method === 0 && (compressedSize !== uncompressedSize || crc32(data) !== centralCrc)) return undefined
+    entries.push({ name, compressedSize, uncompressedSize, method, localOffset, recordEnd, ...(method === 0 ? { data } : {}) })
     offset = entryEnd
   }
-  return offset === endOffset ? entries : undefined
+  if (offset !== endOffset) return undefined
+  const localOrder = [...entries].sort((left, right) => left.localOffset - right.localOffset)
+  if (localOrder[0]?.localOffset !== 0) return undefined
+  for (let index = 0; index < localOrder.length; index += 1) {
+    if (localOrder[index]!.recordEnd !== (localOrder[index + 1]?.localOffset ?? centralOffset)) return undefined
+  }
+  return entries
 }
 
 function zipProbe(bytes: Uint8Array): StructuralProbe | undefined {
@@ -742,14 +778,18 @@ function mp3Probe(bytes: Uint8Array): StructuralProbe | undefined {
     offset = 10 + (bytes[6]! << 21) + (bytes[7]! << 14) + (bytes[8]! << 7) + bytes[9]!
   }
   let frames = 0
-  const bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
-  const sampleRates = [44_100, 48_000, 32_000]
+  const mpeg1Bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
+  const mpeg2Bitrates = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+  const baseSampleRates = [44_100, 48_000, 32_000]
   while (offset < bytes.length) {
-    if (offset + 4 > bytes.length || bytes[offset] !== 0xff || (bytes[offset + 1]! & 0xfe) !== 0xfa) return undefined
-    const bitrate = bitrates[bytes[offset + 2]! >>> 4]
-    const sampleRate = sampleRates[(bytes[offset + 2]! >>> 2) & 0x03]
+    if (offset + 4 > bytes.length || bytes[offset] !== 0xff || (bytes[offset + 1]! & 0xe6) !== 0xe2) return undefined
+    const version = (bytes[offset + 1]! >>> 3) & 0x03
+    if (version === 1) return undefined
+    const bitrate = (version === 3 ? mpeg1Bitrates : mpeg2Bitrates)[bytes[offset + 2]! >>> 4]
+    const baseSampleRate = baseSampleRates[(bytes[offset + 2]! >>> 2) & 0x03]
+    const sampleRate = baseSampleRate === undefined ? undefined : baseSampleRate / (version === 3 ? 1 : version === 2 ? 2 : 4)
     if (!bitrate || !sampleRate) return undefined
-    const length = Math.floor((144_000 * bitrate) / sampleRate) + ((bytes[offset + 2]! >>> 1) & 1)
+    const length = Math.floor(((version === 3 ? 144_000 : 72_000) * bitrate) / sampleRate) + ((bytes[offset + 2]! >>> 1) & 1)
     if (length < 4 || offset + length > bytes.length) return undefined
     offset += length
     frames += 1
@@ -906,7 +946,7 @@ function structuralProbe(bytes: Uint8Array, declaredExtension: ConversionInputFo
   if (ascii(bytes.subarray(0, 2)) === 'II' || ascii(bytes.subarray(0, 2)) === 'MM') return tiffProbe(bytes)
   if (bytes[0] === 0 && bytes[1] === 0 && (bytes[2] === 1 || bytes[2] === 2) && bytes[3] === 0) return iconProbe(bytes)
   if (ascii(bytes.subarray(0, 4)) === 'icns') return icnsProbe(bytes)
-  if (ascii(bytes.subarray(0, 3)) === 'ID3' || (bytes[0] === 0xff && (bytes[1]! & 0xfe) === 0xfa)) return mp3Probe(bytes)
+  if (ascii(bytes.subarray(0, 3)) === 'ID3' || (bytes[0] === 0xff && (bytes[1]! & 0xe6) === 0xe2)) return mp3Probe(bytes)
   if (Buffer.from(bytes.subarray(0, 4)).equals(Buffer.from('1a45dfa3', 'hex'))) return ebmlProbe(bytes)
   if (Buffer.from(bytes.subarray(0, 8)).equals(Buffer.from('d0cf11e0a1b11ae1', 'hex'))) return cfbProbe(bytes)
   const media = detectMediaType(bytes)

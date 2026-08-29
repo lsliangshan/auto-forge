@@ -11,3 +11,9 @@ files:
 extraResources:
   - from: resources/migrations
     to: migrations
+  - from: resources/converter-packs
+    to: converter-packs
+    filter:
+      - bootstrap.json
+      - index.schema.json
+      - root-public-key.pem

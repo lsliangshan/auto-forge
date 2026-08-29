@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "downloadsEnabled": false,
+  "indexUrl": null,
+  "rootPublicKeyFile": null,
+  "requiredPackFamilies": ["image-icon", "document", "pdf", "media"],
+  "supportedTargets": ["darwin-arm64", "darwin-x64", "win32-x64"]
+}

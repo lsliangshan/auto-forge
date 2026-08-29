@@ -88,7 +88,7 @@ function pdf(pageCount: number, streamDecoy = false): Buffer {
   return Buffer.from(body)
 }
 
-function zip(entries: Array<{ name: string; data: string; uncompressedSize?: number }>): Buffer {
+function zip(entries: Array<{ name: string; data: string; uncompressedSize?: number }>, dataDescriptors = false): Buffer {
   const locals: Buffer[] = []
   const central: Buffer[] = []
   let offset = 0
@@ -99,22 +99,33 @@ function zip(entries: Array<{ name: string; data: string; uncompressedSize?: num
     const local = Buffer.alloc(30)
     local.writeUInt32LE(0x04034b50, 0)
     local.writeUInt16LE(20, 4)
-    local.writeUInt32LE(crc, 14)
-    local.writeUInt32LE(data.byteLength, 18)
-    local.writeUInt32LE(entry.uncompressedSize ?? data.byteLength, 22)
+    local.writeUInt16LE(dataDescriptors ? 0x0808 : 0, 6)
+    if (!dataDescriptors) {
+      local.writeUInt32LE(crc, 14)
+      local.writeUInt32LE(data.byteLength, 18)
+      local.writeUInt32LE(entry.uncompressedSize ?? data.byteLength, 22)
+    }
     local.writeUInt16LE(name.byteLength, 26)
-    locals.push(local, name, data)
+    const descriptor = Buffer.alloc(dataDescriptors ? 16 : 0)
+    if (dataDescriptors) {
+      descriptor.writeUInt32LE(0x08074b50, 0)
+      descriptor.writeUInt32LE(crc, 4)
+      descriptor.writeUInt32LE(data.byteLength, 8)
+      descriptor.writeUInt32LE(entry.uncompressedSize ?? data.byteLength, 12)
+    }
+    locals.push(local, name, data, descriptor)
     const header = Buffer.alloc(46)
     header.writeUInt32LE(0x02014b50, 0)
     header.writeUInt16LE(20, 4)
     header.writeUInt16LE(20, 6)
+    header.writeUInt16LE(dataDescriptors ? 0x0808 : 0, 8)
     header.writeUInt32LE(crc, 16)
     header.writeUInt32LE(data.byteLength, 20)
     header.writeUInt32LE(entry.uncompressedSize ?? data.byteLength, 24)
     header.writeUInt16LE(name.byteLength, 28)
     header.writeUInt32LE(offset, 42)
     central.push(header, name)
-    offset += local.byteLength + name.byteLength + data.byteLength
+    offset += local.byteLength + name.byteLength + data.byteLength + descriptor.byteLength
   }
   const centralBytes = Buffer.concat(central)
   const end = Buffer.alloc(22)
@@ -130,6 +141,11 @@ const docx = (bomb = false) => zip([
   { name: '[Content_Types].xml', data: '<Types/>' },
   { name: 'word/document.xml', data: '<w:document/>', ...(bomb ? { uncompressedSize: 0x40000000 } : {}) },
 ])
+
+const descriptorDocx = () => zip([
+  { name: '[Content_Types].xml', data: '<Types/>' },
+  { name: 'word/document.xml', data: '<w:document/>' },
+], true)
 
 function opus(): Buffer {
   const packet = Buffer.from('OpusHead', 'ascii')
@@ -244,6 +260,12 @@ function icns(): Buffer {
 function mp3(): Buffer {
   const bytes = Buffer.alloc(417)
   Buffer.from('fffb9064', 'hex').copy(bytes)
+  return bytes
+}
+
+function mpeg2Mp3(): Buffer {
+  const bytes = Buffer.alloc(180)
+  Buffer.from('fff358c0', 'hex').copy(bytes)
   return bytes
 }
 
@@ -395,6 +417,16 @@ describe('conversion catalog input probing', () => {
       .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
   })
 
+  it('accepts signed-size ZIP data descriptors emitted by LibreOffice OOXML', () => {
+    expect(probe(descriptorDocx(), 'document.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'))
+      .toMatchObject({ format: 'docx' })
+    const mismatchedDescriptor = descriptorDocx()
+    const descriptor = mismatchedDescriptor.lastIndexOf(Buffer.from('504b0708', 'hex'))
+    mismatchedDescriptor.writeUInt32LE(999, descriptor + 8)
+    expect(() => probe(mismatchedDescriptor, 'document.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'))
+      .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+  })
+
   it('rejects AVIF dimensions forged as an ispe substring inside media payload', () => {
     expect(() => probe(avifWithPayloadIspe(), 'image.avif', 'image/avif'))
       .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
@@ -418,6 +450,7 @@ describe('conversion catalog input probing', () => {
     ['ico', ico(), 'icon.ico', 'image/vnd.microsoft.icon'],
     ['icns', icns(), 'icon.icns', 'image/icns'],
     ['mp3', mp3(), 'audio.mp3', 'audio/mpeg'],
+    ['mp3', mpeg2Mp3(), 'mpeg2-audio.mp3', 'audio/mpeg'],
     ['webm', ebml('webm'), 'video.webm', 'video/webm'],
     ['mkv', ebml('matroska'), 'video.mkv', 'video/x-matroska'],
     ['doc', cfb('WordDocument'), 'document.doc', 'application/msword'],
