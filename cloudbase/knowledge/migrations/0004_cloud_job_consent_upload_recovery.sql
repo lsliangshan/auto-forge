@@ -912,8 +912,21 @@ BEGIN
     AND object.storage_reference IN (SELECT jsonb_array_elements_text(canonical_references))
     AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
       WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
-        AND version.source_object_id = object.id);
+        AND version.source_object_id = object.id)
+    AND (
+      object.state IN ('authorized', 'orphaned') OR EXISTS (
+        SELECT 1 FROM public.knowledge_upload_authorizations authorization
+        JOIN public.knowledge_jobs job
+          ON job.owner_id = authorization.owner_id AND job.id = authorization.job_id
+        WHERE authorization.owner_id = object.owner_id AND authorization.object_id = object.id
+          AND object.state = 'verified'
+          AND authorization.cloud_consent_revision IS DISTINCT FROM current_cloud_revision
+      )
+    );
   GET DIAGNOSTICS removed = ROW_COUNT;
+  IF removed <> jsonb_array_length(canonical_references) THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
   completed_response := jsonb_build_object(
     'storageReferences', canonical_references, 'removed', removed
   );

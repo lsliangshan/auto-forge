@@ -487,6 +487,7 @@ describe('CloudBase personal knowledge migration', () => {
     }
     expect(completeCleanup).toContain("SET state = 'cancelled', error_code = 'FORBIDDEN'")
     expect(completeCleanup).toContain('DELETE FROM public.knowledge_objects')
+    expect(completeCleanup).toContain('removed <> jsonb_array_length(canonical_references)')
 
     const claim = functionDefinition(corrective, 'autoforge_knowledge_claim_job')
     expect(claim).not.toContain('\n  LOOP\n')
