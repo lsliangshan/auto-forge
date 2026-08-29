@@ -1343,6 +1343,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             },
           }
           store.outbox.recordWithMessage(mutation, assetIds)
+          if (value.role === 'assistant') {
+            const conversion = value.blocks.find((block): block is Extract<ChatBlock, { type: 'conversion' }> => (
+              typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'conversion'
+                && (block as { state?: unknown }).state === 'active'
+            ))
+            if (conversion && value.executionId) {
+              database.conversionBlockBindings.create({
+                ownerUserId: auth.currentUserId()!, conversationId: value.conversationId,
+                messageId: value.id, blockId: conversion.blockId, executionId: conversion.executionId,
+              })
+              database.conversionBlockBindings.finalize(auth.currentUserId()!, conversion.executionId, Date.now())
+            }
+          }
           queueUserDataFlush()
           const stored = store.messages.get(value.id)
           if (!stored) throw failure('INTERNAL_ERROR')
@@ -1514,27 +1527,28 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
   }
   const reconcileConversionBlocks = (lifecycle: BoundConversionLifecycle, executionId: string): void => {
+    const binding = database.conversionBlockBindings.get(lifecycle.ownerUserId, executionId)
+    if (!binding?.finalizedAt) return
     const execution = database.executions.getForUser(executionId, lifecycle.ownerUserId)
     if (!execution?.chatRunId || !terminalExecutionStatuses.has(execution.status)) return
     const jobs = database.conversionJobs.listForExecution(executionId, lifecycle.ownerUserId)
     if (jobs.length === 0 || !jobs.every((candidate) => terminalConversionStatuses.has(candidate.status))) return
-    const run = chatDatabase.chatRuns.get(execution.chatRunId)
-    if (!run) return
+    if (binding.conversationId !== chatDatabase.chatRuns.get(execution.chatRunId)?.conversationId) return
     const activeConversion = (candidate: unknown): candidate is Extract<ChatBlock, { type: 'conversion' }> => (
       typeof candidate === 'object' && candidate !== null
       && (candidate as { type?: unknown }).type === 'conversion'
       && (candidate as { executionId?: unknown }).executionId === executionId
       && (candidate as { state?: unknown }).state === 'active'
     )
-    const matches = chatDatabase.messages.listForConversation(run.conversationId).flatMap((candidate) => (
-      candidate.role !== 'assistant' ? [] : candidate.blocks.filter(activeConversion).map((block) => ({ candidate, block }))
+    const message = chatDatabase.messages.get(binding.messageId)
+    const block = message?.blocks.find((candidate): candidate is Extract<ChatBlock, { type: 'conversion' }> => (
+      activeConversion(candidate) && (candidate as Extract<ChatBlock, { type: 'conversion' }>).blockId === binding.blockId
     ))
-    if (matches.length !== 1) return
-    const { candidate: message, block } = matches[0]!
+    if (!message || !block || message.conversationId !== binding.conversationId) return
     const replacement = { ...block, state: 'terminal' as const }
     chatDatabase.messages.replaceBlock(message.id, block.blockId, replacement)
     queueUserDataFlush()
-    options.emitChat({ type: 'block_update', conversationId: run.conversationId, messageId: message.id, blockId: replacement.blockId, block: replacement })
+    options.emitChat({ type: 'block_update', conversationId: binding.conversationId, messageId: message.id, blockId: replacement.blockId, block: replacement })
   }
   const emitConversionJob = (lifecycle: BoundConversionLifecycle, job: ConversionJob): void => {
     if (boundConversion !== lifecycle
@@ -1656,8 +1670,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
     boundConversion = lifecycle
     runner.start()
+    for (const binding of database.conversionBlockBindings.listActive(session.user.id)) {
+      reconcileConversionBlocks(lifecycle, binding.executionId)
+    }
     for (const execution of database.executions.listForUser(session.user.id)) {
-      reconcileConversionBlocks(lifecycle, execution.id)
       for (const job of database.conversionJobs.listForExecution(execution.id, session.user.id)) {
         emitConversionJob(lifecycle, job)
       }

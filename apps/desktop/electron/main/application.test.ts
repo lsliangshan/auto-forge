@@ -9544,6 +9544,12 @@ describe('createApplicationRuntime', () => {
       workflowId: 'file.convert.universal', workflowVersion: '0.1.0',
       chatRunId: 'run_conversion_block_terminal', status: 'completed', input: {},
     })
+    database.conversionBlockBindings.create({
+      ownerUserId: session.user.id, conversationId: conversation.id,
+      messageId: 'message_conversion_block_terminal', blockId: 'block_conversion_terminal',
+      executionId: 'execution_conversion_block_terminal',
+    })
+    database.conversionBlockBindings.finalize(session.user.id, 'execution_conversion_block_terminal', 2)
     database.conversionJobs.create({
       id: 'job_conversion_block_terminal', ownerUserId: session.user.id,
       executionId: 'execution_conversion_block_terminal', sourceKind: 'artifact',

@@ -868,6 +868,12 @@ export interface AppRepositories {
     }): boolean
     interruptInFlight(ownerUserId: string): number
   }
+  conversionBlockBindings: {
+    create(input: { ownerUserId: string; conversationId: string; messageId: string; blockId: string; executionId: string }): void
+    finalize(ownerUserId: string, executionId: string, finalizedAt: number): boolean
+    get(ownerUserId: string, executionId: string): { ownerUserId: string; conversationId: string; messageId: string; blockId: string; executionId: string; finalizedAt?: number } | undefined
+    listActive(ownerUserId: string): Array<{ ownerUserId: string; conversationId: string; messageId: string; blockId: string; executionId: string; finalizedAt?: number }>
+  }
   conversionArtifacts: {
     create(input: NewConversionArtifact): ConversionArtifact
     getOwned(artifactId: string, ownerUserId: string): ConversionArtifact | null
@@ -3001,6 +3007,22 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
               AND status IN ('downloading_component', 'converting', 'verifying')
           `).run({ ownerUserId, interruptedAt }).changes
         })
+      },
+    },
+    conversionBlockBindings: {
+      create(input) {
+        const changed = database.prepare(`INSERT INTO conversion_block_bindings (owner_user_id, conversation_id, message_id, block_id, execution_id) VALUES (@ownerUserId, @conversationId, @messageId, @blockId, @executionId)`).run(input).changes
+        if (changed !== 1) throw new Error('Conversion block binding was not created')
+      },
+      finalize(ownerUserId, executionId, finalizedAt) {
+        return database.prepare(`UPDATE conversion_block_bindings SET finalized_at = @finalizedAt WHERE owner_user_id = @ownerUserId AND execution_id = @executionId AND finalized_at IS NULL`).run({ ownerUserId, executionId, finalizedAt }).changes === 1
+      },
+      get(ownerUserId, executionId) {
+        const row = one<Query>(database, `SELECT owner_user_id AS ownerUserId, conversation_id AS conversationId, message_id AS messageId, block_id AS blockId, execution_id AS executionId, finalized_at AS finalizedAt FROM conversion_block_bindings WHERE owner_user_id = @ownerUserId AND execution_id = @executionId`, { ownerUserId, executionId })
+        return row && { ...row, finalizedAt: row.finalizedAt === null ? undefined : row.finalizedAt as number } as { ownerUserId: string; conversationId: string; messageId: string; blockId: string; executionId: string; finalizedAt?: number }
+      },
+      listActive(ownerUserId) {
+        return many<Query>(database, `SELECT owner_user_id AS ownerUserId, conversation_id AS conversationId, message_id AS messageId, block_id AS blockId, execution_id AS executionId, finalized_at AS finalizedAt FROM conversion_block_bindings WHERE owner_user_id = @ownerUserId`, { ownerUserId }).map((row) => ({ ...row, finalizedAt: row.finalizedAt === null ? undefined : row.finalizedAt as number } as { ownerUserId: string; conversationId: string; messageId: string; blockId: string; executionId: string; finalizedAt?: number }))
       },
     },
     conversionArtifacts: {
