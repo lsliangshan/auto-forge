@@ -29,7 +29,7 @@ function apiFor(jobs: ConversionJobView[] = []) {
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn(), onEvent: vi.fn() },
     settings: { get: vi.fn(), update: vi.fn(), saveProviderApiKey: vi.fn(), clearProviderApiKey: vi.fn(), validateProviderCredential: vi.fn(), listProviderModels: vi.fn(), clearLocalData: vi.fn() },
     conversion: {
-      listForExecution: vi.fn().mockResolvedValue(jobs),
+      listForExecution: vi.fn().mockResolvedValue({ availability: 'local', jobs }),
       cancel: vi.fn().mockResolvedValue(undefined), retry: vi.fn().mockResolvedValue(undefined),
       saveCopy: vi.fn().mockResolvedValue({ saved: true }), reveal: vi.fn().mockResolvedValue(undefined),
       deleteArtifact: vi.fn().mockResolvedValue(undefined),
@@ -116,9 +116,22 @@ describe('conversion chat block', () => {
 
   it('shows the cross-device local-only result notice without a local job', async () => {
     const { api } = apiFor([])
+    vi.mocked(api.conversion.listForExecution).mockResolvedValue({ availability: 'unavailable', jobs: [] })
     const wrapper = mountBlock(api, 'terminal')
     await flushPromises()
     expect(wrapper.text()).toContain('转换结果仅在发起转换的设备上可用')
+  })
+
+  it('keeps local load failures distinct and clears them when a valid event arrives', async () => {
+    const { api, emit } = apiFor([])
+    vi.mocked(api.conversion.listForExecution).mockRejectedValue(new Error('offline'))
+    const wrapper = mountBlock(api)
+    await flushPromises()
+    expect(wrapper.text()).toContain('本地转换结果加载失败')
+    emit({ type: 'job_updated', job: job('completed') })
+    await flushPromises()
+    expect(wrapper.text()).toContain('转换完成')
+    expect(wrapper.text()).not.toContain('本地转换结果加载失败')
   })
 
   it('releases the local conversion event subscription when its card unmounts', async () => {
@@ -130,7 +143,7 @@ describe('conversion chat block', () => {
   })
 
   it('does not let an older snapshot overwrite a newer event epoch and releases on reset', async () => {
-    const pending = new Promise<ConversionJobView[]>((resolve) => { setTimeout(() => resolve([job('queued', { epoch: 1, progress: 0 })]), 0) })
+    const pending = new Promise<{ availability: 'local'; jobs: ConversionJobView[] }>((resolve) => { setTimeout(() => resolve({ availability: 'local', jobs: [job('queued', { epoch: 1, progress: 0 })] }), 0) })
     const { api, unsubscribe, emit } = apiFor()
     vi.mocked(api.conversion.listForExecution).mockReturnValue(pending)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -142,6 +155,40 @@ describe('conversion chat block', () => {
     expect(store.jobsForExecution('execution_1')[0]).toMatchObject({ status: 'completed', epoch: 2 })
     store.resetLocalData()
     expect(unsubscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps same-epoch deleted outputs and unions fuller concurrent snapshots', async () => {
+    const { api, emit } = apiFor([])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useConversionStore()
+    store.applyEvent({ type: 'job_updated', job: job('completed', { artifacts: [{ artifactId: 'artifact_1', status: 'deleted', displayName: 'first.png', detectedFormat: 'png', mimeType: 'image/png', byteSize: 1 }] }) })
+    vi.mocked(api.conversion.listForExecution).mockResolvedValue({ availability: 'local', jobs: [job('completed', { artifacts: [{ artifactId: 'artifact_1', status: 'ready', displayName: 'first.png', detectedFormat: 'png', mimeType: 'image/png', byteSize: 1 }, { artifactId: 'artifact_2', status: 'ready', displayName: 'second.png', detectedFormat: 'png', mimeType: 'image/png', byteSize: 1 }] })] })
+    await store.loadForExecution('execution_1')
+    expect(store.jobsForExecution('execution_1')[0]?.artifacts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ artifactId: 'artifact_1', status: 'deleted' }),
+      expect.objectContaining({ artifactId: 'artifact_2', status: 'ready' }),
+    ]))
+    emit({ type: 'job_updated', job: job('completed', { artifacts: [{ artifactId: 'artifact_2', status: 'ready', displayName: 'second.png', detectedFormat: 'png', mimeType: 'image/png', byteSize: 1 }] }) })
+    expect(store.jobsForExecution('execution_1')[0]).toMatchObject({ status: 'completed' })
+  })
+
+  it('releases the old module feed before a reloaded store creates one replacement feed', async () => {
+    const { api, unsubscribe, emit } = apiFor([])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const first = useConversionStore()
+    first.ensureSubscription()
+    expect(api.conversion.onEvent).toHaveBeenCalledTimes(1)
+
+    first.resetLocalData()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    vi.resetModules()
+    const reloaded = await import('../../src/stores/conversion')
+    const second = reloaded.useConversionStore()
+    second.ensureSubscription()
+    emit({ type: 'job_updated', job: job('completed') })
+
+    expect(api.conversion.onEvent).toHaveBeenCalledTimes(2)
+    expect(second.jobsForExecution('execution_1')).toHaveLength(1)
   })
 
   it('is rendered by MessageBlock without exposing conversion payload fields', async () => {

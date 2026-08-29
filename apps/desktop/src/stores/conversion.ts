@@ -3,17 +3,21 @@ import type { ConversionArtifactView, ConversionJobEvent, ConversionJobView, Des
 import { displayError, getDesktopApi } from '../services/desktop-api'
 
 interface ConversionHub { listeners: Set<(event: ConversionJobEvent) => void>; unsubscribe: () => void }
+interface ConversionRuntime { hubs: WeakMap<DesktopAPI, ConversionHub>; release?: () => void; disposeWrapped?: true }
+const runtimeKey = Symbol.for('autoforge.conversion-store.runtime')
+function runtime(store: object): ConversionRuntime {
+  const target = store as object & { [runtimeKey]?: ConversionRuntime }
+  target[runtimeKey] ??= { hubs: new WeakMap() }
+  return target[runtimeKey]
+}
 
-const hubs = new WeakMap<DesktopAPI, ConversionHub>()
-const storeReleases = new WeakMap<object, () => void>()
-const disposeWrapped = new WeakSet<object>()
-
-function acquireConversionEvents(api: DesktopAPI, listener: (event: ConversionJobEvent) => void): () => void {
-  const existing = hubs.get(api)
+function acquireConversionEvents(store: object, api: DesktopAPI, listener: (event: ConversionJobEvent) => void): () => void {
+  const state = runtime(store)
+  const existing = state.hubs.get(api)
   const hub: ConversionHub = existing ?? { listeners: new Set(), unsubscribe: () => undefined }
   if (!existing) {
     hub.unsubscribe = api.conversion.onEvent((event) => { for (const current of hub.listeners) current(event) })
-    hubs.set(api, hub)
+    state.hubs.set(api, hub)
   }
   hub.listeners.add(listener)
   let active = true
@@ -23,7 +27,7 @@ function acquireConversionEvents(api: DesktopAPI, listener: (event: ConversionJo
     hub.listeners.delete(listener)
     if (!hub.listeners.size) {
       hub.unsubscribe()
-      hubs.delete(api)
+      state.hubs.delete(api)
     }
   }
 }
@@ -39,16 +43,24 @@ function isTerminal(status: ConversionJobView['status']): boolean {
   return statusRank(status) === 4
 }
 
+function mergeArtifacts(current: ConversionJobView['artifacts'], candidate: ConversionJobView['artifacts']) {
+  const artifacts = new Map(current.map((artifact) => [artifact.artifactId, artifact]))
+  for (const artifact of candidate) {
+    const previous = artifacts.get(artifact.artifactId)
+    artifacts.set(artifact.artifactId, previous?.status === 'deleted' ? previous : artifact)
+  }
+  return [...artifacts.values()]
+}
 function newerJob(current: ConversionJobView | undefined, candidate: ConversionJobView): ConversionJobView {
   if (!current || candidate.epoch > current.epoch) return candidate
   if (candidate.epoch < current.epoch) return current
   const currentRank = statusRank(current.status)
   const candidateRank = statusRank(candidate.status)
-  if (candidateRank > currentRank) return candidate
+  if (candidateRank > currentRank) return { ...candidate, artifacts: mergeArtifacts(current.artifacts, candidate.artifacts) }
   if (candidateRank < currentRank) return current
   if (isTerminal(current.status) && current.status !== candidate.status) return current
   if (candidate.progress < current.progress && !isTerminal(candidate.status)) return current
-  return candidate
+  return { ...candidate, artifacts: mergeArtifacts(current.artifacts, candidate.artifacts) }
 }
 
 function mergeJobs(current: ConversionJobView[], incoming: ConversionJobView[]): ConversionJobView[] {
@@ -62,6 +74,7 @@ export const useConversionStore = defineStore('conversion', {
     jobsByExecution: {} as Record<string, ConversionJobView[]>,
     loadingByExecution: {} as Record<string, boolean>,
     errorsByExecution: {} as Record<string, string>,
+    unavailableByExecution: {} as Record<string, true>,
     pendingArtifactIds: {} as Record<string, true>,
     actionErrorsByArtifact: {} as Record<string, string>,
     _loadVersions: {} as Record<string, number>,
@@ -75,23 +88,25 @@ export const useConversionStore = defineStore('conversion', {
     },
     resetLocalData() {
       this._stateEpoch += 1
-      storeReleases.get(this)?.()
-      storeReleases.delete(this)
+      runtime(this).release?.()
+      runtime(this).release = undefined
       this._subscribed = false
       this._subscriptionUsers = 0
       this.jobsByExecution = {}
       this.loadingByExecution = {}
       this.errorsByExecution = {}
+      this.unavailableByExecution = {}
       this.pendingArtifactIds = {}
       this.actionErrorsByArtifact = {}
       this._loadVersions = {}
     },
     ensureSubscription() {
-      if (this._subscribed) return
+      if (this._subscribed && runtime(this).release) return
+      runtime(this).release?.()
       this._subscribed = true
-      storeReleases.set(this, acquireConversionEvents(getDesktopApi(), (event) => this.applyEvent(event)))
-      if (!disposeWrapped.has(this)) {
-        disposeWrapped.add(this)
+      runtime(this).release = acquireConversionEvents(this, getDesktopApi(), (event) => this.applyEvent(event))
+      if (!runtime(this).disposeWrapped) {
+        runtime(this).disposeWrapped = true
         const dispose = this.$dispose.bind(this)
         this.$dispose = () => {
           this.resetLocalData()
@@ -108,8 +123,8 @@ export const useConversionStore = defineStore('conversion', {
         released = true
         this._subscriptionUsers = Math.max(0, this._subscriptionUsers - 1)
         if (this._subscriptionUsers === 0) {
-          storeReleases.get(this)?.()
-          storeReleases.delete(this)
+          runtime(this).release?.()
+          runtime(this).release = undefined
           this._subscribed = false
         }
       }
@@ -121,10 +136,15 @@ export const useConversionStore = defineStore('conversion', {
       this._loadVersions[executionId] = version
       this.loadingByExecution[executionId] = true
       delete this.errorsByExecution[executionId]
+      delete this.unavailableByExecution[executionId]
       try {
-        const jobs = await getDesktopApi().conversion.listForExecution({ executionId })
+        const response = await getDesktopApi().conversion.listForExecution({ executionId })
         if (epoch !== this._stateEpoch || version !== this._loadVersions[executionId]) return
-        this.jobsByExecution[executionId] = mergeJobs(this.jobsForExecution(executionId), jobs)
+        if (response.availability === 'unavailable') {
+          this.jobsByExecution[executionId] = []
+          this.unavailableByExecution[executionId] = true
+        }
+        else this.jobsByExecution[executionId] = mergeJobs(this.jobsForExecution(executionId), response.jobs)
       } catch (error) {
         if (epoch === this._stateEpoch && version === this._loadVersions[executionId]) {
           this.errorsByExecution[executionId] = displayError(error, '本地转换结果加载失败')
@@ -137,6 +157,8 @@ export const useConversionStore = defineStore('conversion', {
     },
     applyEvent(event: ConversionJobEvent) {
       const executionId = event.job.executionId
+      delete this.errorsByExecution[executionId]
+      delete this.unavailableByExecution[executionId]
       this.jobsByExecution[executionId] = mergeJobs(this.jobsForExecution(executionId), [event.job])
     },
     async actOnArtifact(action: 'saveCopy' | 'reveal' | 'deleteArtifact', artifact: ConversionArtifactView) {

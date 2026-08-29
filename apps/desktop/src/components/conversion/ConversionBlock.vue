@@ -25,7 +25,7 @@
       {{ loadError }}
     </p>
     <p
-      v-else-if="!jobs.length && block.state === 'terminal'"
+      v-else-if="unavailable"
       class="conversion-note"
       role="status"
     >
@@ -146,6 +146,7 @@ const conversion = useConversionStore()
 const jobs = computed(() => conversion.jobsForExecution(props.block.executionId))
 const loading = computed(() => Boolean(conversion.loadingByExecution[props.block.executionId]))
 const loadError = computed(() => conversion.errorsByExecution[props.block.executionId] ?? '')
+const unavailable = computed(() => Boolean(conversion.unavailableByExecution[props.block.executionId]))
 const summary = computed(() => jobs.value.length ? `${jobs.value.length} 个本地转换任务` : '本地转换结果')
 let releaseSubscription: (() => void) | undefined
 

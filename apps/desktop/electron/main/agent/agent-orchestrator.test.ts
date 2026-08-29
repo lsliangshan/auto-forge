@@ -2823,6 +2823,14 @@ describe('AgentOrchestrator', () => {
         formats: ['pdf'],
       },
     }))
+    const conversion = dependencies.records.events.find((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'conversion'
+    )) as { block: unknown } | undefined
+    expect(conversion?.block).toEqual({
+      type: 'conversion', blockId: expect.any(String), executionId: 'reserved_1', state: 'active',
+    })
+    expect(JSON.stringify(conversion)).not.toMatch(/bytes|path|sha256|artifactId|jobId|metadata/i)
     const providerPayload = JSON.stringify(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls)
     expect(providerPayload).not.toMatch(/media_private_0|b{32}|sourceFingerprint|attachmentBindings/)
   })

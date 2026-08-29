@@ -98,7 +98,7 @@ function services(): DesktopIpcServices {
     },
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn() },
     conversion: {
-      listForExecution: vi.fn().mockResolvedValue([]),
+      listForExecution: vi.fn().mockResolvedValue({ availability: 'local', jobs: [] }),
       cancel: vi.fn().mockResolvedValue(undefined),
       retry: vi.fn().mockResolvedValue(undefined),
       saveCopy: vi.fn().mockResolvedValue({ saved: true }),
@@ -217,7 +217,7 @@ describe('registerDesktopIpc', () => {
     const app = harness()
 
     await expect(app.invoke(ipcChannels.conversionListForExecution, { executionId: 'execution_1' }))
-      .resolves.toEqual([])
+      .resolves.toEqual({ availability: 'local', jobs: [] })
     await expect(app.invoke(ipcChannels.conversionCancel, { jobId: 'job_1' })).resolves.toBeUndefined()
     await expect(app.invoke(ipcChannels.conversionRetry, { jobId: 'job_2' })).resolves.toBeUndefined()
     await expect(app.invoke(ipcChannels.conversionSaveCopy, { artifactId: 'artifact_1' }))
@@ -376,9 +376,7 @@ describe('registerDesktopIpc', () => {
       'http://127.0.0.1:5173/chat',
       { kind: 'development', origin: 'http://127.0.0.1:5173' },
       (dependencies) => {
-        vi.mocked(dependencies.conversion.listForExecution).mockResolvedValue([{
-          ...terminal.job,
-        }])
+        vi.mocked(dependencies.conversion.listForExecution).mockResolvedValue({ availability: 'local', jobs: [{ ...terminal.job }] })
         vi.mocked(dependencies.conversion.onEvent).mockImplementation((listener) => {
           listener(terminal as never)
           return () => undefined
@@ -387,7 +385,7 @@ describe('registerDesktopIpc', () => {
     )
 
     await expect(app.invoke(ipcChannels.conversionListForExecution, { executionId: 'execution_gap' }))
-      .resolves.toEqual([terminal.job])
+      .resolves.toEqual({ availability: 'local', jobs: [terminal.job] })
     expect(app.sent).toEqual([])
     await app.invoke('conversion:subscribe')
     expect(app.sent).toEqual([{ channel: ipcChannels.conversionEvent, payload: terminal }])

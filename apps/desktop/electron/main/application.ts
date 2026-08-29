@@ -1516,6 +1516,34 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       || !auth.isAuthenticated()
       || auth.currentUserId() !== job.ownerUserId) return
     settleConversionWaiters(job)
+    const execution = database.executions.getForUser(job.executionId, job.ownerUserId)
+    if (execution?.chatRunId && terminalConversionStatuses.has(job.status)) {
+      const jobs = database.conversionJobs.listForExecution(job.executionId, job.ownerUserId)
+      if (jobs.length > 0 && jobs.every((candidate) => terminalConversionStatuses.has(candidate.status))) {
+        const run = chatDatabase.chatRuns.get(execution.chatRunId)
+        if (run) {
+          const activeConversion = (candidate: unknown): candidate is Extract<ChatBlock, { type: 'conversion' }> => (
+            typeof candidate === 'object'
+            && candidate !== null
+            && (candidate as { type?: unknown }).type === 'conversion'
+            && (candidate as { executionId?: unknown }).executionId === job.executionId
+            && (candidate as { state?: unknown }).state === 'active'
+          )
+          const message = chatDatabase.messages.listForConversation(run.conversationId).find((candidate) => (
+            candidate.role === 'assistant' && candidate.blocks.some(activeConversion)
+          ))
+          const block = message?.blocks.find(activeConversion)
+          if (message && block) {
+            const replacement = { ...block, state: 'terminal' as const }
+            chatDatabase.messages.replaceBlock(message.id, block.blockId, replacement)
+            options.emitChat({
+              type: 'block_update', conversationId: run.conversationId, messageId: message.id,
+              blockId: replacement.blockId, block: replacement,
+            })
+          }
+        }
+      }
+    }
     let event: DesktopConversionJobEvent
     try {
       event = { type: 'job_updated', job: conversionJobView(database, job) }
@@ -3154,11 +3182,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       listForExecution: async ({ executionId }) => {
         const session = await requireAuthenticatedSession()
         if (!database.executions.getForUser(executionId, session.user.id)) {
-          throw failure('NOT_FOUND')
+          return { availability: 'unavailable' as const, jobs: [] }
         }
         currentConversion(session.user.id)
-        return database.conversionJobs.listForExecution(executionId, session.user.id)
-          .map((job) => conversionJobView(database, job))
+        return {
+          availability: 'local' as const,
+          jobs: database.conversionJobs.listForExecution(executionId, session.user.id)
+            .map((job) => conversionJobView(database, job)),
+        }
       },
       cancel: async ({ jobId }) => {
         const session = await requireAuthenticatedSession()

@@ -1462,6 +1462,12 @@ export const conversionJobViewSchema = z.object({
 }).strict()
 export type ConversionJobView = z.infer<typeof conversionJobViewSchema>
 
+export const conversionExecutionViewSchema = z.union([
+  z.object({ availability: z.literal('local'), jobs: z.array(conversionJobViewSchema) }).strict(),
+  z.object({ availability: z.literal('unavailable'), jobs: z.array(conversionJobViewSchema).length(0) }).strict(),
+])
+export type ConversionExecutionView = z.infer<typeof conversionExecutionViewSchema>
+
 export const conversionJobEventSchema = z.object({
   type: z.literal('job_updated'),
   job: conversionJobViewSchema,
@@ -1811,7 +1817,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.executionsGet]: executionDetailSchema,
   [ipcChannels.executionsDecide]: voidResponseSchema,
   [ipcChannels.executionsCancel]: voidResponseSchema,
-  [ipcChannels.conversionListForExecution]: z.array(conversionJobViewSchema),
+  [ipcChannels.conversionListForExecution]: conversionExecutionViewSchema,
   [ipcChannels.conversionCancel]: voidResponseSchema,
   [ipcChannels.conversionRetry]: voidResponseSchema,
   [ipcChannels.conversionSaveCopy]: z.object({ saved: z.boolean() }).strict(),
@@ -1918,7 +1924,7 @@ export interface DesktopAPI {
     onEvent(listener: (event: ExecutionEvent) => void): () => void
   }
   conversion: {
-    listForExecution(input: { executionId: string }): Promise<ConversionJobView[]>
+    listForExecution(input: { executionId: string }): Promise<ConversionExecutionView>
     cancel(input: { jobId: string }): Promise<void>
     retry(input: { jobId: string }): Promise<void>
     saveCopy(input: { artifactId: string }): Promise<{ saved: boolean }>

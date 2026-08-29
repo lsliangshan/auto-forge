@@ -15,6 +15,7 @@ import {
   authorizationSnapshotSchema,
   chatBlockSchema,
   conversionBlockSchema,
+  conversionExecutionViewSchema,
   chatEventSchema,
   chatSendInputSchema,
   byokUsageEventSchema,
@@ -74,6 +75,14 @@ describe('cross-process contracts', () => {
     for (const forbidden of ['bytes', 'path', 'sha256', 'artifactId', 'jobId', 'metadata', 'managedPath']) {
       expect(chatBlockSchema.safeParse({ ...block, [forbidden]: 'private-value' }).success).toBe(false)
     }
+  })
+
+  it('keeps conversion block updates and local availability strict', () => {
+    const block = { type: 'conversion' as const, blockId: 'conversion_1', executionId: 'execution_1', state: 'active' as const }
+    expect(chatEventSchema.parse({ type: 'block_update', conversationId: 'conversation_1', messageId: 'message_1', blockId: 'conversion_1', block })).toMatchObject({ block })
+    expect(conversionExecutionViewSchema.parse({ availability: 'unavailable', jobs: [] })).toEqual({ availability: 'unavailable', jobs: [] })
+    expect(conversionExecutionViewSchema.safeParse({ availability: 'unavailable', jobs: [{}] }).success).toBe(false)
+    expect(chatEventSchema.safeParse({ type: 'block_update', conversationId: 'conversation_1', messageId: 'message_1', blockId: 'conversion_1', block: { ...block, jobId: 'private' } }).success).toBe(false)
   })
 
   it('exposes stable, safe conversion errors', () => {

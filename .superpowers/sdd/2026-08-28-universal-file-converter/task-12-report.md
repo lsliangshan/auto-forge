@@ -46,3 +46,42 @@ apps/desktop/electron/main/sync/user-data-sync-engine.test.ts
 
 - `apps/desktop/tests/components/chat.test.ts` remains **189 passed / 1 failed** at `keeps the persisted message creation time in renderer state`; the failure is a pre-existing chat-store timestamp assertion and no Task 12 code changes that store.
 - Desktop typecheck remains blocked by unrelated existing diagnostics: one browser screenshot port, one provider-stream `purpose`, two sync-status narrowing errors, four CloudBase safe-code narrowing errors, plus three Renderer diagnostics in InspectorPanel/developer/Settings capability handling. No diagnostic references Task 12 files. The desktop production build does pass.
+
+## Fix round 1 — progress-ruling closure
+
+### Assumptions and scope
+
+- This round implements the four Important rulings only. The two deferred Minors (tone/live-region polishing and broader fixture-only coverage) remain intentionally deferred.
+- A conversion block belongs only to the assistant chat message and contains exactly `type`, `blockId`, `executionId`, and `state`. Conversion jobs/artifacts remain in the authenticated device-local Main repository.
+
+### RED / GREEN counts
+
+- RED: **2 behavioural failures** were captured. The real Application runner reached a terminal conversion job but emitted no `block_update`, exposing that the code read the global chat-run/message repository instead of the current user's repository. The real Agent approval path also produced no active conversion block because approval state clears the transient capability before tool start.
+- GREEN: the focused Application terminal persistence/event test and Agent approval test pass after the smallest fixes. Card/store/MessageBlock is **18/18**, shared contracts **103/103**, context plus user-data sync **81/81**. The combined Application/Agent/IPC/preload run is **441 passed / 2 existing baseline failures**: the legacy-import temporary-directory `ENOTEMPTY` cleanup race and the pre-existing context-summary budget failure.
+
+### Contract, lifecycle, and privacy proof
+
+- On the actual Agent workflow path, a declared `file.convert` permission appends and persists one strict active block after execution reservation/start. It never includes job, artifact, path, hash, bytes, or metadata. The Application runner turns the matching active block terminal exactly once only after every execution job is terminal, persists it through the user-local message repository, and emits the same strict `block_update`.
+- `conversion:list-for-execution` now returns either `{ availability: 'local', jobs }` or `{ availability: 'unavailable', jobs: [] }`; missing and cross-owner requests are indistinguishable. The renderer shows exactly `转换结果仅在发起转换的设备上可用` only for unavailable, retains genuine load errors separately, and clears an earlier load error on a valid event.
+- Same-epoch snapshots union jobs/artifacts, preserve a deleted artifact as absorbing, retain fuller representations, and prevent terminal status regression. The store keeps subscription/hub/release state under `Symbol.for('autoforge.conversion-store.runtime')`; the two-module reload test releases the first feed before exactly one replacement feed is created.
+- JSON assertions cover Agent events, Application persisted/event payloads, shared block-update parsing, and existing context/sync serialization. They reject or exclude `bytes`, `path`, `sha256`, `artifactId`, `jobId`, and metadata/internal local details.
+
+### Fix-round files and gates
+
+```text
+apps/desktop/electron/main/agent/agent-orchestrator.ts
+apps/desktop/electron/main/agent/agent-orchestrator.test.ts
+apps/desktop/electron/main/application.ts
+apps/desktop/electron/main/application.test.ts
+apps/desktop/electron/main/ipc/register-ipc.test.ts
+apps/desktop/src/components/conversion/ConversionBlock.vue
+apps/desktop/src/stores/conversion.ts
+apps/desktop/tests/components/conversion-block.test.ts
+packages/shared/src/desktop-api.ts
+packages/shared/src/events.ts
+packages/shared/src/contracts.test.ts
+```
+
+- `pnpm --filter @autoforge/shared build` passed; scoped ESLint and `git diff --check` passed.
+- Workspace/desktop typecheck remains at the same 8 unrelated pre-existing diagnostics after this round; no Task 12 file is named.
+- Production build was started after the scoped checks; final completion/SHA are recorded with the implementation commit.

@@ -297,7 +297,7 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     conversationId: identifierSchema,
     messageId: identifierSchema,
     blockId: identifierSchema,
-    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema]),
+    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema, conversionBlockSchema]),
   }).strict(),
   z.object({
     type: z.literal('conversation_title_updated'),

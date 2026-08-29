@@ -1796,6 +1796,11 @@ export class AgentOrchestrator {
     }
     pending.executionAvailable = true
     this.updateWorkflowStatus(active, pending, 'running')
+    if (tool.candidate.workflow.permissions.some(({ capability }) => capability === 'file.convert')) {
+      this.appendBlock(active, {
+        type: 'conversion', blockId: this.id(), executionId: tool.executionId, state: 'active',
+      })
+    }
     const actual: WorkflowProvenanceEntry = {
       ...this.workflowStatusContext(tool),
       executionId: tool.executionId,

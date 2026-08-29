@@ -7034,7 +7034,7 @@ describe('createApplicationRuntime', () => {
       expect(await runtime.services.executions.get(result.executionId)).toMatchObject({ status: 'completed' })
     })
     const jobs = await runtime.services.conversion.listForExecution({ executionId: result.executionId })
-    expect(jobs).toHaveLength(1)
+    expect(jobs).toMatchObject({ availability: 'local', jobs: [expect.anything()] })
     await runtime.close()
 
     const database = openAppDatabase(join(root, 'autoforge.sqlite'))
@@ -8986,14 +8986,14 @@ describe('createApplicationRuntime', () => {
     const snapshot = await runtime.services.conversion.listForExecution({
       executionId: alice.executionId,
     })
-    expect(snapshot).toEqual([expect.objectContaining({
+    expect(snapshot).toMatchObject({ availability: 'local', jobs: [expect.objectContaining({
       jobId: alice.jobId,
       executionId: alice.executionId,
       status: 'completed',
       artifacts: [expect.objectContaining({
         artifactId: 'artifact_alice_conversion', status: 'ready', displayName: 'result.png',
       })],
-    })])
+    })] })
     expect(JSON.stringify(snapshot)).not.toMatch(/owner|userId|sourceId|relativePath|absolutePath|sha256/i)
 
     await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_alice_conversion' }))
@@ -9018,7 +9018,7 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.conversion.saveCopy({ artifactId: 'artifact_bob_conversion' }))
       .rejects.toMatchObject({ code: 'NOT_FOUND' })
     await expect(runtime.services.conversion.listForExecution({ executionId: 'execution_bob_conversion' }))
-      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+      .resolves.toEqual({ availability: 'unavailable', jobs: [] })
     for (const action of [
       () => runtime.services.conversion.saveCopy({ artifactId: 'artifact_alice_missing' }),
       () => runtime.services.conversion.reveal({ artifactId: 'artifact_alice_missing' }),
@@ -9422,7 +9422,7 @@ describe('createApplicationRuntime', () => {
       })
       database.close()
       await expect(runtime.services.conversion.listForExecution({ executionId: 'execution_after_clear' }))
-        .resolves.toEqual([expect.objectContaining({ jobId: 'job_after_clear', status: 'completed' })])
+        .resolves.toMatchObject({ availability: 'local', jobs: [expect.objectContaining({ jobId: 'job_after_clear', status: 'completed' })] })
     } finally {
       await runtime.close()
     }
@@ -9514,6 +9514,99 @@ describe('createApplicationRuntime', () => {
     }
   })
 
+  it('persists and emits a payload-free terminal conversion block after the application runner settles', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-block-terminal-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const bootstrap = createApplicationRuntime(options(root, { authService }))
+    const session = await authenticate(bootstrap, 'ConversionBlockTerminal')
+    const conversation = await bootstrap.services.chat.createConversation()
+    await bootstrap.close()
+
+    const stores = new UserDataStoreManager(join(root, 'user-caches'))
+    const store = stores.open(session.user.id)
+    store.chatRuns.insert({
+      id: 'run_conversion_block_terminal', conversationId: conversation.id, userId: session.user.id,
+      provider: 'openrouter', requestId: 'request_conversion_block_terminal', model: 'openrouter/test',
+      status: 'completed', startedAt: 1, endedAt: 2,
+    })
+    store.messages.insert({
+      id: 'message_conversion_block_terminal', conversationId: conversation.id, role: 'assistant',
+      blocks: [{
+        type: 'conversion', blockId: 'block_conversion_terminal',
+        executionId: 'execution_conversion_block_terminal', state: 'active',
+      }], createdAt: 2,
+    })
+    stores.close()
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.executions.insert({
+      id: 'execution_conversion_block_terminal', ownerUserId: session.user.id,
+      workflowId: 'file.convert.universal', workflowVersion: '0.1.0',
+      chatRunId: 'run_conversion_block_terminal', status: 'completed', input: {},
+    })
+    database.conversionJobs.create({
+      id: 'job_conversion_block_terminal', ownerUserId: session.user.id,
+      executionId: 'execution_conversion_block_terminal', sourceKind: 'artifact',
+      sourceId: 'artifact_conversion_block_input', targetFormat: 'png', status: 'queued',
+    })
+    const bytes = Buffer.from('conversion terminal source')
+    database.conversionArtifacts.create({
+      id: 'artifact_conversion_block_input', ownerUserId: session.user.id,
+      executionId: 'execution_conversion_block_terminal', conversionJobId: 'job_conversion_block_terminal',
+      role: 'input', displayName: 'source.png', detectedFormat: 'png', mimeType: 'image/png',
+      byteSize: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex'),
+      relativePath: 'inputs/artifact_conversion_block_input.png',
+    })
+    database.close()
+    const inputPath = join(
+      resolveUserConversionRoot(root, session.user.id), 'inputs', 'artifact_conversion_block_input.png',
+    )
+    await mkdir(dirname(inputPath), { recursive: true })
+    await writeFile(inputPath, bytes)
+    const emitChat = vi.fn()
+    const conversionRuntime: ConversionJobRuntime = {
+      concurrencyClass: () => 'other',
+      acquirePack: async () => ({
+        name: 'image-icon', version: '1.0.0', platform: 'darwin', arch: 'arm64',
+        root: join(root, 'fake-pack'), executables: {}, release: () => undefined,
+      }),
+      createWriter: async () => ({
+        tempPath: join(root, 'terminal-output.partial'),
+        commit: async () => { throw new Error('unexpected commit') },
+        abort: async () => undefined,
+      }),
+      convert: async () => { throw toSafeAppError({ code: 'CONVERSION_CANCELLED' }) },
+    }
+    const runtime = createApplicationRuntime(options(root, { authService, conversionRuntime, emitChat }))
+    const conversionEvents: unknown[] = []
+    runtime.services.conversion.onEvent((event) => { conversionEvents.push(event) })
+    try {
+      await runtime.services.auth.getSession()
+      await vi.waitFor(() => expect(conversionEvents).toContainEqual(expect.objectContaining({
+        type: 'job_updated', job: expect.objectContaining({
+          jobId: 'job_conversion_block_terminal', status: 'failed',
+        }),
+      })))
+      await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'block_update', messageId: 'message_conversion_block_terminal',
+        block: {
+          type: 'conversion', blockId: 'block_conversion_terminal',
+          executionId: 'execution_conversion_block_terminal', state: 'terminal',
+        },
+      })))
+      const message = (await listMessages(runtime, conversation.id))[0]
+      expect(message?.blocks).toEqual([{
+        type: 'conversion', blockId: 'block_conversion_terminal',
+        executionId: 'execution_conversion_block_terminal', state: 'terminal',
+      }])
+      expect(JSON.stringify({ events: emitChat.mock.calls, message })).not.toMatch(
+        /bytes|path|sha256|artifactId|jobId|metadata/i,
+      )
+    } finally {
+      await runtime.close()
+    }
+  })
+
   it('recovers owner partials and interrupted jobs before broadcasting strict snapshots', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-recovery-'))
     directories.push(root)
@@ -9538,9 +9631,9 @@ describe('createApplicationRuntime', () => {
     await expect(access(packPartial)).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(access(artifactPartial)).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(runtime.services.conversion.listForExecution({ executionId: seeded.executionId }))
-      .resolves.toEqual([expect.objectContaining({
+      .resolves.toMatchObject({ availability: 'local', jobs: [expect.objectContaining({
         jobId: seeded.jobId, status: 'interrupted', errorCode: 'CONVERSION_INTERRUPTED',
-      })])
+      })] })
     expect(events).toContainEqual(expect.objectContaining({
       type: 'job_updated', job: expect.objectContaining({ jobId: seeded.jobId, status: 'interrupted' }),
     }))
@@ -9681,9 +9774,9 @@ describe('createApplicationRuntime', () => {
     })
     await expect(runtime.services.conversion.listForExecution({
       executionId: 'execution_conversion_stop_cas',
-    })).resolves.toEqual([expect.objectContaining({
+    })).resolves.toMatchObject({ availability: 'local', jobs: [expect.objectContaining({
       jobId: 'job_conversion_stop_cas', status: 'interrupted',
-    })])
+    })] })
     await runtime.close()
   })
 })
