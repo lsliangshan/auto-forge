@@ -22,7 +22,7 @@ const semverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-
 const portableSegment = /^[A-Za-z0-9._-]+$/u
 const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const launchableExtension = /\.(?:exe|com|cmd|bat|ps1|scr|msi)$/iu
-const codeExtension = /(?:\.(?:dll|dylib|node|jar|py|pyc|pyd|pl|rb|sh|bash|zsh|fish|vbs|wsf|js|mjs|cjs)|\.so(?:\.[0-9]+)*)$/iu
+const codeExtension = /(?:\.(?:dll|dylib|node|jar|py|pyc|pyd|pl|rb|sh|bash|zsh|fish|hta|vbs|vbe|js|jse|mjs|cjs|wsf|wsh|cpl|lnk|reg|url)|\.so(?:\.[0-9]+)*)$/iu
 const exactExecutablePaths = Object.freeze({
   'image-icon': Object.freeze({ darwin: ['bin/autoforge-image-converter'], win32: ['bin/autoforge-image-converter.exe'] }),
   document: Object.freeze({ darwin: ['program/soffice'], win32: ['program/soffice.exe'] }),
@@ -76,6 +76,13 @@ export function isSafeAbsolutePathForPlatform(value, platform = process.platform
   return platform !== 'darwin' && platform !== 'linux'
     ? false
     : posix.isAbsolute(value) && posix.normalize(value) === value
+}
+
+export function isPathInsideRoot(root, candidate, platform = process.platform) {
+  if (!isSafeAbsolutePathForPlatform(root, platform) || !isSafeAbsolutePathForPlatform(candidate, platform)) return false
+  const paths = platform === 'win32' ? win32 : posix
+  const path = paths.relative(root, candidate)
+  return path === '' || (!paths.isAbsolute(path) && path !== '..' && !path.startsWith(`..${paths.sep}`))
 }
 
 export function requireAbsolutePath(value, label) {
@@ -369,7 +376,7 @@ export async function collectPayloadEntries(root, declaredFiles, platform) {
       }
       if (!metadata.isFile() || !child.isFile()) fail('Pack payload may contain regular files only.')
       const resolved = await realpath(absolutePath)
-      if (!resolved.startsWith(`${resolvedRoot}/`)) fail('Pack payload escapes its root.')
+      if (!isPathInsideRoot(resolvedRoot, resolved, process.platform)) fail('Pack payload escapes its root.')
       if (metadata.size > PACK_LIMITS.maxEntryBytes || entries.length >= PACK_LIMITS.maxEntries) {
         fail('Pack payload exceeds converter pack limits.')
       }
@@ -388,8 +395,10 @@ export async function collectPayloadEntries(root, declaredFiles, platform) {
       if ((declared.role === 'license') !== relativePath.startsWith('LICENSES/')) fail('Pack payload license role is invalid.')
       if (declared.role === 'license' && bytes.byteLength === 0) fail('Pack payload is missing a declared license notice.')
       const executable = declared.role === 'executable'
-      const expectedSourceMode = platform === 'darwin' && executable ? 0o755 : 0o644
-      if ((metadata.mode & 0o777) !== expectedSourceMode) fail('Pack payload file mode is invalid for its target platform.')
+      if (platform === 'darwin') {
+        const expectedSourceMode = executable ? 0o755 : 0o644
+        if ((metadata.mode & 0o777) !== expectedSourceMode) fail('Pack payload file mode is invalid for its target platform.')
+      }
       entries.push({ path: relativePath, bytes, executable, role: declared.role, sha256: sha256(bytes) })
     }
   }

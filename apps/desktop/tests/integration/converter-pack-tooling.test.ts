@@ -502,15 +502,20 @@ describe('converter pack release tooling', () => {
   it('uses target-aware Windows paths/modes and rejects disguised launchable or library code', () => {
     const modulePath = join(desktopRoot, 'scripts/converter-packs/pack-tooling-lib.mjs')
     const program = `
-      import { isSafeAbsolutePathForPlatform } from ${JSON.stringify(`file://${modulePath}`)};
+      import { isPathInsideRoot, isSafeAbsolutePathForPlatform } from ${JSON.stringify(`file://${modulePath}`)};
       const result = [
         isSafeAbsolutePathForPlatform('C:\\\\packs\\\\release', 'win32'),
         isSafeAbsolutePathForPlatform('\\\\\\\\server\\\\share\\\\release', 'win32'),
         isSafeAbsolutePathForPlatform('C:relative', 'win32'),
         isSafeAbsolutePathForPlatform('\\\\rooted-without-volume', 'win32'),
         isSafeAbsolutePathForPlatform('\\\\\\\\?\\\\C:\\\\device', 'win32'),
+        isPathInsideRoot('C:\\\\packs\\\\release', 'c:\\\\packs\\\\release\\\\media\\\\bin\\\\ffmpeg.exe', 'win32'),
+        isPathInsideRoot('C:\\\\packs\\\\release', 'C:\\\\packs-escape\\\\ffmpeg.exe', 'win32'),
+        isPathInsideRoot('C:\\\\packs\\\\release', 'D:\\\\packs\\\\release\\\\ffmpeg.exe', 'win32'),
+        isPathInsideRoot('\\\\\\\\server\\\\share\\\\release', '\\\\\\\\SERVER\\\\SHARE\\\\release\\\\media\\\\ffmpeg.exe', 'win32'),
+        isPathInsideRoot('\\\\\\\\server\\\\share\\\\release', '\\\\\\\\server\\\\other\\\\release\\\\ffmpeg.exe', 'win32'),
       ];
-      if (JSON.stringify(result) !== JSON.stringify([true, true, false, false, false])) process.exit(2);
+      if (JSON.stringify(result) !== JSON.stringify([true, true, false, false, false, true, false, false, true, false])) process.exit(2);
     `
     expect(spawnSync(process.execPath, ['--input-type=module', '--eval', program]).status).toBe(0)
 
@@ -526,7 +531,17 @@ describe('converter pack release tooling', () => {
       ['hidden.dylib', 'unsafe library'],
       ['hidden.so', 'unsafe library'],
       ['hidden.node', 'unsafe native library'],
+      ['hidden.hta', '<script>unsafe</script>'],
+      ['hidden.vbs', 'WScript.Quit 0\r\n'],
+      ['hidden.vbe', 'encoded script'],
       ['hidden.js', 'process.exit(0)\n'],
+      ['hidden.jse', 'encoded script'],
+      ['hidden.wsf', '<job/>'],
+      ['hidden.wsh', '[ScriptFile]\r\n'],
+      ['hidden.cpl', 'MZ unsafe control panel'],
+      ['hidden.lnk', 'unsafe shortcut'],
+      ['hidden.reg', 'Windows Registry Editor Version 5.00\r\n'],
+      ['hidden.url', '[InternetShortcut]\r\nURL=https://example.test\r\n'],
       ['hidden.sh', '#!/bin/sh\nexit 0\n'],
       ['hidden-script', '#!/bin/sh\nexit 0\n'],
     ] as const) {
@@ -545,6 +560,8 @@ describe('converter pack release tooling', () => {
 
     const windowsRoot = temporaryRoot()
     const production = stageProduction(windowsRoot)
+    chmodSync(join(production, 'packs/media-win32-x64/payload/bin/ffmpeg.exe'), 0o755)
+    chmodSync(join(production, 'packs/media-win32-x64/payload/LICENSES/media.txt'), 0o600)
     expect(build(production, join(windowsRoot, 'release'), 'production').status).toBe(0)
   })
 
@@ -583,5 +600,40 @@ describe('converter pack release tooling', () => {
       expect(result.status, name).not.toBe(0)
       expect(result.stderr.toLowerCase(), name).toContain(message)
     }
+
+    const privateKey = generateKeyPairSync('ed25519').privateKey.export({ format: 'der', type: 'pkcs8' })
+    const derRoot = temporaryRoot()
+    const derFixture = packagedApp(derRoot, 'darwin', { 'assets/harmless.dat': privateKey })
+    const derResult = run(verifyScript, ['--packaged-app', derFixture.app, '--platform', 'darwin', '--arch', 'arm64'])
+    expect(derResult.status).not.toBe(0)
+    expect(derResult.stderr.toLowerCase()).toContain('private')
+    expect(`${derResult.stdout}${derResult.stderr}`).not.toContain(privateKey.toString('hex'))
+
+    for (const [name, relativePath, message] of [
+      ['root engine', 'ffmpeg.exe', 'engine'],
+      ['root archive', 'old-pack.tar', 'archive'],
+      ['root signature', 'index.sig', 'signature'],
+      ['root test', 'tests/helper.js', 'test'],
+      ['root e2e', 'e2e/run.js', 'e2e'],
+      ['root stale', 'stale/old-output.js', 'stale'],
+    ] as const) {
+      const root = temporaryRoot()
+      const fixture = packagedApp(root, 'darwin')
+      const segments = relativePath.split('/')
+      if (segments.length > 1) mkdirSync(join(fixture.app, ...segments.slice(0, -1)), { recursive: true })
+      writeFileSync(join(fixture.app, ...segments), 'forbidden material')
+      const result = run(verifyScript, ['--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64'])
+      expect(result.status, name).not.toBe(0)
+      expect(result.stderr.toLowerCase(), name).toContain(message)
+    }
+
+    const linkedRoot = temporaryRoot()
+    const linkedFixture = packagedApp(linkedRoot, 'darwin')
+    const outside = join(linkedRoot, 'outside-runtime.bin')
+    writeFileSync(outside, 'external material')
+    symlinkSync(outside, join(linkedFixture.app, 'harmless-runtime'))
+    const linkedResult = run(verifyScript, ['--packaged-app', linkedFixture.app, '--platform', 'darwin', '--arch', 'arm64'])
+    expect(linkedResult.status).not.toBe(0)
+    expect(linkedResult.stderr.toLowerCase()).toContain('symbolic')
   })
 })

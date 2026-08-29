@@ -104,7 +104,10 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
       const height = bytes[entry + 1] || 256
       const payloadBytes = bytes.readUInt32LE(entry + 8)
       const payloadOffset = bytes.readUInt32LE(entry + 12)
+      expect(bytes[entry + 2]).toBe(0)
       expect(bytes[entry + 3]).toBe(0)
+      expect(bytes.readUInt16LE(entry + 4)).toBe(1)
+      expect(bytes.readUInt16LE(entry + 6)).toBe(32)
       expect(payloadOffset).toBeGreaterThanOrEqual(6 + count * 16)
       expect(payloadOffset + payloadBytes).toBeLessThanOrEqual(bytes.byteLength)
       expect(probeBytes(bytes.subarray(payloadOffset, payloadOffset + payloadBytes), `ico-${index}.png`, 'image/png'))
@@ -113,11 +116,38 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     })
   }
 
-  function icnsRepresentations(path: string): Array<{ type: string; width: number; height: number }> {
+  const expectedIcnsSlots = [
+    { type: 'icp4', logicalSize: 16, scale: 1, pixelSize: 16 },
+    { type: 'ic11', logicalSize: 16, scale: 2, pixelSize: 32 },
+    { type: 'icp5', logicalSize: 32, scale: 1, pixelSize: 32 },
+    { type: 'ic12', logicalSize: 32, scale: 2, pixelSize: 64 },
+    { type: 'ic07', logicalSize: 128, scale: 1, pixelSize: 128 },
+    { type: 'ic13', logicalSize: 128, scale: 2, pixelSize: 256 },
+    { type: 'ic08', logicalSize: 256, scale: 1, pixelSize: 256 },
+    { type: 'ic14', logicalSize: 256, scale: 2, pixelSize: 512 },
+    { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 },
+    { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 },
+  ] as const
+
+  function icnsRepresentations(path: string): Array<{
+    type: string
+    logicalSize: number
+    scale: number
+    pixelSize: number
+    width: number
+    height: number
+  }> {
     const bytes = readFileSync(path)
     expect(bytes.subarray(0, 4).toString('ascii')).toBe('icns')
     expect(bytes.readUInt32BE(4)).toBe(bytes.byteLength)
-    const representations: Array<{ type: string; width: number; height: number }> = []
+    const representations: Array<{
+      type: string
+      logicalSize: number
+      scale: number
+      pixelSize: number
+      width: number
+      height: number
+    }> = []
     let offset = 8
     while (offset < bytes.byteLength) {
       const type = bytes.subarray(offset, offset + 4).toString('ascii')
@@ -127,12 +157,50 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
       const embedded = probeBytes(bytes.subarray(offset + 8, offset + length), `${type}.png`, 'image/png')
       expect(embedded).toMatchObject({ format: 'png', frameCount: 1 })
       expect(embedded.width).toBe(embedded.height)
-      representations.push({ type, width: embedded.width!, height: embedded.height! })
+      const slot = expectedIcnsSlots.find((candidate) => candidate.type === type)
+      expect(slot, `approved ICNS representation ${type}`).toBeDefined()
+      expect(embedded.width).toBe(slot?.pixelSize)
+      representations.push({ ...slot!, width: embedded.width!, height: embedded.height! })
       offset += length
     }
     expect(offset).toBe(bytes.byteLength)
-    expect(probeBytes(bytes, 'icon.icns', 'image/icns')).toMatchObject({ format: 'icns', width: 1024, height: 1024 })
+    expect(probeBytes(bytes, 'icon.icns', 'image/icns')).toMatchObject({
+      format: 'icns', width: 1024, height: 1024, frameCount: 10, iconSlots: expectedIcnsSlots,
+    })
     return representations
+  }
+
+  function ebmlVint(bytes: Buffer, offset: number, preserveMarker: boolean): { value: number; next: number } {
+    const first = bytes[offset]
+    if (first === undefined || first === 0) throw new Error('Invalid EBML variable-length integer')
+    let marker = 0x80
+    let length = 1
+    while ((first & marker) === 0) {
+      marker >>= 1
+      length += 1
+    }
+    if (length > 8 || offset + length > bytes.byteLength) throw new Error('Truncated EBML variable-length integer')
+    let value = preserveMarker ? first : first & (marker - 1)
+    for (let index = 1; index < length; index += 1) value = value * 256 + bytes[offset + index]!
+    return { value, next: offset + length }
+  }
+
+  function ebmlDocType(bytes: Buffer): string {
+    const header = ebmlVint(bytes, 0, true)
+    expect(header.value).toBe(0x1a45dfa3)
+    const headerSize = ebmlVint(bytes, header.next, false)
+    const end = headerSize.next + headerSize.value
+    expect(end).toBeLessThanOrEqual(bytes.byteLength)
+    let offset = headerSize.next
+    while (offset < end) {
+      const id = ebmlVint(bytes, offset, true)
+      const size = ebmlVint(bytes, id.next, false)
+      const valueEnd = size.next + size.value
+      expect(valueEnd).toBeLessThanOrEqual(end)
+      if (id.value === 0x4282) return bytes.subarray(size.next, valueEnd).toString('ascii')
+      offset = valueEnd
+    }
+    throw new Error('EBML DocType is absent')
   }
 
   function pngCornerAlpha(path: string): number {
@@ -216,7 +284,10 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     const bytes = readFileSync(path)
     if (target === 'mp4') expect(bytes.subarray(4, 12).toString('ascii')).toBe('ftypisom')
     if (target === 'mov') expect(bytes.subarray(4, 12).toString('ascii')).toBe('ftypqt  ')
-    if (target === 'webm') expect(bytes.subarray(0, 4)).toEqual(Buffer.from('1a45dfa3', 'hex'))
+    if (target === 'webm') {
+      expect(bytes.subarray(0, 4)).toEqual(Buffer.from('1a45dfa3', 'hex'))
+      expect(ebmlDocType(bytes)).toBe('webm')
+    }
     if (target === 'mp3') {
       expect(bytes.subarray(0, 3).toString('ascii') === 'ID3' || (bytes[0] === 0xff && (bytes[1]! & 0xe6) === 0xe2)).toBe(true)
     }
@@ -244,10 +315,9 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     expect(icoRepresentations(defaultIco.path)).toEqual([16, 24, 32, 48, 64, 128, 256].map((size) => ({ width: size, height: size })))
     expect(icoRepresentations(favicon.path)).toEqual([16, 32, 48].map((size) => ({ width: size, height: size })))
     expect(defaultIco.metadata).toMatchObject({ iconRepresentations: [16, 24, 32, 48, 64, 128, 256], transparentPadding: true })
-    expect(icnsRepresentations(icns.path)).toEqual([
-      ['icp4', 16], ['ic11', 32], ['icp5', 32], ['ic12', 64], ['ic07', 128],
-      ['ic13', 256], ['ic08', 256], ['ic14', 512], ['ic09', 512], ['ic10', 1024],
-    ].map(([type, size]) => ({ type, width: size, height: size })))
+    expect(icnsRepresentations(icns.path)).toEqual(expectedIcnsSlots.map((slot) => ({
+      ...slot, width: slot.pixelSize, height: slot.pixelSize,
+    })))
     expect(icns.metadata).toMatchObject({ iconRepresentations: [16, 32, 64, 128, 256, 512, 1024], transparentPadding: true })
 
     const extractedIco = await convert(imageIconAdapter, 'image-icon', {
@@ -258,10 +328,14 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
       .toEqual([16, 24, 32, 48, 64, 128, 256])
     expect(extractedIco.map((output) => pngCornerAlpha(output.path))).toEqual(Array(7).fill(0))
 
-    const extractedIcns = await convert(imageIconAdapter, 'image-icon', {
-      format: 'icns', mimeType: 'image/icns', kind: 'image', byteSize: readFileSync(icns.path).byteLength,
-      width: 1024, height: 1024, frameCount: 10,
-    }, icns.path, { targetFormat: 'png' }, 'extract-icns')
+    const extractedIcns = await convert(
+      imageIconAdapter,
+      'image-icon',
+      probe(icns.path, 'icon.icns', 'image/icns'),
+      icns.path,
+      { targetFormat: 'png' },
+      'extract-icns',
+    )
     expect(extractedIcns.map((output) => probe(output.path, 'representation.png', 'image/png').width))
       .toEqual([16, 32, 32, 64, 128, 256, 256, 512, 512, 1024])
     expect(extractedIcns.map((output) => pngCornerAlpha(output.path))).toEqual(Array(10).fill(0))
@@ -390,6 +464,15 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
       const output = (await convert(mediaAdapter, 'media', input, inputPath, { targetFormat }, `mp4-${targetFormat}`))[0]!
       if (targetFormat === 'gif') {
         expect(probe(output.path, 'video.gif', 'image/gif')).toMatchObject({ format: 'gif', width: 48, height: 32 })
+      }
+      if (targetFormat === 'webm') {
+        let webmProbe: ProbedConversionInput
+        try {
+          webmProbe = probe(output.path, 'video.webm', 'video/webm')
+        } catch (error) {
+          throw new Error('Production structural probe rejected the real webm output', { cause: error })
+        }
+        expect(webmProbe).toMatchObject({ format: 'webm' })
       }
       const metadata = mediaMetadata(output.path)
       expect(metadata.format.format_name).toBe(expected.format)

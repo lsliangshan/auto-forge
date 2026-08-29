@@ -1,4 +1,4 @@
-import { createPublicKey, verify as verifySignature } from 'node:crypto'
+import { createPrivateKey, createPublicKey, verify as verifySignature } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import {
   closeSync,
@@ -12,7 +12,7 @@ import {
   realpathSync,
 } from 'node:fs'
 import { readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { isAbsolute, join, relative, sep } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import {
@@ -36,6 +36,7 @@ const desktopRoot = fileURLToPath(new URL('..', import.meta.url))
 // filesystem. Boundary verification must inspect the regular archive itself.
 process.noAsar = true
 const privateKeyPattern = /-----BEGIN [^-\r\n]*PRIVATE KEY-----/u
+const privateKeyScanLimit = 1024 * 1024
 const forbiddenSegments = new Set([
   'test', 'tests', '__tests__', 'spec', 'fixtures', 'e2e', '.e2e', 'stale', 'test-results', 'playwright-report',
 ])
@@ -49,7 +50,7 @@ function sameFile(left, right) {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size
 }
 
-function readStableRegularFileSync(path, label) {
+function readStableRegularFileSync(path, label, maximumBytes = Number.MAX_SAFE_INTEGER) {
   const before = lstatSync(path)
   if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || realpathSync(path) !== path) {
     fail(`${label} must be one regular, non-linked file without symbolic path components.`)
@@ -59,11 +60,11 @@ function readStableRegularFileSync(path, label) {
     descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
     const opened = fstatSync(descriptor)
     if (!opened.isFile() || opened.nlink !== 1 || !sameFile(before, opened)) fail(`${label} changed while opening.`)
-    const bytes = readFileSync(descriptor)
+    const bytes = opened.size <= maximumBytes ? readFileSync(descriptor) : undefined
     const afterHandle = fstatSync(descriptor)
     const afterPath = lstatSync(path)
     if (
-      bytes.byteLength !== opened.size
+      (bytes !== undefined && bytes.byteLength !== opened.size)
       || afterHandle.nlink !== 1
       || afterPath.nlink !== 1
       || !sameFile(opened, afterHandle)
@@ -80,6 +81,11 @@ function requireStableDirectorySync(path, label) {
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || realpathSync(path) !== path) {
     fail(`${label} must be a directory without symbolic path components.`)
   }
+}
+
+function pathIsWithin(root, candidate) {
+  const path = relative(root, candidate)
+  return path === '' || (!isAbsolute(path) && path !== '..' && !path.startsWith(`..${sep}`))
 }
 
 function decodeAsar(path) {
@@ -101,6 +107,7 @@ function forbiddenPackagedPath(path) {
   const lowerSegments = path.split('/').map((segment) => segment.toLowerCase())
   const name = lowerSegments.at(-1) ?? ''
   if (lowerSegments.some((segment) => forbiddenSegments.has(segment))) return 'stale/test/e2e'
+  if (lowerSegments.some((segment) => segment === 'converter-engines' || segment === 'converter-packs')) return 'converter pack'
   if (forbiddenEngineNames.has(name)) return 'engine'
   if (
     /(?:^|[-_.])(?:private[-_]?key|test-converter-root)(?:[-_.]|$)/iu.test(name)
@@ -112,7 +119,14 @@ function forbiddenPackagedPath(path) {
 }
 
 function rejectPrivateKey(bytes, label) {
+  if (bytes === undefined) return
   if (privateKeyPattern.test(bytes.toString('utf8'))) fail(`${label} contains private key material.`)
+  if (bytes.byteLength === 0 || bytes.byteLength > privateKeyScanLimit || bytes[0] !== 0x30) return
+  for (const type of ['pkcs8', 'pkcs1', 'sec1']) {
+    let parsed = false
+    try { createPrivateKey({ key: bytes, format: 'der', type }); parsed = true } catch { /* not this DER private-key encoding */ }
+    if (parsed) fail(`${label} contains private key material.`)
+  }
 }
 
 function scanAsarNode(node, archive, prefix = '') {
@@ -193,26 +207,36 @@ export function verifyPackagedConverterBoundary(appPath, { platform = process.pl
   const archive = decodeAsar(appAsar)
   scanAsarNode(archive.header, archive)
 
+  const metadataRelative = platform === 'darwin'
+    ? 'Contents/Resources/converter-packs'
+    : 'resources/converter-packs'
+  const asarRelative = platform === 'darwin' ? 'Contents/Resources/app.asar' : 'resources/app.asar'
   const visit = (directory, prefix = '') => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => compareUtf8(a.name, b.name))) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name
       const absolute = join(directory, entry.name)
       const node = lstatSync(absolute)
-      if (node.isSymbolicLink()) fail('Packaged resources contain a symbolic link.')
+      const metadata = path === metadataRelative || path.startsWith(`${metadataRelative}/`)
+      if (!metadata && path !== asarRelative) {
+        const reason = forbiddenPackagedPath(path)
+        if (reason) fail(`Packaged app contains forbidden ${reason} path: ${path}`)
+      }
+      if (node.isSymbolicLink()) {
+        if (!pathIsWithin(appPath, realpathSync(absolute))) {
+          fail(`Packaged app contains a symbolic link outside its package root: ${path}`)
+        }
+        continue
+      }
       if (entry.isDirectory()) {
-        requireStableDirectorySync(absolute, `Packaged resource ${path}`)
+        requireStableDirectorySync(absolute, `Packaged app ${path}`)
         visit(absolute, path)
       } else {
-        const bytes = readStableRegularFileSync(absolute, `Packaged resource ${path}`)
-        if (path !== 'app.asar' && !path.startsWith('converter-packs/')) {
-          const reason = forbiddenPackagedPath(path)
-          if (reason) fail(`Packaged resources contain forbidden ${reason} path: ${path}`)
-          rejectPrivateKey(bytes, `Packaged resource ${path}`)
-        }
+        const bytes = readStableRegularFileSync(absolute, `Packaged app ${path}`, privateKeyScanLimit)
+        if (!metadata && path !== asarRelative) rejectPrivateKey(bytes, `Packaged app ${path}`)
       }
     }
   }
-  visit(resources)
+  visit(appPath)
   process.stdout.write(`verified ${platform}-${arch} packaged converter boundary: kill switch off, no private key, unsigned engine, archive, signature, test, e2e, or stale material\n`)
 }
 

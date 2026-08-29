@@ -49,7 +49,7 @@ const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const portablePathSegment = /^[A-Za-z0-9._-]+$/u
 const packRoles = new Set(['executable', 'code', 'license', 'data'])
 const launchableExtension = /\.(?:exe|com|cmd|bat|ps1|scr|msi)$/iu
-const codeExtension = /(?:\.(?:dll|dylib|node|jar|py|pyc|pyd|pl|rb|sh|bash|zsh|fish|vbs|wsf|js|mjs|cjs)|\.so(?:\.[0-9]+)*)$/iu
+const codeExtension = /(?:\.(?:dll|dylib|node|jar|py|pyc|pyd|pl|rb|sh|bash|zsh|fish|hta|vbs|vbe|js|jse|mjs|cjs|wsf|wsh|cpl|lnk|reg|url)|\.so(?:\.[0-9]+)*)$/iu
 
 function compareUtf8(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'))

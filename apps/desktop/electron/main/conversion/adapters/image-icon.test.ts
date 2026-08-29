@@ -128,6 +128,15 @@ describe('image/icon conversion adapter', () => {
     ])
   })
 
+  it('plans ten collision-free extraction outputs for the full scale-specific ICNS chain', () => {
+    const plan = imageIconAdapter.plan(image({
+      format: 'icns', mimeType: 'image/icns', frameCount: 10,
+    }), { inputPath: '/input/icon.icns', targetFormat: 'png' }, lease, '/work')
+    expect(plan.outputs).toHaveLength(10)
+    expect(new Set(plan.outputs.map(({ path }) => path))).toHaveLength(10)
+    expect(plan.outputs.at(-1)?.path).toBe('/work/representation-010.png')
+  })
+
   it.each([101, 256])('exports all %i trusted ICO representations without the PDF page cap', (frameCount) => {
     const plan = imageIconAdapter.plan(image({
       format: 'ico', mimeType: 'image/vnd.microsoft.icon', frameCount,

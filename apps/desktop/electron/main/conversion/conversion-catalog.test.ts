@@ -240,6 +240,29 @@ function ico(): Buffer {
   return Buffer.concat([bytes, image])
 }
 
+function dibIco(): Buffer {
+  const width = 16
+  const height = 16
+  const xorBytes = width * height * 4
+  const andBytes = Math.ceil(width / 32) * 4 * height
+  const image = Buffer.alloc(40 + xorBytes + andBytes)
+  image.writeUInt32LE(40, 0)
+  image.writeInt32LE(width, 4)
+  image.writeInt32LE(height * 2, 8)
+  image.writeUInt16LE(1, 12)
+  image.writeUInt16LE(32, 14)
+  const header = Buffer.alloc(22)
+  header.writeUInt16LE(1, 2)
+  header.writeUInt16LE(1, 4)
+  header[6] = width
+  header[7] = height
+  header.writeUInt16LE(1, 10)
+  header.writeUInt16LE(32, 12)
+  header.writeUInt32LE(image.byteLength, 14)
+  header.writeUInt32LE(header.byteLength, 18)
+  return Buffer.concat([header, image])
+}
+
 function icoHeader(count: number): Buffer {
   const bytes = Buffer.alloc(6 + count * 16)
   bytes.writeUInt16LE(1, 2)
@@ -255,6 +278,33 @@ function icns(): Buffer {
   header.write('icp4', 8)
   header.writeUInt32BE(8 + image.byteLength, 12)
   return Buffer.concat([header, image])
+}
+
+const expectedIcnsSlots = [
+  { type: 'icp4', logicalSize: 16, scale: 1, pixelSize: 16 },
+  { type: 'ic11', logicalSize: 16, scale: 2, pixelSize: 32 },
+  { type: 'icp5', logicalSize: 32, scale: 1, pixelSize: 32 },
+  { type: 'ic12', logicalSize: 32, scale: 2, pixelSize: 64 },
+  { type: 'ic07', logicalSize: 128, scale: 1, pixelSize: 128 },
+  { type: 'ic13', logicalSize: 128, scale: 2, pixelSize: 256 },
+  { type: 'ic08', logicalSize: 256, scale: 1, pixelSize: 256 },
+  { type: 'ic14', logicalSize: 256, scale: 2, pixelSize: 512 },
+  { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 },
+  { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 },
+] as const
+
+function fullIcns(): Buffer {
+  const chunks = expectedIcnsSlots.map(({ type, pixelSize }) => {
+    const image = png(pixelSize, pixelSize)
+    const header = Buffer.alloc(8)
+    header.write(type)
+    header.writeUInt32BE(header.byteLength + image.byteLength, 4)
+    return Buffer.concat([header, image])
+  })
+  const header = Buffer.alloc(8)
+  header.write('icns')
+  header.writeUInt32BE(header.byteLength + chunks.reduce((total, chunk) => total + chunk.byteLength, 0), 4)
+  return Buffer.concat([header, ...chunks])
 }
 
 function mp3(): Buffer {
@@ -291,7 +341,7 @@ function ebml(docType: 'webm' | 'matroska'): Buffer {
   ]))
   const track = ebmlElement('ae', Buffer.concat([
     ebmlElement('d7', Buffer.from([1])),
-    ebmlElement('73c5', Buffer.from([1])),
+    ebmlElement('73c5', Buffer.from('a647ade685486bfd', 'hex')),
     ebmlElement('83', Buffer.from([1])),
     ebmlElement('86', Buffer.from('V_VP8')),
   ]))
@@ -435,6 +485,52 @@ describe('conversion catalog input probing', () => {
   it('rejects an empty EBML Segment without mandatory metadata and tracks', () => {
     expect(() => probe(emptyEbml('webm'), 'empty.webm', 'video/webm'))
       .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+  })
+
+  it('requires the EBML DocType to match the declared WebM container', () => {
+    expect(probe(ebml('webm'), 'video.webm', 'video/webm')).toMatchObject({ format: 'webm' })
+    expect(() => probe(ebml('matroska'), 'video.webm', 'video/webm'))
+      .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+  })
+
+  it('probes every scale-specific ICNS representation without collapsing duplicate pixel sizes', () => {
+    expect(probe(fullIcns(), 'icon.icns', 'image/icns')).toMatchObject({
+      format: 'icns', width: 1024, height: 1024, frameCount: 10, iconSlots: expectedIcnsSlots,
+    })
+  })
+
+  it('validates ICO entry fields, payload bounds, and PNG/DIB embedded dimensions', () => {
+    expect(probe(ico(), 'icon.ico', 'image/vnd.microsoft.icon')).toMatchObject({ format: 'ico', frameCount: 1 })
+    expect(probe(dibIco(), 'icon.ico', 'image/vnd.microsoft.icon')).toMatchObject({ format: 'ico', width: 16, height: 16 })
+
+    const approvedLegacy = ico()
+    approvedLegacy.writeUInt16LE(0, 10)
+    approvedLegacy.writeUInt16LE(0, 12)
+    expect(probe(approvedLegacy, 'icon.ico', 'image/vnd.microsoft.icon')).toMatchObject({ format: 'ico' })
+
+    const mutations: Array<[string, (bytes: Buffer) => void]> = [
+      ['cursor type', (bytes) => bytes.writeUInt16LE(2, 2)],
+      ['color count', (bytes) => { bytes[8] = 1 }],
+      ['entry reserved byte', (bytes) => { bytes[9] = 1 }],
+      ['planes', (bytes) => bytes.writeUInt16LE(2, 10)],
+      ['bit depth', (bytes) => bytes.writeUInt16LE(16, 12)],
+      ['directory overlap', (bytes) => bytes.writeUInt32LE(6, 18)],
+      ['payload overflow', (bytes) => bytes.writeUInt32LE(bytes.byteLength, 14)],
+      ['PNG width mismatch', (bytes) => { bytes[6] = 32 }],
+    ]
+    for (const [label, mutate] of mutations) {
+      const bytes = ico()
+      mutate(bytes)
+      expect(() => probe(bytes, 'icon.ico', 'image/vnd.microsoft.icon'), label)
+        .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+    }
+
+    for (const [label, offset, value] of [['DIB width', 26, 8], ['DIB doubled height', 30, 16]] as const) {
+      const bytes = dibIco()
+      bytes.writeInt32LE(value, offset)
+      expect(() => probe(bytes, 'icon.ico', 'image/vnd.microsoft.icon'), label)
+        .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+    }
   })
 
   it('distinguishes Ogg Opus from Ogg Vorbis', () => {

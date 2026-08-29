@@ -25,6 +25,13 @@ export type ConversionInputFormat =
   | 'mp3' | 'wav' | 'm4a' | 'aac' | 'flac' | 'ogg' | 'opus'
   | 'mp4' | 'webm' | 'mov' | 'mkv' | 'avi'
 
+export interface ProbedIcnsSlot {
+  readonly type: 'icp4' | 'ic11' | 'icp5' | 'ic12' | 'icp6' | 'ic07' | 'ic13' | 'ic08' | 'ic14' | 'ic09' | 'ic10'
+  readonly logicalSize: 16 | 32 | 64 | 128 | 256 | 512
+  readonly scale: 1 | 2
+  readonly pixelSize: 16 | 32 | 64 | 128 | 256 | 512 | 1024
+}
+
 export interface ProbedConversionInput {
   format: ConversionInputFormat
   mimeType: string
@@ -34,6 +41,7 @@ export interface ProbedConversionInput {
   height?: number
   frameCount: number
   pageCount?: number
+  iconSlots?: readonly ProbedIcnsSlot[]
 }
 
 export interface ConversionRoute {
@@ -135,6 +143,7 @@ interface StructuralProbe {
   frameCount: number
   pageCount?: number
   pixelCounts?: number[]
+  iconSlots?: readonly ProbedIcnsSlot[]
 }
 
 function crc32(bytes: Uint8Array): number {
@@ -719,25 +728,60 @@ function tiffProbe(bytes: Uint8Array): StructuralProbe | undefined {
 }
 
 function iconProbe(bytes: Uint8Array): StructuralProbe | undefined {
-  if (bytes.length < 22 || bytes[0] !== 0 || bytes[1] !== 0 || (bytes[2] !== 1 && bytes[2] !== 2) || bytes[3] !== 0) return undefined
+  if (bytes.length < 22 || bytes[0] !== 0 || bytes[1] !== 0 || bytes[2] !== 1 || bytes[3] !== 0) return undefined
   const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const count = buffer.readUInt16LE(4)
   if (count < 1 || count > 256 || 6 + count * 16 > bytes.length) return undefined
   const pixels: number[] = []
+  const payloadRanges: Array<{ start: number; end: number }> = []
   let width = 0
   let height = 0
   for (let index = 0; index < count; index += 1) {
     const entry = 6 + index * 16
     const entryWidth = bytes[entry] || 256
     const entryHeight = bytes[entry + 1] || 256
+    const colorCount = bytes[entry + 2]!
+    const reserved = bytes[entry + 3]!
+    const planes = buffer.readUInt16LE(entry + 4)
+    const bitCount = buffer.readUInt16LE(entry + 6)
     const size = buffer.readUInt32LE(entry + 8)
     const offset = buffer.readUInt32LE(entry + 12)
-    if (size < 12 || offset < 6 + count * 16 || offset + size > bytes.length) return undefined
+    const end = offset + size
+    if (reserved !== 0 || size < 12 || offset < 6 + count * 16 || end > bytes.length || end < offset) return undefined
+    if (payloadRanges.some((range) => offset < range.end && end > range.start)) return undefined
+    payloadRanges.push({ start: offset, end })
     const payload = bytes.subarray(offset, offset + size)
     const png = pngProbe(payload)
     if (png) {
+      if (!((planes === 1 && bitCount === 32) || (planes === 0 && bitCount === 0)) || colorCount !== 0) return undefined
       if (png.width !== entryWidth || png.height !== entryHeight) return undefined
-    } else if (size < 40 || buffer.readUInt32LE(offset) < 40) return undefined
+    } else {
+      if (planes !== 1 || ![1, 4, 8, 24, 32].includes(bitCount)) return undefined
+      const approvedColorCount = bitCount === 1 ? [0, 2] : bitCount === 4 ? [0, 16] : [0]
+      if (!approvedColorCount.includes(colorCount)) return undefined
+      if (size < 40) return undefined
+      const headerSize = buffer.readUInt32LE(offset)
+      if (headerSize < 40 || headerSize > size) return undefined
+      const dibWidth = buffer.readInt32LE(offset + 4)
+      const dibHeight = buffer.readInt32LE(offset + 8)
+      const dibPlanes = buffer.readUInt16LE(offset + 12)
+      const dibBitCount = buffer.readUInt16LE(offset + 14)
+      const compression = buffer.readUInt32LE(offset + 16)
+      const colorsUsed = buffer.readUInt32LE(offset + 32)
+      if (
+        dibWidth !== entryWidth
+        || dibHeight !== entryHeight * 2
+        || dibPlanes !== 1
+        || dibBitCount !== bitCount
+        || compression !== 0
+      ) return undefined
+      const paletteEntries = bitCount <= 8 ? (colorsUsed || 2 ** bitCount) : 0
+      if (paletteEntries > 256) return undefined
+      const xorStride = Math.ceil((entryWidth * bitCount) / 32) * 4
+      const maskStride = Math.ceil(entryWidth / 32) * 4
+      const minimumSize = headerSize + paletteEntries * 4 + (xorStride + maskStride) * entryHeight
+      if (minimumSize > size) return undefined
+    }
     width = Math.max(width, entryWidth)
     height = Math.max(height, entryHeight)
     pixels.push(entryWidth * entryHeight)
@@ -749,25 +793,42 @@ function icnsProbe(bytes: Uint8Array): StructuralProbe | undefined {
   if (ascii(bytes.subarray(0, 4)) !== 'icns' || bytes.length < 16) return undefined
   const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   if (buffer.readUInt32BE(4) !== bytes.length) return undefined
-  const sizes: Record<string, number> = { icp4: 16, icp5: 32, icp6: 64, ic07: 128, ic08: 256, ic09: 512, ic10: 1024 }
+  const slots = new Map<string, ProbedIcnsSlot>([
+    ['icp4', { type: 'icp4', logicalSize: 16, scale: 1, pixelSize: 16 }],
+    ['ic11', { type: 'ic11', logicalSize: 16, scale: 2, pixelSize: 32 }],
+    ['icp5', { type: 'icp5', logicalSize: 32, scale: 1, pixelSize: 32 }],
+    ['ic12', { type: 'ic12', logicalSize: 32, scale: 2, pixelSize: 64 }],
+    ['icp6', { type: 'icp6', logicalSize: 64, scale: 1, pixelSize: 64 }],
+    ['ic07', { type: 'ic07', logicalSize: 128, scale: 1, pixelSize: 128 }],
+    ['ic13', { type: 'ic13', logicalSize: 128, scale: 2, pixelSize: 256 }],
+    ['ic08', { type: 'ic08', logicalSize: 256, scale: 1, pixelSize: 256 }],
+    ['ic14', { type: 'ic14', logicalSize: 256, scale: 2, pixelSize: 512 }],
+    ['ic09', { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 }],
+    ['ic10', { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 }],
+  ])
   const pixels: number[] = []
+  const iconSlots: ProbedIcnsSlot[] = []
+  const seenTypes = new Set<string>()
   let offset = 8
   let largest = 0
   while (offset + 8 <= bytes.length) {
     const type = ascii(bytes.subarray(offset, offset + 4))
     const length = buffer.readUInt32BE(offset + 4)
     if (length < 8 || offset + length > bytes.length) return undefined
-    const size = sizes[type]
-    if (size) {
+    const slot = slots.get(type)
+    if (slot) {
+      if (seenTypes.has(type)) return undefined
+      seenTypes.add(type)
       const png = pngProbe(bytes.subarray(offset + 8, offset + length))
-      if (!png || png.width !== size || png.height !== size) return undefined
-      largest = Math.max(largest, size)
-      pixels.push(size * size)
+      if (!png || png.width !== slot.pixelSize || png.height !== slot.pixelSize) return undefined
+      largest = Math.max(largest, slot.pixelSize)
+      pixels.push(slot.pixelSize * slot.pixelSize)
+      iconSlots.push(slot)
     }
     offset += length
   }
   return offset === bytes.length && pixels.length > 0
-    ? { format: 'icns', width: largest, height: largest, frameCount: pixels.length, pixelCounts: pixels }
+    ? { format: 'icns', width: largest, height: largest, frameCount: pixels.length, pixelCounts: pixels, iconSlots }
     : undefined
 }
 
@@ -830,11 +891,12 @@ function ebmlElements(bytes: Uint8Array, start: number, end: number): EbmlElemen
   return offset === end ? elements : undefined
 }
 
-function positiveEbmlInteger(bytes: Uint8Array, element: EbmlElement | undefined): number | undefined {
-  if (!element || element.end <= element.dataOffset || element.end - element.dataOffset > 6) return undefined
-  let value = 0
-  for (const byte of bytes.subarray(element.dataOffset, element.end)) value = value * 256 + byte
-  return Number.isSafeInteger(value) && value > 0 ? value : undefined
+function positiveEbmlInteger(bytes: Uint8Array, element: EbmlElement | undefined): number | bigint | undefined {
+  if (!element || element.end <= element.dataOffset || element.end - element.dataOffset > 8) return undefined
+  let value = 0n
+  for (const byte of bytes.subarray(element.dataOffset, element.end)) value = value * 256n + BigInt(byte)
+  if (value === 0n) return undefined
+  return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value
 }
 
 function ebmlProbe(bytes: Uint8Array): StructuralProbe | undefined {
@@ -1026,6 +1088,7 @@ export function probeConversionInput(input: {
     ...(structure.height === undefined ? {} : { height: structure.height }),
     frameCount: structure.frameCount,
     ...(pageCount === undefined ? {} : { pageCount }),
+    ...(structure.iconSlots === undefined ? {} : { iconSlots: structure.iconSlots }),
   }
 }
 

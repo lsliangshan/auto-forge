@@ -80,15 +80,21 @@ describe('converter pack index verification', () => {
     expect(() => verifyConverterPackIndex({ ...inconsistent, minimumSequence: 0 }))
       .toThrowError(expect.objectContaining({ reason: 'index_invalid' }))
 
-    const disguisedCode = signed({
-      ...executable,
-      packs: [{
-        ...executable.packs[0]!,
-        entries: [{ ...executable.packs[0]!.entries[0]!, path: 'bin/hidden.dll', executable: false, role: 'data' }],
-      }],
-    })
-    expect(() => verifyConverterPackIndex({ ...disguisedCode, minimumSequence: 0 }))
-      .toThrowError(expect.objectContaining({ reason: 'index_invalid' }))
+    for (const path of [
+      'bin/hidden.dll', 'bin/hidden.hta', 'bin/hidden.vbs', 'bin/hidden.vbe', 'bin/hidden.js',
+      'bin/hidden.jse', 'bin/hidden.wsf', 'bin/hidden.wsh', 'bin/hidden.cpl', 'bin/hidden.lnk',
+      'bin/hidden.reg', 'bin/hidden.url',
+    ]) {
+      const disguisedCode = signed({
+        ...executable,
+        packs: [{
+          ...executable.packs[0]!,
+          entries: [{ ...executable.packs[0]!.entries[0]!, path, executable: false, role: 'data' }],
+        }],
+      })
+      expect(() => verifyConverterPackIndex({ ...disguisedCode, minimumSequence: 0 }), path)
+        .toThrowError(expect.objectContaining({ reason: 'index_invalid' }))
+    }
   })
 
   it('canonicalizes stable-key UTF-8 JSON independently of insertion order', () => {

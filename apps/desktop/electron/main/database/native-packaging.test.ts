@@ -40,10 +40,32 @@ function packagingFixture() {
   return { desktop, verifier }
 }
 
-function runVerifier(fixture: ReturnType<typeof packagingFixture>, path?: string) {
-  return spawnSync(process.execPath, path ? [fixture.verifier, path] : [fixture.verifier], {
+function runVerifier(fixture: ReturnType<typeof packagingFixture>, pathOrArguments?: string | readonly string[]) {
+  const arguments_ = typeof pathOrArguments === 'string'
+    ? [pathOrArguments]
+    : pathOrArguments ?? []
+  return spawnSync(process.execPath, [fixture.verifier, ...arguments_], {
     encoding: 'utf8',
   })
+}
+
+function fakeWindowsPackagedApp(fixture: ReturnType<typeof packagingFixture>) {
+  const app = join(fixture.desktop, 'dist', 'win-unpacked')
+  const resources = join(app, 'resources')
+  mkdirSync(join(resources, 'app.asar'), { recursive: true })
+  const nativeDirectory = join(
+    resources,
+    'app.asar.unpacked',
+    'node_modules',
+    'better-sqlite3',
+    'build',
+    'Release',
+  )
+  mkdirSync(nativeDirectory, { recursive: true })
+  writeFileSync(join(nativeDirectory, 'better_sqlite3.node'), '')
+  mkdirSync(join(resources, 'app.asar.unpacked', 'node_modules', 'esbuild'), { recursive: true })
+  writeFileSync(join(app, 'AutoForge.exe'), 'MZ structural fixture')
+  return realpathSync(app)
 }
 
 function fakePackagedApp(
@@ -57,6 +79,7 @@ function fakePackagedApp(
   mkdirSync(resources, { recursive: true })
   mkdirSync(executableDirectory, { recursive: true })
   mkdirSync(join(resources, 'app.asar'))
+  mkdirSync(join(resources, 'app.asar.unpacked', 'node_modules', 'esbuild'), { recursive: true })
 
   if (options.nativeModule) {
     const nativeDirectory = join(
@@ -155,6 +178,21 @@ describe('verify-packaged-native', () => {
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('resolves outside the desktop dist directory')
+  })
+
+  it('validates the native win32-x64 package structure without claiming platform execution', () => {
+    const fixture = packagingFixture()
+    const app = fakeWindowsPackagedApp(fixture)
+    const result = runVerifier(fixture, [
+      '--packaged-app', app,
+      '--platform', 'win32',
+      '--arch', 'x64',
+      '--structural-only',
+    ])
+
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.stdout).toContain('win32-x64 packaged native structure verified')
+    expect(result.stdout).toContain('runtime execution not performed')
   })
 
 })
