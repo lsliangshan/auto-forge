@@ -5027,6 +5027,11 @@ describe('createApplicationRuntime', () => {
     'make the attachment into WebP',
     'save this image as PNG',
     'turn this photo into AVIF',
+    '把图片制作成ICO格式',
+    '把图片做成一个 ICO',
+    '将图片保存成 .ico',
+    '把图片保存为 JPG',
+    'make this image into an ICO file',
   ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
@@ -5116,6 +5121,83 @@ describe('createApplicationRuntime', () => {
     const titlePayload = JSON.stringify(titleRequest)
     expect(titlePayload).not.toContain('AI：')
     expect(titlePayload).not.toMatch(/历史附件|private-source\.png|image\/png|bytes|mediaAssetId|sourceId|ASSISTANT_ECHO_PRIVATE_MARKER/i)
+    await runtime.close()
+  })
+
+  it.each([
+    '不要把图片做成 ICO，只需总结它',
+    '不要把图片做成 ICO，而是总结它',
+    '请勿保存为 WebP，我只是问它是什么格式',
+    "don't make this image an ICO; summarize it instead",
+    '支持转换成哪些格式？',
+  ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
+    directories.push(root)
+    const source = join(root, 'ordinary-source.png')
+    const bytes = Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'),
+      Buffer.from('ORDINARY_IMAGE_PRIVATE_CONTENT_MARKER'),
+    ])
+    await writeFile(source, bytes)
+    const captured: ModelStreamRequest[] = []
+    const chatEvents: ChatEvent[] = []
+    const modelInput = vi.fn()
+    const createMediaAssetService = mediaAssetModule.createMediaAssetService
+    vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
+      const service = createMediaAssetService(createOptions)
+      modelInput.mockImplementation(service.modelInput.bind(service))
+      return { ...service, modelInput }
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: async () => [visionTextModelInfo('openrouter/non-conversion-intent')],
+      validateCredential: async () => ({ valid: true }),
+      stream: async function* (request) {
+        captured.push(request)
+        yield {
+          type: 'text_delta' as const,
+          choiceIndex: 0,
+          text: isConversationTitleRequest(request) ? '图片普通问答' : '这是普通图片问答。',
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      },
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source],
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/non-conversion-intent' },
+      },
+    })
+    await installConversionWorkflow(runtime)
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+
+    const sent = await runtime.services.chat.send({
+      ...chatInput(conversation.id, content), assetIds: [asset!.id], outputType: 'text',
+    })
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'status', requestId: sent.requestId, status: 'completed',
+    })))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'conversation_title_updated', conversationId: conversation.id,
+    })))
+
+    expect(modelInput).toHaveBeenCalledTimes(1)
+    expect(captured).toHaveLength(2)
+    expect(JSON.stringify(agentRequests(captured)[0])).toContain(bytes.toString('base64'))
+    expect(chatEvents).not.toContainEqual(expect.objectContaining({
+      type: 'block',
+      block: expect.objectContaining({ type: 'approval', capability: 'file.convert' }),
+    }))
     await runtime.close()
   })
 
