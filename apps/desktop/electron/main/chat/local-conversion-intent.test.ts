@@ -41,9 +41,28 @@ describe('local conversion intent', () => {
     '将图片保存成 .ico',
     '把图片保存为 JPG',
     'make this image into an ICO file',
+    '支持转换成哪些格式？请把图片转成 PDF',
+    'What formats are supported? Save it as WebP',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
+
+  it.each([
+    ["don't make this image an ICO", ', but ', 'save it as WebP'],
+    ["don't make this image an ICO", '; ', 'turn it into WebP'],
+    ["don't make this image an ICO", '. ', 'make it a WebP instead'],
+    ['不要把图片做成 ICO', '，但', '请将它保存为 WebP'],
+    ['不要把文件转成 PDF', '；', '请把它另存为 JPG'],
+    ['不要把照片制作成 ICNS', '，然后', '把它输出为 PNG'],
+  ] as const)(
+    'recognizes a positive second conversion clause: %s%s%s',
+    (negativeClause, separator, positiveClause) => {
+      expect(hasLocalConversionIntent(
+        `${negativeClause}${separator}${positiveClause}`,
+        attachments,
+      )).toBe(true)
+    },
+  )
 
   it.each([
     ['', attachments],
@@ -65,10 +84,33 @@ describe('local conversion intent', () => {
     ['不要把图片做成 ICO，而是总结它', attachments],
     ['请勿保存为 WebP，我只是问它是什么格式', attachments],
     ["don't make this image an ICO; summarize it instead", attachments],
-    ['支持转换成哪些格式？', attachments],
+    ["don't make this image an ICO; don't save it as WebP", attachments],
+    ['不要把图片做成 ICO，也不要将它保存为 WebP', attachments],
+    ['What formats are supported?', attachments],
+    ['Which formats can it convert to?', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)
+  })
+
+  it.each([
+    ['千万不要', '把图片做成', 'ICO格式'],
+    ['请千万不要', '将文件保存为', 'JPG'],
+    ['请勿', '把它转成', '.webp'],
+    ['Please don’t', 'make this image an', 'ICO'],
+    ["Please don't", 'save the file as', 'JPG'],
+    ['Never', 'turn it into', '.WebP'],
+  ] as const)('keeps a negated conversion non-local: %s %s %s', (modifier, action, target) => {
+    expect(hasLocalConversionIntent(`${modifier} ${action} ${target}`, attachments)).toBe(false)
+  })
+
+  it.each([
+    ['支持转换成', '哪些格式？'],
+    ['可以把图片转换成', '什么格式？'],
+    ['请问能将这个文件转成', '哪些格式？'],
+    ['万象转换支持', '什么格式？'],
+  ] as const)('keeps a capability question non-local: %s%s', (prefix, targetQuestion) => {
+    expect(hasLocalConversionIntent(`${prefix}${targetQuestion}`, attachments)).toBe(false)
   })
 
   it('projects only sanitized current metadata with stable zero-based indexes', () => {

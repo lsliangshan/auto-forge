@@ -8,41 +8,32 @@ export interface LocalAttachmentProjection {
 }
 
 const CONVERSION_TARGET_PATTERN = `(?:${[...CONVERSION_TARGET_FORMATS, 'jpg'].join('|')})`
-const CONVERSION_TARGET_REFERENCE = `\\.?${CONVERSION_TARGET_PATTERN}(?:(?:\\s*格式)|(?:\\s+file))?`
-const CONVERSION_REQUEST = /(?:转换|转成|转为|导出为|另存为|万象转换|\bconvert\b|\btranscode\b|\bexport\s+(?:as|to)\b|\bsave\s+as\b)/iu
-const CHINESE_TARGETED_CONVERSION_CLAUSE = `(?:做成|制作成|输出(?:成|为)|(?:保存|存)[^，,；;。.!！？?]{0,24}?(?:成|为))\\s*(?:一(?:个|份|张)\\s*)?${CONVERSION_TARGET_REFERENCE}(?=$|[^\\p{L}\\p{N}])`
-const ENGLISH_ATTACHMENT_NOUN = `(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:image|photo|picture|attachment|file|document|video|audio)`
-const ENGLISH_TARGETED_CONVERSION_CLAUSE = `(?:make\\s+${ENGLISH_ATTACHMENT_NOUN}\\s+(?:(?:into|as)\\s+)?(?:an?\\s+)?${CONVERSION_TARGET_REFERENCE}|(?:save|export)\\s+${ENGLISH_ATTACHMENT_NOUN}\\s+(?:as|to)\\s+${CONVERSION_TARGET_REFERENCE}|(?:turn|change)\\s+${ENGLISH_ATTACHMENT_NOUN}\\s+(?:into|to)\\s+${CONVERSION_TARGET_REFERENCE})(?=$|[^\\p{L}\\p{N}])`
-const TARGETED_CONVERSION_REQUEST = new RegExp(
-  `(?:${CHINESE_TARGETED_CONVERSION_CLAUSE}|\\b${ENGLISH_TARGETED_CONVERSION_CLAUSE})`,
+const CONVERSION_TARGET_REFERENCE = `\\.?${CONVERSION_TARGET_PATTERN}(?:(?:\\s*(?:格式|文件))|(?:\\s+(?:formats?|files?)))?(?=$|[^\\p{L}\\p{N}])`
+const CONVERSION_TARGET_ARGUMENT = `(?:(?:一(?:个|份|张)|an?)\\s+)?${CONVERSION_TARGET_REFERENCE}`
+const CHINESE_ATTACHMENT_REFERENCE = `(?:(?:(?:这|这个|该|当前|那|那个)?(?:张|个|份)?(?:附件|文件|图片|图像|照片|文档|视频|音频))|它们?)`
+const ENGLISH_ATTACHMENT_REFERENCE = `(?:(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:attachment|file|image|photo|picture|document|video|audio)|it|them)`
+const EXPLICIT_CONVERSION_ACTION = new RegExp([
+  `(?:转换|转|导出|输出|改|换)(?:成|为)\\s*${CONVERSION_TARGET_ARGUMENT}`,
+  `另存为\\s*${CONVERSION_TARGET_ARGUMENT}`,
+  `(?:做成|制作成)\\s*${CONVERSION_TARGET_ARGUMENT}`,
+  `(?:保存|存)(?:\\s*${CHINESE_ATTACHMENT_REFERENCE})?\\s*(?:成|为)\\s*${CONVERSION_TARGET_ARGUMENT}`,
+  `\\b(?:convert|transcode)(?:\\s+${ENGLISH_ATTACHMENT_REFERENCE})?\\s+(?:to|as)\\s+${CONVERSION_TARGET_ARGUMENT}`,
+  `\\bmake\\s+${ENGLISH_ATTACHMENT_REFERENCE}\\s+(?:(?:into|as)\\s+)?${CONVERSION_TARGET_ARGUMENT}`,
+  `\\b(?:save|export)\\s+${ENGLISH_ATTACHMENT_REFERENCE}\\s+(?:as|to)\\s+${CONVERSION_TARGET_ARGUMENT}`,
+  `\\b(?:turn|change)\\s+${ENGLISH_ATTACHMENT_REFERENCE}\\s+(?:into|to|as)\\s+${CONVERSION_TARGET_ARGUMENT}`,
+].join('|'), 'iu')
+const CONVERSION_ACTION = /(?:万象转换|转换|转成|转为|导出为|另存为|做成|制作成|输出成|输出为|保存|存为|改成|改为|换成|换为|\bconvert\b|\btranscode\b|\bmake\b|\bsave\b|\bexport\b|\bturn\b|\bchange\b)/iu
+const CONVERSION_NEGATION = /(?:(?:请\s*)?(?:千万\s*)?(?:不要|无需|不必|别|禁止|请勿)|(?:please\s+)?(?:do\s+not|don't|never))\s*/iu
+const FORMAT_CAPABILITY_QUESTION = /(?:(?:哪些|什么|何种)\s*格式|\b(?:what|which)\s+formats?\b)/iu
+const BARE_CONVERSION_TARGET = new RegExp(
+  `^(?:(?:一(?:个|份|张)|an?)\\s+)?${CONVERSION_TARGET_REFERENCE}(?:\\s+(?:instead|rather))?$`,
   'iu',
 )
-const FULLY_NEGATED_CONVERSION_REQUESTS = [
-  /^(?:请\s*)?(?:不要|无需|不必|别|禁止|请勿)\s*(?:把|将)?\s*(?:(?:这|这个|该|当前)\s*)?(?:附件|文件)?\s*(?:转换|转成|转为|导出为|另存为|万象转换)(?:\s*(?:(?:这|这个|该|当前)\s*)?(?:附件|文件))?(?:\s*(?:成|为|到)?\s*[\p{L}\p{N}._-]+)?\s*[。.!！]?$/iu,
-  /^(?:please\s+)?(?:do\s+not|don't|never)\s+(?:(?:convert|transcode)(?:\s+(?:this|the|current))?(?:\s+(?:attachment|file))?(?:\s+(?:to|as)\s+[\p{L}\p{N}._-]+)?|(?:export\s+(?:as|to)|save\s+as)\s+[\p{L}\p{N}._-]+)\s*[.!]?$/iu,
-  new RegExp(
-    `^(?:请\\s*)?(?:不要|无需|不必|别|禁止|请勿)[^，,；;。.!！？?]{0,64}${CHINESE_TARGETED_CONVERSION_CLAUSE}\\s*[。.!！]?$`,
-    'iu',
-  ),
-  new RegExp(
-    `^(?:please\\s+)?(?:do\\s+not|don't|never)\\s+${ENGLISH_TARGETED_CONVERSION_CLAUSE}\\s*[.!]?$`,
-    'iu',
-  ),
-]
-const CONVERSION_TARGET = new RegExp(
-  `(?:^|[^\\p{L}\\p{N}])${CONVERSION_TARGET_REFERENCE}(?=$|[^\\p{L}\\p{N}])`,
-  'iu',
-)
-const BARE_CONVERSION_ALTERNATIVE = new RegExp(
-  `^(?:(?:而是|改成|改为)\\s*)?${CONVERSION_TARGET_REFERENCE}(?:\\s+(?:instead|rather))?\\s*[。.!！]?$`,
-  'iu',
-)
-const CONTRASTIVE_ALTERNATIVE = /(?:而是|改成|改为|(?<!转)换成|(?<!转)换为|\binstead\b|\brather\b|\balternatively\b)/iu
-const CONVERSION_CAPABILITY_QUESTION = /^(?:(?:请问|我想知道)\s*)?(?:支持|可以|能够|能否|可否|是否能)[^，,；;。.!！？?]{0,24}(?:转换|转成|转为)[^，,；;。.!！？?]{0,24}(?:哪些|什么|何种)\s*格式\s*[？?]?$/iu
-const LEADING_CONVERSION_NEGATION = /^(?:(?:请\s*)?(?:不要|无需|不必|别|禁止|请勿)|(?:please\s+)?(?:do\s+not|don't|never))\s*/iu
-const CONVERSION_CLAUSE_BOUNDARY = new RegExp(
-  `[，,；;。!！？?]|\\.(?!${CONVERSION_TARGET_PATTERN})|而是|\\bbut\\b`,
-  'iu',
+const CONTRASTIVE_TARGET = /\b(?:instead|rather)\b/iu
+const CLAUSE_CONNECTOR = /(?:而是|但是|然后|并且|但)|\b(?:and\s+then|but|however|then)\b/giu
+const CLAUSE_SEPARATOR = new RegExp(
+  `[，,；;。!！？?]|\\.(?!${CONVERSION_TARGET_PATTERN})`,
+  'giu',
 )
 const RESERVED_SUMMARY_LABEL = /(?:附\s*件|目\s*标\s*格\s*式)/iu
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
@@ -75,30 +66,27 @@ export function hasLocalConversionIntent(
   attachments: readonly LocalAttachmentProjection[],
 ): boolean {
   if (attachments.length === 0 || !text.trim()) return false
-  const normalized = text.trim()
-  if (CONVERSION_CAPABILITY_QUESTION.test(normalized)) return false
-  const negation = LEADING_CONVERSION_NEGATION.exec(normalized)
-  if (negation) {
-    const afterNegation = normalized.slice(negation[0].length)
-    const boundary = CONVERSION_CLAUSE_BOUNDARY.exec(afterNegation)
-    const firstClause = boundary ? afterNegation.slice(0, boundary.index) : afterNegation
-    const negatesConversion = CONVERSION_REQUEST.test(firstClause)
-      || TARGETED_CONVERSION_REQUEST.test(firstClause)
-    if (negatesConversion) {
-      if (!boundary) return false
-      const remainder = afterNegation.slice(boundary.index + boundary[0].length).trim()
-      return CONVERSION_REQUEST.test(remainder)
-        || TARGETED_CONVERSION_REQUEST.test(remainder)
-        || BARE_CONVERSION_ALTERNATIVE.test(remainder)
-    }
+  const normalized = text.trim().normalize('NFKC').replace(/[‘’]/gu, "'")
+  const clauses = normalized
+    .replace(CLAUSE_CONNECTOR, ',')
+    .split(CLAUSE_SEPARATOR)
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+  let sawNegatedConversion = false
+  for (const clause of clauses) {
+    const action = CONVERSION_ACTION.exec(clause)
+    const explicit = EXPLICIT_CONVERSION_ACTION.exec(clause)
+    const namedWorkflow = /万象转换/u.exec(clause)
+    const actionIndex = explicit?.index ?? namedWorkflow?.index ?? action?.index
+    const negated = actionIndex !== undefined
+      && CONVERSION_NEGATION.test(clause.slice(0, actionIndex))
+    if (negated && action) sawNegatedConversion = true
+    const capabilityQuestion = FORMAT_CAPABILITY_QUESTION.test(clause)
+    if (!capabilityQuestion && !negated && (explicit || namedWorkflow)) return true
+    const bareTarget = BARE_CONVERSION_TARGET.test(clause)
+    if (bareTarget && (sawNegatedConversion || CONTRASTIVE_TARGET.test(clause))) return true
   }
-  const hasAlternative = CONTRASTIVE_ALTERNATIVE.test(normalized)
-  const conversionLike = CONVERSION_REQUEST.test(normalized)
-    || TARGETED_CONVERSION_REQUEST.test(normalized)
-    || (CONVERSION_TARGET.test(normalized) && hasAlternative)
-  const fullyNegated = !hasAlternative
-    && FULLY_NEGATED_CONVERSION_REQUESTS.some((pattern) => pattern.test(normalized))
-  return conversionLike && !fullyNegated
+  return false
 }
 
 export function projectLocalConversionPrompt(

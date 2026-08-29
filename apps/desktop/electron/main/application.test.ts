@@ -5032,6 +5032,12 @@ describe('createApplicationRuntime', () => {
     '将图片保存成 .ico',
     '把图片保存为 JPG',
     'make this image into an ICO file',
+    "don't make this image an ICO, but save it as WebP",
+    "don't make this image an ICO; turn it into WebP",
+    "don't make this image an ICO. make it a WebP instead",
+    '不要把图片做成 ICO，但请将它保存为 WebP',
+    '支持转换成哪些格式？请把图片转成 PDF',
+    'What formats are supported? Save it as WebP',
   ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
@@ -5130,6 +5136,12 @@ describe('createApplicationRuntime', () => {
     '请勿保存为 WebP，我只是问它是什么格式',
     "don't make this image an ICO; summarize it instead",
     '支持转换成哪些格式？',
+    '千万不要把图片做成 ICO',
+    '请千万不要将文件保存为 JPG',
+    'Please don’t make this image an ICO',
+    '可以把图片转换成什么格式？',
+    '请问能将这个文件转成哪些格式？',
+    '万象转换支持什么格式？',
   ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
     directories.push(root)
