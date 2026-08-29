@@ -1289,6 +1289,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       credential: secretStore,
       fetch: options.networkProxy.fetch.bind(options.networkProxy) as typeof globalThis.fetch,
       diagnostic: providerDiagnostics.forProvider('openrouter'),
+    }, (messageId, blocks) => {
+      const ownerUserId = auth.currentUserId()
+      if (!ownerUserId) return
+      for (const block of blocks) {
+        if (block.type !== 'conversion') continue
+        const binding = database.conversionBlockBindings.get(ownerUserId, block.executionId)
+        if (!binding || binding.messageId !== messageId || binding.blockId !== block.blockId) continue
+        database.conversionBlockBindings.finalize(ownerUserId, block.executionId, Date.now())
+        if (boundConversion?.ownerUserId === ownerUserId) reconcileConversionBlocks(boundConversion, block.executionId)
+      }
     }),
     deepseek: options.modelProviders?.deepseek ?? new DeepSeekProvider({
       credential: secretStore,

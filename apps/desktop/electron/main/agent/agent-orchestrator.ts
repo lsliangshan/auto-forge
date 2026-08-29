@@ -299,6 +299,7 @@ export interface AgentPersistencePort {
 export function createAgentPersistence(
   repositories: Pick<AppRepositories, 'messages' | 'chatRuns'>,
   onAssistantBlocks?: (messageId: string, blocks: ChatBlock[]) => void,
+  onAssistantFinalized?: (messageId: string, blocks: ChatBlock[]) => void,
 ): AgentPersistencePort {
   const mergePersistedConversions = (messageId: string, blocks: ChatBlock[]): ChatBlock[] => {
     const get = repositories.messages.get as unknown
@@ -399,6 +400,7 @@ export function createAgentPersistence(
         ...(input.costUsd === undefined ? {} : { costUsd: input.costUsd }),
         ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
       })
+      onAssistantFinalized?.(input.messageId, blocks)
     },
   }
 }
