@@ -80,6 +80,12 @@ describe('local conversion intent', () => {
     '不要 7z，而是 cur',
     'not png; rar instead',
     'not 7z, cur instead',
+    '支持哪些格式并把这个附件转换成 PDF',
+    '万象转换支持什么格式同时将图片保存为 WebP',
+    'What formats are supported and convert this file to PDF',
+    'Which formats can it convert to and save this image as WebP',
+    'not PNG but JPG',
+    'not 7z but rar',
   ])('recognizes a current-attachment conversion request: %s', (text) => {
     expect(hasLocalConversionIntent(text, attachments)).toBe(true)
   })
@@ -146,6 +152,15 @@ describe('local conversion intent', () => {
     ['export chat history', attachments],
     ['解释一下转换率', attachments],
     ['process the conversation', attachments],
+    ["don't convert or save this file", attachments],
+    ["don't convert and save this file", attachments],
+    ['不要转换或导出这个附件', attachments],
+    ['不要转换和导出这个附件', attachments],
+    ['不要解释转换原理', attachments],
+    ["don't explain how to convert this file", attachments],
+    ['制作海报并查看附件', attachments],
+    ['保存对话并描述图片', attachments],
+    ['export chat history and analyze image', attachments],
     ['把附件转换成 PDF', []],
   ] as const)('does not redact ordinary or attachment-free turns: %s', (text, currentAttachments) => {
     expect(hasLocalConversionIntent(text, currentAttachments)).toBe(false)

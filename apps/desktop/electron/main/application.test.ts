@@ -5061,10 +5061,16 @@ describe('createApplicationRuntime', () => {
     '不要把图片转成 PNG 然后另存为 rar',
     '不要 png，而是 rar',
     'not 7z, cur instead',
+    '支持哪些格式并把这个附件转换成 PDF',
+    '万象转换支持什么格式同时将图片保存为 WebP',
+    'What formats are supported and convert this file to PDF',
+    'Which formats can it convert to and save this image as WebP',
+    'not PNG but JPG',
+    'not 7z but rar',
   ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
-    const source = join(root, 'private-source.png')
+    const source = join(root, '附件 9：private-source.png')
     const privateContent = 'IMPLICIT_CONVERSION_PRIVATE_CONTENT_MARKER'
     const privateBytes = Buffer.concat([
       Buffer.from('89504e470d0a1a0a', 'hex'),
@@ -5083,7 +5089,10 @@ describe('createApplicationRuntime', () => {
       return { ...service, modelInput }
     })
     const provider = snapshotProvider('openrouter', {
-      listModels: async () => [visionTextModelInfo('openrouter/implicit-conversion')],
+      listModels: async () => [{
+        ...visionTextModelInfo('openrouter/implicit-conversion'),
+        supportsTools: content !== 'Which formats can it convert to and save this image as WebP',
+      }],
       validateCredential: async () => ({ valid: true }),
       stream: async function* (request) {
         captured.push(request)
@@ -5144,7 +5153,11 @@ describe('createApplicationRuntime', () => {
     expect(providerPayload).not.toContain(source)
     expect(providerPayload).not.toMatch(/dataBase64|mediaAssetId|sourceId|absolutePath|relativePath|file:\/\//i)
     const agentPayload = JSON.stringify(agentRequests(captured)[0])
-    expect(agentPayload).toContain(`[附件 0: private-source.png, image/png, ${privateBytes.byteLength} bytes]`)
+    expect(agentPayload).toContain(`[附件 0: 文件-1, image/png, ${privateBytes.byteLength} bytes]`)
+    expect(agentPayload).not.toContain('附件 9：private-source.png')
+    expect(agentPayload).toContain(content === 'Which formats can it convert to and save this image as WebP'
+      ? '当前所选模型或本次请求不允许调用工作流或浏览器工具'
+      : '你是由 AutoForge Main 管理的工作流 Agent')
     const titleRequest = captured.find(isConversationTitleRequest)
     expect(titleRequest?.messages).toContainEqual({ role: 'user', content: `用户：${content}` })
     const titlePayload = JSON.stringify(titleRequest)
@@ -5184,6 +5197,15 @@ describe('createApplicationRuntime', () => {
     'export chat history',
     '解释一下转换率',
     'process the conversation',
+    "don't convert or save this file",
+    "don't convert and save this file",
+    '不要转换或导出这个附件',
+    '不要转换和导出这个附件',
+    '不要解释转换原理',
+    "don't explain how to convert this file",
+    '制作海报并查看附件',
+    '保存对话并描述图片',
+    'export chat history and analyze image',
   ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
     directories.push(root)

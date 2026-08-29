@@ -32,7 +32,9 @@ const ATTACHMENT_REFERENCE = new RegExp(
 )
 const CONVERSION_NEGATION = /(?:不要|不用|不需要|无需|不必|别|禁止|请勿)|\b(?:do\s+not|don't|never|no\s+need\s+to|do\s+not\s+need\s+to|don't\s+need\s+to|need\s+not|needn't)\b/giu
 const OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION = /(?:解释|询问|问|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:explain|ask|summari[sz]e|describe|discuss|analy[sz]e|review|check|read|tell)\b/iu
-const OPEN_INFORMATION_QUESTION = /(?:(?:(?:请问)?(?:万象转换|这个工具|它|你)?(?:支持|能否|能不能|能|可以|能够))[^，,；;。.!！？?]{0,32}(?:哪些|什么|何种)\s*格式|(?:哪些|什么|何种)\s*格式|(?:介绍|说明|了解)[^，,；;。.!！？?]{0,24}(?:万象转换|转换)|(?:万象转换|转换)[^，,；;。.!！？?]{0,24}(?:是什么|什么意思|含义|安全|隐私|上传|能做什么|如何工作|怎么用)|\b(?:what|which)\s+formats?\b|\b(?:what\s+is|what\s+does|how\s+does|tell\s+me\s+about|describe|explain)[^,;.!?]{0,32}(?:conversion|converter|it)\b|\b(?:conversion|converter|it)\b[^,;.!?]{0,24}\b(?:safe|privacy|upload|mean)\b)/iu
+const ACTION_EMBEDDING_OTHER_INTENT = /(?:解释|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:explain|summari[sz]e|describe|discuss|analy[sz]e|review|check|read)\b/iu
+const OPEN_INFORMATION_QUESTION = /(?:(?:(?:请问)?(?:万象转换|这个工具|它|你)?(?:支持|能否|能不能|能|可以|能够))[^，,；;。.!！？?]{0,32}(?:哪些|什么|何种)\s*格式|(?:哪些|什么|何种)\s*格式|(?:介绍|说明|了解)[^，,；;。.!！？?]{0,24}(?:万象转换|转换)|(?:万象转换|转换)[^，,；;。.!！？?]{0,24}(?:是什么|什么意思|含义|安全|隐私|上传|能做什么|如何工作|怎么用)|\b(?:what\s+is|what\s+does|how\s+does|tell\s+me\s+about|describe|explain)[^,;.!?]{0,32}(?:conversion|converter|it)\b|\b(?:conversion|converter|it)\b[^,;.!?]{0,24}\b(?:safe|privacy|upload|mean)\b)/giu
+const ENGLISH_OPEN_FORMAT_QUESTION = /\b(?:what|which)\s+formats?\b(?:(?!\b(?:and|but|then|while)\b|[,;.!?])[\s\S]){0,48}/giu
 const BARE_TARGET_PATTERN = `(?:${[
   ...CONVERSION_TARGET_FORMATS,
   'jpg', 'zip', 'tif', 'docx', 'word', 'heic', 'svg', 'csv', 'txt', 'rar', '7z', 'cur',
@@ -53,7 +55,7 @@ const CHINESE_CONTRASTIVE_SHORTHAND = new RegExp(
   'iu',
 )
 const ENGLISH_CONTRASTIVE_SHORTHAND = new RegExp(
-  `(?:not|do\\s+not\\s+use|don't\\s+use)\\s+${FORMAT_SHORTHAND}\\s*[,;.]\\s*(?:an?\\s+)?${FORMAT_SHORTHAND}\\s+instead`,
+  `(?:not|do\\s+not\\s+use|don't\\s+use)\\s+${FORMAT_SHORTHAND}\\s*(?:(?:[,;.]\\s*(?:an?\\s+)?${FORMAT_SHORTHAND}\\s+instead)|(?:but\\s+(?:an?\\s+)?${FORMAT_SHORTHAND}))`,
   'iu',
 )
 const CLAUSE_CONNECTOR = /(?:而是|但是|然后|并且|但)|\b(?:and\s+then|but|however|then)\b/giu
@@ -62,23 +64,61 @@ const CLAUSE_SEPARATOR = new RegExp(
   'giu',
 )
 const UPPERCASE_FORMAT_REFERENCE = /(?:^|[^\p{L}\p{N}])\.?[A-Z0-9]{2,10}(?=$|[^\p{L}\p{N}])/u
+const COORDINATED_ACTION_BRIDGE = /(?:或|和|及|以及|并|并且)\s*$|\b(?:or|and|nor)\s*$/iu
+const WEAK_CONTEXT_BOUNDARY = /(?:而是|但是|然后|并且|同时|以及|并|和|或|解释|询问|问|总结|概括|介绍|说明|分析|描述|讨论|评价|检查|查看|读取)|\b(?:and|or|while|then|explain|ask|summari[sz]e|describe|discuss|analy[sz]e|review|check|read|tell)\b/giu
 const RESERVED_SUMMARY_LABEL = /(?:附\s*件|目\s*标\s*格\s*式)/iu
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 
-function conversionActionIsNegated(clause: string, start: number, actionIndex: number): boolean {
+function conversionActionIsNegated(
+  clause: string,
+  start: number,
+  actionIndex: number,
+  previousActionWasNegated: boolean,
+): boolean {
   const prefix = clause.slice(start, actionIndex)
   const negations = [...prefix.matchAll(CONVERSION_NEGATION)]
   const negation = negations.at(-1)
-  if (!negation || negation.index === undefined) return false
-  const bridge = prefix.slice(negation.index + negation[0].length)
-  return !OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION.test(bridge)
+  if (negation?.index !== undefined) {
+    const bridge = prefix.slice(negation.index + negation[0].length)
+    return !OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION.test(bridge)
+  }
+  return previousActionWasNegated
+    && COORDINATED_ACTION_BRIDGE.test(prefix)
+    && !OTHER_INTENT_BETWEEN_NEGATION_AND_ACTION.test(prefix)
 }
 
-function weakActionHasConversionContext(clause: string): boolean {
-  return ATTACHMENT_REFERENCE.test(clause)
-    || FORMAT_LIKE_REFERENCE.test(clause)
-    || UPPERCASE_FORMAT_REFERENCE.test(clause)
-    || /万象转换/u.test(clause)
+function actionIsEmbeddedInOtherIntent(clause: string, start: number, actionIndex: number): boolean {
+  return ACTION_EMBEDDING_OTHER_INTENT.test(clause.slice(start, actionIndex))
+}
+
+function weakActionHasConversionContext(clause: string, actionIndex: number, actionEnd: number): boolean {
+  const prefixWindow = clause.slice(Math.max(0, actionIndex - 48), actionIndex)
+  const prefixBoundaries = [...prefixWindow.matchAll(WEAK_CONTEXT_BOUNDARY)]
+  const lastPrefixBoundary = prefixBoundaries.at(-1)
+  const prefix = lastPrefixBoundary?.index === undefined
+    ? prefixWindow
+    : prefixWindow.slice(lastPrefixBoundary.index + lastPrefixBoundary[0].length)
+  const suffixWindow = clause.slice(actionEnd, actionEnd + 48)
+  const suffixBoundary = [...suffixWindow.matchAll(WEAK_CONTEXT_BOUNDARY)].at(0)
+  const suffix = suffixBoundary?.index === undefined
+    ? suffixWindow
+    : suffixWindow.slice(0, suffixBoundary.index)
+  const context = `${prefix}${clause.slice(actionIndex, actionEnd)}${suffix}`
+  return ATTACHMENT_REFERENCE.test(context)
+    || FORMAT_LIKE_REFERENCE.test(context)
+    || UPPERCASE_FORMAT_REFERENCE.test(context)
+    || /万象转换/u.test(context)
+}
+
+function actionFallsInsideInformationQuestion(
+  actionIndex: number,
+  informationRanges: readonly RegExpMatchArray[],
+): boolean {
+  return informationRanges.some((information) => (
+    information.index !== undefined
+    && information.index <= actionIndex
+    && actionIndex < information.index + information[0].length
+  ))
 }
 
 export function sanitizeDisplayName(value: string, index = 0): string {
@@ -119,21 +159,34 @@ export function hasLocalConversionIntent(
     .filter(Boolean)
   let sawNegatedConversion = false
   for (const clause of clauses) {
-    const information = OPEN_INFORMATION_QUESTION.exec(clause)
+    const informationRanges = [
+      ...clause.matchAll(OPEN_INFORMATION_QUESTION),
+      ...clause.matchAll(ENGLISH_OPEN_FORMAT_QUESTION),
+    ]
     let previousActionEnd = 0
+    let previousActionWasNegated = false
     for (const action of clause.matchAll(CONVERSION_ACTION)) {
       const actionIndex = action.index
-      const negated = conversionActionIsNegated(clause, previousActionEnd, actionIndex)
+      if (actionIsEmbeddedInOtherIntent(clause, previousActionEnd, actionIndex)) {
+        previousActionEnd = actionIndex + action[0].length
+        previousActionWasNegated = false
+        continue
+      }
+      const negated = conversionActionIsNegated(
+        clause,
+        previousActionEnd,
+        actionIndex,
+        previousActionWasNegated,
+      )
       previousActionEnd = actionIndex + action[0].length
+      previousActionWasNegated = negated
       const strong = action.groups?.strong !== undefined
-      if (!strong && !weakActionHasConversionContext(clause)) continue
+      if (!strong && !weakActionHasConversionContext(clause, actionIndex, previousActionEnd)) continue
       if (negated) {
         sawNegatedConversion = true
         continue
       }
-      const informational = information?.index !== undefined
-        && information.index < actionIndex
-      if (!informational) return true
+      if (!actionFallsInsideInformationQuestion(actionIndex, informationRanges)) return true
     }
     const bareTarget = BARE_CONVERSION_TARGET.test(clause)
       || UPPERCASE_BARE_CONVERSION_TARGET.test(clause)
