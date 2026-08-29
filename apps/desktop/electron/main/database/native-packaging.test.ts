@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -17,6 +18,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 const temporaryDirectories: string[] = []
 const verifierSource = fileURLToPath(new URL('../../../scripts/verify-packaged-native.mjs', import.meta.url))
+const nativePathsSource = fileURLToPath(new URL('../../../scripts/native-package-paths.mjs', import.meta.url))
 const builderConfig = fileURLToPath(new URL('../../../electron-builder.yml', import.meta.url))
 
 afterEach(() => {
@@ -37,6 +39,7 @@ function packagingFixture() {
   mkdirSync(scripts)
   const verifier = join(scripts, 'verify-packaged-native.mjs')
   copyFileSync(verifierSource, verifier)
+  copyFileSync(nativePathsSource, join(scripts, 'native-package-paths.mjs'))
   return { desktop, verifier }
 }
 
@@ -52,7 +55,8 @@ function runVerifier(fixture: ReturnType<typeof packagingFixture>, pathOrArgumen
 function fakeWindowsPackagedApp(fixture: ReturnType<typeof packagingFixture>) {
   const app = join(fixture.desktop, 'dist', 'win-unpacked')
   const resources = join(app, 'resources')
-  mkdirSync(join(resources, 'app.asar'), { recursive: true })
+  mkdirSync(resources, { recursive: true })
+  writeFileSync(join(resources, 'app.asar'), 'structural ASAR fixture')
   const nativeDirectory = join(
     resources,
     'app.asar.unpacked',
@@ -78,7 +82,7 @@ function fakePackagedApp(
   const executableDirectory = join(app, 'Contents', 'MacOS')
   mkdirSync(resources, { recursive: true })
   mkdirSync(executableDirectory, { recursive: true })
-  mkdirSync(join(resources, 'app.asar'))
+  writeFileSync(join(resources, 'app.asar'), 'structural ASAR fixture')
   mkdirSync(join(resources, 'app.asar.unpacked', 'node_modules', 'esbuild'), { recursive: true })
 
   if (options.nativeModule) {
@@ -193,6 +197,37 @@ describe('verify-packaged-native', () => {
     expect(result.status, result.stderr).toBe(0)
     expect(result.stdout).toContain('win32-x64 packaged native structure verified')
     expect(result.stdout).toContain('runtime execution not performed')
+  })
+
+  it.each([
+    ['app.asar', (app: string) => join(app, 'resources', 'app.asar')],
+    ['native module', (app: string) => join(app, 'resources', 'app.asar.unpacked', 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')],
+    ['app executable', (app: string) => join(app, 'AutoForge.exe')],
+  ])('rejects a directory in place of the required %s regular file', (_label, target) => {
+    const fixture = packagingFixture()
+    const app = fakeWindowsPackagedApp(fixture)
+    const path = target(app)
+    if (path.endsWith('.asar')) renameSync(path, `${path}.regular-file`)
+    else rmSync(path)
+    mkdirSync(path)
+    const result = runVerifier(fixture, [
+      '--packaged-app', app, '--platform', 'win32', '--arch', 'x64', '--structural-only',
+    ])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr.toLowerCase()).toContain('regular file')
+  })
+
+  it.skipIf(process.platform === 'win32')('rejects a special node in place of a required native file', () => {
+    const fixture = packagingFixture()
+    const app = fakeWindowsPackagedApp(fixture)
+    const native = join(app, 'resources', 'app.asar.unpacked', 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
+    rmSync(native)
+    expect(spawnSync('mkfifo', [native]).status).toBe(0)
+    const result = runVerifier(fixture, [
+      '--packaged-app', app, '--platform', 'win32', '--arch', 'x64', '--structural-only',
+    ])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr.toLowerCase()).toContain('regular file')
   })
 
 })

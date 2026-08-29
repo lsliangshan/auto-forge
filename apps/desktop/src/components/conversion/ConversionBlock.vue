@@ -171,6 +171,10 @@ function artifactMetadata(artifact: ConversionArtifactView): string {
   const metadata = artifact.metadata
   if (!metadata) return artifact.detectedFormat.toUpperCase()
   if (metadata.pdfPage) return `第 ${metadata.pdfPage} 页`
+  if (metadata.iconRepresentation) {
+    const slot = metadata.iconRepresentation
+    return `${slot.sourceType}: ${slot.logicalWidth}×${slot.logicalHeight} @${slot.scale}x (${slot.pixelWidth}×${slot.pixelHeight})`
+  }
   if (metadata.iconRepresentations) return `图标规格: ${metadata.iconRepresentations.map((size) => `${size}×${size}`).join('、')}`
   if (metadata.frameSelection) return '首帧'
   if (metadata.transparentPadding) return '保留透明边距'

@@ -18,6 +18,7 @@ import {
 } from '../../electron/main/conversion/conversion-process-runner.js'
 import { ConverterPackManager } from '../../electron/main/conversion/converter-pack-manager.js'
 import type { ConverterPackIndex, ConverterPackLease, ConverterPackName } from '../../electron/main/conversion/converter-pack-types.js'
+import { isAbsoluteConverterPackTestRoot } from './converter-pack-test-root.js'
 
 const externalGate = 'EXTERNAL GATE: set AUTOFORGE_TEST_CONVERTER_PACK_ROOT to an absolute signed fixture bundle; local fixture evidence is not production release acceptance.'
 const bundleRoot = process.env.AUTOFORGE_TEST_CONVERTER_PACK_ROOT
@@ -33,7 +34,7 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
   let runner: ReturnType<typeof createConversionProcessRunner>
 
   beforeAll(async () => {
-    if (!bundleRoot || !bundleRoot.startsWith('/')) throw new Error(externalGate)
+    if (!bundleRoot || !isAbsoluteConverterPackTestRoot(bundleRoot, process.platform)) throw new Error(externalGate)
     const releaseRoot = join(bundleRoot, 'release')
     const publicKeyPath = join(bundleRoot, 'test-root-public-key.pem')
     fixtureRoot = join(bundleRoot, 'fixtures')
@@ -192,15 +193,17 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     const end = headerSize.next + headerSize.value
     expect(end).toBeLessThanOrEqual(bytes.byteLength)
     let offset = headerSize.next
+    const docTypes: string[] = []
     while (offset < end) {
       const id = ebmlVint(bytes, offset, true)
       const size = ebmlVint(bytes, id.next, false)
       const valueEnd = size.next + size.value
       expect(valueEnd).toBeLessThanOrEqual(end)
-      if (id.value === 0x4282) return bytes.subarray(size.next, valueEnd).toString('ascii')
+      if (id.value === 0x4282) docTypes.push(bytes.subarray(size.next, valueEnd).toString('ascii'))
       offset = valueEnd
     }
-    throw new Error('EBML DocType is absent')
+    if (offset !== end || docTypes.length !== 1) throw new Error('EBML must contain exactly one DocType')
+    return docTypes[0]!
   }
 
   function pngCornerAlpha(path: string): number {
@@ -338,6 +341,16 @@ describe.skipIf(!enabled)(`real signed converter engines (${enabled ? 'enabled' 
     )
     expect(extractedIcns.map((output) => probe(output.path, 'representation.png', 'image/png').width))
       .toEqual([16, 32, 32, 64, 128, 256, 256, 512, 512, 1024])
+    expect(extractedIcns.map((output) => output.metadata)).toEqual(expectedIcnsSlots.map((slot) => ({
+      iconRepresentation: {
+        sourceType: slot.type,
+        logicalWidth: slot.logicalSize,
+        logicalHeight: slot.logicalSize,
+        pixelWidth: slot.pixelSize,
+        pixelHeight: slot.pixelSize,
+        scale: slot.scale,
+      },
+    })))
     expect(extractedIcns.map((output) => pngCornerAlpha(output.path))).toEqual(Array(10).fill(0))
   }, 120_000)
 

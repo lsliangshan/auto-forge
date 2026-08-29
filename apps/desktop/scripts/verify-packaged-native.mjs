@@ -1,8 +1,11 @@
-import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs'
+import { isAbsolute, join, relative, sep } from 'node:path'
 import process from 'node:process'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath, URL } from 'node:url'
+import { isAbsoluteNativePackagePath } from './native-package-paths.mjs'
+
+process.noAsar = true
 
 const targets = new Map([
   ['darwin-arm64', { platform: 'darwin', arch: 'arm64', outputDirectory: 'mac-arm64', productDirectory: 'AutoForge.app' }],
@@ -44,9 +47,10 @@ const target = targets.get(`${platform}-${arch}`)
 if (!target) throw new Error(`Packaged native verification does not support ${platform}/${arch}`)
 
 const expectedPackage = join(distDirectory, target.outputDirectory, target.productDirectory)
-const requestedPackage = arguments_.packagedApp
-  ? resolve(process.cwd(), arguments_.packagedApp)
-  : expectedPackage
+if (arguments_.packagedApp && !isAbsoluteNativePackagePath(arguments_.packagedApp, process.platform)) {
+  throw new Error('Requested packaged target must be an absolute native host path')
+}
+const requestedPackage = arguments_.packagedApp ?? expectedPackage
 if (!sameHostPath(requestedPackage, expectedPackage)) {
   throw new Error(`Requested package does not match the supported packaged target: ${expectedPackage}`)
 }
@@ -71,6 +75,7 @@ const resourcesDirectory = platform === 'darwin'
   : join(packageDirectory, 'resources')
 const appArchive = join(resourcesDirectory, 'app.asar')
 if (!existsSync(appArchive)) throw new Error(`Packaged app archive not found: ${appArchive}`)
+requireRegularFile(appArchive, 'Packaged app archive')
 
 const nativeModule = join(
   resourcesDirectory,
@@ -84,16 +89,22 @@ const nativeModule = join(
 if (!existsSync(nativeModule)) {
   throw new Error(`Packaged better-sqlite3 native module not found: ${nativeModule}`)
 }
+requireRegularFile(nativeModule, 'Packaged better-sqlite3 native module')
 
 const workflowCompilerPackage = join(resourcesDirectory, 'app.asar.unpacked', 'node_modules', 'esbuild')
 if (!existsSync(workflowCompilerPackage)) {
   throw new Error(`Packaged workflow compiler not found: ${workflowCompilerPackage}`)
+}
+const workflowCompilerMetadata = lstatSync(workflowCompilerPackage)
+if (!workflowCompilerMetadata.isDirectory() || workflowCompilerMetadata.isSymbolicLink()) {
+  throw new Error(`Packaged workflow compiler must be a real directory: ${workflowCompilerPackage}`)
 }
 
 const executable = platform === 'darwin'
   ? resolveDarwinExecutable(packageDirectory)
   : join(packageDirectory, 'AutoForge.exe')
 if (!existsSync(executable)) throw new Error(`Packaged executable not found: ${executable}`)
+requireRegularFile(executable, 'Packaged executable')
 
 if (arguments_.structuralOnly) {
   process.stdout.write(`${platform}-${arch} packaged native structure verified; runtime execution not performed\n`)
@@ -142,8 +153,16 @@ if (result.status !== 0) {
 function resolveDarwinExecutable(appDirectory) {
   const executableDirectory = join(appDirectory, 'Contents', 'MacOS')
   const executableName = readdirSync(executableDirectory).find((name) =>
-    statSync(join(executableDirectory, name)).isFile(),
+    lstatSync(join(executableDirectory, name)).isFile()
+      && !lstatSync(join(executableDirectory, name)).isSymbolicLink(),
   )
-  if (!executableName) throw new Error(`No packaged executable found in ${executableDirectory}`)
+  if (!executableName) throw new Error(`No packaged executable regular file found in ${executableDirectory}`)
   return join(executableDirectory, executableName)
+}
+
+function requireRegularFile(path, label) {
+  const metadata = lstatSync(path)
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular file: ${path}`)
+  }
 }

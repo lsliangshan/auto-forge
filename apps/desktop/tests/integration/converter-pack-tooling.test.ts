@@ -135,10 +135,14 @@ function stageProduction(root: string): string {
   return stage
 }
 
-function createAsar(path: string, files: Record<string, Buffer>) {
+function createAsar(
+  path: string,
+  files: Record<string, Buffer>,
+  options: { unindexedPrefix?: Buffer; unindexedTrailer?: Buffer } = {},
+) {
   const header: { files: Record<string, unknown> } = { files: {} }
   const payloads: Buffer[] = []
-  let offset = 0
+  let offset = options.unindexedPrefix?.byteLength ?? 0
   for (const name of Object.keys(files).sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))) {
     const segments = name.split('/')
     let directory = header
@@ -161,7 +165,13 @@ function createAsar(path: string, files: Record<string, Buffer>) {
   outer.writeUInt32LE(4, 0)
   outer.writeUInt32LE(inner.byteLength, 4)
   const temporary = `${path}.building`
-  writeFileSync(temporary, Buffer.concat([outer, inner, ...payloads]))
+  writeFileSync(temporary, Buffer.concat([
+    outer,
+    inner,
+    ...(options.unindexedPrefix === undefined ? [] : [options.unindexedPrefix]),
+    ...payloads,
+    ...(options.unindexedTrailer === undefined ? [] : [options.unindexedTrailer]),
+  ]))
   renameSync(temporary, path)
 }
 
@@ -635,5 +645,20 @@ describe('converter pack release tooling', () => {
     const linkedResult = run(verifyScript, ['--packaged-app', linkedFixture.app, '--platform', 'darwin', '--arch', 'arm64'])
     expect(linkedResult.status).not.toBe(0)
     expect(linkedResult.stderr.toLowerCase()).toContain('symbolic')
+  })
+
+  it.each(['prefix', 'trailer'] as const)('rejects unindexed ASAR %s bytes containing a DER private key', (placement) => {
+    const root = temporaryRoot()
+    const fixture = packagedApp(root, 'darwin')
+    const privateKey = generateKeyPairSync('ed25519').privateKey.export({ format: 'der', type: 'pkcs8' })
+    createAsar(join(fixture.resources, 'app.asar'), { 'package.json': Buffer.from('{}') }, {
+      ...(placement === 'prefix' ? { unindexedPrefix: privateKey } : { unindexedTrailer: privateKey }),
+    })
+    const result = run(verifyScript, [
+      '--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64',
+    ])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr.toLowerCase()).toContain('extent')
+    expect(`${result.stdout}${result.stderr}`).not.toContain(privateKey.toString('hex'))
   })
 })

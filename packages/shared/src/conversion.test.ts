@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   CONVERSION_TARGET_FORMATS,
+  conversionArtifactViewSchema,
   conversionJobStatusSchema,
   conversionTargetFormatSchema,
   fileConvertRequestSchema,
@@ -28,6 +29,26 @@ describe('file conversion contracts', () => {
     }
 
     expect(fileConvertRequestSchema.parse(request)).toEqual(request)
+  })
+
+  it('projects exact scale-specific ICNS representation metadata to the artifact view', () => {
+    const artifact = {
+      artifactId: 'artifact_ic11', status: 'ready' as const, displayName: 'representation-002.png',
+      detectedFormat: 'png' as const, mimeType: 'image/png', byteSize: 100,
+      metadata: {
+        iconRepresentation: {
+          sourceType: 'ic11' as const,
+          logicalWidth: 16, logicalHeight: 16,
+          pixelWidth: 32, pixelHeight: 32,
+          scale: 2,
+        },
+      },
+    }
+    expect(conversionArtifactViewSchema.parse(artifact)).toEqual(artifact)
+    expect(conversionArtifactViewSchema.safeParse({
+      ...artifact,
+      metadata: { iconRepresentation: { ...artifact.metadata.iconRepresentation, sourceType: 'icp5' } },
+    }).success).toBe(false)
   })
 
   it.each([

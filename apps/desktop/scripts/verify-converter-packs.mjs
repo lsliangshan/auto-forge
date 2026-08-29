@@ -129,10 +129,10 @@ function rejectPrivateKey(bytes, label) {
   }
 }
 
-function scanAsarNode(node, archive, prefix = '') {
+function collectAsarEntries(node, prefix = '', entries = []) {
   if (typeof node !== 'object' || node === null || Array.isArray(node)) fail('Packaged app.asar file tree is invalid.')
   const files = node.files
-  if (typeof files !== 'object' || files === null || Array.isArray(files)) return
+  if (typeof files !== 'object' || files === null || Array.isArray(files)) return entries
   for (const name of Object.keys(files).sort(compareUtf8)) {
     const value = files[name]
     if (typeof value !== 'object' || value === null || Array.isArray(value)) fail('Packaged app.asar file tree is invalid.')
@@ -140,7 +140,7 @@ function scanAsarNode(node, archive, prefix = '') {
     const reason = forbiddenPackagedPath(path)
     if (reason) fail(`Packaged app.asar contains forbidden ${reason} path: ${path}`)
     if (value.files !== undefined) {
-      scanAsarNode(value, archive, path)
+      collectAsarEntries(value, path, entries)
       continue
     }
     if (value.unpacked === true) continue
@@ -150,10 +150,34 @@ function scanAsarNode(node, archive, prefix = '') {
       fail('Packaged app.asar file tree is invalid.')
     }
     const offset = Number(offsetText)
-    if (!Number.isSafeInteger(offset) || archive.contentOffset + offset + size > archive.bytes.byteLength) {
+    if (!Number.isSafeInteger(offset)) {
       fail('Packaged app.asar file tree is invalid.')
     }
-    rejectPrivateKey(archive.bytes.subarray(archive.contentOffset + offset, archive.contentOffset + offset + size), `Packaged app.asar ${path}`)
+    entries.push({ path, offset, size })
+  }
+  return entries
+}
+
+function scanCanonicalAsarEntries(archive) {
+  const entries = collectAsarEntries(archive.header)
+  const nonempty = entries.filter(({ size }) => size > 0).sort((left, right) =>
+    left.offset - right.offset || compareUtf8(left.path, right.path),
+  )
+  let extent = 0
+  for (const entry of nonempty) {
+    if (entry.offset !== extent) fail('Packaged app.asar payload extent is not canonical.')
+    extent += entry.size
+    if (!Number.isSafeInteger(extent)) fail('Packaged app.asar file tree is invalid.')
+  }
+  if (archive.contentOffset + extent !== archive.bytes.byteLength) {
+    fail('Packaged app.asar payload extent does not match its raw file size.')
+  }
+  for (const entry of entries) {
+    if (entry.offset > extent || entry.size > extent - entry.offset) fail('Packaged app.asar file tree is invalid.')
+    rejectPrivateKey(
+      archive.bytes.subarray(archive.contentOffset + entry.offset, archive.contentOffset + entry.offset + entry.size),
+      `Packaged app.asar ${entry.path}`,
+    )
   }
 }
 
@@ -205,7 +229,7 @@ export function verifyPackagedConverterBoundary(appPath, { platform = process.pl
   if (!existsSync(appAsar) || !existsSync(converterMetadata)) fail('Packaged converter boundary is incomplete.')
   validateBootstrap(converterMetadata)
   const archive = decodeAsar(appAsar)
-  scanAsarNode(archive.header, archive)
+  scanCanonicalAsarEntries(archive)
 
   const metadataRelative = platform === 'darwin'
     ? 'Contents/Resources/converter-packs'

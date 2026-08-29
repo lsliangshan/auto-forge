@@ -761,26 +761,34 @@ function iconProbe(bytes: Uint8Array): StructuralProbe | undefined {
       if (!approvedColorCount.includes(colorCount)) return undefined
       if (size < 40) return undefined
       const headerSize = buffer.readUInt32LE(offset)
-      if (headerSize < 40 || headerSize > size) return undefined
+      if (![40, 108, 124].includes(headerSize) || headerSize > size) return undefined
       const dibWidth = buffer.readInt32LE(offset + 4)
       const dibHeight = buffer.readInt32LE(offset + 8)
       const dibPlanes = buffer.readUInt16LE(offset + 12)
       const dibBitCount = buffer.readUInt16LE(offset + 14)
       const compression = buffer.readUInt32LE(offset + 16)
+      const imageSize = buffer.readUInt32LE(offset + 20)
       const colorsUsed = buffer.readUInt32LE(offset + 32)
+      const supportedCompression = compression === 0
       if (
-        dibWidth !== entryWidth
+        dibWidth <= 0
+        || dibHeight <= 0
+        || dibWidth !== entryWidth
         || dibHeight !== entryHeight * 2
         || dibPlanes !== 1
         || dibBitCount !== bitCount
-        || compression !== 0
+        || !supportedCompression
       ) return undefined
-      const paletteEntries = bitCount <= 8 ? (colorsUsed || 2 ** bitCount) : 0
-      if (paletteEntries > 256) return undefined
+      const maximumPaletteEntries = bitCount <= 8 ? 2 ** bitCount : 0
+      if (colorsUsed > maximumPaletteEntries || (bitCount > 8 && colorsUsed !== 0)) return undefined
+      const paletteEntries = bitCount <= 8 ? (colorsUsed || maximumPaletteEntries) : 0
       const xorStride = Math.ceil((entryWidth * bitCount) / 32) * 4
       const maskStride = Math.ceil(entryWidth / 32) * 4
-      const minimumSize = headerSize + paletteEntries * 4 + (xorStride + maskStride) * entryHeight
-      if (minimumSize > size) return undefined
+      const xorBytes = xorStride * entryHeight
+      const maskBytes = maskStride * entryHeight
+      if (imageSize !== 0 && imageSize !== xorBytes) return undefined
+      const requiredSize = headerSize + paletteEntries * 4 + xorBytes + maskBytes
+      if (requiredSize !== size) return undefined
     }
     width = Math.max(width, entryWidth)
     height = Math.max(height, entryHeight)
@@ -907,6 +915,7 @@ function ebmlProbe(bytes: Uint8Array): StructuralProbe | undefined {
   const headerEnd = offset + headerSize.value
   if (headerEnd > bytes.length) return undefined
   let docType: string | undefined
+  let docTypeCount = 0
   while (offset < headerEnd) {
     const id = readEbmlVint(bytes, offset, false)
     if (!id) return undefined
@@ -915,10 +924,13 @@ function ebmlProbe(bytes: Uint8Array): StructuralProbe | undefined {
     if (!size) return undefined
     offset += size.length
     if (offset + size.value > headerEnd) return undefined
-    if (id.value === 0x4282) docType = ascii(bytes.subarray(offset, offset + size.value))
+    if (id.value === 0x4282) {
+      docTypeCount += 1
+      docType = ascii(bytes.subarray(offset, offset + size.value))
+    }
     offset += size.value
   }
-  if (offset !== headerEnd || (docType !== 'webm' && docType !== 'matroska')) return undefined
+  if (offset !== headerEnd || docTypeCount !== 1 || (docType !== 'webm' && docType !== 'matroska')) return undefined
   const segmentId = readEbmlVint(bytes, offset, false)
   if (!segmentId || segmentId.value !== 0x18538067) return undefined
   offset += segmentId.length

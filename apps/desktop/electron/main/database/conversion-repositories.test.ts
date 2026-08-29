@@ -268,6 +268,41 @@ describe('conversion repositories', () => {
     database.close()
   })
 
+  it('persists every scale-specific ICNS representation without collapsing equal pixel sizes', () => {
+    const { database, path } = openTestDatabase()
+    createExecution(database, 'execution_icns_metadata')
+    const job = createJob(database, 'job_icns_metadata', 'execution_icns_metadata', 1)
+    const slots = [
+      { sourceType: 'icp4', logicalWidth: 16, logicalHeight: 16, pixelWidth: 16, pixelHeight: 16, scale: 1 },
+      { sourceType: 'ic11', logicalWidth: 16, logicalHeight: 16, pixelWidth: 32, pixelHeight: 32, scale: 2 },
+      { sourceType: 'icp5', logicalWidth: 32, logicalHeight: 32, pixelWidth: 32, pixelHeight: 32, scale: 1 },
+      { sourceType: 'ic12', logicalWidth: 32, logicalHeight: 32, pixelWidth: 64, pixelHeight: 64, scale: 2 },
+      { sourceType: 'ic07', logicalWidth: 128, logicalHeight: 128, pixelWidth: 128, pixelHeight: 128, scale: 1 },
+      { sourceType: 'ic13', logicalWidth: 128, logicalHeight: 128, pixelWidth: 256, pixelHeight: 256, scale: 2 },
+      { sourceType: 'ic08', logicalWidth: 256, logicalHeight: 256, pixelWidth: 256, pixelHeight: 256, scale: 1 },
+      { sourceType: 'ic14', logicalWidth: 256, logicalHeight: 256, pixelWidth: 512, pixelHeight: 512, scale: 2 },
+      { sourceType: 'ic09', logicalWidth: 512, logicalHeight: 512, pixelWidth: 512, pixelHeight: 512, scale: 1 },
+      { sourceType: 'ic10', logicalWidth: 512, logicalHeight: 512, pixelWidth: 1024, pixelHeight: 1024, scale: 2 },
+    ] as const
+    for (const [index, iconRepresentation] of slots.entries()) {
+      database.conversionArtifacts.create({
+        id: `artifact_icns_${index}`, ownerUserId: 'alice', executionId: 'execution_icns_metadata',
+        conversionJobId: job.id, role: 'output', displayName: `representation-${index + 1}.png`,
+        detectedFormat: 'png', mimeType: 'image/png', byteSize: 12,
+        sha256: String(index).padStart(64, '0'), relativePath: `artifacts/representation-${index + 1}.png`,
+        metadata: { iconRepresentation },
+      })
+    }
+    database.close()
+
+    const reopened = openAppDatabase(path)
+    expect(reopened.conversionArtifacts.listForJob(job.id, 'alice').map((artifact) => artifact.metadata))
+      .toEqual(slots.map((iconRepresentation) => ({ iconRepresentation })))
+    expect(reopened.conversionArtifacts.listForJob(job.id, 'alice')[1]?.metadata)
+      .not.toEqual(reopened.conversionArtifacts.listForJob(job.id, 'alice')[2]?.metadata)
+    reopened.close()
+  })
+
   it('enforces non-rooted artifact paths in the migration', () => {
     const { database, path } = openTestDatabase()
     createExecution(database, 'execution_path_check')

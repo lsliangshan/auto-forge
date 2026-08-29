@@ -36,6 +36,10 @@ const icnsSlots = [
   { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 },
   { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 },
 ] as const satisfies readonly ConversionIcnsSlot[]
+const probedIcnsSlots = new Map<string, { readonly type: string; readonly logicalSize: number; readonly scale: number; readonly pixelSize: number }>([
+  ...icnsSlots.map((slot) => [slot.type, slot] as const),
+  ['icp6', { type: 'icp6', logicalSize: 64, scale: 1, pixelSize: 64 }] as const,
+])
 
 function ownedRoute(input: ProbedConversionInput, target: ConversionTargetFormat): boolean {
   if (target === 'ico' || target === 'icns') return input.kind === 'image' && input.format !== 'ico' && input.format !== 'icns'
@@ -120,11 +124,38 @@ export const imageIconAdapter: ConverterAdapter = {
       if (!Number.isSafeInteger(input.frameCount) || input.frameCount < 1 || input.frameCount > 256) {
         throw new ConversionProcessError('CONVERSION_INPUT_INVALID')
       }
+      const extractionSlots = input.format === 'icns' ? input.iconSlots : undefined
+      if (input.format === 'icns' && (
+        extractionSlots?.length !== input.frameCount
+        || new Set(extractionSlots.map((slot) => slot.type)).size !== extractionSlots.length
+        || extractionSlots.some((slot) => {
+          const expected = probedIcnsSlots.get(slot.type)
+          return expected === undefined
+            || expected.logicalSize !== slot.logicalSize
+            || expected.pixelSize !== slot.pixelSize
+            || expected.scale !== slot.scale
+        })
+      )) throw new ConversionProcessError('CONVERSION_INPUT_INVALID')
       const pattern = join(outputRoot, `representation-%03d.${request.targetFormat}`)
-      const outputs = Array.from({ length: input.frameCount }, (_, index) => ({
-        path: join(outputRoot, `representation-${String(index + 1).padStart(3, '0')}.${request.targetFormat}`),
-        format: request.targetFormat,
-      }))
+      const outputs = Array.from({ length: input.frameCount }, (_, index) => {
+        const slot = extractionSlots?.[index]
+        return {
+          path: join(outputRoot, `representation-${String(index + 1).padStart(3, '0')}.${request.targetFormat}`),
+          format: request.targetFormat,
+          ...(slot === undefined ? {} : {
+            metadata: {
+              iconRepresentation: {
+                sourceType: slot.type,
+                logicalWidth: slot.logicalSize,
+                logicalHeight: slot.logicalSize,
+                pixelWidth: slot.pixelSize,
+                pixelHeight: slot.pixelSize,
+                scale: slot.scale,
+              },
+            },
+          }),
+        }
+      })
       return planResult(lease, outputRoot, [
         'extract-icon', '--input-format', input.format, '--output-format', request.targetFormat,
         '--all-representations', '--output-pattern', pattern, '--', request.inputPath,

@@ -11,6 +11,18 @@ const lease: ConverterPackLease = Object.freeze({
   executables: Object.freeze({ 'bin/autoforge-image-converter': executable }), release() {},
 })
 const specialInput = '/input/- cover "quoted"\nline.png'
+const expectedIcnsSlots = [
+  { type: 'icp4', logicalSize: 16, scale: 1, pixelSize: 16 },
+  { type: 'ic11', logicalSize: 16, scale: 2, pixelSize: 32 },
+  { type: 'icp5', logicalSize: 32, scale: 1, pixelSize: 32 },
+  { type: 'ic12', logicalSize: 32, scale: 2, pixelSize: 64 },
+  { type: 'ic07', logicalSize: 128, scale: 1, pixelSize: 128 },
+  { type: 'ic13', logicalSize: 128, scale: 2, pixelSize: 256 },
+  { type: 'ic08', logicalSize: 256, scale: 1, pixelSize: 256 },
+  { type: 'ic14', logicalSize: 256, scale: 2, pixelSize: 512 },
+  { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 },
+  { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 },
+] as const
 
 function image(overrides: Partial<ProbedConversionInput> = {}): ProbedConversionInput {
   return { format: 'png', mimeType: 'image/png', kind: 'image', byteSize: 100, width: 120, height: 80, frameCount: 1, ...overrides }
@@ -98,18 +110,7 @@ describe('image/icon conversion adapter', () => {
       path: '/work/output.icns',
       format: 'icns',
       metadata: { iconRepresentations: [16, 32, 64, 128, 256, 512, 1024], transparentPadding: true },
-      iconSlots: [
-        { type: 'icp4', logicalSize: 16, scale: 1, pixelSize: 16 },
-        { type: 'ic11', logicalSize: 16, scale: 2, pixelSize: 32 },
-        { type: 'icp5', logicalSize: 32, scale: 1, pixelSize: 32 },
-        { type: 'ic12', logicalSize: 32, scale: 2, pixelSize: 64 },
-        { type: 'ic07', logicalSize: 128, scale: 1, pixelSize: 128 },
-        { type: 'ic13', logicalSize: 128, scale: 2, pixelSize: 256 },
-        { type: 'ic08', logicalSize: 256, scale: 1, pixelSize: 256 },
-        { type: 'ic14', logicalSize: 256, scale: 2, pixelSize: 512 },
-        { type: 'ic09', logicalSize: 512, scale: 1, pixelSize: 512 },
-        { type: 'ic10', logicalSize: 512, scale: 2, pixelSize: 1024 },
-      ],
+      iconSlots: expectedIcnsSlots,
     })
   })
 
@@ -130,11 +131,33 @@ describe('image/icon conversion adapter', () => {
 
   it('plans ten collision-free extraction outputs for the full scale-specific ICNS chain', () => {
     const plan = imageIconAdapter.plan(image({
-      format: 'icns', mimeType: 'image/icns', frameCount: 10,
+      format: 'icns', mimeType: 'image/icns', frameCount: 10, iconSlots: expectedIcnsSlots,
     }), { inputPath: '/input/icon.icns', targetFormat: 'png' }, lease, '/work')
     expect(plan.outputs).toHaveLength(10)
     expect(new Set(plan.outputs.map(({ path }) => path))).toHaveLength(10)
-    expect(plan.outputs.at(-1)?.path).toBe('/work/representation-010.png')
+    expect(plan.outputs).toEqual(expectedIcnsSlots.map((slot, index) => ({
+      path: `/work/representation-${String(index + 1).padStart(3, '0')}.png`,
+      format: 'png',
+      metadata: {
+        iconRepresentation: {
+          sourceType: slot.type,
+          logicalWidth: slot.logicalSize,
+          logicalHeight: slot.logicalSize,
+          pixelWidth: slot.pixelSize,
+          pixelHeight: slot.pixelSize,
+          scale: slot.scale,
+        },
+      },
+    })))
+    expect(plan.outputs[1]?.metadata).not.toEqual(plan.outputs[2]?.metadata)
+  })
+
+  it('refuses ICNS extraction when structural slot metadata is absent', () => {
+    expect(() => imageIconAdapter.plan(image({
+      format: 'icns', mimeType: 'image/icns', frameCount: 10,
+    }), { inputPath: '/input/icon.icns', targetFormat: 'png' }, lease, '/work')).toThrowError(
+      expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }),
+    )
   })
 
   it.each([101, 256])('exports all %i trusted ICO representations without the PDF page cap', (frameCount) => {

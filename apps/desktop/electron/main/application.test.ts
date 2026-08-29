@@ -9120,6 +9120,55 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('projects all ten persisted ICNS slot identities through the local conversion snapshot', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-icns-metadata-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const bootstrap = createApplicationRuntime(options(root, { authService }))
+    const session = await authenticate(bootstrap, 'ConversionIcnsMetadata')
+    await bootstrap.close()
+    const slots = [
+      { sourceType: 'icp4', logicalWidth: 16, logicalHeight: 16, pixelWidth: 16, pixelHeight: 16, scale: 1 },
+      { sourceType: 'ic11', logicalWidth: 16, logicalHeight: 16, pixelWidth: 32, pixelHeight: 32, scale: 2 },
+      { sourceType: 'icp5', logicalWidth: 32, logicalHeight: 32, pixelWidth: 32, pixelHeight: 32, scale: 1 },
+      { sourceType: 'ic12', logicalWidth: 32, logicalHeight: 32, pixelWidth: 64, pixelHeight: 64, scale: 2 },
+      { sourceType: 'ic07', logicalWidth: 128, logicalHeight: 128, pixelWidth: 128, pixelHeight: 128, scale: 1 },
+      { sourceType: 'ic13', logicalWidth: 128, logicalHeight: 128, pixelWidth: 256, pixelHeight: 256, scale: 2 },
+      { sourceType: 'ic08', logicalWidth: 256, logicalHeight: 256, pixelWidth: 256, pixelHeight: 256, scale: 1 },
+      { sourceType: 'ic14', logicalWidth: 256, logicalHeight: 256, pixelWidth: 512, pixelHeight: 512, scale: 2 },
+      { sourceType: 'ic09', logicalWidth: 512, logicalHeight: 512, pixelWidth: 512, pixelHeight: 512, scale: 1 },
+      { sourceType: 'ic10', logicalWidth: 512, logicalHeight: 512, pixelWidth: 1024, pixelHeight: 1024, scale: 2 },
+    ] as const
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.executions.insert({
+      id: 'execution_icns_snapshot', ownerUserId: session.user.id,
+      workflowId: 'file.convert.universal', workflowVersion: '0.1.0', status: 'completed', input: {},
+    })
+    database.conversionJobs.create({
+      id: 'job_icns_snapshot', ownerUserId: session.user.id, executionId: 'execution_icns_snapshot',
+      sourceKind: 'artifact', sourceId: 'source_icns_snapshot', targetFormat: 'png', status: 'completed', progress: 100,
+    })
+    for (const [index, iconRepresentation] of slots.entries()) {
+      database.conversionArtifacts.create({
+        id: `artifact_icns_snapshot_${index}`, ownerUserId: session.user.id,
+        executionId: 'execution_icns_snapshot', conversionJobId: 'job_icns_snapshot', role: 'output',
+        displayName: `representation-${index + 1}.png`, detectedFormat: 'png', mimeType: 'image/png',
+        byteSize: 1, sha256: String(index).padStart(64, '0'),
+        relativePath: `results/representation-${index + 1}.png`, metadata: { iconRepresentation },
+      })
+    }
+    database.close()
+
+    const runtime = createApplicationRuntime(options(root, { authService }))
+    await runtime.services.auth.getSession()
+    const snapshot = await runtime.services.conversion.listForExecution({ executionId: 'execution_icns_snapshot' })
+    expect(snapshot.availability).toBe('local')
+    expect(snapshot.jobs[0]?.artifacts.map((artifact) => artifact.metadata))
+      .toEqual(slots.map((iconRepresentation) => ({ iconRepresentation })))
+    expect(snapshot.jobs[0]?.artifacts[1]?.metadata).not.toEqual(snapshot.jobs[0]?.artifacts[2]?.metadata)
+    await runtime.close()
+  })
+
   it('never overwrites a save-copy leaf and rejects a save-dialog parent symlink retarget', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversion-save-races-'))
     directories.push(root)

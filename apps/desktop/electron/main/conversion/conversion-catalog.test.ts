@@ -240,24 +240,37 @@ function ico(): Buffer {
   return Buffer.concat([bytes, image])
 }
 
-function dibIco(): Buffer {
+function dibIco(options: {
+  headerSize?: 40 | 41 | 108 | 124
+  bitCount?: 1 | 4 | 8 | 24 | 32
+  colorsUsed?: number
+  sizeImage?: number
+  compression?: 0 | 3
+} = {}): Buffer {
   const width = 16
   const height = 16
-  const xorBytes = width * height * 4
+  const headerSize = options.headerSize ?? 40
+  const bitCount = options.bitCount ?? 32
+  const colorsUsed = options.colorsUsed ?? 0
+  const paletteEntries = bitCount <= 8 ? (colorsUsed || 2 ** bitCount) : 0
+  const xorBytes = Math.ceil((width * bitCount) / 32) * 4 * height
   const andBytes = Math.ceil(width / 32) * 4 * height
-  const image = Buffer.alloc(40 + xorBytes + andBytes)
-  image.writeUInt32LE(40, 0)
+  const image = Buffer.alloc(headerSize + paletteEntries * 4 + xorBytes + andBytes)
+  image.writeUInt32LE(headerSize, 0)
   image.writeInt32LE(width, 4)
   image.writeInt32LE(height * 2, 8)
   image.writeUInt16LE(1, 12)
-  image.writeUInt16LE(32, 14)
+  image.writeUInt16LE(bitCount, 14)
+  image.writeUInt32LE(options.compression ?? 0, 16)
+  image.writeUInt32LE(options.sizeImage ?? 0, 20)
+  image.writeUInt32LE(colorsUsed, 32)
   const header = Buffer.alloc(22)
   header.writeUInt16LE(1, 2)
   header.writeUInt16LE(1, 4)
   header[6] = width
   header[7] = height
   header.writeUInt16LE(1, 10)
-  header.writeUInt16LE(32, 12)
+  header.writeUInt16LE(bitCount, 12)
   header.writeUInt32LE(image.byteLength, 14)
   header.writeUInt32LE(header.byteLength, 18)
   return Buffer.concat([header, image])
@@ -325,6 +338,15 @@ function ebmlHeader(docType: 'webm' | 'matroska'): Buffer {
   return Buffer.concat([Buffer.from('1a45dfa3', 'hex'), Buffer.from([0x80 | docTypeElement.length]), docTypeElement])
 }
 
+function ebmlHeaderWithDocTypes(docTypes: readonly ('webm' | 'matroska')[]): Buffer {
+  const children = docTypes.map((docType) => {
+    const value = Buffer.from(docType)
+    return Buffer.concat([Buffer.from([0x42, 0x82, 0x80 | value.length]), value])
+  })
+  const payload = Buffer.concat(children)
+  return Buffer.concat([Buffer.from('1a45dfa3', 'hex'), Buffer.from([0x80 | payload.length]), payload])
+}
+
 function ebmlElement(id: string, data: Buffer): Buffer {
   if (data.byteLength > 126) throw new Error('test EBML element too large')
   return Buffer.concat([Buffer.from(id, 'hex'), Buffer.from([0x80 | data.byteLength]), data])
@@ -347,6 +369,12 @@ function ebml(docType: 'webm' | 'matroska'): Buffer {
   ]))
   const tracks = ebmlElement('1654ae6b', track)
   return Buffer.concat([ebmlHeader(docType), ebmlElement('18538067', Buffer.concat([info, tracks]))])
+}
+
+function ebmlWithDocTypes(docTypes: readonly ('webm' | 'matroska')[]): Buffer {
+  const valid = ebml('webm')
+  const originalHeader = ebmlHeader('webm')
+  return Buffer.concat([ebmlHeaderWithDocTypes(docTypes), valid.subarray(originalHeader.byteLength)])
 }
 
 function cfb(streamName: 'WordDocument' | 'Workbook' | 'PowerPoint Document'): Buffer {
@@ -487,10 +515,17 @@ describe('conversion catalog input probing', () => {
       .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
   })
 
-  it('requires the EBML DocType to match the declared WebM container', () => {
+  it('requires exactly one WebM EBML DocType', () => {
     expect(probe(ebml('webm'), 'video.webm', 'video/webm')).toMatchObject({ format: 'webm' })
-    expect(() => probe(ebml('matroska'), 'video.webm', 'video/webm'))
-      .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+    for (const bytes of [
+      ebmlWithDocTypes([]),
+      ebmlWithDocTypes(['webm', 'webm']),
+      ebmlWithDocTypes(['webm', 'matroska']),
+      ebml('matroska'),
+    ]) {
+      expect(() => probe(bytes, 'video.webm', 'video/webm'))
+        .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+    }
   })
 
   it('probes every scale-specific ICNS representation without collapsing duplicate pixel sizes', () => {
@@ -502,6 +537,10 @@ describe('conversion catalog input probing', () => {
   it('validates ICO entry fields, payload bounds, and PNG/DIB embedded dimensions', () => {
     expect(probe(ico(), 'icon.ico', 'image/vnd.microsoft.icon')).toMatchObject({ format: 'ico', frameCount: 1 })
     expect(probe(dibIco(), 'icon.ico', 'image/vnd.microsoft.icon')).toMatchObject({ format: 'ico', width: 16, height: 16 })
+    expect(probe(dibIco({ headerSize: 108, sizeImage: 1024 }), 'icon.ico', 'image/vnd.microsoft.icon'))
+      .toMatchObject({ format: 'ico', width: 16, height: 16 })
+    expect(probe(dibIco({ headerSize: 124, sizeImage: 1024 }), 'icon.ico', 'image/vnd.microsoft.icon'))
+      .toMatchObject({ format: 'ico', width: 16, height: 16 })
 
     const approvedLegacy = ico()
     approvedLegacy.writeUInt16LE(0, 10)
@@ -528,6 +567,16 @@ describe('conversion catalog input probing', () => {
     for (const [label, offset, value] of [['DIB width', 26, 8], ['DIB doubled height', 30, 16]] as const) {
       const bytes = dibIco()
       bytes.writeInt32LE(value, offset)
+      expect(() => probe(bytes, 'icon.ico', 'image/vnd.microsoft.icon'), label)
+        .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
+    }
+
+    for (const [label, bytes] of [
+      ['unsupported 41-byte DIB header', dibIco({ headerSize: 41 })],
+      ['unsupported compressed DIB', dibIco({ headerSize: 108, compression: 3 })],
+      ['1-bpp DIB with three palette entries', dibIco({ bitCount: 1, colorsUsed: 3 })],
+      ['DIB with impossible image size', dibIco({ sizeImage: 0xffffffff })],
+    ] as const) {
       expect(() => probe(bytes, 'icon.ico', 'image/vnd.microsoft.icon'), label)
         .toThrowError(expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }))
     }
