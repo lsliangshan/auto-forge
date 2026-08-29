@@ -107,3 +107,4 @@ packages/shared/src/contracts.test.ts
 ### Round-4 follow-up
 
 - Main now uses one exact active-block reconciler for job signals and startup/rebind scans. It requires terminal execution, nonempty all-terminal jobs, and finds the owner/run/conversation/message/block by exact persisted identifiers; terminal replay is naturally no-op after the active state is consumed.
+- Execution status events now invoke the same reconciler only after the durable terminal state is available. The deployed-DB migration is executable/idempotent for the mutation-kind constraint, and the local writer validates exact active identity while treating exact terminal replay as a no-op.

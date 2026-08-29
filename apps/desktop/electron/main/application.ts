@@ -1993,6 +1993,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       else activeExecutions.delete(event.executionId)
     }
     const ownerUserId = database.executions.get(event.executionId)?.ownerUserId
+    if (event.type === 'status' && ['completed', 'failed', 'cancelled', 'interrupted'].includes(event.status)
+      && ownerUserId !== undefined && boundConversion?.ownerUserId === ownerUserId) {
+      reconcileConversionBlocks(boundConversion, event.executionId)
+    }
     if (auth.isAuthenticated() && ownerUserId !== undefined && ownerUserId === auth.currentUserId()) {
       try { options.emitExecution(event) } catch { /* Renderer events are observational. */ }
     }

@@ -1571,6 +1571,14 @@ export function createUserDataRepositories(
       if (parsed.type !== 'conversion' || parsed.state !== 'terminal') {
         return repositories.messages.replaceBlock(messageId, blockId, parsed)
       }
+      const current = existing.blocks.find((block) => (
+        typeof block === 'object' && block !== null && 'blockId' in block && block.blockId === blockId
+      ))
+      if (current?.type !== 'conversion' || current.executionId !== parsed.executionId) {
+        throw new UserDataConsistencyError()
+      }
+      if (current.state === 'terminal') return existing
+      if (current.state !== 'active') throw new UserDataConsistencyError()
       const summary = conversationSummary(existing.conversationId)
       if (!summary) throw new UserDataConsistencyError()
       const mutation: SyncMutation = {
