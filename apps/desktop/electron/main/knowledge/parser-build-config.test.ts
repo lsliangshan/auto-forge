@@ -30,4 +30,12 @@ describe('knowledge parser build boundary', () => {
       /^pnpm build:knowledge-parser-smoke && electron-builder /,
     )
   })
+
+  it('keeps the packaged smoke main alive after its hidden parser window closes', async () => {
+    const source = await readFile(
+      new URL('../../../electron/e2e/knowledge-parser-smoke-main.ts', import.meta.url),
+      'utf8',
+    )
+    expect(source).toContain("app.on('window-all-closed', () => undefined)")
+  })
 })

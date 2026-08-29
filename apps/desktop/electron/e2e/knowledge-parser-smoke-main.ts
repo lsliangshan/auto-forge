@@ -22,6 +22,8 @@ import {
 const HANDLE = '0123456789abcdef0123456789abcdef'
 let stage = 'start'
 
+app.on('window-all-closed', () => undefined)
+
 async function verifyCanonicalPortBoundary(): Promise<void> {
   const { port1, port2 } = new MessageChannelMain()
   try {
