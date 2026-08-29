@@ -471,7 +471,7 @@ export function createDeveloperAttachmentDraftService(
               claim.materializedIdentity = undefined
             }
           }
-          await destinationHandle?.truncate(0).catch(() => undefined)
+          if (!preserveDestination) await destinationHandle?.truncate(0).catch(() => undefined)
           await destinationHandle?.close().catch(() => undefined)
           if (destinationIdentity && !preserveDestination) {
             const current = await lstat(destination).catch(() => undefined)
@@ -516,6 +516,13 @@ export function createDeveloperAttachmentDraftService(
         const trash = await ensureDirectory(join(root, '.trash'))
         const quarantined = join(trash, `${id}.quarantine-${randomUUID()}`)
         if (!inside(inputs, source) || !inside(trash, quarantined)) throw failure('CONVERSION_INPUT_INVALID')
+        const drafts = await verifiedDraftDirectory()
+        const draftPath = join(drafts, `${id}.input`)
+        const draftLive = await lstat(draftPath).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+          throw error
+        })
+        if (draftLive) await removeExact(draftPath, record.draftIdentity)
         const sourceHandle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW)
         try {
           const sourceIdentity = await sourceHandle.stat()
@@ -549,15 +556,6 @@ export function createDeveloperAttachmentDraftService(
           if (sourceRemaining) throw failure('CONVERSION_INPUT_INVALID')
           if (!options.artifacts.markDeleted(id, options.ownerUserId, artifact)) {
             throw failure('CONVERSION_INPUT_INVALID')
-          }
-          const drafts = await verifiedDraftDirectory()
-          const draftPath = join(drafts, `${id}.input`)
-          const draftLive = await lstat(draftPath).catch((error: unknown) => {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
-            throw error
-          })
-          if (draftLive) {
-            await removeExact(draftPath, record.draftIdentity)
           }
         } finally {
           await sourceHandle.close().catch(() => undefined)

@@ -1,4 +1,5 @@
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
+import { linkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -314,5 +315,48 @@ describe('developer attachment drafts', () => {
     await expect(service.materialize('execution_1', [draft!.id])).resolves.toBeUndefined()
     await expect(service.releaseExecution('execution_1', new Set())).resolves.toBeUndefined()
     expect(records.get('draft_1')).toMatchObject({ status: 'deleted' })
+  })
+
+  it('preserves a committed destination when draft cleanup and artifact rollback both fail', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-developer-draft-post-insert-'))
+    roots.push(root)
+    const source = join(root, 'source.bmp')
+    const bytes = bmp(8)
+    await writeFile(source, bytes)
+    const artifacts = artifactRepository()
+    let draftPath = ''
+    const create = artifacts.create.bind(artifacts)
+    artifacts.create = (input: NewConversionArtifact) => {
+      linkSync(draftPath, `${draftPath}.busy`)
+      return create(input)
+    }
+    let failRollback = true
+    const markDeleted = artifacts.markDeleted.bind(artifacts)
+    artifacts.markDeleted = (id: string, ownerUserId: string, expected: ConversionArtifact) => {
+      if (failRollback) {
+        failRollback = false
+        return false
+      }
+      return markDeleted(id, ownerUserId, expected)
+    }
+    const service = createDeveloperAttachmentDraftService({
+      dataRoot: root, ownerUserId: 'user_1', artifacts, id: () => 'draft_1',
+    })
+    await service.recover()
+    const [draft] = await service.importPaths({ projectId: 'project_1', existingAttachmentIds: [], paths: [source] })
+    draftPath = join(resolveUserConversionRoot(root, 'user_1'), '.developer-drafts', `${draft!.id}.input`)
+    service.claim('project_1', 'execution_1', [draft!.id])
+
+    await expect(service.materialize('execution_1', [draft!.id]))
+      .rejects.toMatchObject({ code: 'CONVERSION_INPUT_INVALID' })
+    const destination = join(resolveUserConversionRoot(root, 'user_1'), 'inputs', `${draft!.id}.input`)
+    expect(await readFile(destination)).toEqual(bytes)
+    expect(await readFile(draftPath)).toEqual(bytes)
+    expect(artifacts.records.get('draft_1')).toMatchObject({ status: 'ready', byteSize: bytes.byteLength })
+
+    await unlink(`${draftPath}.busy`)
+    await expect(service.releaseExecution('execution_1', new Set())).resolves.toBeUndefined()
+    expect(artifacts.records.get('draft_1')).toMatchObject({ status: 'deleted' })
+    await expect(lstat(draftPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })
