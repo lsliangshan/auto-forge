@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs'
+import { existsSync, lstatSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import process from 'node:process'
 import { spawnSync } from 'node:child_process'
@@ -8,9 +8,9 @@ import { isAbsoluteNativePackagePath } from './native-package-paths.mjs'
 process.noAsar = true
 
 const targets = new Map([
-  ['darwin-arm64', { platform: 'darwin', arch: 'arm64', outputDirectory: 'mac-arm64', productDirectory: 'AutoForge.app' }],
-  ['darwin-x64', { platform: 'darwin', arch: 'x64', outputDirectory: 'mac', productDirectory: 'AutoForge.app' }],
-  ['win32-x64', { platform: 'win32', arch: 'x64', outputDirectory: 'win-unpacked', productDirectory: '' }],
+  ['darwin-arm64', { platform: 'darwin', arch: 'arm64', outputDirectory: 'mac-arm64', productDirectory: 'AutoForge.app', executableName: 'AutoForge' }],
+  ['darwin-x64', { platform: 'darwin', arch: 'x64', outputDirectory: 'mac', productDirectory: 'AutoForge.app', executableName: 'AutoForge' }],
+  ['win32-x64', { platform: 'win32', arch: 'x64', outputDirectory: 'win-unpacked', productDirectory: '', executableName: 'AutoForge.exe' }],
 ])
 
 function parseArguments(argv) {
@@ -101,10 +101,10 @@ if (!workflowCompilerMetadata.isDirectory() || workflowCompilerMetadata.isSymbol
 }
 
 const executable = platform === 'darwin'
-  ? resolveDarwinExecutable(packageDirectory)
-  : join(packageDirectory, 'AutoForge.exe')
+  ? join(packageDirectory, 'Contents', 'MacOS', target.executableName)
+  : join(packageDirectory, target.executableName)
 if (!existsSync(executable)) throw new Error(`Packaged executable not found: ${executable}`)
-requireRegularFile(executable, 'Packaged executable')
+requireRegularFile(executable, 'Packaged executable', { executable: platform === 'darwin' })
 
 if (arguments_.structuralOnly) {
   process.stdout.write(`${platform}-${arch} packaged native structure verified; runtime execution not performed\n`)
@@ -150,19 +150,12 @@ if (result.status !== 0) {
   throw new Error(`Packaged runtime dependency probe failed with exit code ${result.status ?? 'unknown'}`)
 }
 
-function resolveDarwinExecutable(appDirectory) {
-  const executableDirectory = join(appDirectory, 'Contents', 'MacOS')
-  const executableName = readdirSync(executableDirectory).find((name) =>
-    lstatSync(join(executableDirectory, name)).isFile()
-      && !lstatSync(join(executableDirectory, name)).isSymbolicLink(),
-  )
-  if (!executableName) throw new Error(`No packaged executable regular file found in ${executableDirectory}`)
-  return join(executableDirectory, executableName)
-}
-
-function requireRegularFile(path, label) {
+function requireRegularFile(path, label, { executable = false } = {}) {
   const metadata = lstatSync(path)
   if (!metadata.isFile() || metadata.isSymbolicLink()) {
     throw new Error(`${label} must be a regular file: ${path}`)
+  }
+  if (executable && (metadata.mode & 0o111) === 0) {
+    throw new Error(`${label} must have an executable mode: ${path}`)
   }
 }

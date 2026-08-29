@@ -199,6 +199,35 @@ describe('verify-packaged-native', () => {
     expect(result.stdout).toContain('runtime execution not performed')
   })
 
+  it('requires the exact configured Darwin executable and ignores an executable decoy', () => {
+    const fixture = packagingFixture()
+    const app = fakePackagedApp(fixture, 'mac-arm64', { nativeModule: true })
+    const executableDirectory = join(app, 'Contents', 'MacOS')
+    mkdirSync(join(executableDirectory, 'AutoForge'))
+    writeFileSync(join(executableDirectory, '00-decoy'), '#!/bin/sh\nexit 0\n')
+    chmodSync(join(executableDirectory, '00-decoy'), 0o755)
+
+    const result = runVerifier(fixture, ['--structural-only'])
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('AutoForge')
+    expect(result.stderr.toLowerCase()).toContain('regular file')
+  })
+
+  it('accepts the exact configured Darwin executable only when it is executable', () => {
+    const fixture = packagingFixture()
+    fakePackagedApp(fixture, 'mac-arm64', {
+      nativeModule: true,
+      executable: '#!/bin/sh\nexit 0\n',
+    })
+    expect(runVerifier(fixture, ['--structural-only']).status).toBe(0)
+
+    chmodSync(join(fixture.desktop, 'dist', 'mac-arm64', 'AutoForge.app', 'Contents', 'MacOS', 'AutoForge'), 0o644)
+    const nonExecutable = runVerifier(fixture, ['--structural-only'])
+    expect(nonExecutable.status).not.toBe(0)
+    expect(nonExecutable.stderr.toLowerCase()).toContain('executable')
+  })
+
   it.each([
     ['app.asar', (app: string) => join(app, 'resources', 'app.asar')],
     ['native module', (app: string) => join(app, 'resources', 'app.asar.unpacked', 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')],
@@ -235,7 +264,10 @@ describe('verify-packaged-native', () => {
 describe('desktop package branding', () => {
   it('uses the approved logo for macOS and Windows packages', () => {
     const config = readFileSync(builderConfig, 'utf8')
+    const verifier = readFileSync(verifierSource, 'utf8')
 
+    expect(config).toContain('productName: AutoForge')
+    expect(verifier).toContain("executableName: 'AutoForge'")
     expect(config).toContain('mac:\n  icon: resources/branding/autoforge-logo.icns')
     expect(config).toContain('win:\n  icon: resources/branding/autoforge-logo.ico')
   })

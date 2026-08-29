@@ -2,7 +2,9 @@ import { createHash, generateKeyPairSync, sign as signBytes } from 'node:crypto'
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -138,7 +140,12 @@ function stageProduction(root: string): string {
 function createAsar(
   path: string,
   files: Record<string, Buffer>,
-  options: { unindexedPrefix?: Buffer; unindexedTrailer?: Buffer } = {},
+  options: {
+    unindexedPrefix?: Buffer
+    unindexedTrailer?: Buffer
+    headerSlack?: Buffer
+    nonzeroPadding?: boolean
+  } = {},
 ) {
   const header: { files: Record<string, unknown> } = { files: {} }
   const payloads: Buffer[] = []
@@ -156,11 +163,19 @@ function createAsar(
     offset += bytes.byteLength
   }
   const json = Buffer.from(JSON.stringify(header))
-  const innerPayloadBytes = 4 + Math.ceil(json.byteLength / 4) * 4
+  const alignedJsonBytes = Math.ceil(json.byteLength / 4) * 4
+  const headerSlack = options.headerSlack ?? Buffer.alloc(0)
+  if (headerSlack.byteLength % 4 !== 0) throw new Error('ASAR header slack fixture must be 4-byte aligned')
+  const innerPayloadBytes = 4 + alignedJsonBytes + headerSlack.byteLength
   const inner = Buffer.alloc(4 + innerPayloadBytes)
   inner.writeUInt32LE(innerPayloadBytes, 0)
   inner.writeUInt32LE(json.byteLength, 4)
   json.copy(inner, 8)
+  if (options.nonzeroPadding) {
+    if (alignedJsonBytes === json.byteLength) throw new Error('ASAR fixture JSON has no alignment padding')
+    inner[8 + json.byteLength] = 1
+  }
+  headerSlack.copy(inner, 8 + alignedJsonBytes)
   const outer = Buffer.alloc(8)
   outer.writeUInt32LE(4, 0)
   outer.writeUInt32LE(inner.byteLength, 4)
@@ -197,6 +212,25 @@ function keyPair(root: string) {
 }
 
 describe('converter pack release tooling', () => {
+  const actualDarwinApp = join(desktopRoot, 'dist', 'mac-arm64', 'AutoForge.app')
+
+  it.skipIf(!existsSync(actualDarwinApp))('accepts the actual large electron-builder ASAR with canonical Pickle sizing', () => {
+    const appAsar = join(actualDarwinApp, 'Contents', 'Resources', 'app.asar')
+    const previousNoAsar = process.noAsar
+    let rawSize: number
+    try {
+      process.noAsar = true
+      rawSize = lstatSync(appAsar).size
+    } finally {
+      process.noAsar = previousNoAsar
+    }
+    expect(rawSize).toBeGreaterThan(100 * 1024 * 1024)
+    const result = run(verifyScript, [
+      '--packaged-app', actualDarwinApp, '--platform', 'darwin', '--arch', 'arm64',
+    ])
+    expect(result.status, result.stderr).toBe(0)
+  })
+
   it('builds canonical archives and indexes byte-identically, signs with an explicit key, and verifies every hash', () => {
     const root = temporaryRoot()
     const stage = stagePack(root)
@@ -659,6 +693,35 @@ describe('converter pack release tooling', () => {
     ])
     expect(result.status).not.toBe(0)
     expect(result.stderr.toLowerCase()).toContain('extent')
+    expect(`${result.stdout}${result.stderr}`).not.toContain(privateKey.toString('hex'))
+  })
+
+  it.each([
+    ['oversized zero header slack', { headerSlack: Buffer.alloc(4) }],
+    ['nonzero alignment padding', { nonzeroPadding: true }],
+  ] as const)('rejects noncanonical ASAR %s', (_label, options) => {
+    const root = temporaryRoot()
+    const fixture = packagedApp(root, 'darwin')
+    createAsar(join(fixture.resources, 'app.asar'), { 'package.json': Buffer.from('{}') }, options)
+    const result = run(verifyScript, [
+      '--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64',
+    ])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr.toLowerCase()).toContain('header')
+  })
+
+  it('rejects a DER private key hidden in oversized ASAR header slack', () => {
+    const root = temporaryRoot()
+    const fixture = packagedApp(root, 'darwin')
+    const privateKey = generateKeyPairSync('ed25519').privateKey.export({ format: 'der', type: 'pkcs8' })
+    const aligned = Buffer.alloc(Math.ceil(privateKey.byteLength / 4) * 4)
+    privateKey.copy(aligned)
+    createAsar(join(fixture.resources, 'app.asar'), { 'package.json': Buffer.from('{}') }, { headerSlack: aligned })
+    const result = run(verifyScript, [
+      '--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64',
+    ])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr.toLowerCase()).toContain('header')
     expect(`${result.stdout}${result.stderr}`).not.toContain(privateKey.toString('hex'))
   })
 })

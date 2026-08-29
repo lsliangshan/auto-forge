@@ -92,15 +92,26 @@ function decodeAsar(path) {
   const bytes = readStableRegularFileSync(path, 'Packaged app.asar')
   if (bytes.byteLength < 16 || bytes.readUInt32LE(0) !== 4) fail('Packaged app.asar header is invalid.')
   const headerSize = bytes.readUInt32LE(4)
-  if (headerSize < 8 || 8 + headerSize > bytes.byteLength) fail('Packaged app.asar header is invalid.')
   const payloadSize = bytes.readUInt32LE(8)
   const jsonBytes = bytes.readUInt32LE(12)
-  if (payloadSize + 4 !== headerSize || jsonBytes > payloadSize - 4 || 16 + jsonBytes > bytes.byteLength) {
+  const alignedJsonBytes = jsonBytes + ((4 - (jsonBytes % 4)) % 4)
+  const expectedPayloadSize = 4 + alignedJsonBytes
+  const expectedHeaderSize = 4 + expectedPayloadSize
+  const contentOffset = 8 + expectedHeaderSize
+  if (
+    jsonBytes < 2
+    || payloadSize !== expectedPayloadSize
+    || headerSize !== expectedHeaderSize
+    || contentOffset > bytes.byteLength
+    || bytes[16] !== 0x7b
+    || bytes[16 + jsonBytes - 1] !== 0x7d
+    || bytes.subarray(16 + jsonBytes, contentOffset).some((byte) => byte !== 0)
+  ) {
     fail('Packaged app.asar header is invalid.')
   }
   let header
   try { header = JSON.parse(bytes.subarray(16, 16 + jsonBytes).toString('utf8')) } catch { fail('Packaged app.asar header is invalid.') }
-  return { bytes, header, contentOffset: 8 + headerSize }
+  return { bytes, header, contentOffset }
 }
 
 function forbiddenPackagedPath(path) {

@@ -4,7 +4,7 @@
 
 - Worktree: `/Users/liangshan/Downloads/workspace/workspace_qisi/auto-forge/.worktrees/universal-file-converter`
 - Base: `2d6d8972b700678e347479ce7f73bc90c2ff7f10`
-- Task 13 and Important-finding fix rounds 1–3 are implemented. Task 14 was not started.
+- Task 13 and Important-finding fix rounds 1–4 are implemented. Task 14 was not started.
 - Production remains fail-closed: `downloadsEnabled=false`, `indexUrl=null`, `rootPublicKeyFile=null`.
 - Task 12 remains reader-first: deploy the v1-safe/v2 Cloud SQL and handler before Desktop v2 writers, then prove PostgreSQL locking, RLS, purge, receipts, and cross-device convergence.
 
@@ -29,6 +29,11 @@ Fix round 3 again began with tests against the fix-round-2 implementation:
 - focused catalog, adapter, repository, native, cross-platform-root, and ASAR tooling coverage: **16 failed, 95 passed**; failures proved duplicate EBML DocTypes were accepted, ICNS slot identity was dropped, malformed DIBs were accepted, Windows root helpers were absent, native directories/FIFOs could satisfy existence checks, and unindexed ASAR prefix/trailer bytes were ignored;
 - the local Application snapshot boundary was then exercised independently after the strict shared view schema was rebuilt.
 
+Fix round 4 began with tests against the fix-round-3 implementation:
+
+- native and ASAR tooling coverage produced **6 genuine failures**: a configured `AutoForge` directory plus executable `00-decoy` passed, non-executable `AutoForge` passed, the verifier was not bound to the configured product name, and zero slack, nonzero alignment padding, and DER-key header slack were accepted;
+- the positive package test also opens the actual electron-builder ASAR as a raw file, proves it exceeds 100 MiB, and verifies its production Pickle/header layout rather than relying only on synthetic fixtures.
+
 Final GREEN evidence:
 
 - strengthened signed real-engine matrix: **11/11 passed**;
@@ -38,6 +43,7 @@ Final GREEN evidence:
 - final signed-index runtime verifier: **35/35 passed**;
 - final fix-round-2 catalog/adapter/runtime/tooling/native gate: **5 files / 127 tests passed**; this includes Win32 drive/UNC containment, source-mode independence, the reviewed active-content extension table, full-package traversal, DER private-key detection, and structural Win32 x64 native verification without simulated execution;
 - final fix-round-3 Task 4/5 adjacency, catalog/adapter/artifact persistence, tooling, native and build-config gate: **16 files / 249 tests passed**;
+- final fix-round-4 native, ASAR tooling and build-config gate: **3 files / 41 tests passed**;
 - shared artifact-view contract: **12/12 passed**; the focused Application snapshot persisted and projected all ten scale-specific ICNS identities, including distinct `ic11` and `icp5` records at the same 32×32 pixel size;
 - the full Application suite passed **192/194**; its two repeatable unrelated baselines are the legacy-import cleanup `ENOTEMPTY` race and context-summary fixture `CONTEXT_LIMIT_EXCEEDED`. The new ICNS snapshot test passes independently;
 - scoped ESLint passed; `pnpm build` passed;
@@ -75,8 +81,8 @@ The local Darwin arm64 engines are ImageMagick 7.1.1-47, LibreOfficeDev 26.8.0.0
 - The private key is supplied only by explicit absolute path, must be Ed25519 with restrictive Unix permissions, is never copied or logged, and repeated signing of identical canonical bytes is deterministic.
 - electron-builder now uses a positive `out` allowlist plus source-map and test/e2e/stale exclusions. Only exact canonical `bootstrap.json` and `index.schema.json` are packaged; the optional future root public key is absent while the kill switch is off.
 - The package verifier reads every ASAR payload and walks the complete physical application root. It rejects converter engines/packs, archives, signatures, private/trust material, and test/e2e/stale paths wherever placed. Regular files require no-follow, `nlink=1`, and stable identity; standard Electron framework symlinks are not traversed and must resolve inside the package root. Bounded small-file scans reject PEM/OpenSSH text and parseable DER PKCS8/PKCS1/SEC1 private keys regardless of filename.
-- The ASAR parser validates the declared header and every packed offset/size, requires one contiguous canonical payload extent ending at the raw stable-file size, and rejects DER-key prefix/trailer bytes before scanning indexed entry contents.
-- Native packaging requires `app.asar`, `better_sqlite3.node`, and the selected app executable to be non-symlink regular files; directory and FIFO substitutes fail. POSIX hosts inspect POSIX paths, while native Win32 validation accepts canonical drive/UNC roots and rejects drive-relative, root-without-volume, and device paths without pretending to execute Windows binaries locally.
+- The ASAR parser validates both Pickle size records, the declared JSON string length and closing terminator, minimal four-byte alignment, zero-only padding, and the exact derived content offset before reading entry bytes. Oversized zero slack, nonzero padding, DER-key header slack, and unindexed DER prefix/trailer bytes reject. The freshly built 353,880,101-byte electron-builder ASAR passes this exact parser.
+- Native packaging requires `app.asar`, `better_sqlite3.node`, and the selected app executable to be non-symlink regular files; directory and FIFO substitutes fail. Darwin resolves only the `AutoForge` product executable declared by electron-builder, requires executable mode, and never falls back to a decoy directory entry. POSIX hosts inspect POSIX paths, while native Win32 validation accepts canonical drive/UNC roots and rejects drive-relative, root-without-volume, and device paths without pretending to execute Windows binaries locally.
 - Actual `dist:dir` evidence: Darwin arm64 `app.asar` had **23,161 entries**; required main/preload/renderer/worker/package files were present; forbidden path/content scans were empty; packaged bootstrap/schema matched the pinned canonical bytes exactly. Developer ID signing completed; notarization was explicitly skipped because notarize options were unavailable.
 
 ## Deferred Minors (per ruling)
@@ -120,7 +126,7 @@ fc3bffe1aad5c0e956fa61d087ad7f2fe092dcdf26cff303a087bf5391377565  apps/desktop/e
 4744eb73f0e97af979c0c26c4d74b0590b470a6835a2b6d65f9b8fd7c067c1a0  apps/desktop/electron/main/conversion/converter-pack-verifier.ts
 26d5f8f7270d09aed8e6a76cde163fb311c9674b155e3ec6f0a13effce08bbfb  apps/desktop/electron/main/database/conversion-repositories.test.ts
 9a79af7193c98f575d0b09194bef022eba41b86adbb7acca500fd27ad215ffee  apps/desktop/electron/main/database/repositories.ts
-20c84c11e3699eb59d4728b574c4d549c882d8b3e01d17972879f7af6ded807a  apps/desktop/electron/main/database/native-packaging.test.ts
+af2d38108924f34e9fcb9b6baf5487a447dedbd7be747ca5f5f51b088201797c  apps/desktop/electron/main/database/native-packaging.test.ts
 7f09ce5c8f6b28707985bf113a8728b5c3b419c149ed3eefcd6c6aac4b7db292  apps/desktop/electron/main/database/native-package-paths.test.ts
 58a244d069217058001e205ea563010de154f897d9c87572627854046e9362a0  apps/desktop/resources/converter-packs/bootstrap.json
 c72112dcfc676041ff7201f72dde3bbf8b38027eb1fb86acc26b952d810275ac  apps/desktop/resources/converter-packs/index.schema.json
@@ -129,14 +135,14 @@ b498e529400adb98ccb3121c62815f235dc06ac8769480473e169aa74f4ae010  apps/desktop/s
 276af8db85e594a7174d2e7d1c567ae944a0d953c3afb2f0b0c4a84fce7837f6  apps/desktop/scripts/converter-packs/pack-tooling-lib.mjs
 b86723e1883fbc49bb4ac0debdde905098301684dc03e03743c8719f984c0e96  apps/desktop/scripts/converter-packs/sign-index.mjs
 1bc2da6349c3a3a4498ed7ec6c7a1a12d29aa3f2d178eeacda1b5f17a8daf95c  apps/desktop/scripts/native-package-paths.mjs
-0d2d696cec91ec3bc8f70e50429e0f37cd14f900a2a84e418d77692a0419d346  apps/desktop/scripts/verify-converter-packs.mjs
-8430f04a1b50edbe9deaeace5e1de3cb1813b24a92995b8642db35fa10ff2b95  apps/desktop/scripts/verify-packaged-native.mjs
+70f0af998e7ce8b28ca3c1e7423d3b08eb99ab2960b5e0d81c8290055881a96b  apps/desktop/scripts/verify-converter-packs.mjs
+c12c6407c0c6d254270e2f8c5fb18a6ab1afa2801e486ef83ba901618c1e5b3e  apps/desktop/scripts/verify-packaged-native.mjs
 9f65bab2cbece6e3e936b9d5b2331b854924b404cfc698a902840c505f3e09af  apps/desktop/src/components/conversion/ConversionBlock.vue
 0515af3233416feb9b0d8131746e8825851f797c21fd63d8952feea3201bed5e  apps/desktop/tests/fixtures/conversion/README.md
 0b26a2cd951fdaa2cb805d5efcfcba7e45ae36f3348a5bff1f54de3def83f1e0  apps/desktop/tests/integration/conversion-engines.test.ts
 d72b8445063ffbbc228b35cf01c3f83e5c7c501422c564d0f2eacb02462831d5  apps/desktop/tests/integration/converter-pack-test-root.test.ts
 25c8479f793a7e334b2bf2a441a2b97df226350a6c86f8b64dad0f6c7e4a8dae  apps/desktop/tests/integration/converter-pack-test-root.ts
-1658044670f33025685ea384e36bdf56b9b10a854c2c193e3b20034fc80f32cd  apps/desktop/tests/integration/converter-pack-tooling.test.ts
+afa27bdfccb2ca9c27b7d0966ac2e0f7f87320d60500d836a71fd439a237fee8  apps/desktop/tests/integration/converter-pack-tooling.test.ts
 9033659e47d86de1a2d9bb4b1c5a159b1e00b3d0815cdaeb3d6601fa41090716  packages/shared/src/conversion.test.ts
 22baeda793cfc5c7821014a541efd45bfc522af5e7641e0bf2d5f0e9bd3c9eeb  packages/shared/src/desktop-api.ts
 ```
