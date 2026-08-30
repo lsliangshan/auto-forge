@@ -124,6 +124,23 @@ describe('attachment conversion policy', () => {
   })
 
   it.each([
+    'transform this image into pdf',
+    'render this image to jpg',
+    'create this image as ico',
+    'make this image into .heif',
+    'render this image as JPEGXL',
+  ])('does not let the reference-image exception authorize a format target: %s', (text) => {
+    const classified = classifyAttachmentConversionIntent(text, attachments)
+    const access = providerAttachmentAccess(classified, text, {
+      hasAttachments: true,
+      requestedOutput: 'image',
+      attachmentKinds: ['image'],
+    })
+    expect(access.decision).not.toBe('ordinary')
+    expect(access.allowProviderBytes).toBe(false)
+  })
+
+  it.each([
     ['make image', 'image'],
     ['make audio', 'audio'],
     ['make video', 'video'],
@@ -146,11 +163,27 @@ describe('attachment conversion policy', () => {
   it.each([
     '总结这张图片',
     'Describe this image',
+    'What format is this image?',
+    'What format is this file?',
     '查看附件并告诉我主要内容',
     '这张图片是什么格式？',
     'process the conversation',
   ])('classifies a high-confidence attachment understanding request as ordinary: %s', (text) => {
     expect(classifyAttachmentConversionIntent(text, attachments)).toBe('ordinary')
+  })
+
+  it.each([
+    'What format is this image?',
+    'What format is this file?',
+    '这张图片是什么格式？',
+    '查看附件并告诉我主要内容',
+    '查看PDF并告诉我主要内容',
+  ])('allows a complete high-confidence format/content understanding request: %s', (text) => {
+    expect(providerAttachmentAccess(
+      classifyAttachmentConversionIntent(text, attachments),
+      text,
+      { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['file'] },
+    )).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
   })
 
   it('classifies an attachment-free request as ordinary', () => {

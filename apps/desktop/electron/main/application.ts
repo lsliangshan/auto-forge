@@ -2458,6 +2458,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           activeRequests.delete(requestId)
         }
       }, (error: unknown) => {
+        releaseConversationTitleContext(requestId)
         recordFailure(error, 'background-chat')
         activeRequests.delete(requestId)
       })

@@ -363,6 +363,28 @@ describe('local conversion intent', () => {
     expect(prompt).not.toMatch(/strasse|straße|invoice|i\u0307nvoice|οσ|ος|office|oﬃce/iu)
   })
 
+  it.each([
+    ['Straße.pdf', '/Users/alice/Tax/STRASSE.PDF'],
+    ['Straße.pdf', String.raw`C:\Users\Alice\Tax\STRASSE.PDF`],
+    ['Straße.pdf', String.raw`\\server\private\Folder\Straße.pdf`],
+    ['Folder\\Straße.pdf', 'private/Folder/STRASSE.PDF'],
+    ['Folder/Straße.pdf', String.raw`private\Folder\STRASSE.PDF`],
+  ])('anonymizes the complete path-like token containing a folded basename: %s in %s', (name, mention) => {
+    const prompt = projectLocalConversionPrompt(
+      `转换 ${mention} 和 ${mention}`,
+      [{ index: 0, name, mimeType: 'application/pdf', byteSize: 12 }],
+    )
+
+    expect(prompt).toContain('转换 文件-1 和 文件-1')
+    expect(prompt).not.toMatch(/users|alice|tax|server|private|folder|strasse|straße/iu)
+  })
+
+  it('keeps ordinary slash-separated prose that does not end in an attachment basename', () => {
+    expect(projectLocalConversionPrompt('说明 yes/no 选项', [{
+      index: 0, name: 'report.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])).toContain('说明 yes/no 选项')
+  })
+
   it('keeps a long non-conversion attachment request non-local', () => {
     const text = `总结这段对话 ${'ordinary context '.repeat(2_000)} 并描述附件`
     expect(hasLocalConversionIntent(text, attachments)).toBe(false)

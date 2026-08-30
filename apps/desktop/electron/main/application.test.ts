@@ -2741,6 +2741,79 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('keeps strict format/content understanding requests on the ordinary attachment path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-ordinary-grammar-'))
+    directories.push(root)
+    const imageSource = join(root, 'ordinary.png')
+    const pdfSource = join(root, 'ordinary.pdf')
+    const imageBytes = Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('ORDINARY_GRAMMAR_IMAGE'),
+    ])
+    const pdfBytes = Buffer.from('%PDF-1.7\nORDINARY_GRAMMAR_PDF')
+    await writeFile(imageSource, imageBytes)
+    await writeFile(pdfSource, pdfBytes)
+    let selectedSource = imageSource
+    const captured: ModelStreamRequest[] = []
+    const modelInput = vi.fn()
+    const run = vi.spyOn(AgentOrchestrator.prototype, 'run')
+    const createMediaAssetService = mediaAssetModule.createMediaAssetService
+    vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
+      const service = createMediaAssetService(createOptions)
+      modelInput.mockImplementation(service.modelInput.bind(service))
+      return { ...service, modelInput }
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: async () => [visionTextModelInfo('openrouter/ordinary-grammar')],
+      validateCredential: async () => ({ valid: true }),
+      stream: async function* (request) {
+        captured.push(request)
+        yield {
+          type: 'text_delta' as const, choiceIndex: 0,
+          text: isConversationTitleRequest(request) ? '附件理解' : '完成',
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      },
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [selectedSource], modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/ordinary-grammar' },
+      },
+    })
+
+    for (const [content, source] of [
+      ['What format is this image?', imageSource],
+      ['这张图片是什么格式？', imageSource],
+      ['What format is this file?', pdfSource],
+      ['查看附件并告诉我主要内容', pdfSource],
+    ] as const) {
+      selectedSource = source
+      const conversation = await runtime.services.chat.createConversation()
+      const [asset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id, existingAssetIds: [],
+      })
+      const sent = await runtime.services.chat.send({
+        ...chatInput(conversation.id, content), assetIds: [asset!.id], outputType: 'text',
+      })
+      await vi.waitFor(() => expect(run).toHaveBeenCalledWith(expect.objectContaining({
+        requestId: sent.requestId, allowTools: true,
+      })))
+    }
+
+    expect(modelInput).toHaveBeenCalledTimes(4)
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(4))
+    expect(agentRequests(captured)).toHaveLength(4)
+    expect(JSON.stringify(agentRequests(captured))).toContain(imageBytes.toString('base64'))
+    expect(JSON.stringify(agentRequests(captured))).toContain(pdfBytes.toString('base64'))
+    await runtime.close()
+  })
+
   it.each([
     ['text', 'run', modelInfo('openai/gpt-4.1-mini', 'Text')],
     ['image', 'runImage', imageModelInfo('openrouter/image')],
@@ -5356,6 +5429,9 @@ describe('createApplicationRuntime', () => {
     ['查看这个附件，然后把它变成PDF', 'ambiguous', 'text'],
     ['transform this image into pdf', 'ambiguous', 'text'],
     ['render this image to jpg', 'ambiguous', 'text'],
+    ['transform this image into pdf', 'ambiguous', 'image'],
+    ['render this image to jpg', 'ambiguous', 'image'],
+    ['create this image as ico', 'ambiguous', 'image'],
     ['edit this image and export it as png', 'local', 'text'],
   ] as const)(
     'enforces the final attachment disclosure boundary for %s as %s from %s output',
@@ -5492,6 +5568,8 @@ describe('createApplicationRuntime', () => {
     ['Secret-Ｆile.PDF', 'reformat Secret-Ｆile.PDF as PDF', 0, ['secret-file.pdf']],
     ['Straße.pdf', 'Convert STRASSE.PDF and Straße.pdf to PDF', 2, ['STRASSE.PDF', 'Straße.pdf']],
     ['İnvoice.pdf', 'Convert invoice.pdf and İNVOICE.PDF to PDF', 2, ['invoice.pdf', 'İNVOICE.PDF']],
+    ['Straße.pdf', String.raw`Convert /Users/alice/Tax/STRASSE.PDF and C:\Private\Straße.pdf and \\server\share\STRASSE.PDF to PDF`, 2,
+      ['Users', 'alice', 'Tax', 'Private', 'server', 'share', 'STRASSE.PDF', 'Straße.pdf']],
   ] as const)('anonymizes exact attachment names in metadata-only main and title egress: %s', async (
     sourceName,
     content,
@@ -6047,6 +6125,68 @@ describe('createApplicationRuntime', () => {
     expect(activeDisclosureCount()).toBe(0)
     await runtime.close()
   })
+
+  it.each(['agent', 'media'] as const)(
+    'releases title ownership when tracked %s work rejects without a terminal event',
+    async (path) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-track-reject-'))
+      directories.push(root)
+      const source = join(root, 'track-reject.png')
+      await writeFile(source, Buffer.concat([
+        Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('TRACK_REJECT_PRIVATE'),
+      ]))
+      const rejection = new Error(`tracked ${path} rejected`)
+      let protectedSnapshot: ModelProviderSnapshot | undefined
+      const operation = path === 'agent'
+        ? vi.spyOn(AgentOrchestrator.prototype, 'run').mockImplementationOnce(async (input) => {
+            protectedSnapshot = input.providerSnapshot
+            throw rejection
+          })
+        : vi.spyOn(MediaGenerationOrchestrator.prototype, 'runImage').mockImplementationOnce(async (input) => {
+            protectedSnapshot = input.providerSnapshot
+            throw rejection
+          })
+      const stream = vi.fn<ModelProvider['stream']>(async function* () {})
+      const generateImage = vi.fn(async () => ({ outputs: [] }))
+      let activeDisclosureCount = () => -1
+      const runtime = createApplicationRuntime(options(root, {
+        chooseMediaFiles: async () => [source],
+        modelProviders: { openrouter: snapshotProvider('openrouter', {
+          listModels: async () => [
+            visionTextModelInfo('openrouter/track-reject'), imageModelInfo('openrouter/track-reject-image'),
+          ],
+          validateCredential: async () => ({ valid: true }), stream, generateImage,
+        }) },
+        inspectAttachmentDisclosureAuthority: (authority) => {
+          activeDisclosureCount = () => authority.activeCount('openrouter')
+        },
+      }))
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' },
+          openrouter: { text: 'openrouter/track-reject', image: 'openrouter/track-reject-image' },
+        },
+      })
+      const conversation = await runtime.services.chat.createConversation()
+      const [asset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id, existingAssetIds: [],
+      })
+
+      await runtime.services.chat.send({
+        ...chatInput(conversation.id, path === 'agent' ? 'describe this image' : 'make this image watercolor'),
+        assetIds: [asset!.id], outputType: path === 'agent' ? 'text' : 'image',
+      })
+      await vi.waitFor(() => expect(operation).toHaveBeenCalled())
+      await vi.waitFor(() => expect(activeDisclosureCount()).toBe(0))
+      expect(stream).not.toHaveBeenCalled()
+      expect(generateImage).not.toHaveBeenCalled()
+      expect(() => protectedSnapshot!.provider.stream({ model: 'model', messages: [] })).toThrow('revoked')
+      await expect(runtime.close()).rejects.toBe(rejection)
+    },
+  )
 
   it('projects verified generic files only into the current Provider request and persists metadata', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-file-attachments-'))

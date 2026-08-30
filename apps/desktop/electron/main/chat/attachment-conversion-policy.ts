@@ -20,9 +20,10 @@ const ENGLISH_ORDINARY_REQUEST = new RegExp(
   'iu',
 )
 const CHINESE_ORDINARY_REQUEST = /^(?:请)?(?:再)?(?:查看|读取|阅读|描述|总结|概括|分析|识别|检查)(?:一下)?(?:这个|这张|该|当前)?(?:文本)?(?:附件|图片|图像|照片|文件|文档|PDF|JPE?G|PNG)(?:的)?(?:内容|页面)?(?:，?请)?(?:简要|仔细|准确)?(?:说明|描述|总结)?[。！？]?$/iu
-const IMAGE_REFERENCE_EDIT = /(?:做成|制作成?)[^，,；;。.!！？?]{0,32}(?:水彩|油画|素描|电影感|日落)|\b(?:make|create|render|edit|transform)\b[^,;.!?]{0,64}\b(?:this|the)\s+image\b|\b(?:make|edit|transform)\s+(?:this|the)\s+image\b[^,;.!?]{0,48}\b(?:cinematic|watercolou?r|sunset|painting|sketch)\b/iu
+const IMAGE_REFERENCE_EDIT = /^(?:please\s+)?(?:(?:make|edit|transform)\s+(?:this|the)\s+image\s+(?:(?:look\s+)?(?:cinematic|watercolou?r|like\s+(?:a\s+)?sunset|like\s+(?:a\s+)?painting|like\s+(?:a\s+)?sketch))|create\s+(?:an?\s+)?new\s+image\s+based\s+on\s+(?:this|the)\s+image)(?:\s+please)?[.!?]?$|^(?:请)?(?:把)?(?:这个|这张|该|当前)?(?:图片|图像|照片)(?:做成|制作成?)(?:水彩画?|油画|素描|电影感|日落风格)[。！？]?$/iu
 const MEDIA_OUTPUT_REQUEST = /(?:生成|创建|制作)[^，,；;。.!！？?]{0,48}(?:图片|图像|音频|视频)|\b(?:make|create|generate|produce|edit)\b[^,;.!?]{0,48}\b(?:image|photo|audio|video)\b/iu
 const FILE_FORMAT_TARGET = /(?:\b\.?[a-z][a-z0-9]{1,15}\s+(?:file\s+format|format|version)\b|\.?[a-z0-9]{2,16}\s*(?:格式|版本))/iu
+const MEDIA_FORMAT_TARGET = /\b(?:to|as|into)\s+(?:an?\s+)?\.?[a-z0-9][a-z0-9._+-]{1,15}\b|(?:转成|转为|导出为|保存为|生成为?)\s*\.?[a-z0-9][a-z0-9._+-]{1,15}\b/iu
 function issueAccessDecision(decision: AttachmentConversionIntent): ProviderAttachmentAccessDecision {
   return Object.freeze({
     decision,
@@ -37,9 +38,13 @@ export function hasConversionRiskSignal(text: string): boolean {
     || FILE_FORMAT_TARGET.test(normalized)
 }
 
-function hasOrdinaryUnderstandingRequest(text: string): boolean {
+export function hasHighConfidenceOrdinaryAttachmentRequest(text: string): boolean {
   const normalized = text.trim().normalize('NFKC')
-  return ENGLISH_ORDINARY_REQUEST.test(normalized) || CHINESE_ORDINARY_REQUEST.test(normalized)
+  return ENGLISH_ORDINARY_REQUEST.test(normalized)
+    || CHINESE_ORDINARY_REQUEST.test(normalized)
+    || /^(?:please\s+)?what\s+format\s+is\s+(?:this|the|that)\s+(?:attachment|file|image|photo|document|pdf|jpe?g|png)\s*\??$/iu.test(normalized)
+    || /^(?:请)?(?:这张|这个|该|当前)?(?:附件|文件|图片|图像|照片|文档|PDF|JPE?G|PNG)(?:是)?什么格式[？?]?$/iu.test(normalized)
+    || /^(?:请)?(?:查看|读取|阅读)(?:一下)?(?:这个|这张|该|当前)?(?:附件|文件|图片|图像|照片|文档|PDF|JPE?G|PNG)(?:的)?(?:内容)?(?:，)?(?:并|然后)?(?:请)?告诉我(?:它的)?主要内容[。！？]?$/iu.test(normalized)
 }
 
 export function providerAttachmentAccess(
@@ -56,16 +61,14 @@ export function providerAttachmentAccess(
   const imageReferenceEdit = context.requestedOutput === 'image'
     && context.attachmentKinds.includes('image')
     && IMAGE_REFERENCE_EDIT.test(text)
-    && !FILE_FORMAT_TARGET.test(text)
+    && !MEDIA_FORMAT_TARGET.test(text)
   if (imageReferenceEdit) return issueAccessDecision('ordinary')
   const explicitMediaOutput = context.requestedOutput !== 'auto'
     && context.requestedOutput !== 'text'
     && MEDIA_OUTPUT_REQUEST.test(text)
-    && !FILE_FORMAT_TARGET.test(text)
+    && !MEDIA_FORMAT_TARGET.test(text)
   if (explicitMediaOutput) return issueAccessDecision('ordinary')
-  if (decision === 'ordinary'
-    && hasOrdinaryUnderstandingRequest(text)
-    && !hasConversionRiskSignal(text)) {
+  if (decision === 'ordinary' && hasHighConfidenceOrdinaryAttachmentRequest(text)) {
     return issueAccessDecision('ordinary')
   }
   return issueAccessDecision('ambiguous')

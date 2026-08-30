@@ -1,5 +1,6 @@
 import { CONVERSION_TARGET_FORMATS } from '@autoforge/shared'
 import {
+  hasHighConfidenceOrdinaryAttachmentRequest,
   hasConversionRiskSignal,
   type AttachmentConversionIntent,
 } from './attachment-conversion-policy.js'
@@ -384,10 +385,26 @@ export function anonymizeAttachmentNames(
   }
   const foldedText = foldedParts.join('')
   const replacements: Array<{ start: number; end: number; text: string }> = []
-  for (const attachment of [...attachments].sort((left, right) => (
-    fold(right.name).length - fold(left.name).length
-  ))) {
-    const foldedName = fold(attachment.name.normalize('NFKC'))
+  const candidates = [...attachments].map((attachment) => ({
+    attachment,
+    basename: attachment.name.normalize('NFKC').split(/[\\/]/u).at(-1) ?? '',
+  })).sort((left, right) => (
+    fold(right.basename).length - fold(left.basename).length
+  ))
+  const pathToken = /(?<![\p{L}\p{N}._+-])(?:(?:[A-Za-z]:)?[\\/]{1,2}|[\p{L}\p{N}._+-]+[\\/])(?:[\p{L}\p{N}._+-]+[\\/])*[\p{L}\p{N}._+-]+/gu
+  for (const match of normalized.matchAll(pathToken)) {
+    if (match.index === undefined) continue
+    const finalSegment = match[0].split(/[\\/]/u).at(-1) ?? ''
+    const candidate = candidates.find(({ basename }) => fold(basename) === fold(finalSegment))
+    if (!candidate) continue
+    replacements.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      text: `文件-${candidate.attachment.index + 1}`,
+    })
+  }
+  for (const { attachment, basename } of candidates) {
+    const foldedName = fold(basename)
     if (!foldedName) continue
     let searchFrom = 0
     while (searchFrom <= foldedText.length - foldedName.length) {
@@ -527,6 +544,7 @@ export function classifyAttachmentConversionIntent(
 ): AttachmentConversionIntent {
   if (attachments.length === 0) return 'ordinary'
   const normalized = text.trim().normalize('NFKC').replace(/[‘’]/gu, "'")
+  if (hasHighConfidenceOrdinaryAttachmentRequest(normalized)) return 'ordinary'
   if (REFERENCE_IMAGE_STYLE_EDIT.test(normalized)) return 'ordinary'
   const informationalScope = /^\s*(?:(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b|(?:如何|怎么))/iu.test(normalized)
   const explicitRestart = /\b(?:otherwise|then|directly|just|please)\b[^,;.!?]{0,48}\b(?:convert|transcode|save|export)\b|\b(?:i\s+(?:would|want|need)|(?:can|could|would)\s+you)\b[^,;.!?]{0,48}\b(?:convert|transcode|save|export)\b|(?:然后|但是|但|请|直接|立即|马上)[^，,；;。.!！？?]{0,32}(?:转换|转成|转为|另存|保存|导出|输出)/iu.test(normalized)
