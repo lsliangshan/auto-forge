@@ -2,13 +2,16 @@
 
 :root {
   color-scheme: light;
-  font-size: 16px;
+  font-size: 17px;
   --el-font-size-extra-large: 1.25rem;
   --el-font-size-large: 1.125rem;
   --el-font-size-medium: 1rem;
   --el-font-size-base: 0.875rem;
   --el-font-size-small: 0.8125rem;
   --el-font-size-extra-small: 0.75rem;
+  --af-app-rail-width: 64px;
+  --af-context-sidebar-width: 240px;
+  --af-inspector-width: 320px;
   --af-canvas: #f3f5f8;
   --af-surface: #ffffff;
   --af-surface-muted: #f8f9fb;
@@ -38,10 +41,10 @@
 }
 
 :root[data-font-size='extra-small'] { font-size: 14px; }
-:root[data-font-size='small'] { font-size: 15px; }
-:root[data-font-size='normal'] { font-size: 16px; }
-:root[data-font-size='large'] { font-size: 18px; }
-:root[data-font-size='extra-large'] { font-size: 20px; }
+:root[data-font-size='small'] { font-size: 15.5px; }
+:root[data-font-size='normal'] { font-size: 17px; }
+:root[data-font-size='large'] { font-size: 19px; --af-app-rail-width: 68px; --af-context-sidebar-width: 264px; --af-inspector-width: 340px; }
+:root[data-font-size='extra-large'] { font-size: 21px; --af-app-rail-width: 72px; --af-context-sidebar-width: 288px; --af-inspector-width: 360px; }
 
 @media (prefers-color-scheme: dark) {
   :root {
@@ -91,6 +94,7 @@
 html, body, #app { width: 100%; min-width: 860px; height: 100%; min-height: 600px; margin: 0; overflow: hidden; }
 body { color: var(--af-text); background: var(--af-canvas); }
 button, input, textarea, select { font: inherit; }
+button { white-space: nowrap; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:focus-visible { outline: none; box-shadow: var(--af-focus); }
 
 .af-scrollbar { scrollbar-width: thin; scrollbar-color: var(--af-border-strong) transparent; }

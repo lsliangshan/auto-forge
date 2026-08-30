@@ -139,8 +139,8 @@ watch(
 .app-rail {
   z-index: 30;
   display: flex;
-  width: 64px;
-  min-width: 64px;
+  width: var(--af-app-rail-width);
+  min-width: var(--af-app-rail-width);
   height: 100%;
   flex-direction: column;
   align-items: center;
@@ -171,7 +171,7 @@ watch(
 .rail-item {
   position: relative;
   display: flex;
-  width: 56px;
+  width: calc(var(--af-app-rail-width) - 8px);
   min-height: 60px;
   flex-direction: column;
   align-items: center;
@@ -223,9 +223,10 @@ watch(
   filter: drop-shadow(0 1px 1px rgb(0 0 0 / 16%));
 }
 .rail-item-label {
-  max-width: 40px;
+  max-width: calc(var(--af-app-rail-width) - 16px);
   font-weight: 560;
   letter-spacing: 0.01em;
+  white-space: nowrap;
 }
 .rail-item.router-link-active .rail-item-label {
   font-weight: 680;
@@ -233,7 +234,7 @@ watch(
 .rail-account {
   position: relative;
   display: grid;
-  width: 56px;
+  width: calc(var(--af-app-rail-width) - 8px);
   margin-top: auto;
   justify-items: center;
   gap: 5px;
@@ -246,7 +247,7 @@ watch(
 }
 .rail-profile-entry {
   display: grid;
-  width: 56px;
+  width: calc(var(--af-app-rail-width) - 8px);
   justify-items: center;
   gap: 4px;
   border-radius: 7px;
@@ -323,7 +324,7 @@ watch(
 .rail-error {
   position: fixed;
   bottom: 12px;
-  left: 64px;
+  left: var(--af-app-rail-width);
   width: max-content;
   max-width: 320px;
   border: 1px solid var(--af-danger-border);

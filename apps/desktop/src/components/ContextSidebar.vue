@@ -335,6 +335,7 @@ const settingsSections = [
   { id: 'billing', label: '用量与消费' },
   { id: 'proxy', label: 'VPN 代理' },
   { id: 'appearance', label: '外观与行为' },
+  { id: 'developer', label: '开发者' },
   { id: 'data', label: '本地数据' },
   { id: 'permissions', label: '已保存授权' },
   { id: 'about', label: '关于 AutoForge' },
@@ -427,7 +428,7 @@ onBeforeUnmount(detachSettingsScrollSync)
 </script>
 
 <style scoped>
-.context-sidebar { display: flex; width: 240px; min-width: 240px; height: 100%; flex-direction: column; gap: 10px; border-right: 1px solid var(--af-border); padding: 14px 8px 14px 12px; background: var(--af-surface-muted); }
+.context-sidebar { display: flex; width: var(--af-context-sidebar-width); min-width: var(--af-context-sidebar-width); height: 100%; flex-direction: column; gap: 10px; border-right: 1px solid var(--af-border); padding: 14px 8px 14px 12px; background: var(--af-surface-muted); }
 .sidebar-toolbar { display: flex; min-height: 28px; align-items: center; justify-content: space-between; }
 .conversation-toolbar { min-height: 32px; padding: 0 2px; }
 .conversation-new-button { min-height: 30px; border-radius: 8px; padding: 6px 10px; font-weight: 650; box-shadow: 0 5px 14px color-mix(in srgb, var(--af-cobalt) 18%, transparent); }
@@ -447,7 +448,7 @@ onBeforeUnmount(detachSettingsScrollSync)
 .conversation-sync-status { width: 7px; height: 7px; flex: 0 0 auto; border: 2px solid var(--af-surface); border-radius: 50%; background: var(--af-text-muted); box-shadow: 0 0 0 1px var(--af-border); }
 .conversation-sync-status.is-pending { background: var(--af-warning); }.conversation-sync-status.is-syncing { background: var(--af-cobalt); box-shadow: 0 0 0 2px var(--af-cobalt-soft); }.conversation-sync-status.is-failed { background: var(--af-danger); box-shadow: 0 0 0 1px color-mix(in srgb, var(--af-danger) 35%, var(--af-border)); }
 .durable-sync-warning { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; color: var(--af-warning-strong); background: var(--af-warning-soft); border-radius: 8px; font-size: 0.75rem; }
-.durable-sync-warning button { color: inherit; background: none; border: 0; padding: 0; font: inherit; text-decoration: underline; cursor: pointer; }
+.durable-sync-warning button { flex: none; color: inherit; background: none; border: 0; padding: 0; font: inherit; text-decoration: underline; white-space: nowrap; cursor: pointer; }
 .durable-sync-warning button:disabled { cursor: default; opacity: .65; }
 .conversation-actions { display: none; flex: 0 0 auto; align-items: center; gap: 2px; margin-right: 5px; border: 1px solid var(--af-border); border-radius: 9px; padding: 2px; background: var(--af-surface); box-shadow: 0 4px 12px rgb(32 36 43 / 8%); }
 .conversation-row:hover .conversation-actions, .conversation-row:focus-within .conversation-actions, .conversation-actions.has-retry { display: flex; }
@@ -459,7 +460,7 @@ onBeforeUnmount(detachSettingsScrollSync)
 .sync-retry-error { padding: 0 8px; }
 .field-label { margin-top: 4px; color: var(--af-text-muted); font-size: 0.6875rem; font-weight: 650; }
 .native-filter { width: 100%; border: 1px solid var(--af-border-strong); border-radius: 4px; padding: 7px 8px; color: var(--af-text); background: var(--af-surface); font-size: 0.6875rem; }
-.settings-section-link { width: 100%; min-height: 38px; border: 0; border-radius: 9px; padding: 9px 11px; color: var(--af-text); background: transparent; font: inherit; font-size: 0.8125rem; cursor: pointer; text-align: left; transition: color .16s ease, background-color .16s ease, box-shadow .16s ease; }
+.settings-section-link { width: 100%; min-height: 38px; border: 0; border-radius: 9px; padding: 9px 11px; color: var(--af-text); background: transparent; font: inherit; font-size: 0.8125rem; line-height: 1.4; cursor: pointer; text-align: left; transition: color .16s ease, background-color .16s ease, box-shadow .16s ease; }
 .settings-section-link:hover, .settings-section-link.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 .settings-section-link.active { padding-left: 14px; box-shadow: inset 3px 0 var(--af-cobalt); font-weight: 680; }
 </style>

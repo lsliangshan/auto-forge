@@ -193,7 +193,7 @@ const formatData = (value: unknown) => {
 </script>
 
 <style scoped>
-.inspector { display: none; width: 320px; min-width: 320px; height: 100%; border-left: 1px solid var(--af-border); background: var(--af-surface); }
+.inspector { display: none; width: var(--af-inspector-width); min-width: var(--af-inspector-width); height: 100%; border-left: 1px solid var(--af-border); background: var(--af-surface); }
 .inspector.open { display: block; }
 .inspector header { display: flex; min-height: 58px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 9px 14px; }
 .inspector header > div { display: grid; gap: 2px; }.inspector header strong { font-size: 0.875rem; }

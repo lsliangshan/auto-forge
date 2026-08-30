@@ -75,16 +75,16 @@ watch(() => auth.session?.user.id, ownerId => store.bindOwner(ownerId))
 </script>
 
 <style scoped>
-.knowledge-view { display: flex; height: 100%; min-height: 0; flex-direction: column; background: var(--af-canvas); }
-.knowledge-availability { display: flex; min-height: 39px; flex: none; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 7px 14px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: 0.625rem; }
+.knowledge-view { --af-knowledge-font-caption: 0.625rem; --af-knowledge-font-small: 0.6875rem; --af-knowledge-font-body: 0.75rem; --af-knowledge-font-label: 0.8125rem; --af-knowledge-font-document: 0.875rem; display: flex; height: 100%; min-height: 0; flex-direction: column; background: var(--af-canvas); }
+.knowledge-availability { display: flex; min-height: 39px; flex: none; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 7px 14px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: var(--af-knowledge-font-body); }
 .availability-copy { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
 .knowledge-availability.success .availability-copy .el-icon { color: var(--af-success); }
 .knowledge-availability.warning { background: var(--af-warning-soft); }
 .knowledge-availability.warning .availability-copy .el-icon { color: var(--af-warning); }
-.knowledge-availability button { border: 1px solid color-mix(in srgb, var(--af-cobalt) 30%, var(--af-border)); border-radius: 7px; padding: 5px 9px; color: var(--af-cobalt); background: var(--af-surface); cursor: pointer; font-size: 0.625rem; font-weight: 700; }
+.knowledge-availability button { border: 1px solid color-mix(in srgb, var(--af-cobalt) 30%, var(--af-border)); border-radius: 7px; padding: 5px 9px; color: var(--af-cobalt); background: var(--af-surface); cursor: pointer; font-size: var(--af-knowledge-font-body); font-weight: 700; }
 .knowledge-availability button:hover:not(:disabled) { border-color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 .knowledge-availability button:disabled { cursor: not-allowed; opacity: .5; }
-.knowledge-error { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--af-danger-border); padding: 9px 14px; color: var(--af-danger); background: var(--af-danger-soft); font-size: 0.6875rem; }
+.knowledge-error { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--af-danger-border); padding: 9px 14px; color: var(--af-danger); background: var(--af-danger-soft); font-size: var(--af-knowledge-font-label); }
 .knowledge-error .el-icon { flex: none; }
 .knowledge-workspace { display: grid; min-height: 0; flex: 1; overflow: hidden; grid-template-columns: minmax(250px, 285px) minmax(0, 1fr); }
 @media (max-width: 950px) { .knowledge-workspace { grid-template-columns: 235px minmax(0, 1fr); } }

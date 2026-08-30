@@ -326,8 +326,9 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   align-items: center;
   gap: 9px;
   color: var(--af-graphite);
-  font-size: 1rem;
+  font-size: var(--af-settings-font-section-title);
   font-weight: 700;
+  line-height: var(--af-settings-line-tight);
   letter-spacing: -.01em;
 }
 
@@ -349,8 +350,8 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 .billing-header p {
   margin: 6px 0 0 12px;
-  font-size: 0.75rem;
-  line-height: 1.55;
+  font-size: var(--af-settings-font-body);
+  line-height: var(--af-settings-line-body);
 }
 
 .billing-body {
@@ -366,11 +367,14 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 .billing-error {
   margin-bottom: 12px;
   color: var(--af-danger);
+  font-size: var(--af-settings-font-body);
+  line-height: var(--af-settings-line-body);
 }
 
 .billing-period {
   margin-bottom: 14px;
-  font-size: 0.8125rem;
+  font-size: var(--af-settings-font-body);
+  line-height: var(--af-settings-line-body);
 }
 
 .billing-summary {
@@ -396,12 +400,15 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 .remote-usage-summary dt {
   color: var(--af-text-muted);
-  font-size: 0.75rem;
+  font-size: var(--af-settings-font-caption);
+  line-height: var(--af-settings-line-caption);
 }
 
 .remote-usage-summary dd {
   margin: 4px 0 0;
+  font-size: var(--af-settings-font-body);
   font-weight: 600;
+  line-height: var(--af-settings-line-caption);
 }
 
 .billing-summary div {
@@ -416,7 +423,8 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   align-items: center;
   gap: 6px;
   color: var(--af-text-muted);
-  font-size: 0.75rem;
+  font-size: var(--af-settings-font-caption);
+  line-height: var(--af-settings-line-caption);
 }
 
 .billing-summary-marker {
@@ -430,12 +438,14 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   margin: 6px 0 0;
   font-size: 1.25rem;
   font-weight: 700;
+  line-height: 1.25;
 }
 
 .billing-summary p {
   margin: 6px 0 0;
   color: var(--af-text-muted);
-  font-size: 0.75rem;
+  font-size: var(--af-settings-font-caption);
+  line-height: var(--af-settings-line-caption);
 }
 
 .billing-summary .billing-cost-warning {
@@ -462,7 +472,8 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 .billing-chart-section h3 {
   margin: 0 0 8px;
   color: var(--af-graphite);
-  font-size: 0.875rem;
+  font-size: var(--af-settings-font-card-title);
+  line-height: var(--af-settings-line-tight);
 }
 
 .billing-table-wrap {
@@ -480,6 +491,26 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   padding: 10px 12px;
   border-bottom: 1px solid var(--af-border);
   text-align: right;
+}
+
+.billing-table th {
+  font-size: var(--af-settings-font-caption);
+  line-height: var(--af-settings-line-caption);
+}
+
+.billing-table td {
+  font-size: var(--af-settings-font-body);
+  line-height: var(--af-settings-line-caption);
+}
+
+.billing-empty {
+  font-size: var(--af-settings-font-body);
+  line-height: var(--af-settings-line-body);
+}
+
+.billing-panel :deep(.el-tabs__item) {
+  font-size: var(--af-settings-font-body);
+  line-height: var(--af-settings-line-tight);
 }
 
 .billing-table th:first-child,

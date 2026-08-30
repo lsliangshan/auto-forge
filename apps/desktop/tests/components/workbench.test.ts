@@ -2189,11 +2189,32 @@ describe('workbench', () => {
       '用量与消费',
       'VPN 代理',
       '外观与行为',
+      '开发者',
       '本地数据',
       '已保存授权',
       '关于 AutoForge',
     ])
     expect(menuLabels).toEqual(sectionLabels)
+  })
+
+  it('separates developer mode from appearance and explains its runtime impact', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.update).mockImplementation(async (patch) => ({
+      ...await api.settings.get(),
+      ...patch,
+    }))
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.find('#developer').exists()).toBe(true))
+
+    expect(wrapper.get('#appearance').find('[data-testid="developer-mode-switch"]').exists()).toBe(false)
+    const developer = wrapper.get('#developer')
+    expect(developer.text()).toContain('本地开发工作流')
+    expect(developer.text()).toContain('聊天 AI')
+    expect(developer.text()).toContain('不会打开开发者工具')
+    expect(developer.text()).toContain('不会绕过权限审批、隔离运行或输入校验')
+
+    await developer.get('[data-testid="developer-mode-switch"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.update).toHaveBeenCalledWith({ developerMode: true }))
   })
 
   it('scrolls to a settings section without leaving the settings route', async () => {
@@ -2249,7 +2270,7 @@ describe('workbench', () => {
     scrollContainer.getBoundingClientRect = () => ({ top: 50 } as DOMRect)
     const tops: Record<string, number> = {
       provider: 20, model: 40, billing: 100, proxy: 160,
-      appearance: 220, data: 280, permissions: 340, about: 400,
+      appearance: 220, developer: 250, data: 280, permissions: 340, about: 400,
     }
     const sectionElements = Object.fromEntries(Object.entries(tops).map(([id]) => {
       const element = document.createElement('section')
@@ -2273,7 +2294,7 @@ describe('workbench', () => {
       scrollContainer.scrollTop = 600
       scrollContainer.dispatchEvent(new Event('scroll'))
       await wrapper.vm.$nextTick()
-      expect(wrapper.findAll('[data-testid="settings-section-nav-item"]')[7]?.classes()).toContain('active')
+      expect(wrapper.findAll('[data-testid="settings-section-nav-item"]')[8]?.classes()).toContain('active')
     } finally {
       querySelector.mockRestore()
       getElementById.mockRestore()
