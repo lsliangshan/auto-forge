@@ -73,6 +73,7 @@ import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrato
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { OpenRouterProvider } from './chat/openrouter-provider.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
+import { classifyAttachmentConversionIntent } from './chat/local-conversion-intent.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from './chat/model-provider.js'
 import type { CredentialBoundModelProvider } from './chat/model-provider-registry.js'
 import { openAppDatabase } from './database/client.js'
@@ -2880,6 +2881,109 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('persists canonical local history across restart and uses it for later main and summary requests', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-local-history-projection-'))
+    directories.push(root)
+    const source = join(root, 'Tax Return Records', 'secret-history.pdf')
+    await mkdir(dirname(source), { recursive: true })
+    const privateBytes = Buffer.from('%PDF-1.7\nLOCAL_HISTORY_PRIVATE_BYTES')
+    await writeFile(source, privateBytes)
+    const rawPrompt = `Convert ${source} to PDF`
+    const requests: ModelStreamRequest[] = []
+    const events: ChatEvent[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: async () => [{ ...modelInfo('openrouter/history-projection', 'History projection'), contextLength: 8_000 }],
+      validateCredential: async () => ({ valid: true }),
+      stream: async function* (request) {
+        requests.push(request)
+        const summary = request.maxOutputTokens !== undefined && !isConversationTitleRequest(request)
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: summary ? '安全历史摘要' : '已完成。' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      },
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source], modelProviders: { openrouter: provider },
+      emitChat: (event) => { events.push(event) },
+    }))
+    const session = await authenticate(runtime, 'HistoryProjection')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/history-projection' },
+      },
+    })
+    await installConversionWorkflow(runtime)
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+    const first = await runtime.services.chat.send({
+      ...chatInput(conversation.id, rawPrompt), assetIds: [asset!.id], outputType: 'text',
+    })
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
+      type: 'status', requestId: first.requestId, status: 'completed',
+    })))
+    expect(await listMessages(runtime, conversation.id)).toContainEqual(expect.objectContaining({
+      role: 'user', blocks: expect.arrayContaining([{ type: 'text', text: rawPrompt }]),
+    }))
+    expect(JSON.stringify(requests)).toContain('任务：选择并调用具备 file.convert 能力的本地工作流。')
+    await runtime.close()
+
+    const persisted = new Database(userCachePath(root, session.user.id), { readonly: true })
+    expect(persisted.prepare(`
+      SELECT provider_projection_json AS providerProjectionJson
+      FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY ordinal LIMIT 1
+    `).get(conversation.id)).toEqual(expect.objectContaining({
+      providerProjectionJson: expect.stringContaining('任务：选择并调用具备 file.convert 能力的本地工作流。'),
+    }))
+    persisted.close()
+
+    withUserData(root, session.user.id, (store) => {
+      for (let turn = 0; turn < 10; turn += 1) {
+        store.messages.insert({
+          id: `history_ordinary_user_${turn}`, conversationId: conversation.id, role: 'user',
+          blocks: [{ type: 'text', text: `ordinary retained context ${turn} ${'safe detail '.repeat(80)}` }],
+          createdAt: 100 + turn * 2,
+        })
+        store.messages.insert({
+          id: `history_ordinary_assistant_${turn}`, conversationId: conversation.id, role: 'assistant',
+          blocks: [{ type: 'text', text: `ordinary answer ${turn} ${'safe response '.repeat(80)}` }],
+          createdAt: 101 + turn * 2,
+        })
+      }
+    })
+
+    requests.splice(0)
+    events.splice(0)
+    const restarted = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider }, emitChat: (event) => { events.push(event) },
+    }))
+    await authenticate(restarted, 'HistoryProjection')
+    await restarted.recover()
+    const second = await restarted.services.chat.send(chatInput(conversation.id, 'Summarize our safe progress.'))
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
+      type: 'status', requestId: second.requestId, status: 'completed',
+    })))
+
+    const summaryRequest = requests.find((request) => (
+      request.maxOutputTokens !== undefined && !isConversationTitleRequest(request)
+    ))
+    expect(summaryRequest).toBeDefined()
+    const payload = JSON.stringify(requests)
+    expect(payload).toContain('任务：选择并调用具备 file.convert 能力的本地工作流。')
+    expect(payload).toContain('ordinary retained context')
+    expect(payload).not.toContain(rawPrompt)
+    expect(payload).not.toContain(source)
+    expect(payload).not.toContain('Tax Return Records')
+    expect(payload).not.toContain('secret-history.pdf')
+    expect(payload).not.toContain('application/pdf')
+    expect(payload).not.toContain(asset!.id)
+    expect(payload).not.toContain(privateBytes.toString('base64'))
+    await restarted.close()
+  })
+
   it.each([
     ['text', 'run', modelInfo('openai/gpt-4.1-mini', 'Text')],
     ['image', 'runImage', imageModelInfo('openrouter/image')],
@@ -5371,7 +5475,7 @@ describe('createApplicationRuntime', () => {
     'No matter what it can convert please save this image as WebP',
     'How do I convert PNG then I want you to convert this file to PDF',
     'How can I save PNG or please convert this attachment to PDF',
-  ])('keeps an attachment conversion private across chat and title calls: %s', async (content) => {
+  ])('keeps an attachment conversion risk private across chat and title calls: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-implicit-conversion-'))
     directories.push(root)
     const source = join(root, '附件 9：private-source.png')
@@ -5436,6 +5540,9 @@ describe('createApplicationRuntime', () => {
       conversationId: conversation.id, existingAssetIds: [],
     })
     attachmentSourceId = asset!.id
+    const expectedDecision = classifyAttachmentConversionIntent(content, [{
+      index: 0, name: asset!.name, mimeType: asset!.mimeType, byteSize: asset!.byteSize,
+    }])
 
     const sent = await runtime.services.chat.send({
       ...chatInput(conversation.id, content), assetIds: [asset!.id], outputType: 'text',
@@ -5443,11 +5550,13 @@ describe('createApplicationRuntime', () => {
     await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
       type: 'status', requestId: sent.requestId, status: 'completed',
     })))
-    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
-      type: 'conversation_title_updated', conversationId: conversation.id,
-    })))
+    if (expectedDecision === 'local') {
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'conversation_title_updated', conversationId: conversation.id,
+      })))
+    }
 
-    expect(captured).toHaveLength(2)
+    expect(captured).toHaveLength(expectedDecision === 'local' ? 2 : 0)
     expect(modelInput).not.toHaveBeenCalled()
     const providerPayload = JSON.stringify(captured)
     expect(providerPayload).not.toContain(privateContent)
@@ -5456,22 +5565,26 @@ describe('createApplicationRuntime', () => {
     expect(providerPayload).not.toContain(asset!.id)
     expect(providerPayload).not.toContain(source)
     expect(providerPayload).not.toMatch(/dataBase64|mediaAssetId|sourceId|absolutePath|relativePath|file:\/\//i)
-    const agentPayload = JSON.stringify(agentRequests(captured)[0])
-    expect(agentPayload).toContain('任务：选择并调用具备 file.convert 能力的本地工作流。')
-    expect(agentPayload).toContain('附件数量：1')
-    expect(agentPayload).toContain('附件索引：0')
-    expect(agentPayload).not.toContain(content.normalize('NFKC'))
-    expect(agentPayload).not.toContain('附件 9：private-source.png')
-    expect(agentPayload).toContain(content === 'No matter what this tool can convert just convert this attachment to PDF'
-      ? '当前所选模型或本次请求不允许调用工作流或浏览器工具'
-      : '你是由 AutoForge Main 管理的工作流 Agent')
-    const titleRequest = captured.find(isConversationTitleRequest)
-    expect(titleRequest?.messages).toContainEqual({
-      role: 'user', content: expect.stringMatching(/^本地文件转换 · 1 个附件(?: · [A-Z0-9]+)?$/u),
-    })
-    const titlePayload = JSON.stringify(titleRequest)
-    expect(titlePayload).not.toContain('AI：')
-    expect(titlePayload).not.toMatch(/历史附件|private-source\.png|image\/png|bytes|mediaAssetId|sourceId|ASSISTANT_ECHO_PRIVATE_MARKER/i)
+    if (expectedDecision === 'local') {
+      const agentPayload = JSON.stringify(agentRequests(captured)[0])
+      expect(agentPayload).toContain('任务：选择并调用具备 file.convert 能力的本地工作流。')
+      expect(agentPayload).toContain('附件数量：1')
+      expect(agentPayload).toContain('附件索引：0')
+      expect(agentPayload).not.toContain(content.normalize('NFKC'))
+      expect(agentPayload).not.toContain('附件 9：private-source.png')
+      expect(agentPayload).toContain(content === 'No matter what this tool can convert just convert this attachment to PDF'
+        ? '当前所选模型或本次请求不允许调用工作流或浏览器工具'
+        : '你是由 AutoForge Main 管理的工作流 Agent')
+      const titleRequest = captured.find(isConversationTitleRequest)
+      expect(titleRequest?.messages).toContainEqual({
+        role: 'user', content: expect.stringMatching(/^本地文件转换 · 1 个附件(?: · [A-Z0-9]+)?$/u),
+      })
+      const titlePayload = JSON.stringify(titleRequest)
+      expect(titlePayload).not.toContain('AI：')
+      expect(titlePayload).not.toMatch(/历史附件|private-source\.png|image\/png|bytes|mediaAssetId|sourceId|ASSISTANT_ECHO_PRIVATE_MARKER/i)
+    } else {
+      expect(provider.acquireSnapshot).not.toHaveBeenCalled()
+    }
     await runtime.close()
   })
 
@@ -5486,6 +5599,11 @@ describe('createApplicationRuntime', () => {
     ['Could it convert PDF or export this document as DOCX?', 'ambiguous', 'image'],
     ['怎么把这个图片保存为WebP或导出为PNG？', 'ambiguous', 'audio'],
     ['Check the chat history containing this image, then export it as PDF', 'ambiguous', 'video'],
+    ['Convert /Users/Alice/PDF/private.txt to WebP', 'local', 'text'],
+    [String.raw`转换 C:\Private\PDF\资料.txt 为 WebP`, 'local', 'text'],
+    ['Convert this attachment not to PDF', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF, then save it as WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment to DOCX', 'ambiguous', 'text'],
     ['reformat this attachment as PDF', 'ambiguous', 'text'],
     ['encode this image as WebP', 'ambiguous', 'text'],
     ['render this document to PDF', 'ambiguous', 'text'],
@@ -5508,9 +5626,9 @@ describe('createApplicationRuntime', () => {
     ['generate an image with this image in foo format', 'ambiguous', 'image'],
     ['生成这个图片，格式为任意', 'ambiguous', 'image'],
     ['生成一张图片，格式为PNG', 'ambiguous', 'image'],
-    ['制作一段视频，格式为任意', 'local', 'video'],
-    ['生成一张图片并转换这个附件', 'local', 'image'],
-    ['制作一段视频，然后描述附件', 'local', 'video'],
+    ['制作一段视频，格式为任意', 'ambiguous', 'video'],
+    ['生成一张图片并转换这个附件', 'ambiguous', 'image'],
+    ['制作一段视频，然后描述附件', 'ambiguous', 'video'],
     ['生成一张图片', 'ambiguous', 'audio'],
     ['生成一张图片', 'ambiguous', 'video'],
     ['创建一个音频', 'ambiguous', 'image'],

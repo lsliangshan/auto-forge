@@ -290,6 +290,7 @@ describe('provider attachment disclosure', () => {
     })
 
     expect(plan.access.decision).toBe('local')
+    expect(plan.targetFormat).toBe('jpeg')
     expect(plan.mainText).toBe([
       '任务：选择并调用具备 file.convert 能力的本地工作流。',
       '附件数量：2',
@@ -301,6 +302,25 @@ describe('provider attachment disclosure', () => {
     expect(`${plan.mainText}\n${plan.titleText}`).not.toMatch(
       /See|yes|no|Users|Alice|Tax|Return|Records|private|other|asset_/iu,
     )
+  })
+
+  it.each([
+    'convert this attachment to PDF, then save it as WebP',
+    'convert this attachment not to PDF',
+    'convert this attachment to DOCX',
+  ])('keeps untrusted or conflicting conversion targets unbindable: %s', (text) => {
+    const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+    const plan = authority.createPlan({
+      requestId: 'request_untrusted_target', text,
+      context: { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['file'] },
+      attachments: [{
+        index: 0, id: 'asset_private', name: 'private.txt', mimeType: 'text/plain',
+        byteSize: bytesA.length, fingerprint: fingerprintA,
+      }],
+    })
+
+    expect(plan.access.decision).toBe('ambiguous')
+    expect(plan.targetFormat).toBeUndefined()
   })
 
   it('does not issue a summary capability for local conversion disclosure', () => {

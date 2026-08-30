@@ -1749,7 +1749,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               createdAt: occurredAt,
             },
           }
-          store.outbox.recordWithMessage(mutation, assetIds)
+          store.outbox.recordWithMessage(mutation, assetIds, value.providerProjection)
           queueUserDataFlush()
           const stored = store.messages.get(value.id)
           if (!stored) throw failure('INTERNAL_ERROR')
@@ -3315,7 +3315,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 } : {}),
                 attachmentBindings,
                 allowTools: attachmentDecision === 'ambiguous' ? false : route.supportsTools,
-                ...(localConversionIntent ? { localConversionOnly: true } : {}),
+                ...(localConversionIntent ? {
+                  localConversionOnly: true,
+                  localConversionTarget: privacyPlan.targetFormat!,
+                } : {}),
                 ...(attachmentDecision === 'ambiguous'
                   ? { fixedResponse: AMBIGUOUS_CONVERSION_CLARIFICATION }
                   : {}),

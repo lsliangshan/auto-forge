@@ -2831,7 +2831,7 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
@@ -2917,7 +2917,7 @@ describe('UserDataStoreManager', () => {
 
     const inspection = new Database(path)
     expect(inspection.prepare('SELECT MAX(version) AS version FROM schema_migrations').get())
-      .toEqual({ version: 8 })
+      .toEqual({ version: 9 })
     expect(inspection.prepare(`
       SELECT revision, sync_state AS syncState, last_activity_at AS lastActivityAt,
              metadata_updated_at AS metadataUpdatedAt

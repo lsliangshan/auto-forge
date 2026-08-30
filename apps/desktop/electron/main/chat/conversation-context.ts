@@ -140,6 +140,9 @@ export function serializeHistoricalMessage(
   if (message.role !== 'user' && message.role !== 'assistant') {
     throw new Error('Historical message role is invalid')
   }
+  if (message.role === 'user' && message.providerProjection !== undefined) {
+    return { role: 'user', content: message.providerProjection.content }
+  }
   const content = chatBlockSchema.array().parse(message.blocks)
     .filter((block) => !omitAttachments || (block.type !== 'media' && block.type !== 'media_generation'))
     .flatMap(serializeBlock)

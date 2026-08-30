@@ -29,6 +29,34 @@ afterEach(() => {
 })
 
 describe('conversation context primitives', () => {
+  it('uses the persisted canonical local projection instead of raw user blocks', () => {
+    const rawPath = '/Users/Alice/Tax Return Records/secret.pdf'
+    const rawId = 'asset_private_history_1'
+    const canonical = [
+      '任务：选择并调用具备 file.convert 能力的本地工作流。',
+      '附件数量：1',
+      '附件索引：0',
+      '目标格式：pdf',
+      '禁止读取附件内容或调用非 file.convert 工具。',
+    ].join('\n')
+    const message: Message = {
+      id: 'm_local', conversationId: 'c1', role: 'user', ordinal: 1, createdAt: 1,
+      providerProjection: { kind: 'local_conversion', content: canonical },
+      blocks: [
+        { type: 'text', text: `Convert ${rawPath} to PDF` },
+        {
+          type: 'media', blockId: 'b_local', assetId: rawId, kind: 'file', purpose: 'input',
+          name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 4242,
+        },
+      ],
+    }
+
+    expect(serializeHistoricalMessage(message)).toEqual({ role: 'user', content: canonical })
+    expect(JSON.stringify(serializeHistoricalMessage(message))).not.toMatch(
+      /Alice|Tax Return Records|secret\.pdf|application\/pdf|4242|asset_private_history_1/u,
+    )
+  })
+
   it('uses 60 percent of a positive context length and the 32000 fallback otherwise', () => {
     expect(resolveChatInputBudget(100_000)).toBe(60_000)
     expect(resolveChatInputBudget(0)).toBe(19_200)
@@ -367,6 +395,30 @@ function contextHarness(options: {
 }
 
 describe('conversation context manager', () => {
+  it('compresses persisted local turns from canonical projections without raw attachment history', async () => {
+    const rawPath = '/Users/Alice/Tax Return Records/secret.pdf'
+    const canonical = [
+      '任务：选择并调用具备 file.convert 能力的本地工作流。',
+      '附件数量：1',
+      '附件索引：0',
+      '目标格式：pdf',
+      '禁止读取附件内容或调用非 file.convert 工具。',
+    ].join('\n')
+    const messages = Array.from({ length: 12 }, (_, index): Message => index % 2 === 0 ? {
+      id: `local_${index}`, conversationId: 'c1', role: 'user', ordinal: index + 1, createdAt: index + 1,
+      providerProjection: { kind: 'local_conversion', content: canonical },
+      blocks: [{ type: 'text', text: `Convert ${rawPath} to PDF ${'private '.repeat(80)}` }],
+    } : assistant(index + 1, `ack ${index}`))
+    const { manager, provider } = contextHarness({ messages })
+
+    await manager.prepare(prepareInput({ provider, contextLength: 512 }))
+
+    expect(provider.stream).toHaveBeenCalled()
+    const payload = JSON.stringify(provider.stream.mock.calls)
+    expect(payload).toContain('任务：选择并调用具备 file.convert 能力的本地工作流。')
+    expect(payload).not.toMatch(/Alice|Tax Return Records|secret\.pdf|private private/u)
+  })
+
   it('returns ordered raw history without calling the provider below budget', async () => {
     const { manager, provider } = contextHarness({
       messages: [user(1, '我的代号是青山'), assistant(2, '已记住')],

@@ -1,4 +1,7 @@
-import { CONVERSION_TARGET_FORMATS } from '@autoforge/shared'
+import {
+  CONVERSION_TARGET_FORMATS,
+  type ConversionTargetFormat,
+} from '@autoforge/shared'
 import {
   hasHighConfidenceMediaGenerationRequest,
   hasHighConfidenceOrdinaryAttachmentRequest,
@@ -95,6 +98,21 @@ const DIRECT_OBJECT_ENTITY = new RegExp(
 const RESERVED_SUMMARY_LABEL = /(?:附\s*件|目\s*标\s*格\s*式)/iu
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const REFERENCE_IMAGE_STYLE_EDIT = /(?:把)?(?:这个|这张|该|当前)?(?:图片|图像|照片)(?:做成|制作成?)[^，,；;。.!！？?]{0,24}(?:水彩|油画|素描|电影感|日落)|\b(?:make|edit|transform)\s+(?:this|the)\s+image\b[^,;.!?]{0,48}\b(?:cinematic|watercolou?r|sunset|painting|sketch)\b|\bcreate\s+(?:an?\s+)?new\s+image\s+based\s+on\s+(?:this|the)\s+image\b/iu
+const TRUSTED_TARGET_ALIASES = new Map<string, ConversionTargetFormat>([
+  ...CONVERSION_TARGET_FORMATS.map((format) => [format, format] as const),
+  ['jpg', 'jpeg'],
+  ['tif', 'tiff'],
+])
+const TRUSTED_TARGET_TOKEN = `(?:${[...TRUSTED_TARGET_ALIASES.keys()].join('|')})`
+const TRUSTED_TARGET_CONTEXT = new RegExp([
+  `(?:to|into|as)\\s+(?:an?\\s+)?\\.?(?<english>${TRUSTED_TARGET_TOKEN})(?=$|[\\s,;.!?])`,
+  `(?:转换成|转换为|转成|转为|另存为|保存为|保存成|导出为|输出为|做成|制作成?|改成|改为|换成|换为|变成|生成为?|格式为|目标格式\\s*[:：]?|为)\\s*(?:一(?:个|份|张)\\s*)?\\.?(?<chinese>${TRUSTED_TARGET_TOKEN})(?=\\s*(?:格式|文件)?(?:$|[，,；;。.!！？?]))`,
+  `\\b(?:make|turn|change)\\b[^,;.!?]{0,48}\\b(?:an?\\s+)?\\.?(?<made>${TRUSTED_TARGET_TOKEN})(?=\\s*(?:formats?|files?)?(?:$|[,;.!?]))`,
+  `\\.?(?<version>${TRUSTED_TARGET_TOKEN})\\s*(?:version|版本)(?=$|[\\s，,；;。.!！？?])`,
+  `(?:\\bbut\\b|\\binstead\\b|而是)\\s*(?:an?\\s+)?\\.?(?<contrast>${TRUSTED_TARGET_TOKEN})(?=$|[\\s，,；;。.!！？?])`,
+].join('|'), 'giu')
+const GENERIC_TARGET_CONTEXT = /(?:(?:\b(?:to|into|as)\s+(?!(?:well|this|the|that|current)\b)(?:an?\s+)?)|(?:(?:转换成|转换为|转成|转为|另存为|保存为|保存成|导出为|输出为|做成|制作成?|改成|改为|换成|换为|变成|生成为?|格式为|目标格式\s*[:：]?|为)\s*)(?:一(?:个|份|张)\s*)?|(?:\bbut\b|\binstead\b|而是)\s*(?:an?\s+)?)(?<target>\.?[A-Za-z0-9][A-Za-z0-9._+-]{1,15})/giu
+const NEGATED_TARGET_PREFIX = /(?:不要|不用|别|请勿|并非|不是)|\b(?:not|don't|do\s+not|never)\b/iu
 
 function conversionActionIsNegated(
   clause: string,
@@ -635,7 +653,7 @@ export function hasLocalConversionIntent(
   return false
 }
 
-export function classifyAttachmentConversionIntent(
+function baseAttachmentConversionIntent(
   text: string,
   attachments: readonly LocalAttachmentProjection[],
 ): AttachmentConversionIntent {
@@ -651,6 +669,63 @@ export function classifyAttachmentConversionIntent(
   }
   if (hasLocalConversionIntent(text, attachments)) return 'local'
   return hasConversionRiskSignal(text) ? 'ambiguous' : 'ordinary'
+}
+
+export interface AttachmentConversionClassification {
+  readonly decision: AttachmentConversionIntent
+  readonly targetFormat?: ConversionTargetFormat
+}
+
+function targetMatchIsNegated(text: string, index: number): boolean {
+  const prefix = text.slice(Math.max(0, index - 64), index)
+  const negations = [...prefix.matchAll(new RegExp(NEGATED_TARGET_PREFIX.source, 'giu'))]
+  const negation = negations.at(-1)
+  if (negation?.index === undefined) return false
+  const bridge = prefix.slice(negation.index + negation[0].length)
+  if (/(?:[，,；;。.!]|而是|但是|但|\b(?:but|then|however)\b)[^，,；;。.!]*$/iu.test(bridge)) {
+    return false
+  }
+  const actions = bridge.match(/(?:转换|转成|转为|保存|另存|导出|输出|制作|做成)|\b(?:convert|transcode|save|export|make|turn|change)\b/giu) ?? []
+  return actions.length < 2
+}
+
+function trustedUniqueTargetFormat(text: string): ConversionTargetFormat | undefined {
+  const normalized = text.normalize('NFKC').replace(/[‘’]/gu, "'")
+  const targets = new Set<ConversionTargetFormat>()
+  let unknown = false
+  for (const match of normalized.matchAll(TRUSTED_TARGET_CONTEXT)) {
+    if (match.index === undefined || targetMatchIsNegated(normalized, match.index)) continue
+    const token = Object.values(match.groups ?? {}).find((value) => value !== undefined)
+      ?.replace(/^\./u, '')
+      .toLocaleLowerCase('und')
+    const target = token === undefined ? undefined : TRUSTED_TARGET_ALIASES.get(token)
+    if (target !== undefined) targets.add(target)
+  }
+  for (const match of normalized.matchAll(GENERIC_TARGET_CONTEXT)) {
+    if (match.index === undefined || targetMatchIsNegated(normalized, match.index)) continue
+    const token = match.groups?.target?.replace(/^\./u, '').toLocaleLowerCase('und')
+    if (token !== undefined && !TRUSTED_TARGET_ALIASES.has(token)) unknown = true
+  }
+  return !unknown && targets.size === 1 ? [...targets][0] : undefined
+}
+
+export function classifyAttachmentConversionRequest(
+  text: string,
+  attachments: readonly LocalAttachmentProjection[],
+): AttachmentConversionClassification {
+  const decision = baseAttachmentConversionIntent(text, attachments)
+  if (decision !== 'local') return Object.freeze({ decision })
+  const targetFormat = trustedUniqueTargetFormat(text)
+  return targetFormat === undefined
+    ? Object.freeze({ decision: 'ambiguous' })
+    : Object.freeze({ decision: 'local', targetFormat })
+}
+
+export function classifyAttachmentConversionIntent(
+  text: string,
+  attachments: readonly LocalAttachmentProjection[],
+): AttachmentConversionIntent {
+  return classifyAttachmentConversionRequest(text, attachments).decision
 }
 
 export function projectLocalConversionPrompt(

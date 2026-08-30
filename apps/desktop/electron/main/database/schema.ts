@@ -26,6 +26,7 @@ export const messages = sqliteTable('messages', {
   conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
   role: text('role').notNull(),
   blocksJson: text('blocks_json').notNull(),
+  providerProjectionJson: text('provider_projection_json'),
   executionId: text('execution_id'),
   createdAt: integer('created_at').notNull(),
 }, (table) => [index('messages_conversation_created_at_idx').on(table.conversationId, table.createdAt, table.id)])

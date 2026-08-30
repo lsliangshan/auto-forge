@@ -7,6 +7,7 @@ import {
   type ApprovalDecision,
   type ChatBlock,
   type ChatEvent,
+  type ConversionTargetFormat,
   type ModelProviderId,
   type WorkflowDetail,
 } from '@autoforge/shared'
@@ -19,6 +20,7 @@ import { trackProviderStream } from '../billing/provider-usage-stream.js'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
+  type MessageProviderProjection,
   type ProviderUsageRepository,
 } from '../database/repositories.js'
 import type {
@@ -246,6 +248,7 @@ export interface PersistUserInput {
   blocks: ChatBlock[]
   assetIds: string[]
   createdAt: number
+  providerProjection?: MessageProviderProjection
 }
 
 export interface PersistedUserPosition {
@@ -331,6 +334,9 @@ export function createAgentPersistence(
         role: 'user',
         blocks: input.blocks,
         createdAt: input.createdAt,
+        ...(input.providerProjection === undefined
+          ? {}
+          : { providerProjection: input.providerProjection }),
       }, input.assetIds)
       return { ordinal: message.ordinal }
     },
@@ -457,6 +463,7 @@ export interface AgentRunInput extends UsageAttribution {
   attachmentDisclosure?: ProviderAttachmentDisclosure
   fixedResponse?: string
   localConversionOnly?: boolean
+  localConversionTarget?: ConversionTargetFormat
   allowTools: boolean
   readonly supportsImageInput: boolean
   provider: ModelProviderId
@@ -504,6 +511,7 @@ interface ActiveAgentRun {
   contextLength?: number
   readonly supportsImageInput: boolean
   readonly attachmentBindings: readonly ExecutionAttachmentBinding[]
+  readonly localConversionTarget?: ConversionTargetFormat
   blocks: ChatBlock[]
   messages: ModelMessage[]
   tools: ModelTool[]
@@ -573,6 +581,28 @@ function immutableClone<T>(value: T, seen = new WeakSet<object>()): T {
   }
   freeze(clone)
   return clone
+}
+
+function boundConversionCandidate(
+  candidate: WorkflowCandidate,
+  targetFormat: ConversionTargetFormat,
+): WorkflowCandidate {
+  const tool = structuredClone(candidate.tool)
+  const parameters = tool.function.parameters as {
+    properties?: { input?: { properties?: { targetFormat?: Record<string, unknown> } } }
+  }
+  const targetSchema = parameters.properties?.input?.properties?.targetFormat
+  if (targetSchema === undefined) throw appFailure('INVALID_INPUT')
+  targetSchema.enum = [targetFormat]
+  return Object.freeze({ ...candidate, tool: immutableClone(tool) })
+}
+
+function requestedConversionTarget(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const input = (value as { input?: unknown }).input
+  return input && typeof input === 'object' && !Array.isArray(input)
+    ? (input as { targetFormat?: unknown }).targetFormat
+    : undefined
 }
 
 function asAppError(error: unknown): AppError {
@@ -865,8 +895,13 @@ export class AgentOrchestrator {
           purpose: 'main',
         })
         if (input.localConversionOnly) {
-          if (input.summaryProviderSnapshot !== undefined) throw appFailure('CONFLICT')
+          if (input.summaryProviderSnapshot !== undefined
+            || input.localConversionTarget === undefined
+            || input.attachmentDisclosure?.targetFormat !== input.localConversionTarget) {
+            throw appFailure('CONFLICT')
+          }
         } else {
+          if (input.localConversionTarget !== undefined) throw appFailure('CONFLICT')
           if (!input.summaryProviderSnapshot) throw appFailure('CONFLICT')
           assertProtectedProviderSnapshot(input.summaryProviderSnapshot, input.attachmentDisclosure, {
             requestId,
@@ -889,6 +924,12 @@ export class AgentOrchestrator {
         blocks: input.userBlocks,
         assetIds: input.assetIds,
         createdAt: startedAt,
+        ...(input.localConversionOnly ? {
+          providerProjection: Object.freeze({
+            kind: 'local_conversion' as const,
+            content: input.attachmentDisclosure!.mainSafeText.text,
+          }),
+        } : {}),
       })
       this.dependencies.persistence.createRun({
         runId,
@@ -918,6 +959,9 @@ export class AgentOrchestrator {
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
         supportsImageInput: input.supportsImageInput,
         attachmentBindings: immutableClone(input.attachmentBindings ?? []),
+        ...(input.localConversionTarget === undefined
+          ? {}
+          : { localConversionTarget: input.localConversionTarget }),
         blocks: [],
         messages: [],
         tools: [],
@@ -968,7 +1012,7 @@ export class AgentOrchestrator {
         const conversionCandidates = input.localConversionOnly
           ? catalog.filter(({ workflow }) => workflow.permissions.some(({ capability }) => (
               capability === 'file.convert'
-            )))
+            ))).map((candidate) => boundConversionCandidate(candidate, input.localConversionTarget!))
           : undefined
         const exactCandidate = conversionCandidates === undefined
           ? exactWorkflowCandidate(input.content, catalog)
@@ -1438,6 +1482,16 @@ export class AgentOrchestrator {
       return this.drive(active)
     }
     if (!active.loop.canOfferTools()) return this.terminalize(active, 'failed', appFailure('TOOL_CALL_LIMIT'))
+    if (active.localConversionTarget !== undefined
+      && requestedConversionTarget(call.arguments) !== active.localConversionTarget) {
+      this.appendToolExchange(active, {
+        callId: call.id,
+        assistantContent,
+        toolName: candidate.toolName,
+        arguments: call.arguments,
+      }, { kind: 'tool_error', code: 'INVALID_INPUT' })
+      return this.drive(active)
+    }
     const prepared = await this.workflowTools.prepare({
       candidate,
       arguments: call.arguments,

@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto'
 import {
-  CONVERSION_TARGET_FORMATS,
   type ConversionTargetFormat,
   type ModelProviderId,
 } from '@autoforge/shared'
@@ -13,7 +12,7 @@ import {
 import { projectAttachmentInputs } from './file-attachment-projection.js'
 import {
   anonymizeAttachmentNames,
-  classifyAttachmentConversionIntent,
+  classifyAttachmentConversionRequest,
   projectLocalConversionPrompt,
   type LocalAttachmentProjection,
 } from './local-conversion-intent.js'
@@ -52,6 +51,7 @@ export interface AttachmentPrivacyPlan {
   readonly forbiddenValues: readonly string[]
   readonly mainText: string
   readonly titleText: string
+  readonly targetFormat?: ConversionTargetFormat
 }
 
 export interface ProviderAttachmentDisclosure extends AttachmentPrivacyPlan {
@@ -130,41 +130,20 @@ const issuedMediaProjectionReferences = new WeakMap<object, {
   references: readonly { mimeType: string; dataBase64: string; fingerprint: string; kind: 'image' }[]
 }>()
 const protectedSnapshots = new WeakMap<object, ProtectedSnapshotBinding>()
-const LOCAL_TARGET_ALIASES = new Map<string, ConversionTargetFormat>([
-  ...CONVERSION_TARGET_FORMATS.map((format) => [format, format] as const),
-  ['jpg', 'jpeg'],
-  ['tif', 'tiff'],
-])
-const LOCAL_TARGET_TOKEN = `(?:${[...LOCAL_TARGET_ALIASES.keys()].join('|')})`
-const LOCAL_TARGET_CONTEXT = new RegExp([
-  `(?:to|into|as)\\s+(?:an?\\s+)?\\.?(?<english>${LOCAL_TARGET_TOKEN})`,
-  `(?:转换成|转换为|转成|转为|另存为|保存为|导出为|输出为|做成|制作成?|改成|改为|换成|换为|变成|生成为?|格式为|目标格式\\s*[:：]?|为)\\s*(?:一(?:个|份|张)\\s*)?\\.?(?<chinese>${LOCAL_TARGET_TOKEN})`,
-  `\\b(?:make|turn|change)\\b[^,;.!?]{0,48}\\b(?:an?\\s+)?\\.?(?<made>${LOCAL_TARGET_TOKEN})(?=\\s*(?:formats?|files?)?\\b|$)`,
-  `\\.?(?<version>${LOCAL_TARGET_TOKEN})\\s*(?:version|版本)`,
-  `(?:\\bbut\\b|\\binstead\\b|而是)\\s*(?:an?\\s+)?\\.?(?<contrast>${LOCAL_TARGET_TOKEN})`,
-].join('|'), 'giu')
-
 interface CanonicalLocalConversionIntent {
   readonly attachmentCount: number
   readonly attachmentIndexes: readonly number[]
-  readonly targetFormat?: ConversionTargetFormat
+  readonly targetFormat: ConversionTargetFormat
 }
 
 function canonicalLocalConversionIntent(
-  text: string,
   attachments: readonly AttachmentDisclosurePlanAsset[],
+  targetFormat: ConversionTargetFormat,
 ): CanonicalLocalConversionIntent {
-  let targetFormat: ConversionTargetFormat | undefined
-  for (const match of text.matchAll(LOCAL_TARGET_CONTEXT)) {
-    const token = Object.values(match.groups ?? {}).find((value) => value !== undefined)
-    const normalized = token?.toLocaleLowerCase('und')
-    const candidate = normalized === undefined ? undefined : LOCAL_TARGET_ALIASES.get(normalized)
-    if (candidate !== undefined) targetFormat = candidate
-  }
   return Object.freeze({
     attachmentCount: attachments.length,
     attachmentIndexes: Object.freeze(attachments.map(({ index }) => index)),
-    ...(targetFormat === undefined ? {} : { targetFormat }),
+    targetFormat,
   })
 }
 
@@ -172,19 +151,14 @@ function canonicalLocalProviderText(intent: CanonicalLocalConversionIntent): {
   mainText: string
   titleText: string
 } {
-  const target = intent.targetFormat ?? '未确认'
   const mainText = [
     '任务：选择并调用具备 file.convert 能力的本地工作流。',
     `附件数量：${intent.attachmentCount}`,
     `附件索引：${intent.attachmentIndexes.join(', ')}`,
-    `目标格式：${target}`,
-    intent.targetFormat === undefined
-      ? '目标格式尚未确认，不得调用工具；仅要求用户确认受支持的目标格式。'
-      : '禁止读取附件内容或调用非 file.convert 工具。',
+    `目标格式：${intent.targetFormat}`,
+    '禁止读取附件内容或调用非 file.convert 工具。',
   ].join('\n')
-  const titleText = intent.targetFormat === undefined
-    ? `本地文件转换 · ${intent.attachmentCount} 个附件`
-    : `本地文件转换 · ${intent.attachmentCount} 个附件 · ${intent.targetFormat.toUpperCase()}`
+  const titleText = `本地文件转换 · ${intent.attachmentCount} 个附件 · ${intent.targetFormat.toUpperCase()}`
   return Object.freeze({ mainText, titleText })
 }
 
@@ -261,13 +235,20 @@ export function createProviderAttachmentDisclosureAuthority(input: {
       const projections = attachments.map(({ index, name, mimeType, byteSize }) => ({
         index, name, mimeType, byteSize,
       }))
+      const classification = classifyAttachmentConversionRequest(normalizedText, projections)
       const access = providerAttachmentAccess(
-        classifyAttachmentConversionIntent(normalizedText, projections),
+        classification.decision,
         normalizedText,
         value.context,
       )
+      if (access.decision === 'local' && classification.targetFormat === undefined) {
+        throw new Error('Local conversion target authority is missing')
+      }
       const providerText = access.decision === 'local'
-        ? canonicalLocalProviderText(canonicalLocalConversionIntent(normalizedText, attachments))
+        ? canonicalLocalProviderText(canonicalLocalConversionIntent(
+            attachments,
+            classification.targetFormat!,
+          ))
         : {
             mainText: projectLocalConversionPrompt(normalizedText, projections),
             titleText: `用户：${anonymizeAttachmentNames(normalizedText, projections)}`,
@@ -285,6 +266,7 @@ export function createProviderAttachmentDisclosureAuthority(input: {
         ]).filter(Boolean))]),
         mainText: providerText.mainText,
         titleText: providerText.titleText,
+        ...(access.decision === 'local' ? { targetFormat: classification.targetFormat } : {}),
       })
       issuedPrivacyPlans.add(plan)
       privacyPlanAuthorities.set(plan, {

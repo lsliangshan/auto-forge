@@ -8,6 +8,7 @@ import {
   capabilitySchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  conversionTargetFormatSchema,
   httpsUrlPatternSchema,
   runtimeCapabilityPermissionSchema,
   runtimeCapabilityScopeSchema,
@@ -39,9 +40,15 @@ export interface Message {
   conversationId: string
   role: string
   blocks: unknown[]
+  providerProjection?: MessageProviderProjection
   ordinal: number
   executionId?: string
   createdAt: number
+}
+
+export interface MessageProviderProjection {
+  kind: 'local_conversion'
+  content: string
 }
 
 export interface ConversationContextRecord {
@@ -950,7 +957,7 @@ export interface AppRepositories {
 }
 
 const conversationColumns = 'id, title, title_state AS titleState, user_id AS userId, generation_preferences_json AS generationPreferencesJson, created_at AS createdAt, updated_at AS updatedAt'
-const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, ordinal, execution_id AS executionId, created_at AS createdAt'
+const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, provider_projection_json AS providerProjectionJson, ordinal, execution_id AS executionId, created_at AS createdAt'
 const conversationContextColumns = 'conversation_id AS conversationId, summary_text AS summaryText, through_ordinal AS throughOrdinal, estimated_tokens AS estimatedTokens, updated_at AS updatedAt'
 const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
 const mediaGenerationJobColumns = 'id, conversation_id AS conversationId, assistant_message_id AS assistantMessageId, provider, model, kind, provider_job_id AS providerJobId, status, parameters_json AS parametersJson, next_poll_at AS nextPollAt, poll_attempts AS pollAttempts, error_code AS errorCode, asset_id AS assetId, created_at AS createdAt, updated_at AS updatedAt, ended_at AS endedAt'
@@ -1164,11 +1171,34 @@ function summarizeTokenUsagePeriod(
 }
 
 function messageFromRow(row: Query): Message {
+  const providerProjection = parseMessageProviderProjection(row.providerProjectionJson)
   return {
     ...row,
     blocks: parse(row.blocksJson as string) as unknown[],
     ordinal: positiveIntegerSchema.parse(row.ordinal),
+    ...(providerProjection === undefined ? {} : { providerProjection }),
   } as Message
+}
+
+function parseMessageProviderProjection(value: unknown): MessageProviderProjection | undefined {
+  if (value === null || value === undefined) return undefined
+  if (typeof value !== 'string') throw new Error('Message Provider projection is invalid')
+  const parsed = z.object({
+    kind: z.literal('local_conversion'),
+    content: z.string().max(512),
+  }).strict().parse(parse(value))
+  const match = /^任务：选择并调用具备 file\.convert 能力的本地工作流。\n附件数量：(?<count>[1-5])\n附件索引：(?<indexes>\d(?:, \d)*)\n目标格式：(?<target>[a-z0-9]+)\n禁止读取附件内容或调用非 file\.convert 工具。$/u.exec(parsed.content)
+  if (!match?.groups) throw new Error('Message Provider projection is invalid')
+  const count = Number(match.groups.count)
+  const indexes = match.groups.indexes!.split(', ').map(Number)
+  const expectedIndexes = Array.from({ length: count }, (_, index) => index)
+  const target = match.groups.target!
+  if (indexes.length !== count
+    || indexes.some((index, position) => index !== expectedIndexes[position])
+    || !conversionTargetFormatSchema.safeParse(target).success) {
+    throw new Error('Message Provider projection is invalid')
+  }
+  return Object.freeze({ kind: parsed.kind, content: parsed.content })
 }
 
 function conversationContextFromRow(row: Query): ConversationContextRecord {
@@ -1409,9 +1439,12 @@ function insertMessage(
   blocks: unknown[] = value.blocks,
 ): Message {
   const ordinal = nextMessageOrdinal(database, value.conversationId)
-  database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @ordinal, @executionId, @createdAt)').run({
+  database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, provider_projection_json, ordinal, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @providerProjectionJson, @ordinal, @executionId, @createdAt)').run({
     ...value,
     blocksJson: JSON.stringify(blocks),
+    providerProjectionJson: value.providerProjection === undefined
+      ? null
+      : JSON.stringify(value.providerProjection),
     ordinal,
     executionId: value.executionId ?? null,
   })

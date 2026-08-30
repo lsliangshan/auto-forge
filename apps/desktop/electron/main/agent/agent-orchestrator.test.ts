@@ -328,6 +328,7 @@ function protectedAttachmentRunInput(
     ...(decision === 'local' ? {
       modelContent: attachmentDisclosure.mainSafeText.text,
       localConversionOnly: true,
+      localConversionTarget: plan.targetFormat,
     } : {}),
     attachmentFingerprints: assetFingerprints,
     providerSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
@@ -2916,6 +2917,10 @@ describe('AgentOrchestrator', () => {
     const pending = await orchestrator.run(runInput)
 
     expect(pending).toMatchObject({ status: 'awaiting_approval', executionId: 'reserved_1' })
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0])
+      .toMatchObject({ tools: [{ function: { parameters: {
+        properties: { input: { properties: { targetFormat: { enum: ['pdf'] } } } },
+      } } }] })
     const approvalEvent = dependencies.records.events.find((event) => (
       typeof event === 'object' && event !== null && 'block' in event
       && (event as { block?: { type?: string } }).block?.type === 'approval'
@@ -2980,6 +2985,39 @@ describe('AgentOrchestrator', () => {
     expect(JSON.stringify(conversion)).not.toMatch(/bytes|path|sha256|artifactId|jobId|metadata/i)
     const providerPayload = JSON.stringify(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls)
     expect(providerPayload).not.toMatch(/media_private_0|b{32}|sourceFingerprint|attachmentBindings/)
+  })
+
+  it('rejects a Provider tool call that changes the Main-bound conversion target before approval', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_wrong_target', name: 'workflow_1',
+        arguments: { input: { files: [0], targetFormat: 'png' } },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '未执行不一致的转换请求' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [conversionWorkflow]
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    const result = await orchestrator.run(protectedAttachmentRunInput({
+      ...textRunInput({
+        conversationId: 'conversion_target_authority', content: '将附件转换成 PDF',
+        provider: 'openrouter', model: 'model',
+      }),
+      modelContent: 'canonical local conversion request',
+      assetIds: ['media_private_0'],
+      attachmentBindings: currentConversionAttachments(),
+      localConversionTarget: 'pdf',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(dependencies.records.events.filter((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'approval'
+    ))).toHaveLength(0)
+    expect(dependencies.records.starts).toHaveLength(0)
   })
 
   it.each(['failed', 'cancelled'] as const)(
