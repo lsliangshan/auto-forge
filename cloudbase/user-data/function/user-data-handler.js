@@ -1130,10 +1130,10 @@ function createUserDataHandler({ rpc }) {
       if (event.action === 'listMessages') {
         if (!hasStrictShape(
           event,
-          ['action', 'protocolVersion', 'conversationId', 'limit'],
-          ['cursor'],
+          ['action', 'conversationId', 'limit'],
+          ['cursor', 'protocolVersion'],
         )
-          || !protocolIsCurrent(event)
+          || (event.protocolVersion !== undefined && !protocolIsCurrent(event))
           || !identifier(event.conversationId)
           || event.limit !== 100
           || (event.cursor !== undefined && !opaqueCursor(event.cursor))) return invalid()

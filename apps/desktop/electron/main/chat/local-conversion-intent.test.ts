@@ -44,6 +44,10 @@ describe('local conversion intent', () => {
     'Convert this attachment; targetFormat field says WEBP',
     '转换这个附件；备注：目标格式为 WEBP',
     '转换这个附件；文件名字字段写着保存为 PDF',
+    'Convert this attachment and the note says save it as WEBP',
+    'Convert this attachment and filename says save as PDF',
+    'Convert this attachment while metadata says output as WEBP',
+    '转换这个附件且备注写着保存为 WEBP',
   ])('does not grant target authority to trailing notes or filename fields: %s', (text) => {
     expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
   })

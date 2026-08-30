@@ -117,6 +117,7 @@ const FINAL_TARGET_SUFFIX = /^(?:\s*(?:formats?|files?|格式|文件))?\s*[。.!
 const EXECUTABLE_TARGET_SEGMENT = /^(?:(?:please\s*,?\s*)|(?:请\s*))?(?:(?:not\s+\.?[A-Za-z0-9][A-Za-z0-9._+-]{1,15}\s*$)|(?:不要\s*\.?[A-Za-z0-9][A-Za-z0-9._+-]{1,15}\s*$)|(?:转换|转成|转为|另存|保存|导出|输出|制作|做成|变成|生成)|\b(?:convert|transcode|reformat|encode|render|transform|create|make|turn|change|save|export)\b|(?:把|将)\s*(?:(?:这个|这张|该|当前)?(?:附件|文件|图片|图像|照片|文档|视频|音频)|文件-\d+)[^,;，；—]{0,32}(?:转换|转成|转为|另存|保存|导出|输出|制作|做成|变成|生成)[^,;，；—]{0,24}$)/iu
 const EXECUTABLE_TARGET_RESTART = /(?:\b(?:then|just|directly|otherwise|and|but)\b[^,;.!?]{0,64}\b(?:convert|transcode|reformat|encode|render|transform|create|make|turn|change|save|export)\b|(?:然后|随后|直接|请|并|以及|但是|但)[^，,；;。.!！？?]{0,48}(?:转换|转成|转为|另存|保存|导出|输出|制作|做成|变成|生成))/iu
 const TARGET_SEGMENT_BOUNDARY = /[,;，；—]+|\.(?=\s+(?:[A-Z]|\p{Script=Han}))/gu
+const NON_EXECUTABLE_TARGET_SOURCE = /(?:\b(?:and|while)\s+(?:the\s+)?(?:note|metadata|file\s*name|filename|target\s*format|footer)\s+(?:says?|states?|reads?|shows?)\b|(?:且|同时|以及)\s*(?:备注|元数据|文件名(?:字)?字段|目标格式字段|页脚)\s*(?:写着|显示|说明|记载|为|是))/iu
 
 function conversionActionIsNegated(
   clause: string,
@@ -720,6 +721,7 @@ function finalTargetBelongsToExecutableCommand(text: string, matchIndex: number,
     if (boundary.index !== undefined) start = boundary.index + boundary[0].length
   }
   const segment = text.slice(start, matchEnd).trimStart()
+  if (NON_EXECUTABLE_TARGET_SOURCE.test(segment)) return false
   return EXECUTABLE_TARGET_SEGMENT.test(segment)
     || EXECUTABLE_TARGET_RESTART.test(segment)
 }

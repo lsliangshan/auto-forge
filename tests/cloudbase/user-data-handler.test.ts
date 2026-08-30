@@ -564,6 +564,14 @@ describe('CloudBase user data function', () => {
       : { mutations: [pulled], cursor: null })
     const handler = createUserDataHandler({ rpc })
 
+    const legacyList = await handler({
+      action: 'listMessages', conversationId: 'conv_1', limit: 100,
+    }, authenticatedContext)
+    expect(legacyList).toHaveProperty('ok', true)
+    expect(legacyList).not.toHaveProperty('data.items.0.providerProjection')
+    expect(Object.keys((legacyList as { data: { items: object[] } }).data.items[0]!).sort())
+      .toEqual(['blocks', 'conversationId', 'createdAt', 'id', 'role'])
+
     for (const protocolVersion of [1, 2] as const) {
       await expect(handler({
         action: 'listMessages', protocolVersion, conversationId: 'conv_1', limit: 100,

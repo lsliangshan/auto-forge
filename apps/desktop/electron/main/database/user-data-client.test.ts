@@ -637,6 +637,10 @@ describe('UserDataStoreManager', () => {
     ['Describe this PDF', 'pdf'],
     ['Convert this image to WEBP', 'pdf'],
     ['Convert this attachment to PDF', 'webp'],
+    ['Convert this attachment and the note says save it as WEBP', 'webp'],
+    ['Convert this attachment and filename says save as PDF', 'pdf'],
+    ['Convert this attachment while metadata says output as WEBP', 'webp'],
+    ['转换这个附件且备注写着保存为 WEBP', 'webp'],
   ] as const)('discards a forged remote projection after Main reclassification: %s', (text, targetFormat) => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open(`projection-forged-${targetFormat}-${text.length}`)
