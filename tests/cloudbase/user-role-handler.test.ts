@@ -163,7 +163,7 @@ describe('CloudBase user role function', () => {
 
     await handler({
       action: 'listUsers', page: 1, pageSize: 20,
-      filter: { field: 'email', value: 'alice@example.com' },
+      filter: { field: 'keyword', value: 'alice@example.com' },
       platformTraceId: 'trace_1', userId: 'attacker',
     }, context)
     await handler({
@@ -174,7 +174,7 @@ describe('CloudBase user role function', () => {
 
     expect(rpc).toHaveBeenNthCalledWith(1, 'autoforge_list_users', {
       p_caller_user_id: 'admin_1', p_page: 1, p_page_size: 20,
-      p_filter_field: 'email', p_filter_value: 'alice@example.com',
+      p_filter_field: 'keyword', p_filter_value: 'alice@example.com',
     })
     expect(rpc).toHaveBeenNthCalledWith(2, 'autoforge_update_user_role', {
       p_caller_user_id: 'admin_1', p_request_id: 'request_1', p_target_user_id: 'user_1',

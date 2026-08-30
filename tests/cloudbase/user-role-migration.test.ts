@@ -22,6 +22,18 @@ const moduleRollbackUrl = new URL(
   '../../cloudbase/user-roles/migrations/0002_knowledge_entitlement.rollback.sql',
   import.meta.url,
 )
+const publishedKeywordSearchUrl = new URL(
+  '../../cloudbase/migrations/20260830140000_user_admin_keyword_search.sql',
+  import.meta.url,
+)
+const moduleKeywordSearchUrl = new URL(
+  '../../cloudbase/user-roles/migrations/0003_keyword_search.sql',
+  import.meta.url,
+)
+const moduleKeywordSearchRollbackUrl = new URL(
+  '../../cloudbase/user-roles/migrations/0003_keyword_search.rollback.sql',
+  import.meta.url,
+)
 const readmeUrl = new URL('../../cloudbase/user-roles/README.md', import.meta.url)
 
 function extractFunction(sql: string, name: string): string {
@@ -138,5 +150,27 @@ describe('CloudBase PostgreSQL user role migration', () => {
     expect(sql).toContain('GRANT EXECUTE ON FUNCTION public.autoforge_list_users')
     expect(sql).toContain('TO service_role')
     expect(sql).toContain("SET search_path = pg_catalog, public")
+  })
+
+  it('adds one cross-field keyword filter without exposing unmasked contact data', async () => {
+    const [published, moduleSql, rollback] = await Promise.all([
+      readFile(publishedKeywordSearchUrl, 'utf8'),
+      readFile(moduleKeywordSearchUrl, 'utf8'),
+      readFile(moduleKeywordSearchRollbackUrl, 'utf8'),
+    ])
+
+    expect(moduleSql).toBe(published)
+    expect(moduleSql).toContain("p_filter_field NOT IN ('keyword', 'username', 'displayName', 'userId', 'email', 'phone')")
+    expect(moduleSql).toContain("p_filter_field = 'keyword'")
+    expect(moduleSql).toContain("username ILIKE '%' || p_filter_value || '%'")
+    expect(moduleSql).toContain("display_name ILIKE '%' || p_filter_value || '%'")
+    expect(moduleSql).toContain("user_id ILIKE '%' || p_filter_value || '%'")
+    expect(moduleSql).toContain("email ILIKE '%' || p_filter_value || '%'")
+    expect(moduleSql).toContain("phone ILIKE '%' || p_filter_value || '%'")
+    expect(moduleSql).toContain("'maskedEmail', public.autoforge_mask_email(email)")
+    expect(moduleSql).toContain("'maskedPhone', public.autoforge_mask_phone(phone)")
+    expect(extractFunction(rollback, 'autoforge_list_users'))
+      .not.toContain("p_filter_field = 'keyword'")
+    expect(rollback).not.toMatch(/\b(?:DROP|TRUNCATE|DELETE)\b/i)
   })
 })

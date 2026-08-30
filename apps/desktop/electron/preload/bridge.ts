@@ -220,6 +220,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       ),
       setConsent: (provider, status) => invoke(ipcRenderer, ipcChannels.knowledgeSetConsent, { provider, status }),
       revokeConsent: (provider) => invoke(ipcRenderer, ipcChannels.knowledgeRevokeConsent, { provider }),
+      getDocumentPreview: (documentId) => invoke(
+        ipcRenderer,
+        ipcChannels.knowledgeGetDocumentPreview,
+        { documentId },
+      ),
       getSourcePreview: (input) => invoke(ipcRenderer, ipcChannels.knowledgeGetSourcePreview, input),
       onEvent: (listener) => subscribe(ipcRenderer, ipcChannels.knowledgeEvent, (payload) => knowledgeEventSchema.safeParse(payload), listener),
     },

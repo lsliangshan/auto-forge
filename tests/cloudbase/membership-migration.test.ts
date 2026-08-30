@@ -13,6 +13,14 @@ const rollbackUrl = new URL(
   '../../cloudbase/membership/migrations/0001_membership_control_plane.rollback.sql',
   import.meta.url,
 )
+const selfManagementPublishedUrl = new URL(
+  '../../cloudbase/migrations/20260830010000_allow_super_admin_self_membership.sql',
+  import.meta.url,
+)
+const selfManagementModuleUrl = new URL(
+  '../../cloudbase/membership/migrations/0002_allow_super_admin_self_membership.sql',
+  import.meta.url,
+)
 
 describe('CloudBase PostgreSQL membership control plane migration', () => {
   it('keeps the published migration mirrored and builds one authoritative audited ledger', async () => {
@@ -39,6 +47,21 @@ describe('CloudBase PostgreSQL membership control plane migration', () => {
     expect(published).toContain('REQUEST_ID_CONFLICT')
     expect(published).not.toContain('autoforge_ensure_my_role')
     expect(published).toMatch(/REVOKE ALL ON (TABLE )?public\.membership_accounts FROM PUBLIC/)
+    expect(published).toContain('GRANT EXECUTE ON FUNCTION public.autoforge_membership_mutate')
+  })
+
+  it('allows the authorized super admin to mutate their own membership', async () => {
+    const [published, module] = await Promise.all([
+      readFile(selfManagementPublishedUrl, 'utf8'),
+      readFile(selfManagementModuleUrl, 'utf8'),
+    ])
+
+    expect(module).toBe(published)
+    expect(published).toContain('CREATE OR REPLACE FUNCTION public.autoforge_membership_mutate')
+    expect(published).toContain(
+      'FROM public.autoforge_membership_require_admin(p_caller_user_id, p_target_user_id)',
+    )
+    expect(published).not.toContain('SELF_MEMBERSHIP_CHANGE_FORBIDDEN')
     expect(published).toContain('GRANT EXECUTE ON FUNCTION public.autoforge_membership_mutate')
   })
 

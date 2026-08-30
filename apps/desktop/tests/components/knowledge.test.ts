@@ -1,7 +1,12 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DesktopAPI, KnowledgeBaseSummary, KnowledgeDocumentSummary } from '@autoforge/shared'
+import type {
+  DesktopAPI,
+  KnowledgeBaseSummary,
+  KnowledgeDocumentPreview,
+  KnowledgeDocumentSummary,
+} from '@autoforge/shared'
 import ElementPlus, { ElMessageBox } from 'element-plus'
 import KnowledgeView from '../../src/views/KnowledgeView.vue'
 import { useKnowledgeStore } from '../../src/stores/knowledge'
@@ -55,6 +60,7 @@ function api(overrides: Partial<DesktopAPI['knowledge']> = {}): DesktopAPI {
     getConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
     setConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'granted' }),
     revokeConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
+    getDocumentPreview: vi.fn().mockResolvedValue({ kind: 'unavailable' }),
     getSourcePreview: vi.fn().mockResolvedValue({ kind: 'unavailable' }),
     onEvent: vi.fn(() => vi.fn()),
     ...overrides,
@@ -69,10 +75,11 @@ describe('personal knowledge workspace', () => {
   afterEach(() => {
     Reflect.deleteProperty(window, 'autoForge')
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
     vi.useRealTimers()
   })
 
-  it('renders bases, documents, and an inspector as three distinct panes', async () => {
+  it('renders a unified tree and switches the document workspace between preview, information, and versions', async () => {
     const client = api({
       list: vi.fn().mockResolvedValue([base('base_1', '个人资料')]),
       listDocuments: vi.fn().mockResolvedValue([document('doc_1', 'base_1')]),
@@ -80,6 +87,11 @@ describe('personal knowledge workspace', () => {
         id: 'version_1', documentId: 'doc_1', number: 1, status: 'ready',
         createdAt: '2026-08-27T00:00:00.000Z',
       }]),
+      getDocumentPreview: vi.fn().mockResolvedValue({
+        kind: 'original', mimeType: 'text/plain',
+        bytes: new TextEncoder().encode('春游活动公告\n请于上午八点半到园。'),
+        fallback: { content: '春游活动公告 请于上午八点半到园。', truncated: false },
+      }),
     })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
     const pinia = createPinia()
@@ -91,13 +103,82 @@ describe('personal knowledge workspace', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-testid="knowledge-workspace"]').classes()).toContain('knowledge-workspace')
-    expect(wrapper.get('[data-testid="knowledge-base-pane"]').text()).toContain('个人资料')
-    expect(wrapper.get('[data-testid="knowledge-document-pane"]').text()).toContain('doc_1.txt')
-    await wrapper.get('[data-testid="knowledge-document-doc_1"]').trigger('click')
+    expect(wrapper.get('[data-testid="knowledge-tree"]').text()).toContain('个人资料')
+    expect(wrapper.get('[data-testid="knowledge-tree"]').text()).toContain('doc_1.txt')
+    expect(wrapper.find('[data-testid="knowledge-document-pane"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="knowledge-original-preview"]').text()).toContain('春游活动公告')
+    expect(wrapper.get('[data-testid="knowledge-original-preview"]').text()).toContain('原始文件')
+    await wrapper.get('[data-testid="knowledge-tab-info"]').trigger('click')
     await flushPromises()
-    const inspector = wrapper.get('[data-testid="knowledge-inspector-pane"]')
-    expect(inspector.text()).toContain('版本 1 · 可检索')
-    expect(inspector.text()).not.toContain('ready')
+    expect(wrapper.get('[data-testid="knowledge-workbench"]').text()).toContain('text/plain')
+    await wrapper.get('[data-testid="knowledge-tab-versions"]').trigger('click')
+    expect(wrapper.get('[data-testid="knowledge-workbench"]').text()).toContain('版本 1 · 可检索')
+    expect(wrapper.get('[data-testid="knowledge-workbench"]').text()).not.toContain('ready')
+  })
+
+  it('turns empty states into contextual next actions', async () => {
+    const client = api()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { attachTo: globalThis.document.body, global: { plugins: [pinia] } })
+    await useKnowledgeStore().bindOwner('alice')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-empty-create"]').text()).toContain('新建知识库')
+    const trigger = wrapper.get('[data-testid="knowledge-empty-create"]')
+    await trigger.trigger('click')
+    await flushPromises()
+    const dialog = globalThis.document.body.querySelector<HTMLElement>('[data-testid="knowledge-create-dialog"]')
+    const input = dialog?.querySelector<HTMLInputElement>('input[aria-label="知识库名称"]')
+    expect(dialog?.getAttribute('role')).toBe('dialog')
+    expect(dialog?.getAttribute('aria-modal')).toBe('true')
+    expect(wrapper.get('[data-testid="knowledge-tree"]').find('input').exists()).toBe(false)
+    expect(globalThis.document.activeElement).toBe(input)
+
+    input?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushPromises()
+    expect(globalThis.document.body.querySelector('[data-testid="knowledge-create-dialog"]')).toBeNull()
+    expect(globalThis.document.activeElement).toBe(trigger.element)
+    wrapper.unmount()
+  })
+
+  it('creates a knowledge base from the modal and closes it after success', async () => {
+    const pendingCreate = deferred<KnowledgeBaseSummary>()
+    const create = vi.fn(() => pendingCreate.promise)
+    const client = api({
+      create,
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'member', status: 'active', localEnabled: true, cloudEnabled: false,
+        limits: { knowledgeBases: 20, knowledgeDocuments: 500, knowledgeFileBytes: 67_108_864 },
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { attachTo: globalThis.document.body, global: { plugins: [pinia] } })
+    await useKnowledgeStore().bindOwner('alice')
+    await flushPromises()
+
+    await wrapper.get('[data-testid="knowledge-create-toggle"]').trigger('click')
+    await flushPromises()
+    const dialog = globalThis.document.body.querySelector<HTMLElement>('[data-testid="knowledge-create-dialog"]')
+    const input = dialog?.querySelector<HTMLInputElement>('input[aria-label="知识库名称"]')
+    const form = dialog?.querySelector<HTMLFormElement>('form')
+    input!.value = '  项目资料  '
+    input!.dispatchEvent(new Event('input', { bubbles: true }))
+    form!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await wrapper.vm.$nextTick()
+
+    expect(dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(true)
+    form!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    expect(create).toHaveBeenCalledOnce()
+    pendingCreate.resolve(base('base_created', '项目资料'))
+    await flushPromises()
+
+    expect(create).toHaveBeenCalledWith('项目资料')
+    expect(globalThis.document.body.querySelector('[data-testid="knowledge-create-dialog"]')).toBeNull()
+    wrapper.unmount()
   })
 
   it('guides a free user to replace the active file instead of starting a conflicting import', async () => {
@@ -121,6 +202,27 @@ describe('personal knowledge workspace', () => {
     await store.importDocuments()
     expect(store.error).toBe('当前会员版本的文件数量已达上限；回收站、处理失败和处理中条目也会计入，请永久删除后重试')
     expect(client.knowledge.pickImportFiles).not.toHaveBeenCalled()
+  })
+
+  it('keeps import enabled for a Pro member with one existing document', async () => {
+    const client = api({
+      list: vi.fn().mockResolvedValue([base('base_1', '日常')]),
+      listDocuments: vi.fn().mockResolvedValue([document('doc_1', 'base_1')]),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'member', status: 'active', localEnabled: true, cloudEnabled: false,
+        limits: { knowledgeBases: 20, knowledgeDocuments: 500, knowledgeFileBytes: 67_108_864 },
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia] } })
+    await useKnowledgeStore().bindOwner('alice')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-import"]').attributes())
+      .not.toHaveProperty('disabled')
+    expect(wrapper.text()).not.toContain('免费版：1 个本地知识库')
   })
 
   it('renders expired extras read-only and sends the chosen keep-one pair through preload', async () => {
@@ -498,6 +600,35 @@ describe('personal knowledge workspace', () => {
     expect(store.bases.map(({ id }) => id)).toEqual(['base_bob'])
     store.resetLocalData()
     expect(store.bases).toEqual([])
+  })
+
+  it('zeroes original preview bytes when a late document response loses selection', async () => {
+    const late = deferred<KnowledgeDocumentPreview>()
+    const lateBytes = new TextEncoder().encode('Alice private document')
+    const currentBytes = new TextEncoder().encode('Current document')
+    const client = api({
+      list: vi.fn().mockResolvedValue([base('base_1', '个人资料')]),
+      listDocuments: vi.fn().mockResolvedValue([
+        document('doc_1', 'base_1'), document('doc_2', 'base_1'),
+      ]),
+      getDocumentPreview: vi.fn((documentId: string) => documentId === 'doc_1'
+        ? late.promise
+        : Promise.resolve({ kind: 'original', mimeType: 'text/plain', bytes: currentBytes })),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const store = useKnowledgeStore()
+
+    const initial = store.bindOwner('alice')
+    await vi.waitFor(() => expect(client.knowledge.getDocumentPreview).toHaveBeenCalledWith('doc_1'))
+    await store.selectDocument('doc_2')
+    late.resolve({ kind: 'original', mimeType: 'text/plain', bytes: lateBytes })
+    await initial
+
+    expect(store.selectedDocumentId).toBe('doc_2')
+    expect(store.documentPreview).toMatchObject({ kind: 'original' })
+    expect(Array.from(lateBytes)).toEqual(Array(lateBytes.length).fill(0))
+    store.resetLocalData()
+    expect(Array.from(currentBytes)).toEqual(Array(currentBytes.length).fill(0))
   })
 
   it('does not let an Alice mutation release Bob busy state or publish Alice errors', async () => {

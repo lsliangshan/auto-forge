@@ -5,6 +5,7 @@ import {
   type AppError,
   type KnowledgeAvailability,
   type KnowledgeBaseSummary,
+  type KnowledgeDocumentPreview,
   type KnowledgeDocumentSummary,
   type KnowledgeEvent,
   type KnowledgeEvidence,
@@ -2803,6 +2804,79 @@ export function createLocalKnowledgeService(
       const active = current(owner)
       active.store.database.prepare('DELETE FROM knowledge_provider_consents WHERE provider = ?').run(provider)
       return { provider, status: 'unknown' }
+    },
+    getDocumentPreview: async (owner, documentId): Promise<KnowledgeDocumentPreview> => {
+      const active = current(owner)
+      const document = documentSummary(active.store.database, documentId)
+      if (!document || document.status !== 'ready') return { kind: 'unavailable' }
+      const state = entitlement(active)
+      const kept = retention(active, state)
+      if ((state.tier !== 'member' || state.status === 'expired')
+        && (kept?.baseId !== document.baseId || kept.documentId !== document.id)) {
+        return { kind: 'unavailable' }
+      }
+      const rows = active.store.database.prepare(`
+        SELECT chunk.body
+        FROM kb_chunks AS chunk
+        JOIN documents AS document ON document.id = chunk.document_id
+        JOIN knowledge_bases AS base ON base.id = chunk.knowledge_base_id
+        JOIN document_versions AS version
+          ON version.id = chunk.version_id AND version.document_id = chunk.document_id
+        WHERE document.id = ?
+          AND base.recycled_at IS NULL AND document.recycled_at IS NULL
+          AND document.active_version_id = version.id AND version.status = 'ready'
+        ORDER BY chunk.ordinal
+        LIMIT 129
+      `).all(documentId) as Array<{ body: string }>
+      const normalized = rows.slice(0, 128)
+        .map(row => sanitizeKnowledgeText(row.body).trim())
+        .filter(Boolean)
+        .join('\n\n')
+        .trim()
+      const content = normalized.slice(0, 20_000).trim()
+      const fallback = content ? {
+        content,
+        truncated: rows.length > 128 || normalized.length > content.length,
+      } : undefined
+      const version = active.store.database.prepare(`
+        SELECT version.object_id AS objectId, version.mime_type AS mimeType
+        FROM documents AS document
+        JOIN knowledge_bases AS base ON base.id = document.knowledge_base_id
+        JOIN document_versions AS version
+          ON version.id = document.active_version_id AND version.document_id = document.id
+        WHERE document.id = ?
+          AND base.recycled_at IS NULL AND document.recycled_at IS NULL
+          AND version.status = 'ready'
+        LIMIT 1
+      `).get(documentId) as { objectId: string; mimeType: ParserMediaType } | undefined
+      if (!version || !mediaTypes.has(version.mimeType)) {
+        return fallback ? { kind: 'available', ...fallback } : { kind: 'unavailable' }
+      }
+
+      let cleartext: Buffer | undefined
+      let previewBytes: Uint8Array | undefined
+      let delivered = false
+      try {
+        cleartext = await active.store.objects.read(version.objectId)
+        assertCurrentBinding(active)
+        if (cleartext.byteLength < 1 || cleartext.byteLength > MAX_KNOWLEDGE_IMPORT_BYTES) {
+          return fallback ? { kind: 'available', ...fallback } : { kind: 'unavailable' }
+        }
+        previewBytes = Uint8Array.from(cleartext)
+        delivered = true
+        return {
+          kind: 'original',
+          mimeType: version.mimeType,
+          bytes: previewBytes,
+          ...(fallback ? { fallback } : {}),
+        }
+      } catch {
+        assertCurrentBinding(active)
+        return fallback ? { kind: 'available', ...fallback } : { kind: 'unavailable' }
+      } finally {
+        cleartext?.fill(0)
+        if (!delivered) previewBytes?.fill(0)
+      }
     },
     getSourcePreview: async (owner, input: KnowledgeSourcePreviewRequest): Promise<KnowledgeSourcePreview> => {
       const active = current(owner)

@@ -295,12 +295,13 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 <style scoped>
 .billing-panel.settings-section {
-  margin-top: 14px;
+  margin-top: 18px;
   overflow: hidden;
-  border: 1px solid var(--af-border);
-  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--af-border) 88%, transparent);
+  border-radius: 16px;
   padding: 0;
   background: var(--af-surface);
+  box-shadow: 0 1px 2px rgb(32 36 43 / 3%), 0 14px 34px rgb(32 36 43 / 4%);
 }
 
 .billing-header {
@@ -308,7 +309,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 20px;
+  padding: 22px;
   border-bottom: 1px solid var(--af-border);
 }
 
@@ -321,8 +322,23 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 }
 
 .billing-header h2 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
   color: var(--af-graphite);
-  font-size: 15px;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -.01em;
+}
+
+.billing-header h2::before {
+  width: 3px;
+  height: 16px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--af-cobalt);
+  box-shadow: 0 0 0 3px var(--af-cobalt-soft);
+  content: '';
 }
 
 .billing-header p,
@@ -332,12 +348,19 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 }
 
 .billing-header p {
-  margin-top: 4px;
+  margin: 6px 0 0 12px;
   font-size: 12px;
+  line-height: 1.55;
 }
 
 .billing-body {
-  padding: 16px 20px 20px;
+  padding: 18px 22px 22px;
+}
+
+.billing-panel :deep(.el-button) {
+  min-height: 36px;
+  border-radius: 8px;
+  font-weight: 650;
 }
 
 .billing-error {
@@ -365,9 +388,10 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 }
 
 .remote-usage-summary div {
-  padding: 10px;
+  padding: 12px;
   border: 1px solid var(--af-border);
   border-radius: 10px;
+  background: var(--af-surface-muted);
 }
 
 .remote-usage-summary dt {
@@ -383,7 +407,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 .billing-summary div {
   padding: 14px;
   border: 1px solid var(--af-border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--af-surface-muted);
 }
 
@@ -431,7 +455,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   margin: 0 0 16px;
   padding: 14px;
   border: 1px solid var(--af-border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--af-surface-muted);
 }
 

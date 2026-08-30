@@ -75,6 +75,7 @@ import { createLocalKnowledgeService } from './knowledge/knowledge-service.js'
 import { canonicalizeEntitlementPayload, KnowledgeEntitlementVerifier } from './knowledge/entitlement-verifier.js'
 import type { KnowledgeParserPort } from './knowledge/import-job-runner.js'
 import { memoryKnowledgeStore, parsedText } from './knowledge/knowledge-test-support.js'
+import type { MembershipControlService } from './membership/cloudbase-membership-service.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
 import {
@@ -1799,6 +1800,69 @@ describe('createApplicationRuntime', () => {
 
     expect(refreshEntitlement).toHaveBeenCalledOnce()
     expect(refreshEntitlement).toHaveBeenCalledWith(session.user.id, after, true)
+    await runtime.close()
+  })
+
+  it('refreshes the signed knowledge entitlement immediately after a self membership mutation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-membership-self-refresh-'))
+    directories.push(root)
+    const userId = 'test_user_membershipselfrefresh'
+    const before = { payload: 'ZnJlZQ', signature: 'ZnJlZQ' }
+    const after = { payload: 'cHJv', signature: 'cHJv' }
+    const freeMembership = {
+      userId, planId: 'free' as const, planVersion: 1, state: 'active' as const,
+      effectiveStatus: 'active' as const, grantKind: null, version: 0, termEndsAt: null,
+      limits: { knowledgeBases: 1, knowledgeDocuments: 1, knowledgeFileBytes: 67_108_864 },
+      cloudEligible: false, updatedAt: '2026-08-30T00:00:00.000Z',
+    }
+    const proMembership = {
+      ...freeMembership,
+      planId: 'pro' as const,
+      grantKind: 'manual_grant' as const,
+      version: 1,
+      termEndsAt: '2027-08-30T00:00:00.000Z',
+      limits: { knowledgeBases: 20, knowledgeDocuments: 500, knowledgeFileBytes: 67_108_864 },
+      cloudEligible: true,
+      updatedAt: '2026-08-30T00:01:00.000Z',
+    }
+    let current: Awaited<ReturnType<MembershipControlService['refreshCurrent']>> = {
+      membership: freeMembership, entitlement: before,
+    }
+    const membershipService: MembershipControlService = {
+      refreshCurrent: vi.fn(async () => current),
+      getCurrent: vi.fn(async () => current.membership),
+      getTarget: vi.fn(async () => current.membership),
+      mutate: vi.fn(async () => {
+        current = { membership: proMembership, entitlement: after }
+        return { status: 'applied' as const, membership: proMembership }
+      }),
+      listAudit: vi.fn(async () => ({ items: [], page: 1, pageSize: 20 as const, total: 0 })),
+    }
+    const refreshEntitlement = vi.fn(async () => undefined)
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined),
+      refreshEntitlement,
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      captureSearchScope: vi.fn(async () => { throw new Error('not reached') }),
+      releaseSearchScope: vi.fn(),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const runtime = createApplicationRuntime(options(root, { knowledgeService, membershipService }))
+    await authenticate(runtime, 'MembershipSelfRefresh')
+    vi.mocked(membershipService.refreshCurrent).mockClear()
+    refreshEntitlement.mockClear()
+
+    await expect(runtime.services.membership.mutate({
+      action: 'grant', requestId: 'membership-self-refresh', targetUserId: userId,
+      expectedVersion: 0, reasonCode: 'internal_grant', grantKind: 'manual_grant',
+      termEndsAt: '2027-08-30T00:00:00.000Z',
+    })).resolves.toMatchObject({ membership: { planId: 'pro' } })
+
+    expect(membershipService.refreshCurrent).toHaveBeenCalledOnce()
+    expect(refreshEntitlement).toHaveBeenCalledOnce()
+    expect(refreshEntitlement).toHaveBeenCalledWith(userId, after, true)
     await runtime.close()
   })
 

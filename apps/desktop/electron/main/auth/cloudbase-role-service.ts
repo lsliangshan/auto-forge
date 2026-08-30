@@ -94,7 +94,51 @@ export class CloudBaseRoleService implements BusinessRoleService {
   }
 
   async listUsers(input: UserAdminListRequest): Promise<UserAdminListResponse> {
+    try {
+      return await this.invokeUserList(input)
+    } catch (error) {
+      const code = toSafeAppError(error).code
+      if (input.filter?.field !== 'keyword' || code !== 'INVALID_INPUT') {
+        throw error
+      }
+      return this.listUsersWithLegacyKeyword(input)
+    }
+  }
+
+  private async invokeUserList(input: UserAdminListRequest): Promise<UserAdminListResponse> {
     return parseCloudData(userAdminListResponseSchema, await this.invoke('listUsers', input))
+  }
+
+  private async listUsersWithLegacyKeyword(input: UserAdminListRequest): Promise<UserAdminListResponse> {
+    const keyword = input.filter?.value ?? ''
+    const pageSize = 100 as const
+    const firstPage = await this.invokeUserList({ page: 1, pageSize })
+    const usersById = new Map(firstPage.items.map(user => [user.userId, user]))
+    const pageCount = Math.ceil(firstPage.total / pageSize)
+    for (let page = 2; page <= pageCount; page += 1) {
+      const result = await this.invokeUserList({ page, pageSize })
+      for (const user of result.items) usersById.set(user.userId, user)
+    }
+
+    const exactContactMatches = await Promise.all((['email', 'phone'] as const).map(field => (
+      this.invokeUserList({ page: 1, pageSize, filter: { field, value: keyword } })
+    )))
+    const exactUserIds = new Set(exactContactMatches.flatMap(result => (
+      result.items.map(user => user.userId)
+    )))
+    const normalizedKeyword = keyword.toLocaleLowerCase()
+    const matches = [...usersById.values()].filter(user => (
+      exactUserIds.has(user.userId)
+      || [user.username, user.displayName, user.userId, user.maskedEmail, user.maskedPhone]
+        .some(value => value?.toLocaleLowerCase().includes(normalizedKeyword))
+    ))
+    const offset = (input.page - 1) * input.pageSize
+    return {
+      items: matches.slice(offset, offset + input.pageSize),
+      page: input.page,
+      pageSize: input.pageSize,
+      total: matches.length,
+    }
   }
 
   async updateUserRole(input: UserAdminUpdateRoleRequest): Promise<UserAdminUpdateRoleResponse> {

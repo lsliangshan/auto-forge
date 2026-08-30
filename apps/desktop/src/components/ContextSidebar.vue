@@ -4,9 +4,10 @@
     aria-label="页面上下文"
   >
     <template v-if="route.name === 'chat'">
-      <div class="sidebar-toolbar">
+      <div class="sidebar-toolbar conversation-toolbar">
         <span class="af-panel-heading">会话</span>
         <el-button
+          class="conversation-new-button"
           size="small"
           type="primary"
           :icon="Plus"
@@ -18,6 +19,7 @@
       </div>
       <el-input
         v-model="conversationSearch"
+        class="conversation-search"
         clearable
         placeholder="搜索会话"
         aria-label="搜索会话"
@@ -96,35 +98,37 @@
                   :aria-label="syncStateLabel[conversation.syncState]"
                 />
               </button>
-              <button
-                v-if="conversation.syncState === 'failed'"
-                class="conversation-action sync-retry"
-                data-testid="retry-conversation-sync"
-                :disabled="Boolean(chat.retryingSyncByConversation[conversation.id])"
-                :aria-busy="Boolean(chat.retryingSyncByConversation[conversation.id])"
-                :aria-label="chat.retryingSyncByConversation[conversation.id]
-                  ? `正在重试同步${conversation.title}`
-                  : `重试同步${conversation.title}`"
-                @click="chat.retrySync(conversation.id)"
-              >
-                <el-icon :class="{ 'is-loading': chat.retryingSyncByConversation[conversation.id] }">
-                  <Refresh />
-                </el-icon>
-              </button>
-              <button
-                class="conversation-action"
-                :aria-label="`重命名${conversation.title}`"
-                @click="renameConversation(conversation.id, conversation.title)"
-              >
-                <el-icon><Edit /></el-icon>
-              </button>
-              <button
-                class="conversation-action danger"
-                :aria-label="`删除${conversation.title}`"
-                @click="deleteConversation(conversation.id, conversation.title)"
-              >
-                <el-icon><Delete /></el-icon>
-              </button>
+              <div :class="['conversation-actions', { 'has-retry': conversation.syncState === 'failed' }]">
+                <button
+                  class="conversation-action"
+                  :aria-label="`重命名${conversation.title}`"
+                  @click="renameConversation(conversation.id, conversation.title)"
+                >
+                  <el-icon><Edit /></el-icon>
+                </button>
+                <button
+                  class="conversation-action danger"
+                  :aria-label="`删除${conversation.title}`"
+                  @click="deleteConversation(conversation.id, conversation.title)"
+                >
+                  <el-icon><Delete /></el-icon>
+                </button>
+                <button
+                  v-if="conversation.syncState === 'failed'"
+                  class="conversation-action sync-retry"
+                  data-testid="retry-conversation-sync"
+                  :disabled="Boolean(chat.retryingSyncByConversation[conversation.id])"
+                  :aria-busy="Boolean(chat.retryingSyncByConversation[conversation.id])"
+                  :aria-label="chat.retryingSyncByConversation[conversation.id]
+                    ? `正在重试同步${conversation.title}`
+                    : `重试同步${conversation.title}`"
+                  @click="chat.retrySync(conversation.id)"
+                >
+                  <el-icon :class="{ 'is-loading': chat.retryingSyncByConversation[conversation.id] }">
+                    <Refresh />
+                  </el-icon>
+                </button>
+              </div>
             </div>
           </li>
         </template>
@@ -425,26 +429,37 @@ onBeforeUnmount(detachSettingsScrollSync)
 <style scoped>
 .context-sidebar { display: flex; width: 240px; min-width: 240px; height: 100%; flex-direction: column; gap: 10px; border-right: 1px solid var(--af-border); padding: 14px 8px 14px 12px; background: var(--af-surface-muted); }
 .sidebar-toolbar { display: flex; min-height: 28px; align-items: center; justify-content: space-between; }
-.context-list { min-height: 0; margin: 0 -4px; padding: 0 4px; overflow: auto; list-style: none; }
-.context-list li + li { margin-top: 2px; }
-.conversation-group { padding: 9px 7px 3px; color: var(--af-text-muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-.conversation-row { display: flex; align-items: center; border-radius: 5px; }
-.conversation-row:hover { background: var(--af-hover); }.conversation-row.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
-.conversation-select { display: flex; width: 100%; min-width: 0; flex: 1 1 auto; align-items: center; gap: 8px; border: 0; padding: 9px 8px; color: inherit; background: transparent; cursor: pointer; text-align: left; }
-.conversation-sync-status { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--af-text-muted); }
-.conversation-sync-status.is-pending { background: var(--af-warning); }.conversation-sync-status.is-syncing { background: var(--af-cobalt); box-shadow: 0 0 0 2px var(--af-cobalt-soft); }.conversation-sync-status.is-failed { background: var(--af-danger); }
+.conversation-toolbar { min-height: 32px; padding: 0 2px; }
+.conversation-new-button { min-height: 30px; border-radius: 8px; padding: 6px 10px; font-weight: 650; box-shadow: 0 5px 14px color-mix(in srgb, var(--af-cobalt) 18%, transparent); }
+.conversation-search :deep(.el-input__wrapper) { min-height: 36px; border-radius: 9px; background: var(--af-surface); box-shadow: 0 0 0 1px var(--af-border) inset; transition: box-shadow .16s ease; }
+.conversation-search :deep(.el-input__wrapper:hover) { box-shadow: 0 0 0 1px var(--af-border-strong) inset; }
+.conversation-search :deep(.el-input__wrapper.is-focus) { box-shadow: 0 0 0 1px var(--af-cobalt) inset, var(--af-focus); }
+.context-list { min-height: 0; margin: 0 -4px; padding: 0 4px 8px; overflow: auto; list-style: none; }
+.context-list li + li { margin-top: 3px; }
+.conversation-group { display: flex; align-items: center; gap: 8px; padding: 12px 8px 5px; color: var(--af-text-muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+.conversation-group::after { height: 1px; flex: 1; background: linear-gradient(90deg, var(--af-border), transparent); content: ''; }
+.conversation-row { position: relative; display: flex; min-height: 44px; align-items: center; overflow: hidden; border: 1px solid transparent; border-radius: 10px; transition: border-color .16s ease, background-color .16s ease, box-shadow .16s ease; }
+.conversation-row:hover { border-color: color-mix(in srgb, var(--af-border) 82%, transparent); background: var(--af-surface); box-shadow: 0 5px 14px rgb(32 36 43 / 5%); }.conversation-row.active { border-color: color-mix(in srgb, var(--af-cobalt) 16%, var(--af-border)); color: var(--af-cobalt); background: linear-gradient(90deg, var(--af-cobalt-soft), color-mix(in srgb, var(--af-cobalt-soft) 58%, var(--af-surface))); box-shadow: inset 3px 0 var(--af-cobalt), 0 5px 16px color-mix(in srgb, var(--af-cobalt) 7%, transparent); }
+.conversation-select { display: flex; width: 100%; min-width: 0; min-height: 42px; flex: 1 1 auto; align-items: center; gap: 9px; border: 0; padding: 7px 8px 7px 10px; color: inherit; background: transparent; cursor: pointer; text-align: left; }
+.conversation-select > .el-icon { display: grid; width: 26px; height: 26px; flex: 0 0 26px; place-items: center; border: 1px solid var(--af-border); border-radius: 8px; color: var(--af-text-muted); background: var(--af-surface); transition: border-color .16s ease, color .16s ease, background-color .16s ease; }
+.conversation-row:hover .conversation-select > .el-icon { border-color: var(--af-border-strong); color: var(--af-text); }.conversation-row.active .conversation-select > .el-icon { border-color: color-mix(in srgb, var(--af-cobalt) 24%, var(--af-border)); color: var(--af-cobalt); background: color-mix(in srgb, var(--af-cobalt-soft) 72%, var(--af-surface)); }
+.conversation-select .af-truncate { font-size: 12px; font-weight: 560; line-height: 1.35; }.conversation-row.active .conversation-select .af-truncate { font-weight: 680; }
+.conversation-sync-status { width: 7px; height: 7px; flex: 0 0 auto; border: 2px solid var(--af-surface); border-radius: 50%; background: var(--af-text-muted); box-shadow: 0 0 0 1px var(--af-border); }
+.conversation-sync-status.is-pending { background: var(--af-warning); }.conversation-sync-status.is-syncing { background: var(--af-cobalt); box-shadow: 0 0 0 2px var(--af-cobalt-soft); }.conversation-sync-status.is-failed { background: var(--af-danger); box-shadow: 0 0 0 1px color-mix(in srgb, var(--af-danger) 35%, var(--af-border)); }
 .durable-sync-warning { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; color: var(--af-warning-strong); background: var(--af-warning-soft); border-radius: 8px; font-size: 12px; }
 .durable-sync-warning button { color: inherit; background: none; border: 0; padding: 0; font: inherit; text-decoration: underline; cursor: pointer; }
 .durable-sync-warning button:disabled { cursor: default; opacity: .65; }
-.conversation-action { display: none; width: 24px; height: 24px; flex: 0 0 24px; place-items: center; border: 0; border-radius: 4px; color: var(--af-text-muted); background: transparent; cursor: pointer; }
-.conversation-row:hover .conversation-action, .conversation-row:focus-within .conversation-action, .conversation-action.sync-retry { display: grid; }.conversation-action:hover { color: var(--af-cobalt); background: var(--af-surface); }.conversation-action.danger:hover { color: var(--af-danger); }.conversation-action.sync-retry { color: var(--af-danger); }
+.conversation-actions { display: none; flex: 0 0 auto; align-items: center; gap: 2px; margin-right: 5px; border: 1px solid var(--af-border); border-radius: 9px; padding: 2px; background: var(--af-surface); box-shadow: 0 4px 12px rgb(32 36 43 / 8%); }
+.conversation-row:hover .conversation-actions, .conversation-row:focus-within .conversation-actions, .conversation-actions.has-retry { display: flex; }
+.conversation-action { display: none; width: 26px; height: 26px; flex: 0 0 26px; place-items: center; border: 0; border-radius: 7px; color: var(--af-text-muted); background: transparent; cursor: pointer; transition: color .14s ease, background-color .14s ease; }
+.conversation-row:hover .conversation-action, .conversation-row:focus-within .conversation-action, .conversation-action.sync-retry { display: grid; }.conversation-action:hover { color: var(--af-cobalt); background: var(--af-cobalt-soft); }.conversation-action.danger:hover { color: var(--af-danger); background: var(--af-danger-soft); }.conversation-action.sync-retry { color: var(--af-danger); }.conversation-action:disabled { cursor: wait; opacity: .6; }
 .conversation-more { padding: 8px 4px; text-align: center; }.conversation-more button { border: 0; color: var(--af-cobalt); background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
 .sidebar-state { margin-top: 20px; color: var(--af-text-muted); font-size: 12px; line-height: 1.6; text-align: center; }
 .sidebar-state small { color: var(--af-text-muted); }.sidebar-error { color: var(--af-danger); font-size: 12px; }
 .sync-retry-error { padding: 0 8px; }
 .field-label { margin-top: 4px; color: var(--af-text-muted); font-size: 11px; font-weight: 650; }
 .native-filter { width: 100%; border: 1px solid var(--af-border-strong); border-radius: 4px; padding: 7px 8px; color: var(--af-text); background: var(--af-surface); font-size: 11px; }
-.settings-section-link { width: 100%; border: 0; border-radius: 5px; padding: 8px 9px; color: var(--af-text); background: transparent; font: inherit; font-size: 13px; cursor: pointer; text-align: left; }
+.settings-section-link { width: 100%; min-height: 38px; border: 0; border-radius: 9px; padding: 9px 11px; color: var(--af-text); background: transparent; font: inherit; font-size: 13px; cursor: pointer; text-align: left; transition: color .16s ease, background-color .16s ease, box-shadow .16s ease; }
 .settings-section-link:hover, .settings-section-link.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
-.settings-section-link.active { font-weight: 650; }
+.settings-section-link.active { padding-left: 14px; box-shadow: inset 3px 0 var(--af-cobalt); font-weight: 680; }
 </style>

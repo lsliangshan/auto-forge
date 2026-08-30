@@ -2,6 +2,7 @@ import { acceptHMRUpdate, defineStore } from 'pinia'
 import type {
   KnowledgeAvailability,
   KnowledgeBaseSummary,
+  KnowledgeDocumentPreview,
   KnowledgeDocumentSummary,
   KnowledgeEntitlementState,
   KnowledgeVersionSummary,
@@ -26,12 +27,19 @@ function clearTimer(store: object): void {
   timers.delete(store)
 }
 
+function releaseDocumentPreview(preview: KnowledgeDocumentPreview | undefined): void {
+  if (preview?.kind !== 'original') return
+  try { preview.bytes.fill(0) } catch { /* The backing buffer may already be detached. */ }
+}
+
 export const useKnowledgeStore = defineStore('knowledge', {
   state: () => ({
     ownerId: '' as string,
     bases: [] as KnowledgeBaseSummary[],
     documents: [] as KnowledgeDocumentSummary[],
     versions: [] as KnowledgeVersionSummary[],
+    documentPreview: undefined as KnowledgeDocumentPreview | undefined,
+    previewLoading: false,
     selectedBaseId: '' as string,
     selectedDocumentId: '' as string,
     availability: undefined as KnowledgeAvailability | undefined,
@@ -72,6 +80,10 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
   },
   actions: {
+    clearDocumentPreview() {
+      releaseDocumentPreview(this.documentPreview)
+      this.documentPreview = undefined
+    },
     resetLocalData() {
       this._epoch += 1
       clearTimer(this)
@@ -82,6 +94,8 @@ export const useKnowledgeStore = defineStore('knowledge', {
       this.bases = []
       this.documents = []
       this.versions = []
+      this.clearDocumentPreview()
+      this.previewLoading = false
       this.selectedBaseId = ''
       this.selectedDocumentId = ''
       this.availability = undefined
@@ -161,6 +175,8 @@ export const useKnowledgeStore = defineStore('knowledge', {
           this.documents = []
           this.selectedDocumentId = ''
           this.versions = []
+          this.clearDocumentPreview()
+          this.previewLoading = false
         }
         return
       }
@@ -170,7 +186,10 @@ export const useKnowledgeStore = defineStore('knowledge', {
       if (!documents.some(({ id }) => id === this.selectedDocumentId)) {
         this.selectedDocumentId = documents[0]?.id ?? ''
       }
-      await this.loadVersions(this.selectedDocumentId, expectedEpoch)
+      await Promise.all([
+        this.loadVersions(this.selectedDocumentId, expectedEpoch),
+        this.loadDocumentPreview(this.selectedDocumentId, expectedEpoch),
+      ])
     },
     async selectBase(baseId: string) {
       if (baseId === this.selectedBaseId) return
@@ -180,6 +199,8 @@ export const useKnowledgeStore = defineStore('knowledge', {
       this.documents = []
       this.selectedDocumentId = ''
       this.versions = []
+      this.clearDocumentPreview()
+      this.previewLoading = false
       try {
         await this.loadDocuments(baseId, epoch)
       } catch (error) {
@@ -202,11 +223,43 @@ export const useKnowledgeStore = defineStore('knowledge', {
       const ownerId = this.ownerId
       this.selectedDocumentId = documentId
       this.versions = []
+      this.clearDocumentPreview()
       try {
-        await this.loadVersions(documentId, epoch)
+        await Promise.all([
+          this.loadVersions(documentId, epoch),
+          this.loadDocumentPreview(documentId, epoch),
+        ])
       } catch (error) {
         if (epoch === this._epoch && ownerId === this.ownerId && documentId === this.selectedDocumentId) {
           this.error = displayError(error, '版本加载失败')
+        }
+      }
+    },
+    async loadDocumentPreview(documentId: string, epoch?: number) {
+      const expectedEpoch = epoch ?? this._epoch
+      if (!documentId) {
+        if (expectedEpoch === this._epoch) {
+          this.clearDocumentPreview()
+          this.previewLoading = false
+        }
+        return
+      }
+      this.previewLoading = true
+      try {
+        const preview = await getDesktopApi().knowledge.getDocumentPreview(documentId)
+        if (expectedEpoch === this._epoch && documentId === this.selectedDocumentId) {
+          this.clearDocumentPreview()
+          this.documentPreview = preview
+        } else {
+          releaseDocumentPreview(preview)
+        }
+      } catch {
+        if (expectedEpoch === this._epoch && documentId === this.selectedDocumentId) {
+          this.documentPreview = { kind: 'unavailable' }
+        }
+      } finally {
+        if (expectedEpoch === this._epoch && documentId === this.selectedDocumentId) {
+          this.previewLoading = false
         }
       }
     },

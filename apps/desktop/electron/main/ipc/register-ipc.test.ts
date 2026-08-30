@@ -179,6 +179,7 @@ function services(): DesktopIpcServices {
       getConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
       setConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'granted' }),
       revokeConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
+      getDocumentPreview: vi.fn().mockResolvedValue({ kind: 'unavailable' }),
       getSourcePreview: vi.fn().mockResolvedValue({ kind: 'unavailable' }),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
@@ -548,6 +549,8 @@ describe('registerDesktopIpc', () => {
     })
     await expect(app.invoke(ipcChannels.knowledgeRestoreDocument, { documentId: 'document_1' })).resolves.toBeUndefined()
     await expect(app.invoke(ipcChannels.knowledgeRestoreBase, { baseId: 'base_1' })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.knowledgeGetDocumentPreview, { documentId: 'document_1' }))
+      .resolves.toEqual({ kind: 'unavailable' })
 
     const owner = { userId: 'user_1' }
     expect(app.dependencies.knowledge.pickImportFiles).toHaveBeenCalledWith(owner)
@@ -556,11 +559,13 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.knowledge.search).toHaveBeenNthCalledWith(2, owner, '合同')
     expect(app.dependencies.knowledge.restoreDocument).toHaveBeenCalledWith(owner, 'document_1')
     expect(app.dependencies.knowledge.restoreBase).toHaveBeenCalledWith(owner, 'base_1')
+    expect(app.dependencies.knowledge.getDocumentPreview).toHaveBeenCalledWith(owner, 'document_1')
 
     for (const [channel, input] of [
       [ipcChannels.knowledgeList, { userId: 'forged' }],
       [ipcChannels.knowledgeImportDocument, { baseId: 'base_1', importHandleId: 'import_1', path: '/private/source.txt' }],
       [ipcChannels.knowledgeSearch, { query: '合同', topK: 99 }],
+      [ipcChannels.knowledgeGetDocumentPreview, { documentId: 'document_1', path: '/private/source.txt' }],
     ] as const) {
       await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     }

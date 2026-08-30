@@ -264,7 +264,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
         tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false,
       }),
       retainFreeAllowance: vi.fn(), getConsent: vi.fn(), setConsent: vi.fn(),
-      revokeConsent: vi.fn(), getSourcePreview: vi.fn(), onEvent: vi.fn(() => vi.fn()),
+      revokeConsent: vi.fn(), getDocumentPreview: vi.fn(), getSourcePreview: vi.fn(), onEvent: vi.fn(() => vi.fn()),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
@@ -1245,6 +1245,12 @@ describe('workbench', () => {
       .find((row) => row.text().includes('synced-conversation'))
     expect(syncedConversation).toBeDefined()
     expect(syncedConversation?.find('[data-testid="conversation-sync-status"]').exists()).toBe(false)
+    expect(wrapper.get('.conversation-actions').findAll('button')
+      .map((button) => button.attributes('aria-label'))).toEqual([
+      '重命名需重试',
+      '删除需重试',
+      '重试同步需重试',
+    ])
     const retry = wrapper.get('[data-testid="retry-conversation-sync"]')
     expect(retry.attributes('aria-label')).toContain('需重试')
     const store = useChatStore()

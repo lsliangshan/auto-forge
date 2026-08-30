@@ -3,10 +3,14 @@
     <div
       v-if="availabilityLabel"
       class="knowledge-availability"
+      :class="availabilityTone"
       data-testid="knowledge-local-availability"
       role="status"
     >
-      {{ availabilityLabel }}
+      <span class="availability-copy">
+        <el-icon><CircleCheckFilled v-if="availabilityTone === 'success'" /><WarningFilled v-else /></el-icon>
+        {{ availabilityLabel }}
+      </span>
       <button
         v-if="canRetainSelection"
         type="button"
@@ -19,26 +23,26 @@
     </div>
     <div
       v-if="store.error"
-      class="af-error"
+      class="knowledge-error"
       role="alert"
     >
-      {{ store.error }}
+      <el-icon><WarningFilled /></el-icon>
+      <span>{{ store.error }}</span>
     </div>
     <div
       class="knowledge-workspace"
       data-testid="knowledge-workspace"
     >
       <KnowledgeBaseList />
-      <KnowledgeDocumentList />
       <KnowledgeInspector />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
+import { CircleCheckFilled, WarningFilled } from '@element-plus/icons-vue'
 import { computed, onMounted, watch } from 'vue'
 import KnowledgeBaseList from '../components/knowledge/KnowledgeBaseList.vue'
-import KnowledgeDocumentList from '../components/knowledge/KnowledgeDocumentList.vue'
 import KnowledgeInspector from '../components/knowledge/KnowledgeInspector.vue'
 import { useAuthStore } from '../stores/auth'
 import { useKnowledgeStore } from '../stores/knowledge'
@@ -65,14 +69,23 @@ const canRetainSelection = computed(() => store.entitlement?.tier === 'free'
   && (store.entitlement.retentionConfirmed === false
     || store.entitlement.retainedBaseId !== store.selectedBaseId
     || store.entitlement.retainedDocumentId !== store.selectedDocumentId))
+const availabilityTone = computed(() => store.localAvailable ? 'success' : 'warning')
 onMounted(() => store.bindOwner(auth.session?.user.id))
 watch(() => auth.session?.user.id, ownerId => store.bindOwner(ownerId))
 </script>
 
 <style scoped>
-.knowledge-view { display: flex; height: 100%; min-height: 0; flex-direction: column; }
-.knowledge-availability { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 7px 12px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: 11px; }
-.knowledge-availability button { border: 1px solid var(--af-border-strong); border-radius: 7px; padding: 4px 8px; color: var(--af-text); background: var(--af-surface); cursor: pointer; }
-.knowledge-workspace { display: grid; min-height: 0; flex: 1; grid-template-columns: minmax(190px, .75fr) minmax(260px, 1fr) minmax(280px, 1.15fr); }
-@media (max-width: 1050px) { .knowledge-workspace { grid-template-columns: 190px minmax(240px, 1fr) minmax(250px, 1fr); } }
+.knowledge-view { display: flex; height: 100%; min-height: 0; flex-direction: column; background: var(--af-canvas); }
+.knowledge-availability { display: flex; min-height: 39px; flex: none; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 7px 14px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: 10px; }
+.availability-copy { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+.knowledge-availability.success .availability-copy .el-icon { color: var(--af-success); }
+.knowledge-availability.warning { background: var(--af-warning-soft); }
+.knowledge-availability.warning .availability-copy .el-icon { color: var(--af-warning); }
+.knowledge-availability button { border: 1px solid color-mix(in srgb, var(--af-cobalt) 30%, var(--af-border)); border-radius: 7px; padding: 5px 9px; color: var(--af-cobalt); background: var(--af-surface); cursor: pointer; font-size: 10px; font-weight: 700; }
+.knowledge-availability button:hover:not(:disabled) { border-color: var(--af-cobalt); background: var(--af-cobalt-soft); }
+.knowledge-availability button:disabled { cursor: not-allowed; opacity: .5; }
+.knowledge-error { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--af-danger-border); padding: 9px 14px; color: var(--af-danger); background: var(--af-danger-soft); font-size: 11px; }
+.knowledge-error .el-icon { flex: none; }
+.knowledge-workspace { display: grid; min-height: 0; flex: 1; overflow: hidden; grid-template-columns: minmax(250px, 285px) minmax(0, 1fr); }
+@media (max-width: 950px) { .knowledge-workspace { grid-template-columns: 235px minmax(0, 1fr); } }
 </style>

@@ -25,7 +25,9 @@ export const useUserAdminStore = defineStore('user-admin', {
       const input: UserAdminListRequest = {
         page: this.page,
         pageSize: this.pageSize,
-        ...(this.filter ? { filter: this.filter } : {}),
+        ...(this.filter ? {
+          filter: { field: this.filter.field, value: this.filter.value },
+        } : {}),
       }
       try {
         const result = await getDesktopApi().userAdmin.list(input)

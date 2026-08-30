@@ -10,7 +10,8 @@ file at 64 MiB.
 - `membership_accounts` is the current state. `membership_events` is immutable audit history.
 - Only the Cloud Function service role may execute the membership RPC functions.
 - The caller identity is taken from the CloudBase authenticated context, never from request data.
-- Main requires confirmed `manage_memberships`; self-mutation is rejected in Main and PostgreSQL.
+- Main requires confirmed `manage_memberships`; an authorized super admin may manage their own
+  membership, and every mutation remains versioned and audited in PostgreSQL.
 - Every Free and Pro snapshot is Ed25519 signed. The private key belongs only in a CloudBase
   Secret/KMS-backed function environment variable. It must never enter Git, PostgreSQL, an Electron
   bundle, a command line, a log, the clipboard, or a temporary file.
@@ -72,6 +73,24 @@ described below and compensating membership mutations.
 
 Use `scripts/run-production-canary.mjs --verify` for a read-only repeat of the final membership and
 audit assertions. `--apply` creates a new four-event canary cycle and must not be used as a probe.
+
+## Super-admin self-management patch
+
+`migrations/0002_allow_super_admin_self_membership.sql` is mirrored at
+`../migrations/20260830010000_allow_super_admin_self_membership.sql`. Apply only this incremental
+migration to an existing membership control plane after the normal environment and backup gates;
+do not reapply or edit the already-recorded `0001` migration. The patch changes only the mutation
+function: confirmed super admins keep the same authorization, optimistic-version, idempotency, and
+audit requirements when the target user is themselves.
+
+The patch was applied to `autoforge-d1gkhyfb419ba8455` in `ap-shanghai` on 2026-08-30 after the
+operator confirmed the production write and backup gate. The mirrored migration SHA-256 was
+`f05bb099a33de360e2ee19e801090a68169df8edfda5f9a55bc297d14801cf77`; CloudBase task
+`task-03599955` succeeded and applied only the one pending migration. A follow-up dry-run reported
+no pending migrations. A state-preserving self-mutation probe for the sole super admin, fingerprint
+`98ad26b8c62a`, passed authorization and stopped at the deliberately impossible expected version
+with `MEMBERSHIP_CONFLICT`, confirming that the obsolete self-mutation rejection was no longer
+active without changing membership state or audit history.
 
 ## Canary sequence
 

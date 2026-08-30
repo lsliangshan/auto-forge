@@ -2330,6 +2330,14 @@ describe('local knowledge service', () => {
     await vi.waitFor(async () => {
       expect((await service.listDocuments({ userId: 'alice' }, base.id))[0]?.status).toBe('ready')
     })
+    const documentPreview = await service.getDocumentPreview({ userId: 'alice' }, document!.id)
+    expect(documentPreview).toMatchObject({
+      kind: 'original', mimeType: 'text/plain',
+      fallback: { content: expect.stringContaining('合同经双方签字后生效'), truncated: false },
+    })
+    if (documentPreview.kind !== 'original') throw new Error('Expected original document preview')
+    expect(new TextDecoder().decode(documentPreview.bytes)).toBe('合同经双方签字后生效。')
+    expect(JSON.stringify(documentPreview.fallback)).not.toMatch(/\/etc\/private|\/opt\/autoforge|\/Users\/alice|server\\share/u)
     const search = await service.searchSelected({ userId: 'alice' }, '合同经双', [base.id])
     if (search.kind !== 'results' || !search.evidence[0]) throw new Error('Expected evidence')
     const evidence = search.evidence[0]
@@ -2353,6 +2361,8 @@ describe('local knowledge service', () => {
       versionId: evidence.versionId, coordinate: evidence.citation.coordinate,
     })).resolves.toEqual({ kind: 'unavailable' })
     await service.recycleDocument({ userId: 'alice' }, document!.id)
+    await expect(service.getDocumentPreview({ userId: 'alice' }, document!.id))
+      .resolves.toEqual({ kind: 'unavailable' })
     await expect(service.getSourcePreview({ userId: 'alice' }, {
       evidenceId: evidence.id, baseId: evidence.baseId, documentId: evidence.documentId,
       versionId: evidence.versionId, coordinate: evidence.citation.coordinate,

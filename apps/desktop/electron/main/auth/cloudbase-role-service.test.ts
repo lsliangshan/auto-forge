@@ -104,4 +104,48 @@ describe('CloudBaseRoleService', () => {
     })
     await expect(service.ensureMyRole()).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
   })
+
+  it('falls back to legacy listUsers pages when the deployed function rejects keyword filters', async () => {
+    const users = [
+      {
+        userId: '2090350246298132480', username: 'afphone_7213252235', displayName: null,
+        maskedEmail: null, maskedPhone: '+86****2722', status: 'active', role: 'super_admin',
+        roleVersion: 1, createdAt: '2026-08-20T08:08:30.000Z',
+      },
+      {
+        userId: '2090348177264742400', username: 'afsmoke_7212763557', displayName: null,
+        maskedEmail: 'a***@126.com', maskedPhone: null, status: 'active', role: 'user',
+        roleVersion: 0, createdAt: '2026-08-20T08:00:16.000Z',
+      },
+      {
+        userId: '2089908515857502208', username: 'administrator', displayName: 'Administrator',
+        maskedEmail: null, maskedPhone: null, status: 'active', role: 'user',
+        roleVersion: 0, createdAt: '2026-08-19T02:53:13.000Z',
+      },
+    ] as const
+    const callFunction = vi.fn().mockImplementation(({ data }) => {
+      if (data.filter?.field === 'keyword') {
+        return Promise.resolve({ result: { ok: false, error: { code: 'INVALID_INPUT' } } })
+      }
+      if (data.filter?.field === 'email' || data.filter?.field === 'phone') {
+        return Promise.resolve({
+          result: { ok: true, data: { items: [], page: 1, pageSize: 100, total: 0 } },
+        })
+      }
+      return Promise.resolve({
+        result: { ok: true, data: { items: users, page: 1, pageSize: 100, total: users.length } },
+      })
+    })
+    const service = new CloudBaseRoleService({ callFunction })
+
+    await expect(service.listUsers({
+      page: 1, pageSize: 20, filter: { field: 'keyword', value: '22' },
+    })).resolves.toEqual({
+      items: [users[0], users[2]], page: 1, pageSize: 20, total: 2,
+    })
+    expect(callFunction).toHaveBeenCalledWith({
+      name: 'autoforge-user-roles',
+      data: { action: 'listUsers', page: 1, pageSize: 100 },
+    })
+  })
 })

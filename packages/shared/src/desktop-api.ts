@@ -146,6 +146,38 @@ export const knowledgeSourcePreviewSchema = z.discriminatedUnion('kind', [
 ])
 export type KnowledgeSourcePreview = z.infer<typeof knowledgeSourcePreviewSchema>
 
+const knowledgeDocumentPreviewFallbackSchema = z.object({
+  content: nonEmptyStringSchema.max(20_000),
+  truncated: z.boolean(),
+}).strict()
+
+const knowledgeDocumentPreviewBytesSchema = z.custom<Uint8Array>(
+  value => value instanceof Uint8Array && value.byteLength > 0 && value.byteLength <= 64 * 1024 * 1024,
+  { message: 'Expected bounded original document bytes' },
+)
+
+export const knowledgeDocumentPreviewSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('original'),
+    mimeType: z.enum([
+      'application/pdf',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'text/plain',
+      'text/markdown',
+      'text/html',
+    ]),
+    bytes: knowledgeDocumentPreviewBytesSchema,
+    fallback: knowledgeDocumentPreviewFallbackSchema.optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal('available'),
+    content: nonEmptyStringSchema.max(20_000),
+    truncated: z.boolean(),
+  }).strict(),
+  z.object({ kind: z.literal('unavailable') }).strict(),
+])
+export type KnowledgeDocumentPreview = z.infer<typeof knowledgeDocumentPreviewSchema>
+
 function knowledgeGateSchema(reason: string) {
   return z.object({
     available: z.boolean(),
@@ -541,7 +573,7 @@ export const assignableRoleSchema = z.enum(['user', 'super_admin'])
 export type AssignableRole = z.infer<typeof assignableRoleSchema>
 
 export const userAdminFilterSchema = z.object({
-  field: z.enum(['username', 'displayName', 'userId', 'email', 'phone']),
+  field: z.enum(['keyword', 'username', 'displayName', 'userId', 'email', 'phone']),
   value: z.string().trim().min(1).max(254),
 }).strict()
 export type UserAdminFilter = z.infer<typeof userAdminFilterSchema>
@@ -1860,6 +1892,7 @@ export const ipcChannels = {
   knowledgeGetConsent: 'knowledge:get-consent',
   knowledgeSetConsent: 'knowledge:set-consent',
   knowledgeRevokeConsent: 'knowledge:revoke-consent',
+  knowledgeGetDocumentPreview: 'knowledge:get-document-preview',
   knowledgeGetSourcePreview: 'knowledge:get-source-preview',
   knowledgeEvent: 'knowledge:event',
   systemOpenExternal: 'system:open-external',
@@ -2093,6 +2126,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentRequestSchema.optional(),
   [ipcChannels.knowledgeSetConsent]: knowledgeSetConsentRequestSchema,
   [ipcChannels.knowledgeRevokeConsent]: knowledgeConsentRequestSchema,
+  [ipcChannels.knowledgeGetDocumentPreview]: knowledgeDocumentRequestSchema,
   [ipcChannels.knowledgeGetSourcePreview]: knowledgeSourcePreviewRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
@@ -2201,6 +2235,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
   [ipcChannels.knowledgeSetConsent]: knowledgeConsentStateSchema,
   [ipcChannels.knowledgeRevokeConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeGetDocumentPreview]: knowledgeDocumentPreviewSchema,
   [ipcChannels.knowledgeGetSourcePreview]: knowledgeSourcePreviewSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
@@ -2334,6 +2369,7 @@ export interface DesktopAPI {
     getConsent(provider?: ModelProviderId): Promise<KnowledgeConsentState>
     setConsent(provider: ModelProviderId, status: 'granted' | 'denied'): Promise<KnowledgeConsentState>
     revokeConsent(provider: ModelProviderId): Promise<KnowledgeConsentState>
+    getDocumentPreview(documentId: string): Promise<KnowledgeDocumentPreview>
     getSourcePreview(input: KnowledgeSourcePreviewRequest): Promise<KnowledgeSourcePreview>
     onEvent(listener: (event: KnowledgeEvent) => void): () => void
   }

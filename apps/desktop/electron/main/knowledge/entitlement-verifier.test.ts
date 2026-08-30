@@ -203,6 +203,55 @@ describe('KnowledgeEntitlementVerifier', () => {
     })
   })
 
+  it('uses the membership refresh window for ordered offline entitlement boundaries', () => {
+    const key = generateKeyPairSync('ed25519')
+    const payload = {
+      schemaVersion: 2 as const,
+      userId: 'alice',
+      membershipVersion: 1,
+      planId: 'pro' as const,
+      planVersion: 1,
+      state: 'active' as const,
+      effectiveStatus: 'active' as const,
+      grantKind: 'manual_grant' as const,
+      termEndsAt: '2027-08-30T04:21:00.000Z',
+      issuedAt: '2026-08-30T04:48:00.969Z',
+      refreshAfter: '2026-08-30T04:53:00.969Z',
+      offlineGraceEndsAt: '2026-09-02T04:48:00.969Z',
+      limits: {
+        knowledgeBases: 20,
+        knowledgeDocuments: 500,
+        knowledgeFileBytes: 67_108_864,
+      },
+      cloudEligible: true,
+      keyId: 'membership',
+    }
+    const canonical = canonicalizeMembershipEntitlementPayload(payload)
+    const snapshot = {
+      payload: Buffer.from(canonical).toString('base64url'),
+      signature: sign(null, Buffer.from(canonical), key.privateKey).toString('base64url'),
+    }
+    const verifyAt = (now: string) => new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        membership: { publicKey: key.publicKey, generation: 2, status: 'active' },
+      },
+      now: () => Date.parse(now),
+    }).verify('alice', snapshot)
+
+    expect(verifyAt(payload.issuedAt)).toMatchObject({
+      status: 'active',
+      expiresAt: payload.refreshAfter,
+      graceEndsAt: payload.offlineGraceEndsAt,
+    })
+    expect(verifyAt('2026-08-30T04:53:00.970Z')).toMatchObject({
+      tier: 'member', status: 'offline_grace',
+    })
+    expect(verifyAt('2026-09-02T04:48:00.970Z')).toMatchObject({
+      tier: 'free', status: 'expired', cloudEnabled: false,
+      limits: { knowledgeBases: 1, knowledgeDocuments: 1 },
+    })
+  })
+
   it('fails closed for a snapshot whose expiry precedes issuance', () => {
     const { key, payload, verifier } = fixture()
     const invalid = JSON.stringify({

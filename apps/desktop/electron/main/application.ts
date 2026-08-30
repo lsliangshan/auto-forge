@@ -860,7 +860,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }, delay)
     membershipRefreshTimer.unref?.()
   }
-  const refreshMembershipEntitlement = async (session: AuthSession): Promise<void> => {
+  const refreshMembershipEntitlement = async (
+    session: AuthSession,
+    force = false,
+  ): Promise<void> => {
     if (!membershipSource) {
       await knowledge?.refreshEntitlement?.(
         session.user.id,
@@ -869,7 +872,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       )
       return
     }
-    if (membershipRefreshDueAt > Date.now()) return
+    if (!force && membershipRefreshDueAt > Date.now()) return
     try {
       const refreshed = await membershipSource.refreshCurrent()
       await knowledge?.refreshEntitlement?.(session.user.id, refreshed.entitlement, true)
@@ -1910,7 +1913,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     membership: {
       getCurrent: () => memberships.getCurrent(),
       getTarget: (targetUserId) => memberships.getTarget(targetUserId),
-      mutate: (input) => memberships.mutate(input),
+      mutate: async (input) => {
+        const result = await memberships.mutate(input)
+        const session = await auth.requireSession().catch(() => null)
+        if (session?.user.id === input.targetUserId
+          && boundUserId === session.user.id
+          && knowledge?.refreshEntitlement) {
+          await refreshMembershipEntitlement(session, true)
+        }
+        return result
+      },
       listAudit: (input) => memberships.listAudit(input),
     },
     profile: {

@@ -13,7 +13,7 @@ const stableErrorCodes = new Set([
   'INTERNAL_ERROR',
 ])
 
-const filterFields = new Set(['username', 'displayName', 'userId', 'email', 'phone'])
+const filterFields = new Set(['keyword', 'username', 'displayName', 'userId', 'email', 'phone'])
 const assignableRoles = new Set(['user', 'super_admin'])
 
 function isRecord(value) {

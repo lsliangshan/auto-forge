@@ -96,10 +96,7 @@ export class CloudBaseMembershipService implements MembershipControlService {
   }
 
   async mutate(input: Parameters<DesktopAPI['membership']['mutate']>[0]) {
-    const session = await this.requireManageMemberships()
-    if (input.targetUserId === session.user.id) {
-      throw toSafeAppError({ code: 'SELF_MEMBERSHIP_CHANGE_FORBIDDEN' })
-    }
+    await this.requireManageMemberships()
     const parsed = membershipMutationResponseSchema.safeParse(await this.invoke({
       action: 'mutate', operation: input.action,
       ...Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'action')),

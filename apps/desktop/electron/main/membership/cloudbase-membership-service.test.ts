@@ -36,19 +36,31 @@ describe('CloudBaseMembershipService', () => {
     })
   })
 
-  it('requires confirmed manage_memberships and forbids self mutation in Main', async () => {
+  it('requires confirmed manage_memberships and allows an authorized admin to mutate their membership', async () => {
     const functions = { callFunction: vi.fn() }
     const denied = new CloudBaseMembershipService({ requireSession: async () => session() }, functions)
     await expect(denied.getTarget('user_2')).rejects.toMatchObject({ code: 'FORBIDDEN' })
 
+    functions.callFunction.mockResolvedValue({
+      result: { ok: true, data: { status: 'applied', membership: summary } },
+    })
     const allowed = new CloudBaseMembershipService({
       requireSession: async () => session(['manage_memberships']),
     }, functions)
-    await expect(allowed.mutate({
+    const mutation = {
       action: 'revoke', requestId: 'request_1', targetUserId: 'user_1', expectedVersion: 1,
       reasonCode: 'risk_revocation',
-    })).rejects.toMatchObject({ code: 'SELF_MEMBERSHIP_CHANGE_FORBIDDEN' })
-    expect(functions.callFunction).not.toHaveBeenCalled()
+    } as const
+    await expect(allowed.mutate(mutation)).resolves.toEqual({
+      status: 'applied', membership: summary,
+    })
+    expect(functions.callFunction).toHaveBeenCalledWith({
+      name: 'autoforge-membership',
+      data: {
+        action: 'mutate', operation: 'revoke', requestId: 'request_1',
+        targetUserId: 'user_1', expectedVersion: 1, reasonCode: 'risk_revocation',
+      },
+    })
   })
 
   it('maps narrow admin calls and rejects malformed cloud responses', async () => {

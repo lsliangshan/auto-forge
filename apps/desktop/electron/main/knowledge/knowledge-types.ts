@@ -2,6 +2,7 @@ import type {
   KnowledgeAvailability,
   KnowledgeBaseSummary,
   KnowledgeConsentState,
+  KnowledgeDocumentPreview,
   KnowledgeDocumentSummary,
   KnowledgeEntitlementState,
   KnowledgeRetentionSelection,
@@ -45,6 +46,7 @@ export interface KnowledgeService {
   getConsent(owner: KnowledgeOwner, provider?: ModelProviderId): Promise<KnowledgeConsentState>
   setConsent(owner: KnowledgeOwner, provider: ModelProviderId, status: 'granted' | 'denied'): Promise<KnowledgeConsentState>
   revokeConsent(owner: KnowledgeOwner, provider: ModelProviderId): Promise<KnowledgeConsentState>
+  getDocumentPreview(owner: KnowledgeOwner, documentId: string): Promise<KnowledgeDocumentPreview>
   getSourcePreview(owner: KnowledgeOwner, input: KnowledgeSourcePreviewRequest): Promise<KnowledgeSourcePreview>
 }
 
@@ -86,6 +88,7 @@ export function createUnavailableKnowledgeService(): KnowledgeService {
     getConsent: async () => ({ provider: 'openrouter', status: 'unknown' }),
     setConsent: async () => unavailable(),
     revokeConsent: async () => unavailable(),
+    getDocumentPreview: async () => ({ kind: 'unavailable' }),
     getSourcePreview: async () => ({ kind: 'unavailable' }),
   }
 }

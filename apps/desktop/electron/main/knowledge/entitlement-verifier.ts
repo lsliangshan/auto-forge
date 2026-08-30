@@ -215,20 +215,29 @@ export class KnowledgeEntitlementVerifier {
       if (issuedAt > observedAt) fail('FORBIDDEN')
       if (configuredKey.retiredAt !== undefined && issuedAt > configuredKey.retiredAt) fail('FORBIDDEN')
 
-      let status: VerifiedKnowledgeEntitlement['status'] = membership.data.effectiveStatus === 'revoked'
-        ? 'expired'
-        : membership.data.effectiveStatus
-      if (status === 'active' && membership.data.planId === 'pro'
-        && membership.data.termEndsAt !== null
-        && observedAt > Date.parse(membership.data.termEndsAt)) {
-        status = observedAt <= Date.parse(membership.data.offlineGraceEndsAt)
-          ? 'offline_grace'
-          : 'expired'
+      const refreshAfter = Date.parse(membership.data.refreshAfter)
+      const termEndsAt = membership.data.termEndsAt === null
+        ? undefined
+        : Date.parse(membership.data.termEndsAt)
+      const activeUntil = termEndsAt === undefined
+        ? refreshAfter
+        : Math.min(refreshAfter, termEndsAt)
+      const offlineGraceEndsAt = Date.parse(membership.data.offlineGraceEndsAt)
+      let status: VerifiedKnowledgeEntitlement['status']
+      if (membership.data.effectiveStatus === 'active') {
+        status = observedAt <= activeUntil
+          ? 'active'
+          : observedAt <= offlineGraceEndsAt ? 'offline_grace' : 'expired'
+      } else if (membership.data.effectiveStatus === 'offline_grace') {
+        status = observedAt <= offlineGraceEndsAt ? 'offline_grace' : 'expired'
+      } else {
+        status = membership.data.effectiveStatus === 'unavailable' ? 'unavailable' : 'expired'
       }
-      if (observedAt > Date.parse(membership.data.offlineGraceEndsAt)
-        && status === 'offline_grace') status = 'expired'
       const member = membership.data.planId === 'pro'
         && (status === 'active' || status === 'offline_grace')
+      const limits = membership.data.planId === 'pro' && !member
+        ? { knowledgeBases: 1, knowledgeDocuments: 1, knowledgeFileBytes: 67_108_864 }
+        : membership.data.limits
       return Object.freeze({
         tier: member ? 'member' : 'free',
         status,
@@ -237,10 +246,10 @@ export class KnowledgeEntitlementVerifier {
         cloudEnabled: member && membership.data.cloudEligible,
         planId: membership.data.planId,
         membershipVersion: membership.data.membershipVersion,
-        limits: Object.freeze({ ...membership.data.limits }),
+        limits: Object.freeze({ ...limits }),
         issuedAt: membership.data.issuedAt,
-        ...(membership.data.termEndsAt !== null ? {
-          expiresAt: membership.data.termEndsAt,
+        ...(membership.data.planId === 'pro' ? {
+          expiresAt: new Date(activeUntil).toISOString(),
           graceEndsAt: membership.data.offlineGraceEndsAt,
         } : {}),
         keyId: membership.data.keyId,

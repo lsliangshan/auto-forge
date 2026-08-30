@@ -285,6 +285,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   registerKnowledge(ipcChannels.knowledgeRevokeConsent, (owner, input) => (
     options.services.knowledge.revokeConsent(owner, input.provider)
   ))
+  registerKnowledge(ipcChannels.knowledgeGetDocumentPreview, (owner, input) => (
+    options.services.knowledge.getDocumentPreview(owner, input.documentId)
+  ))
   registerKnowledge(ipcChannels.knowledgeGetSourcePreview, (owner, input) => (
     options.services.knowledge.getSourcePreview(owner, input)
   ))

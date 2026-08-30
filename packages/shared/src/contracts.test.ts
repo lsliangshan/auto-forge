@@ -787,6 +787,11 @@ describe('cross-process contracts', () => {
       pageSize: 50,
       filter: { field: 'email', value: 'admin@example.com' },
     })).toEqual({ page: 2, pageSize: 50, filter: { field: 'email', value: 'admin@example.com' } })
+    expect(userAdminListRequestSchema.parse({
+      page: 1,
+      pageSize: 20,
+      filter: { field: 'keyword', value: 'Alice' },
+    })).toEqual({ page: 1, pageSize: 20, filter: { field: 'keyword', value: 'Alice' } })
     expect(userAdminListRequestSchema.safeParse({ page: 1, pageSize: 25 }).success).toBe(false)
     expect(userAdminListRequestSchema.safeParse({
       page: 1, pageSize: 20, filter: { field: 'all', value: 'alice' }, extra: true,
@@ -2048,6 +2053,23 @@ describe('cross-process contracts', () => {
     expect(ipcRequestSchemas[ipcChannels.knowledgeGetSourcePreview].safeParse({
       evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
       coordinate: { kind: 'text', line: 2, startOffset: 0, endOffset: 6 }, ownerId: 'forged',
+    }).success).toBe(false)
+    expect(ipcRequestSchemas[ipcChannels.knowledgeGetDocumentPreview].safeParse({
+      documentId: 'document_1',
+    }).success).toBe(true)
+    expect(ipcRequestSchemas[ipcChannels.knowledgeGetDocumentPreview].safeParse({
+      documentId: 'document_1', path: '/tmp/private',
+    }).success).toBe(false)
+    const originalBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46])
+    expect(ipcResponseSchemas[ipcChannels.knowledgeGetDocumentPreview].parse({
+      kind: 'original', mimeType: 'application/pdf', bytes: originalBytes,
+      fallback: { content: '经过清洗的文档内容', truncated: false },
+    })).toEqual({
+      kind: 'original', mimeType: 'application/pdf', bytes: originalBytes,
+      fallback: { content: '经过清洗的文档内容', truncated: false },
+    })
+    expect(ipcResponseSchemas[ipcChannels.knowledgeGetDocumentPreview].safeParse({
+      kind: 'original', mimeType: 'application/pdf', bytes: [0x25, 0x50],
     }).success).toBe(false)
   })
 

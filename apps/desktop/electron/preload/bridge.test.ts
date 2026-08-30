@@ -317,14 +317,16 @@ describe('preload desktop bridge', () => {
     expect(JSON.stringify(app.api)).not.toContain('/private')
   })
 
-  it('exposes only fixed Provider-consent and lazy source-preview knowledge calls', async () => {
+  it('exposes only fixed Provider-consent and bounded preview knowledge calls', async () => {
     const app = harness()
     vi.mocked(app.ipcRenderer.invoke)
       .mockResolvedValueOnce({ provider: 'deepseek', status: 'granted' })
       .mockResolvedValueOnce({ provider: 'deepseek', status: 'unknown' })
+      .mockResolvedValueOnce({ kind: 'available', content: '文档预览', truncated: false })
       .mockResolvedValueOnce({ kind: 'available', preview: '最小原文' })
     await app.api.knowledge.setConsent('deepseek', 'granted')
     await app.api.knowledge.revokeConsent('deepseek')
+    await app.api.knowledge.getDocumentPreview('document_1')
     await app.api.knowledge.getSourcePreview({
       evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
       coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 4 },
@@ -335,7 +337,10 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeRevokeConsent, {
       provider: 'deepseek',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.knowledgeGetSourcePreview, {
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.knowledgeGetDocumentPreview, {
+      documentId: 'document_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.knowledgeGetSourcePreview, {
       evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
       coordinate: { kind: 'text', line: 1, startOffset: 0, endOffset: 4 },
     })

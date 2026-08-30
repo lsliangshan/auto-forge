@@ -47,11 +47,12 @@ test('runs local knowledge, degradation, expiry, and Provider-switch paths throu
     await expect(page.getByText('新会话', { exact: true })).toBeVisible()
 
     await page.getByRole('link', { name: '知识库' }).click()
-    await page.getByRole('button', { name: '新建', exact: true }).click()
+    await page.getByTestId('knowledge-create-toggle').click()
     await page.getByRole('textbox', { name: '知识库名称' }).fill('发布门禁资料')
     await page.getByRole('button', { name: '创建', exact: true }).click()
-    await page.getByRole('button', { name: '导入', exact: true }).click()
-    await expect(page.getByTestId('knowledge-document-pane').getByText('可检索', { exact: true })).toBeVisible()
+    await page.getByTestId('knowledge-import').click()
+    await expect(page.getByTestId('knowledge-tree').getByTestId(/^knowledge-document-/)
+      .getByText('可检索', { exact: true })).toBeVisible()
 
     const availability = await command<{
       encryption: { available: boolean }; parser: { available: boolean }; cloud: { available: boolean }
