@@ -31,6 +31,7 @@ import type { ResolvedChatRoute } from './multimodal-router.js'
 import {
   assertAttachmentByteAccess,
   assertProtectedProviderSnapshot,
+  createProviderAttachmentProjection,
   type ProviderAttachmentDisclosure,
 } from './provider-attachment-disclosure.js'
 
@@ -296,6 +297,9 @@ export class MediaGenerationOrchestrator {
       input.conversationId,
       input.route.assets.map((asset) => asset.id),
     )
+    if (input.attachmentDisclosure) {
+      createProviderAttachmentProjection(input.attachmentDisclosure, input.route.provider, modelInputs)
+    }
     if (modelInputs.some((asset) => asset.kind !== 'image')) {
       throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
     }
@@ -423,6 +427,9 @@ export class MediaGenerationOrchestrator {
       input.conversationId,
       input.route.assets.map((asset) => asset.id),
     )
+    const protectedProjection = input.attachmentDisclosure === undefined
+      ? undefined
+      : createProviderAttachmentProjection(input.attachmentDisclosure, input.route.provider, modelInputs)
     if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
     const writer = await this.dependencies.media.createGeneratedWriter({
       conversationId: input.conversationId,
@@ -437,13 +444,10 @@ export class MediaGenerationOrchestrator {
     let finishReason: string | undefined
     let generationId: string | undefined
     let usage: { inputTokens?: number; outputTokens?: number; costUsd?: string } | undefined
-    const content = [
+    const content = protectedProjection?.content ?? [
       { type: 'text' as const, text: input.prompt },
       ...modelInputs.map(({ kind, mimeType, dataBase64 }) => ({
-        type: 'media' as const,
-        kind,
-        mimeType,
-        dataBase64,
+        type: 'media' as const, kind, mimeType, dataBase64,
       })),
     ]
     const operationKey = `audio:${input.requestId}`

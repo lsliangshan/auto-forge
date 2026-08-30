@@ -92,6 +92,7 @@ const DIRECT_OBJECT_ENTITY = new RegExp(
 )
 const RESERVED_SUMMARY_LABEL = /(?:附\s*件|目\s*标\s*格\s*式)/iu
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
+const REFERENCE_IMAGE_STYLE_EDIT = /(?:把)?(?:这个|这张|该|当前)?(?:图片|图像|照片)(?:做成|制作成?)[^，,；;。.!！？?]{0,24}(?:水彩|油画|素描|电影感|日落)|\b(?:make|edit|transform)\s+(?:this|the)\s+image\b[^,;.!?]{0,48}\b(?:cinematic|watercolou?r|sunset|painting|sketch)\b|\bcreate\s+(?:an?\s+)?new\s+image\s+based\s+on\s+(?:this|the)\s+image\b/iu
 
 function conversionActionIsNegated(
   clause: string,
@@ -362,11 +363,13 @@ export function anonymizeAttachmentNames(
   attachments: readonly LocalAttachmentProjection[],
 ): string {
   return [...attachments]
+    .map((attachment) => ({ ...attachment, name: attachment.name.normalize('NFKC') }))
     .filter(({ name }) => name.length > 0)
     .sort((left, right) => right.name.length - left.name.length)
-    .reduce((value, attachment) => (
-      value.split(attachment.name).join(`文件-${attachment.index + 1}`)
-    ), text)
+    .reduce((value, attachment) => value.replace(
+      new RegExp(attachment.name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'giu'),
+      `文件-${attachment.index + 1}`,
+    ), text.normalize('NFKC'))
 }
 
 export function hasLocalConversionIntent(
@@ -486,6 +489,7 @@ export function classifyAttachmentConversionIntent(
 ): AttachmentConversionIntent {
   if (attachments.length === 0) return 'ordinary'
   const normalized = text.trim().normalize('NFKC').replace(/[‘’]/gu, "'")
+  if (REFERENCE_IMAGE_STYLE_EDIT.test(normalized)) return 'ordinary'
   const informationalScope = /^\s*(?:(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b|(?:如何|怎么))/iu.test(normalized)
   const explicitRestart = /\b(?:otherwise|then|directly|just|please)\b[^,;.!?]{0,48}\b(?:convert|transcode|save|export)\b|\b(?:i\s+(?:would|want|need)|(?:can|could|would)\s+you)\b[^,;.!?]{0,48}\b(?:convert|transcode|save|export)\b|(?:然后|但是|但|请|直接|立即|马上)[^，,；;。.!！？?]{0,32}(?:转换|转成|转为|另存|保存|导出|输出)/iu.test(normalized)
   if (informationalScope && !explicitRestart && hasConversionRiskSignal(normalized)) {

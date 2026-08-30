@@ -1,40 +1,91 @@
+import { createHash } from 'node:crypto'
 import type { ModelProviderId } from '@autoforge/shared'
+import type { ModelMediaInput } from '../media/media-asset-service.js'
+import {
+  providerAttachmentAccess,
+  type ProviderAttachmentAccessContext,
+  type ProviderAttachmentAccessDecision,
+} from './attachment-conversion-policy.js'
+import { projectAttachmentInputs } from './file-attachment-projection.js'
+import {
+  anonymizeAttachmentNames,
+  classifyAttachmentConversionIntent,
+  projectLocalConversionPrompt,
+  type LocalAttachmentProjection,
+} from './local-conversion-intent.js'
 import type {
+  ModelContentPart,
   ModelImageRequest,
+  ModelMessage,
   ModelProvider,
   ModelProviderSnapshot,
+  ModelStreamEvent,
   ModelStreamRequest,
   ModelVideoRequest,
 } from './model-provider.js'
-import {
-  isIssuedProviderAttachmentAccessDecision,
-  type ProviderAttachmentAccessDecision,
-} from './attachment-conversion-policy.js'
 
 export type ProviderAttachmentPurpose = 'main' | 'title'
-
-export interface ProviderAttachmentDisclosure {
-  readonly requestId: string
-  readonly providerId: ModelProviderId
-  readonly credentialEpoch: number
-  readonly access: ProviderAttachmentAccessDecision
-  readonly assetIds: readonly string[]
-  readonly assetFingerprints: readonly string[]
-  readonly forbiddenValues: readonly string[]
-}
 
 export interface ProviderAttachmentSafeText {
   readonly text: string
 }
 
-interface CreateProviderAttachmentDisclosureInput {
-  requestId: string
-  providerSnapshot: ModelProviderSnapshot
-  credentialEpoch: number
-  access: ProviderAttachmentAccessDecision
-  assetIds: readonly string[]
-  assetFingerprints: readonly string[]
-  forbiddenValues: readonly string[]
+export interface ProviderAttachmentProjection {
+  readonly content: string | ModelContentPart[]
+}
+
+export interface AttachmentPrivacyPlan {
+  readonly requestId: string
+  readonly access: ProviderAttachmentAccessDecision
+  readonly assetIds: readonly string[]
+  readonly assetFingerprints: readonly string[]
+  readonly forbiddenValues: readonly string[]
+  readonly mainText: string
+  readonly titleText: string
+}
+
+export interface ProviderAttachmentDisclosure extends AttachmentPrivacyPlan {
+  readonly providerId: ModelProviderId
+  readonly credentialEpoch: number
+  readonly mainSafeText: ProviderAttachmentSafeText
+  readonly titleSafeText: ProviderAttachmentSafeText
+}
+
+export interface AttachmentDisclosurePlanAsset extends LocalAttachmentProjection {
+  readonly id: string
+  readonly fingerprint: string
+  readonly forbiddenValues?: readonly string[]
+}
+
+export interface CreateAttachmentDisclosurePlanInput {
+  readonly requestId: string
+  readonly text: string
+  readonly context: ProviderAttachmentAccessContext
+  readonly attachments: readonly AttachmentDisclosurePlanAsset[]
+}
+
+export interface ProviderAttachmentDisclosureAuthority {
+  createPlan(input: CreateAttachmentDisclosurePlanInput): AttachmentPrivacyPlan
+  bindProvider(
+    plan: AttachmentPrivacyPlan,
+    providerSnapshot: ModelProviderSnapshot,
+  ): ProviderAttachmentDisclosure
+  revokeProvider(providerId: ModelProviderId): void
+}
+
+interface PrivacyPlanAuthority {
+  readonly originalText: string
+  readonly originalTextHash: string
+  readonly attachments: readonly AttachmentDisclosurePlanAsset[]
+  readonly attachmentKinds: readonly ProviderAttachmentAccessContext['attachmentKinds'][number][]
+}
+
+interface DisclosureAuthority extends PrivacyPlanAuthority {
+  readonly snapshot: ModelProviderSnapshot
+  readonly apiKeyFingerprint?: string
+  readonly currentCredentialEpoch: () => number
+  readonly credentialProtected: boolean
+  readonly revocation: AbortController
 }
 
 interface AttachmentDisclosureBinding {
@@ -44,26 +95,39 @@ interface AttachmentDisclosureBinding {
   assetFingerprints: readonly string[]
 }
 
-interface DisclosureAuthority {
-  readonly snapshot: ModelProviderSnapshot
-  readonly apiKeyFingerprint?: string
-}
-
 interface ProtectedSnapshotBinding {
   readonly disclosure: ProviderAttachmentDisclosure
   readonly purpose: ProviderAttachmentPurpose
 }
 
 const issuedDisclosures = new WeakSet<object>()
+const issuedPrivacyPlans = new WeakSet<object>()
+const privacyPlanAuthorities = new WeakMap<object, PrivacyPlanAuthority>()
 const disclosureAuthorities = new WeakMap<object, DisclosureAuthority>()
 const issuedSafeTexts = new WeakMap<object, {
   disclosure: ProviderAttachmentDisclosure
   purpose: ProviderAttachmentPurpose
 }>()
+const disclosureProjectionPayloads = new WeakMap<object, Set<string>>()
 const protectedSnapshots = new WeakMap<object, ProtectedSnapshotBinding>()
 
 function sameValues(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function sha256(value: Uint8Array | string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function assertLive(disclosure: ProviderAttachmentDisclosure): DisclosureAuthority {
+  const authority = disclosureAuthorities.get(disclosure)
+  if (!authority || (authority.credentialProtected && (
+    authority.revocation.signal.aborted
+    || authority.currentCredentialEpoch() !== disclosure.credentialEpoch
+  ))) {
+    throw new Error('Attachment disclosure capability has been revoked')
+  }
+  return authority
 }
 
 function assertIssued(
@@ -83,53 +147,169 @@ function assertIssued(
     || !sameValues(disclosure.assetFingerprints, binding.assetFingerprints)) {
     throw new Error('Attachment disclosure capability is missing or invalid')
   }
+  assertLive(disclosure)
 }
 
-export function createProviderAttachmentDisclosure(
-  input: CreateProviderAttachmentDisclosureInput,
-): ProviderAttachmentDisclosure {
-  if (!isIssuedProviderAttachmentAccessDecision(input.access)) {
-    throw new Error('Attachment access decision is missing or invalid')
-  }
-  if (input.assetIds.length !== input.assetFingerprints.length
-    || new Set(input.assetIds).size !== input.assetIds.length
-    || !Number.isSafeInteger(input.credentialEpoch)
-    || input.credentialEpoch < 0) {
-    throw new Error('Attachment disclosure binding is invalid')
-  }
-  const disclosure = Object.freeze({
-    requestId: input.requestId,
-    providerId: input.providerSnapshot.providerId,
-    credentialEpoch: input.credentialEpoch,
-    access: input.access,
-    assetIds: Object.freeze([...input.assetIds]),
-    assetFingerprints: Object.freeze([...input.assetFingerprints]),
-    forbiddenValues: Object.freeze([...new Set(input.forbiddenValues.filter(Boolean))]),
-  })
-  issuedDisclosures.add(disclosure)
-  disclosureAuthorities.set(disclosure, {
-    snapshot: input.providerSnapshot,
-    ...(input.providerSnapshot.apiKeyFingerprint === undefined
-      ? {}
-      : { apiKeyFingerprint: input.providerSnapshot.apiKeyFingerprint }),
-  })
-  return disclosure
-}
-
-export function createProviderAttachmentSafeText(
+function issueSafeText(
   disclosure: ProviderAttachmentDisclosure,
   purpose: ProviderAttachmentPurpose,
   text: string,
 ): ProviderAttachmentSafeText {
-  assertIssued(disclosure, {
-    requestId: disclosure.requestId,
-    providerId: disclosure.providerId,
-    assetIds: disclosure.assetIds,
-    assetFingerprints: disclosure.assetFingerprints,
-  })
   const safeText = Object.freeze({ text })
   issuedSafeTexts.set(safeText, { disclosure, purpose })
   return safeText
+}
+
+export function createProviderAttachmentDisclosureAuthority(input: {
+  currentCredentialEpoch(providerId: ModelProviderId): number
+}): ProviderAttachmentDisclosureAuthority {
+  const active = new Map<ModelProviderId, Set<ProviderAttachmentDisclosure>>()
+  const authority: ProviderAttachmentDisclosureAuthority = {
+    createPlan(value: CreateAttachmentDisclosurePlanInput) {
+      const hasAttachments = value.attachments.length > 0
+      if (value.context.hasAttachments !== hasAttachments
+        || value.context.attachmentKinds.length !== value.attachments.length
+        || value.attachments.some((attachment, index) => (
+          attachment.index !== index || !attachment.id || !/^[a-f0-9]{64}$/u.test(attachment.fingerprint)
+        ))
+        || new Set(value.attachments.map(({ id }) => id)).size !== value.attachments.length) {
+        throw new Error('Attachment disclosure plan input is inconsistent')
+      }
+      const normalizedText = value.text.normalize('NFKC')
+      const attachments = Object.freeze(value.attachments.map((attachment) => Object.freeze({
+        ...attachment,
+        forbiddenValues: Object.freeze([...(attachment.forbiddenValues ?? [])]),
+      })))
+      const projections = attachments.map(({ index, name, mimeType, byteSize }) => ({
+        index, name, mimeType, byteSize,
+      }))
+      const access = providerAttachmentAccess(
+        classifyAttachmentConversionIntent(normalizedText, projections),
+        normalizedText,
+        value.context,
+      )
+      const plan = Object.freeze({
+        requestId: value.requestId,
+        access,
+        assetIds: Object.freeze(attachments.map(({ id }) => id)),
+        assetFingerprints: Object.freeze(attachments.map(({ fingerprint }) => fingerprint)),
+        forbiddenValues: Object.freeze([...new Set<string>(attachments.flatMap((attachment) => [
+          attachment.name,
+          attachment.id,
+          attachment.fingerprint,
+          ...(attachment.forbiddenValues ?? []),
+        ]).filter(Boolean))]),
+        mainText: projectLocalConversionPrompt(normalizedText, projections),
+        titleText: `用户：${anonymizeAttachmentNames(normalizedText, projections)}`,
+      })
+      issuedPrivacyPlans.add(plan)
+      privacyPlanAuthorities.set(plan, {
+        originalText: normalizedText,
+        originalTextHash: sha256(normalizedText),
+        attachments,
+        attachmentKinds: Object.freeze([...value.context.attachmentKinds]),
+      })
+      return plan
+    },
+    bindProvider(plan: AttachmentPrivacyPlan, providerSnapshot: ModelProviderSnapshot) {
+      const planAuthority = privacyPlanAuthorities.get(plan)
+      if (!issuedPrivacyPlans.has(plan) || !planAuthority || plan.access.decision === 'ambiguous') {
+        throw new Error('Attachment privacy plan cannot be bound to a Provider')
+      }
+      const credentialEpoch = input.currentCredentialEpoch(providerSnapshot.providerId)
+      if (!Number.isSafeInteger(credentialEpoch) || credentialEpoch < 0) {
+        throw new Error('Attachment disclosure credential epoch is invalid')
+      }
+      const publicValue = {
+        ...plan,
+        providerId: providerSnapshot.providerId,
+        credentialEpoch,
+      }
+      const disclosure = publicValue as ProviderAttachmentDisclosure
+      const mainSafeText = issueSafeText(disclosure, 'main', plan.mainText)
+      const titleSafeText = issueSafeText(disclosure, 'title', plan.titleText)
+      Object.assign(publicValue, { mainSafeText, titleSafeText })
+      Object.freeze(publicValue)
+      issuedDisclosures.add(disclosure)
+      const revocation = new AbortController()
+      disclosureAuthorities.set(disclosure, {
+        ...planAuthority,
+        snapshot: providerSnapshot,
+        ...(providerSnapshot.apiKeyFingerprint === undefined
+          ? {}
+          : { apiKeyFingerprint: providerSnapshot.apiKeyFingerprint }),
+        currentCredentialEpoch: () => input.currentCredentialEpoch(providerSnapshot.providerId),
+        credentialProtected: planAuthority.attachments.length > 0,
+        revocation,
+      })
+      disclosureProjectionPayloads.set(disclosure, new Set())
+      if (planAuthority.attachments.length > 0) {
+        const providerPlans = active.get(disclosure.providerId) ?? new Set()
+        providerPlans.add(disclosure)
+        active.set(disclosure.providerId, providerPlans)
+      }
+      return disclosure
+    },
+    revokeProvider(providerId: ModelProviderId) {
+      const plans = active.get(providerId)
+      if (!plans) return
+      active.delete(providerId)
+      for (const disclosure of plans) disclosureAuthorities.get(disclosure)?.revocation.abort()
+    },
+  }
+  return Object.freeze(authority)
+}
+
+function decodeCanonicalBase64(value: string): Uint8Array {
+  const bytes = Buffer.from(value, 'base64')
+  if (bytes.toString('base64') !== value) throw new Error('Attachment projection contains invalid Base64')
+  return bytes
+}
+
+function assertInputsMatchPlan(
+  disclosure: ProviderAttachmentDisclosure,
+  inputs: readonly ModelMediaInput[],
+): void {
+  const authority = assertLive(disclosure)
+  if (inputs.length !== authority.attachments.length || inputs.some((mediaInput, index) => {
+    const attachment = authority.attachments[index]
+    return attachment === undefined
+      || mediaInput.assetId !== attachment.id
+      || mediaInput.name.normalize('NFKC') !== attachment.name.normalize('NFKC')
+      || mediaInput.mimeType !== attachment.mimeType
+      || mediaInput.kind !== authority.attachmentKinds[index]
+  })) {
+    throw new Error('Attachment projection metadata does not match the request')
+  }
+  assertAttachmentByteAccess(disclosure, {
+    requestId: disclosure.requestId,
+    providerId: disclosure.providerId,
+    assetIds: inputs.map(({ assetId }) => assetId),
+    assetFingerprints: inputs.map(({ dataBase64 }) => sha256(decodeCanonicalBase64(dataBase64))),
+  })
+}
+
+export function createProviderAttachmentProjection(
+  disclosure: ProviderAttachmentDisclosure,
+  provider: ModelProviderId,
+  inputs: readonly ModelMediaInput[],
+): ProviderAttachmentProjection {
+  const authority = assertLive(disclosure)
+  if (provider !== disclosure.providerId || sha256(authority.originalText) !== authority.originalTextHash) {
+    throw new Error('Attachment projection plan does not match the request')
+  }
+  assertInputsMatchPlan(disclosure, inputs)
+  const projected = projectAttachmentInputs(provider, inputs)
+  const content: string | ModelContentPart[] = projected.length === 0
+    ? authority.originalText
+    : [
+        ...(authority.originalText ? [{ type: 'text' as const, text: authority.originalText }] : []),
+        ...projected,
+      ]
+  deepFreezeRequestValue(content)
+  const projection = Object.freeze({ content })
+  disclosureProjectionPayloads.get(disclosure)!.add(JSON.stringify(content))
+  return projection
 }
 
 export function assertAttachmentByteAccess(
@@ -142,34 +322,37 @@ export function assertAttachmentByteAccess(
   }
 }
 
-function deepFreezeRequestValue(value: unknown, signal: AbortSignal | undefined): void {
+function deepFreezeRequestValue(value: unknown, signal?: AbortSignal): void {
   if (!value || typeof value !== 'object' || value === signal || Object.isFrozen(value)) return
   for (const child of Object.values(value)) deepFreezeRequestValue(child, signal)
   Object.freeze(value)
 }
 
-function cloneAndFreezeRequest<T extends ModelStreamRequest | ModelImageRequest | ModelVideoRequest>(request: T): T {
+function combinedSignal(signal: AbortSignal | undefined, revocation: AbortSignal): AbortSignal {
+  return signal === undefined ? revocation : AbortSignal.any([signal, revocation])
+}
+
+function cloneAndFreezeRequest<T extends ModelStreamRequest | ModelImageRequest | ModelVideoRequest>(
+  request: T,
+  revocation: AbortSignal,
+): T {
   const { signal, ...cloneable } = request
   const outbound = {
     ...structuredClone(cloneable),
-    ...(signal === undefined ? {} : { signal }),
+    signal: combinedSignal(signal, revocation),
   } as T
-  deepFreezeRequestValue(outbound, signal)
+  deepFreezeRequestValue(outbound, outbound.signal)
   return outbound
 }
 
 function assertSafeText(
   disclosure: ProviderAttachmentDisclosure,
   purpose: ProviderAttachmentPurpose,
-  safeText: ProviderAttachmentSafeText | undefined,
   request: ModelStreamRequest,
 ): void {
-  if (disclosure.access.decision === 'ordinary') return
-  if (safeText === undefined) {
-    throw new Error('Protected attachment request is missing signed text')
-  }
+  const safeText = purpose === 'main' ? disclosure.mainSafeText : disclosure.titleSafeText
   const binding = issuedSafeTexts.get(safeText)
-  if (!binding || binding.disclosure !== disclosure || binding.purpose !== purpose) {
+  if (binding?.disclosure !== disclosure || binding.purpose !== purpose) {
     throw new Error('Protected attachment request is missing signed text')
   }
   const userMessages = request.messages.filter(({ role }) => role === 'user')
@@ -178,22 +361,44 @@ function assertSafeText(
   }
 }
 
+function hasStructuredAttachment(message: ModelMessage): boolean {
+  return Array.isArray(message.content) && message.content.some((part) => part.type !== 'text')
+}
+
+function assertOrdinaryProjection(
+  disclosure: ProviderAttachmentDisclosure,
+  request: ModelStreamRequest,
+): void {
+  if (disclosure.assetIds.length === 0) return
+  const userMessages = request.messages.filter(({ role }) => role === 'user')
+  const current = userMessages.at(-1)
+  const payload = JSON.stringify(current?.content)
+  if (!current || !disclosureProjectionPayloads.get(disclosure)?.has(payload)) {
+    throw new Error('Provider attachment projection is missing or invalid')
+  }
+  if (request.messages.some((message) => message !== current && hasStructuredAttachment(message))) {
+    throw new Error('Provider request contains an unsigned attachment projection')
+  }
+}
+
 function assertSafeStreamRequest(
   disclosure: ProviderAttachmentDisclosure,
   purpose: ProviderAttachmentPurpose,
-  safeText: ProviderAttachmentSafeText | undefined,
   request: ModelStreamRequest,
 ): void {
-  if (disclosure.access.decision === 'ordinary') return
-  assertSafeText(disclosure, purpose, safeText, request)
+  assertLive(disclosure)
+  if (disclosure.access.decision === 'ordinary') {
+    if (purpose === 'main') assertOrdinaryProjection(disclosure, request)
+    return
+  }
+  assertSafeText(disclosure, purpose, request)
   if (request.output?.type === 'audio') throw new Error('Protected attachment request must be text-only')
   if (disclosure.access.decision === 'ambiguous'
     && ((request.tools?.length ?? 0) > 0 || request.toolChoice !== undefined)) {
     throw new Error('Ambiguous attachment request cannot expose tools')
   }
   for (const message of request.messages) {
-    if (Array.isArray(message.content)
-      && message.content.some((part) => part.type !== 'text')) {
+    if (hasStructuredAttachment(message)) {
       throw new Error('Protected attachment request contains structured attachment data')
     }
   }
@@ -206,13 +411,49 @@ function assertSafeStreamRequest(
   }
 }
 
+function assertReferenceHashes(
+  disclosure: ProviderAttachmentDisclosure,
+  references: readonly { dataBase64: string }[],
+): void {
+  assertAttachmentByteAccess(disclosure, {
+    requestId: disclosure.requestId,
+    providerId: disclosure.providerId,
+    assetIds: disclosure.assetIds,
+    assetFingerprints: references.map(({ dataBase64 }) => sha256(decodeCanonicalBase64(dataBase64))),
+  })
+}
+
+function deferredProtectedStream(
+  source: ModelProvider,
+  disclosure: ProviderAttachmentDisclosure,
+  outbound: ModelStreamRequest,
+): AsyncIterable<ModelStreamEvent> {
+  return {
+    [Symbol.asyncIterator]() {
+      let iterator: AsyncIterator<ModelStreamEvent> | undefined
+      return {
+        async next() {
+          assertLive(disclosure)
+          if (outbound.signal?.aborted) throw new Error('Attachment disclosure capability has been revoked')
+          iterator ??= source.stream(outbound)[Symbol.asyncIterator]()
+          const result = await iterator.next()
+          assertLive(disclosure)
+          return result
+        },
+        async return() {
+          return iterator?.return === undefined
+            ? { done: true, value: undefined }
+            : await iterator.return()
+        },
+      }
+    },
+  }
+}
+
 export function protectProviderSnapshot(
   snapshot: ModelProviderSnapshot,
   disclosure: ProviderAttachmentDisclosure,
-  input: {
-    purpose: ProviderAttachmentPurpose
-    safeText?: ProviderAttachmentSafeText
-  },
+  input: { purpose: ProviderAttachmentPurpose },
 ): ModelProviderSnapshot {
   assertIssued(disclosure, {
     requestId: disclosure.requestId,
@@ -220,21 +461,10 @@ export function protectProviderSnapshot(
     assetIds: disclosure.assetIds,
     assetFingerprints: disclosure.assetFingerprints,
   })
-  const authority = disclosureAuthorities.get(disclosure)
-  if (!authority
-    || authority.snapshot !== snapshot
+  const authority = assertLive(disclosure)
+  if (authority.snapshot !== snapshot
     || authority.apiKeyFingerprint !== snapshot.apiKeyFingerprint) {
     throw new Error('Provider snapshot does not match the attachment disclosure capability')
-  }
-  if (disclosure.access.decision !== 'ordinary') {
-    const safeTextBinding = input.safeText === undefined
-      ? undefined
-      : issuedSafeTexts.get(input.safeText)
-    if (!safeTextBinding
-      || safeTextBinding.disclosure !== disclosure
-      || safeTextBinding.purpose !== input.purpose) {
-      throw new Error('Protected attachment snapshot is missing signed text')
-    }
   }
   const source = snapshot.provider
   let titleUsed = false
@@ -245,17 +475,21 @@ export function protectProviderSnapshot(
       if (input.purpose === 'title' && titleUsed) {
         throw new Error('Attachment title capability has already been used')
       }
-      const outbound = cloneAndFreezeRequest(request)
-      assertSafeStreamRequest(disclosure, input.purpose, input.safeText, outbound)
+      const outbound = cloneAndFreezeRequest(request, authority.revocation.signal)
+      assertSafeStreamRequest(disclosure, input.purpose, outbound)
       if (input.purpose === 'title') titleUsed = true
-      return source.stream(outbound)
+      return deferredProtectedStream(source, disclosure, outbound)
     },
     ...(source.generateImage === undefined ? {} : {
       generateImage: async (request) => {
         if (!disclosure.access.allowProviderBytes || input.purpose !== 'main') {
           throw new Error('Protected attachment request cannot generate image output')
         }
-        return source.generateImage!(cloneAndFreezeRequest(request))
+        const outbound = cloneAndFreezeRequest(request, authority.revocation.signal)
+        assertReferenceHashes(disclosure, outbound.references)
+        const result = await source.generateImage!(outbound)
+        assertLive(disclosure)
+        return result
       },
     }),
     ...(source.submitVideo === undefined ? {} : {
@@ -263,7 +497,11 @@ export function protectProviderSnapshot(
         if (!disclosure.access.allowProviderBytes || input.purpose !== 'main') {
           throw new Error('Protected attachment request cannot submit video output')
         }
-        return source.submitVideo!(cloneAndFreezeRequest(request))
+        const outbound = cloneAndFreezeRequest(request, authority.revocation.signal)
+        assertReferenceHashes(disclosure, outbound.references)
+        const result = await source.submitVideo!(outbound)
+        assertLive(disclosure)
+        return result
       },
     }),
     ...(source.pollVideo === undefined ? {} : { pollVideo: source.pollVideo.bind(source) }),
@@ -272,10 +510,7 @@ export function protectProviderSnapshot(
       getGenerationUsage: source.getGenerationUsage.bind(source),
     }),
   }
-  const protectedSnapshot = Object.freeze({
-    ...snapshot,
-    provider: Object.freeze(provider),
-  })
+  const protectedSnapshot = Object.freeze({ ...snapshot, provider: Object.freeze(provider) })
   protectedSnapshots.set(protectedSnapshot, { disclosure, purpose: input.purpose })
   return protectedSnapshot
 }

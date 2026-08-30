@@ -56,6 +56,36 @@ describe('attachment conversion policy', () => {
   })
 
   it.each([
+    'describe this image, then reformat it as PDF',
+    'summarize this attachment and encode it as WebP',
+    'analyze this document; create a DOCX version of it',
+    '查看这个附件，然后把它变成PDF',
+    'transform this image into pdf',
+    'render this image to jpg',
+    'edit this image and export it as png',
+  ])('does not let one understanding clause authorize a transformation clause: %s', (text) => {
+    expect(providerAttachmentAccess('ordinary', text, {
+      hasAttachments: true,
+      requestedOutput: 'text',
+      attachmentKinds: ['image'],
+    }).decision).toBe('ambiguous')
+  })
+
+  it.each([
+    'read this PDF',
+    'describe this JPG',
+    'summarize this PDF',
+    '请阅读这个PDF',
+    '再读取这个文本附件',
+  ])('keeps a pure document-understanding request ordinary: %s', (text) => {
+    expect(providerAttachmentAccess('ordinary', text, {
+      hasAttachments: true,
+      requestedOutput: 'text',
+      attachmentKinds: ['file'],
+    })).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
+  })
+
+  it.each([
     'make this image cinematic',
     'make this image watercolor',
     'make this image look like sunset',

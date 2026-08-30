@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import type { AppErrorCode, ModelProviderId, WorkflowDetail } from '@autoforge/shared'
 import {
@@ -12,11 +13,10 @@ import { scopeHash } from '../permissions/policy-engine.js'
 import type { ConversationHistoryPort } from '../chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from '../chat/model-provider.js'
 import {
-  createProviderAttachmentDisclosure,
-  createProviderAttachmentSafeText,
+  createProviderAttachmentDisclosureAuthority,
+  createProviderAttachmentProjection,
   protectProviderSnapshot,
 } from '../chat/provider-attachment-disclosure.js'
-import { providerAttachmentAccess } from '../chat/attachment-conversion-policy.js'
 import {
   ProviderUsageConsistencyError,
   type Execution,
@@ -283,38 +283,52 @@ function protectedAttachmentRunInput(
   decision: 'local' | 'ordinary' = 'local',
 ): AgentRunInput {
   const requestId = input.requestId ?? 'request_attachment'
-  const provider = input.providerSnapshot.provider
+  const provider = input.providerSnapshot!.provider
   const providerSnapshot = {
     ...input.providerSnapshot,
+    providerId: input.provider,
     provider: {
       ...provider,
       listModels: provider.listModels ?? (async () => []),
       validateCredential: provider.validateCredential ?? (async () => ({ valid: true })),
     },
   }
-  const assetFingerprints = input.assetIds.map(() => 'b'.repeat(64))
-  const attachmentDisclosure = createProviderAttachmentDisclosure({
-    requestId,
-    providerSnapshot,
-    credentialEpoch: 0,
-    access: providerAttachmentAccess(decision, decision === 'ordinary'
-      ? '描述这个附件'
-      : 'convert this attachment to PDF', {
-      hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['image'],
-    }),
-    assetIds: input.assetIds,
-    assetFingerprints,
-    forbiddenValues: [],
+  const structuredParts = Array.isArray(input.modelContent)
+    ? input.modelContent.filter((part) => part.type === 'media' || part.type === 'file')
+    : []
+  const assetFingerprints = input.assetIds.map((_, index) => {
+    const part = structuredParts[index]
+    return part === undefined
+      ? 'b'.repeat(64)
+      : createHash('sha256').update(Buffer.from(part.dataBase64, 'base64')).digest('hex')
   })
-  const safeText = decision === 'ordinary'
-    ? undefined
-    : createProviderAttachmentSafeText(attachmentDisclosure, 'main', String(input.modelContent))
+  const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+  const plan = authority.createPlan({
+    requestId,
+    text: decision === 'ordinary' ? input.content : 'convert this attachment to PDF',
+    context: { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['image'] },
+    attachments: input.assetIds.map((id, index) => ({
+      index, id, name: `private-${index}.png`, mimeType: 'image/png', byteSize: 12,
+      fingerprint: assetFingerprints[index]!,
+    })),
+  })
+  const attachmentDisclosure = authority.bindProvider(plan, providerSnapshot)
+  if (decision === 'ordinary') {
+    createProviderAttachmentProjection(attachmentDisclosure, input.provider, structuredParts.map((part, index) => ({
+      assetId: input.assetIds[index]!,
+      kind: part.type === 'file' ? 'file' : part.kind,
+      mimeType: part.mimeType,
+      name: `private-${index}.png`,
+      dataBase64: part.dataBase64,
+    })))
+  }
   return {
     ...input,
     requestId,
+    ...(decision === 'local' ? { modelContent: attachmentDisclosure.mainSafeText.text } : {}),
     attachmentFingerprints: assetFingerprints,
     providerSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
-      purpose: 'main', ...(safeText === undefined ? {} : { safeText }),
+      purpose: 'main',
     }),
     attachmentDisclosure,
   }

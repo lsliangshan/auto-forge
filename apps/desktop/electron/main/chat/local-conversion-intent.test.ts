@@ -338,6 +338,16 @@ describe('local conversion intent', () => {
     expect(prompt).not.toContain('tax-return-secret.pdf')
   })
 
+  it('anonymizes every NFKC and case-equivalent attachment basename mention', () => {
+    const prompt = projectLocalConversionPrompt(
+      '转换 secret-file.pdf、SECRET-FILE.PDF 和 Secret-Ｆile.PDF',
+      [{ index: 0, name: 'Secret-Ｆile.PDF', mimeType: 'application/pdf', byteSize: 12 }],
+    )
+
+    expect(prompt).toContain('转换 文件-1、文件-1 和 文件-1')
+    expect(prompt.normalize('NFKC').toLocaleLowerCase('und')).not.toContain('secret-file.pdf')
+  })
+
   it('keeps a long non-conversion attachment request non-local', () => {
     const text = `总结这段对话 ${'ordinary context '.repeat(2_000)} 并描述附件`
     expect(hasLocalConversionIntent(text, attachments)).toBe(false)

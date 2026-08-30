@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -17,9 +18,8 @@ import type {
 } from '../media/media-asset-service.js'
 import type { ModelProvider, ModelProviderSnapshot } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
-import { providerAttachmentAccess } from './attachment-conversion-policy.js'
 import {
-  createProviderAttachmentDisclosure,
+  createProviderAttachmentDisclosureAuthority,
   protectProviderSnapshot,
 } from './provider-attachment-disclosure.js'
 import {
@@ -29,6 +29,7 @@ import {
 
 const temporaryDirectories: string[] = []
 const userDataManagers: UserDataStoreManager[] = []
+const referenceInputSha = createHash('sha256').update(Buffer.from('iVBORw0KGgo=', 'base64')).digest('hex')
 
 afterEach(() => {
   vi.useRealTimers()
@@ -71,18 +72,21 @@ const submitInput = {
 }
 
 function ordinaryAttachmentAuthority(snapshot: ModelProviderSnapshot, assetIds: string[]) {
-  const attachmentFingerprints = assetIds.map(() => 'a'.repeat(64))
-  const attachmentDisclosure = createProviderAttachmentDisclosure({
+  const attachmentFingerprints = assetIds.map(() => referenceInputSha)
+  const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+  const plan = authority.createPlan({
     requestId: submitInput.requestId,
-    providerSnapshot: snapshot,
-    credentialEpoch: 0,
-    access: providerAttachmentAccess('ordinary', '描述这个图片', {
-      hasAttachments: true, requestedOutput: 'video', attachmentKinds: ['image'],
-    }),
-    assetIds,
-    assetFingerprints: attachmentFingerprints,
-    forbiddenValues: [],
+    text: '描述这个图片',
+    context: {
+      hasAttachments: true, requestedOutput: 'video', attachmentKinds: assetIds.map(() => 'image'),
+    },
+    attachments: assetIds.map((id, index) => ({
+      index, id, name: id === 'reference_image' ? 'reference.png' : `${id}.png`,
+      mimeType: 'image/png', byteSize: 12,
+      fingerprint: attachmentFingerprints[index]!,
+    })),
   })
+  const attachmentDisclosure = authority.bindProvider(plan, snapshot)
   return {
     attachmentDisclosure,
     attachmentFingerprints,
@@ -1666,7 +1670,7 @@ describe('VideoJobRunner', () => {
       byteSize: 12,
       width: 1,
       height: 1,
-      sha256: 'a'.repeat(64),
+      sha256: referenceInputSha,
       status: 'ready',
       createdAt: 1,
       updatedAt: 1,

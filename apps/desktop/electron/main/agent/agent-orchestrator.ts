@@ -462,7 +462,7 @@ export interface AgentRunInput extends UsageAttribution {
   provider: ModelProviderId
   model: string
   requestId?: string
-  providerSnapshot: ModelProviderSnapshot
+  providerSnapshot?: ModelProviderSnapshot
 }
 
 export interface AgentRunResult {
@@ -837,9 +837,6 @@ export class AgentOrchestrator {
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const requestId = input.requestId ?? this.id()
-    if (input.providerSnapshot.providerId !== input.provider) {
-      throw appFailure('CONFLICT')
-    }
     if (this.activeByRequest.has(requestId) || this.activeByConversation.has(input.conversationId)) {
       const error = appFailure('CONFLICT')
       this.safeEmit({
@@ -854,6 +851,10 @@ export class AgentOrchestrator {
     this.activeByConversation.set(input.conversationId, requestId)
     let active: ActiveAgentRun | undefined
     try {
+      if (input.fixedResponse !== undefined) return this.runFixedResponse(input, requestId)
+      if (!input.providerSnapshot || input.providerSnapshot.providerId !== input.provider) {
+        throw appFailure('CONFLICT')
+      }
       if (input.assetIds.length > 0) {
         assertProtectedProviderSnapshot(input.providerSnapshot, input.attachmentDisclosure, {
           requestId,
@@ -933,10 +934,6 @@ export class AgentOrchestrator {
       }
       this.activeByRequest.set(requestId, active)
       this.activeByRun.set(runId, active)
-      if (input.fixedResponse !== undefined) {
-        this.appendText(active, input.fixedResponse)
-        return await this.terminalize(active, 'completed')
-      }
       const workflowToolsAllowed = input.allowTools && !EXPLICIT_WORKFLOW_OPTOUT.test(input.content)
       const browserToolsAllowed = input.allowTools
         && !input.localConversionOnly
@@ -2623,6 +2620,59 @@ export class AgentOrchestrator {
       ...(error ? { error } : {}),
     })
     return result
+  }
+
+  private runFixedResponse(input: AgentRunInput, requestId: string): AgentRunResult {
+    const userMessageId = this.id()
+    const runId = this.id()
+    const messageId = this.id()
+    const startedAt = this.now()
+    const blocks: ChatBlock[] = input.fixedResponse
+      ? [{ type: 'text', text: input.fixedResponse }]
+      : []
+    this.dependencies.persistence.persistUser({
+      messageId: userMessageId,
+      conversationId: input.conversationId,
+      blocks: input.userBlocks,
+      assetIds: input.assetIds,
+      createdAt: startedAt,
+    })
+    this.dependencies.persistence.createRun({
+      runId,
+      conversationId: input.conversationId,
+      requestId,
+      userId: input.userId,
+      provider: input.provider,
+      model: input.model,
+      startedAt,
+    })
+    this.dependencies.persistence.createAssistant({
+      messageId,
+      conversationId: input.conversationId,
+      initialBlocks: [],
+      createdAt: startedAt,
+    })
+    this.dependencies.persistence.updateAssistant(messageId, structuredClone(blocks))
+    if (blocks[0]) {
+      this.safeEmit({
+        type: 'block', conversationId: input.conversationId, messageId, block: blocks[0],
+      })
+    }
+    this.dependencies.persistence.finalize({
+      runId,
+      requestId,
+      messageId,
+      blocks,
+      status: 'completed',
+      endedAt: this.now(),
+    })
+    if (this.activeByConversation.get(input.conversationId) === requestId) {
+      this.activeByConversation.delete(input.conversationId)
+    }
+    this.safeEmit({
+      type: 'status', conversationId: input.conversationId, requestId, status: 'completed',
+    })
+    return { requestId, status: 'completed' }
   }
 
   private safeEmit(event: ChatEvent): void {

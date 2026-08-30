@@ -34,6 +34,7 @@ import type { ResolvedChatRoute } from './multimodal-router.js'
 import {
   assertAttachmentByteAccess,
   assertProtectedProviderSnapshot,
+  createProviderAttachmentProjection,
   type ProviderAttachmentDisclosure,
 } from './provider-attachment-disclosure.js'
 
@@ -382,6 +383,9 @@ export class VideoJobRunner {
         input.conversationId,
         input.assetIds,
       )
+      if (input.attachmentDisclosure) {
+        createProviderAttachmentProjection(input.attachmentDisclosure, input.route.provider, inputs)
+      }
       if (this.stopped || controller.signal.aborted) {
         throw toSafeAppError({ code: 'CANCELLED' })
       }
