@@ -3011,13 +3011,100 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversion_block_bindings'").get())
       .toBeDefined()
+    inspection.close()
+  })
+
+  it('strips queued provider projections that predate exact attachment selection', () => {
+    const root = temporaryRoot()
+    const path = cachePath(root, 'cloud-alice')
+    const sqlite = new Database(path)
+    const migrationNames = [
+      '0001_user_cache',
+      '0002_outbox_enqueue_sequence',
+      '0003_sync_receipt_evidence',
+      '0004_account_sync_projection',
+      '0005_legacy_import_identity',
+      '0006_legacy_import_identity_history',
+      '0007_attachment_kind',
+      '0008_conversion_block_binding_journal',
+      '0009_message_provider_projection',
+    ]
+    for (const [index, name] of migrationNames.entries()) {
+      sqlite.exec(readFileSync(new URL(
+        `../../../resources/user-cache-migrations/${name}.sql`,
+        import.meta.url,
+      ), 'utf8'))
+      sqlite.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(index + 1, index + 1)
+    }
+    const payload = {
+      id: 'legacy_projection_message',
+      conversationId: 'legacy_projection_conversation',
+      role: 'user',
+      blocks: [{ type: 'text', text: 'Convert private.pdf to PDF' }],
+      providerProjection: {
+        kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+      },
+      createdAt: '2026-08-24T00:01:00.000Z',
+    }
+    sqlite.prepare(`
+      INSERT INTO conversations (
+        id, title, title_state, user_id, revision, sync_state,
+        created_at, updated_at, last_activity_at, metadata_updated_at
+      ) VALUES (?, 'Legacy', 'pending', 'cloud-alice', 1, 'pending', 1, 1, 1, 1)
+    `).run(payload.conversationId)
+    sqlite.prepare(`
+      INSERT INTO messages (
+        id, conversation_id, role, blocks_json, provider_projection_json, ordinal, created_at
+      ) VALUES (?, ?, 'user', ?, ?, 1, 1)
+    `).run(
+      payload.id,
+      payload.conversationId,
+      JSON.stringify(payload.blocks),
+      JSON.stringify(payload.providerProjection),
+    )
+    sqlite.prepare(`
+      INSERT INTO outbox_mutations (
+        id, kind, entity_id, base_revision, payload_json, state, attempts,
+        occurred_at, created_at, enqueue_sequence
+      ) VALUES ('legacy_projection_outbox', 'message.append', ?, 1, ?, 'pending', 0, 1, 1, 1)
+    `).run(payload.id, JSON.stringify(payload))
+    sqlite.prepare(`
+      INSERT INTO sync_receipt_evidence (
+        mutation_id, kind, entity_id, base_revision, payload_json, occurred_at, created_at
+      ) VALUES ('legacy_projection_receipt', 'message.append', ?, 1, ?, 1, 1)
+    `).run(payload.id, JSON.stringify(payload))
+    sqlite.close()
+
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    expect(store.outbox.listReady(Date.now(), 10)).toContainEqual(expect.objectContaining({
+      id: 'legacy_projection_outbox',
+      payload: expect.not.objectContaining({ providerProjection: expect.anything() }),
+    }))
+    manager.close()
+
+    const inspection = new Database(path, { readonly: true })
+    expect(inspection.prepare(`
+      SELECT provider_projection_json AS providerProjectionJson
+      FROM messages WHERE id = ?
+    `).get(payload.id)).toEqual({ providerProjectionJson: null })
+    for (const table of ['outbox_mutations', 'sync_receipt_evidence']) {
+      const column = table === 'outbox_mutations' ? 'id' : 'mutation_id'
+      const id = table === 'outbox_mutations'
+        ? 'legacy_projection_outbox'
+        : 'legacy_projection_receipt'
+      const row = inspection.prepare(`SELECT payload_json AS payloadJson FROM ${table} WHERE ${column} = ?`)
+        .get(id) as { payloadJson: string }
+      expect(JSON.parse(row.payloadJson)).not.toHaveProperty('providerProjection')
+    }
     inspection.close()
   })
 
@@ -3097,7 +3184,7 @@ describe('UserDataStoreManager', () => {
 
     const inspection = new Database(path)
     expect(inspection.prepare('SELECT MAX(version) AS version FROM schema_migrations').get())
-      .toEqual({ version: 9 })
+      .toEqual({ version: 10 })
     expect(inspection.prepare(`
       SELECT revision, sync_state AS syncState, last_activity_at AS lastActivityAt,
              metadata_updated_at AS metadataUpdatedAt

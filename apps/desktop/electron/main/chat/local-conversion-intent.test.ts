@@ -109,6 +109,17 @@ describe('local conversion intent', () => {
   })
 
   it.each([
+    ['Convert report.pdf to .PDF', 'pdf'],
+    ['Convert report.pdf to .ico', 'ico'],
+    ['Convert report.pdf to .icns', 'icns'],
+    ['Convert report.pdf to WebP.', 'webp'],
+  ] as const)('does not split an extension target at its dot: %s', (text, targetFormat) => {
+    expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({
+      decision: 'local', targetFormat, selectedAttachmentIndexes: [0],
+    })
+  })
+
+  it.each([
     ['Convert both files to PDF', 1],
     ['Convert both files to PDF', 3],
     ['Convert these files to PDF', 1],

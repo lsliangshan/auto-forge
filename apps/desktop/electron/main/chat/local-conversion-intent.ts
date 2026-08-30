@@ -116,7 +116,7 @@ const AUTHORITY_CHINESE_REFERENCE = `(?:${AUTHORITY_FILE_REFERENCE}|(?:(?:这|�
 const AUTHORITY_ENGLISH_POLITE = `(?:(?:please\\s*,?\\s*)|(?:(?:can|could|would)\\s+you\\s+)|(?:i\\s+(?:want|need|would\\s+like)\\s+you\\s+to\\s+))?(?:(?:just|directly)\\s+)?`
 const AUTHORITY_TERMINAL = `(?:\\s+(?:formats?|files?))?\\s*[.!?]*`
 const AUTHORITY_CHINESE_TERMINAL = `(?:\\s*(?:格式|文件))?\\s*[。！!？?]*`
-const AUTHORITY_SEGMENT_SEPARATOR = /(?:[,，]\s*)?(?:\bthen\b|然后|随后)|[;；。.!！？?]/giu
+const AUTHORITY_SEGMENT_SEPARATOR = /(?:[,，]\s*)?(?:\bthen\b|然后|随后)|[;；。！？?]|[.!](?=\s|$)/giu
 const AUTHORITY_INFORMATION_SEGMENT = /^\s*(?:no\s+matter\s+what\b|how\s+(?:do|can|could|would|should)\b|(?:what|which)\s+formats?\b|(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b|如何|怎么|(?:(?:这个工具|该工具|它|你)\s*)?(?:支持|能否|能不能|能|可以|能够))/iu
 const AUTHORITY_NEGATED_SEGMENT = /^\s*(?:不要|不用|不需要|无需|不必|别|禁止|请勿|do\s+not\b|don't\b|never\b|no\s+need\s+to\b|need\s+not\b|needn't\b)/iu
 const AUTHORITY_COMMAND_CACHE = new Map<number, readonly RegExp[]>()
