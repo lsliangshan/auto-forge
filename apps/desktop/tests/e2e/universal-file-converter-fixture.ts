@@ -189,8 +189,9 @@ function currentUserText(request: ModelStreamRequest): string {
   return message.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n')
 }
 
-function workflowCallCount(request: ModelStreamRequest, name: string): number {
-  return request.messages.reduce((count, message) => (
+function currentTurnWorkflowCallCount(request: ModelStreamRequest, name: string): number {
+  const lastUserIndex = request.messages.findLastIndex((message) => message.role === 'user')
+  return request.messages.slice(lastUserIndex + 1).reduce((count, message) => (
     message.role === 'assistant'
       ? count + (message.tool_calls?.filter((call) => call.function.name === name).length ?? 0)
       : count
@@ -215,7 +216,7 @@ const deterministicProvider: CredentialBoundModelProvider = {
   async validateCredential() { return { valid: true } },
   async *stream(request: ModelStreamRequest) {
     const workflowTool = request.tools?.find((tool) => tool.function.description.includes('file.convert.universal@1.0.0'))
-    const calls = workflowTool ? workflowCallCount(request, workflowTool.function.name) : 0
+    const calls = workflowTool ? currentTurnWorkflowCallCount(request, workflowTool.function.name) : 0
     providerRequests.push({
       serialized: JSON.stringify({ messages: request.messages, tools: request.tools }),
       ...(workflowTool === undefined ? {} : { workflowToolName: workflowTool.function.name }),
@@ -227,18 +228,22 @@ const deterministicProvider: CredentialBoundModelProvider = {
       return
     }
     const userText = currentUserText(request)
-    const twoTargets = userText.includes('文档') && /PDF/iu.test(userText)
-    if (calls === 0) {
-      yield scriptedToolCall(workflowTool.function.name, { files: [0], targetFormat: 'ico', preset: 'favicon' })
+    const targetFormat = /\bico\b/iu.test(userText)
+      ? 'ico'
+      : /\bpdf\b/iu.test(userText)
+        ? 'pdf'
+        : undefined
+    if (targetFormat === 'ico' && calls === 0) {
+      yield scriptedToolCall(workflowTool.function.name, { files: [0], targetFormat: 'ico' })
       yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
       return
     }
-    if (twoTargets && calls === 1) {
-      yield scriptedToolCall(workflowTool.function.name, { files: [1], targetFormat: 'pdf' })
+    if (targetFormat === 'pdf' && calls === 0) {
+      yield scriptedToolCall(workflowTool.function.name, { files: [0], targetFormat: 'pdf' })
       yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
       return
     }
-    yield { type: 'text_delta', choiceIndex: 0, text: twoTargets ? '两个本地转换均已提交。' : '本地转换已提交。' }
+    yield { type: 'text_delta', choiceIndex: 0, text: '本地转换已提交。' }
     yield { type: 'finish', choiceIndex: 0, reason: 'stop' }
   },
   async acquireSnapshot() {

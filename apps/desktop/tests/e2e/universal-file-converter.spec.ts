@@ -187,7 +187,7 @@ test.describe.serial('universal file conversion through Electron', () => {
     cleanupRoots.clear()
   })
 
-  test('converts chat PNG and DOCX through two exact approvals and saves verified native copies', async () => {
+  test('fails closed on combined targets, then converts PNG and DOCX through exact approvals', async () => {
     const profile = await launchProfile()
     launchedProfiles.push(profile)
     const conversationId = await createConversation(profile)
@@ -196,6 +196,13 @@ test.describe.serial('universal file conversion through Electron', () => {
     await expect(profile.page.getByTestId('attachment-card').nth(1)).toContainText('sample.docx')
 
     await submitChat(profile.page, '把图片转成 favicon ico，把文档转成 PDF')
+    await expect(profile.page.getByText('请确认要转换哪个附件，以及希望转换成什么格式。我尚未读取或转换附件内容。'))
+      .toBeVisible()
+    await expect(profile.page.getByTestId('approval-card')).toHaveCount(0)
+    await command(profile.app, 'waitForIdle', { conversationId })
+
+    await attachFixtureFiles(profile, ['transparent-nonsquare.png', 'sample.docx'])
+    await submitChat(profile.page, '把 transparent-nonsquare.png 转成 ico')
 
     const firstApproval = profile.page.getByTestId('approval-card').filter({ hasText: '目标格式：ico' })
     await expect(firstApproval).toBeVisible()
@@ -203,11 +210,15 @@ test.describe.serial('universal file conversion through Electron', () => {
     await expect(firstApproval).not.toContainText('附件 1')
     await expect(profile.page.getByTestId('approve-once')).toHaveCount(1)
     await firstApproval.getByTestId('approve-once').click()
+    await command(profile.app, 'waitForIdle', { conversationId })
+
+    await attachFixtureFiles(profile, ['sample.docx'])
+    await submitChat(profile.page, '把 sample.docx 转成 PDF')
 
     const secondApproval = profile.page.getByTestId('approval-card').filter({ hasText: '目标格式：pdf' })
     await expect(secondApproval).toBeVisible()
-    await expect(secondApproval).toContainText('附件 1：sample.docx')
-    await expect(secondApproval).not.toContainText('附件 0')
+    await expect(secondApproval).toContainText('附件 0：sample.docx')
+    await expect(secondApproval).not.toContainText('附件 1')
     await expect(profile.page.getByTestId('approve-once')).toHaveCount(1)
     await secondApproval.getByTestId('approve-once').click()
     await command(profile.app, 'waitForIdle', { conversationId })
@@ -216,7 +227,9 @@ test.describe.serial('universal file conversion through Electron', () => {
     await expect(blocks).toHaveCount(2)
     await expect(blocks.filter({ hasText: 'ICO' })).toContainText('转换完成', { timeout: 60_000 })
     await expect(blocks.filter({ hasText: 'PDF' })).toContainText('转换完成', { timeout: 60_000 })
-    await expect(blocks.filter({ hasText: 'ICO' })).toContainText('图标规格: 16×16、32×32、48×48')
+    await expect(blocks.filter({ hasText: 'ICO' })).toContainText(
+      '图标规格: 16×16、24×24、32×32、48×48、64×64、128×128、256×256',
+    )
     await expect(profile.page.getByTestId('approval-card')).toHaveCount(2)
     await expect(profile.page.getByTestId('approve-once')).toHaveCount(0)
 
@@ -236,7 +249,11 @@ test.describe.serial('universal file conversion through Electron', () => {
       .toBe(1)
 
     const snapshot = await command<HarnessSnapshot>(profile.app, 'snapshot')
-    expect(snapshot.nativePickerNames).toEqual([['transparent-nonsquare.png', 'sample.docx']])
+    expect(snapshot.nativePickerNames).toEqual([
+      ['transparent-nonsquare.png', 'sample.docx'],
+      ['transparent-nonsquare.png', 'sample.docx'],
+      ['sample.docx'],
+    ])
     expect(snapshot.saveDialogDefaults).toEqual([
       'transparent-nonsquare.ico',
       'sample.pdf',
@@ -246,8 +263,13 @@ test.describe.serial('universal file conversion through Electron', () => {
       expect.objectContaining({ pack: 'document', targetFormat: 'pdf', processExited: true }),
     ]))
     const providerPayload = snapshot.providerRequests.map(({ serialized }) => serialized).join('\n')
-    expect(providerPayload).toContain('[附件 0: transparent-nonsquare.png, image/png,')
-    expect(providerPayload).toContain('[附件 1: sample.docx, application/vnd.openxmlformats-officedocument.wordprocessingml.document,')
+    expect(providerPayload).toContain('附件数量：1')
+    expect(providerPayload).toContain('附件索引：0')
+    expect(providerPayload).toContain('目标格式：ico')
+    expect(providerPayload).toContain('目标格式：pdf')
+    expect(providerPayload).not.toMatch(
+      /transparent-nonsquare|sample\.docx|image\/png|application\/vnd\.openxmlformats/iu,
+    )
     expect(providerPayload).not.toContain(profile.userData)
     expect(providerPayload).not.toContain(bundleRoot!)
     expect(providerPayload).not.toMatch(
@@ -379,7 +401,7 @@ test.describe.serial('universal file conversion through Electron', () => {
     const conversationId = await createConversation(first)
     await attachFixtureFiles(first, ['transparent-nonsquare.png'])
     await command(first.app, 'armHold', { mode: 'restart' })
-    await submitChat(first.page, '把图片转成 favicon ico')
+    await submitChat(first.page, '把 transparent-nonsquare.png 转成 ico')
     const approval = first.page.getByTestId('approval-card').filter({ hasText: '目标格式：ico' })
     await expect(approval).toBeVisible()
     await approval.getByTestId('approve-once').click()

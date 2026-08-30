@@ -920,7 +920,7 @@ git commit -m "test: verify signed converter packs"
 
 - [ ] **Step 1: 写端到端 RED 场景**
 
-聊天场景：附加 PNG 和 DOCX，输入“把图片转成 favicon ico，把文档转成 PDF”，断言 Provider fixture 收到 metadata 而非 bytes，出现精确附件审批，批准后卡片完成，保存副本的 magic bytes 正确。开发者场景：打开“万象转换”，native picker 选择 MP4，运行到 WebM，取消后 late process event 不得恢复 completed。重启场景：转换中退出再启动，显示 interrupted，可 retry 完成。
+聊天场景：附加 PNG 和 DOCX，先输入“把图片转成 favicon ico，把文档转成 PDF”并断言多动作请求 fail-closed；再分别提交两个绑定精确文件名的单动作请求，断言 Provider fixture 仅收到规范化附件数量/索引和目标格式，不收到名称、MIME、路径或 bytes，逐次出现精确附件审批，批准后卡片完成，保存副本的 magic bytes 正确。开发者场景：打开“万象转换”，native picker 选择 MP4，运行到 WebM，取消后 late process event 不得恢复 completed。重启场景：转换中退出再启动，显示 interrupted，可 retry 完成。
 
 - [ ] **Step 2: 运行并确认 RED**
 

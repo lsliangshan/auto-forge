@@ -761,11 +761,13 @@ The Task 14 Electron suite exercises the production Renderer, Preload, IPC,
 Main, restricted Worker, signed-pack process runner, SQLite repositories, and
 visible conversion card. With an explicit Task 13 test-pack root, it proves:
 
-- the exact chat request `把图片转成 favicon ico，把文档转成 PDF` binds a PNG and
-  DOCX by attachment index, presents two separately approved sanitized scopes,
-  keeps paths, bytes, base64, and internal identifiers out of Provider input,
-  and produces durable ICO and PDF results whose native saved copies pass
-  signature/content checks;
+- a combined two-command request such as `把图片转成 favicon ico，把文档转成 PDF`
+  fails closed without presenting an approval; two subsequent single-command
+  requests bind the PNG and DOCX by exact attachment index, present separately
+  approved sanitized scopes, expose only canonical attachment count/index and
+  target format to the Provider, keep names, MIME types, paths, bytes, base64,
+  and internal identifiers out of Provider input, and produce durable ICO and
+  PDF results whose native saved copies pass signature/content checks;
 - `file.convert.universal` / `万象转换` is discovered through the Renderer
   workflow page, Debug Panel native selection sends only indexes plus opaque
   attachment IDs, and a real MP4-to-WebM process result arriving after cancel
