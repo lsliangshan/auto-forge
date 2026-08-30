@@ -79,6 +79,10 @@ export function providerAttachmentAccess(
     && context.requestedOutput !== declaredMedia) {
     return issueAccessDecision('ambiguous')
   }
+  if ((declaredMedia === 'image' || declaredMedia === 'video')
+    && context.attachmentKinds.some((kind) => kind !== 'image')) {
+    return issueAccessDecision('ambiguous')
+  }
   if (!context.hasAttachments) return issueAccessDecision('ordinary')
   if (decision === 'local') return issueAccessDecision('local')
   const imageReferenceEdit = decision === 'ordinary'

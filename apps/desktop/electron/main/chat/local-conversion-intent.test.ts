@@ -489,6 +489,33 @@ describe('local conversion intent', () => {
     }])).toContain(expected)
   })
 
+  it.each([
+    ["O'Neil/Private/SECRET.PDF", "O'Neil/Private/SECRET.PDF"],
+    ['O’Neil/Private/SECRET.PDF', 'O’Neil/Private/SECRET.PDF'],
+    ['Private Folder/Legal/SECRET.PDF', 'Private Folder/Legal/SECRET.PDF'],
+    ['Private\u00a0Folder/Legal/SECRET.PDF', 'Private\u00a0Folder/Legal/SECRET.PDF'],
+    ['中文 空格/资料/SECRET.PDF', '中文 空格/资料/SECRET.PDF'],
+    ['“Draft” Folder/Legal/SECRET.PDF', '“Draft” Folder/Legal/SECRET.PDF'],
+    ['"O\'Neil/Private/SECRET.PDF"', '"O\'Neil/Private/SECRET.PDF"'],
+  ])('anonymizes a relative path whose first segment contains spaces or quotes: %s', (mention, request) => {
+    const prompt = anonymizeAttachmentNames(request, [{
+      index: 0, name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])
+    expect(prompt).toBe(mention.startsWith('"') ? '"文件-1"' : '文件-1')
+  })
+
+  it.each([
+    ['see yes/no first, then convert /Users/Alice/SECRET.PDF', 'see yes/no first, then convert 文件-1'],
+    ['read https://example.test/a/b then convert /Users/Alice/SECRET.PDF', 'read https://example.test/a/b then convert 文件-1'],
+    ['email a/b@example.com then convert /Users/Alice/SECRET.PDF', 'email a/b@example.com then convert 文件-1'],
+    ['ordinary/path note. Convert /Users/Alice/SECRET.PDF', 'ordinary/path note. Convert 文件-1'],
+    ["don't convert yes/no; use /Users/Alice/SECRET.PDF", "don't convert yes/no; use 文件-1"],
+  ])('terminates an earlier slash token before anonymizing a later absolute path: %s', (request, expected) => {
+    expect(anonymizeAttachmentNames(request, [{
+      index: 0, name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])).toBe(expected)
+  })
+
   it('keeps ordinary slash-separated prose that does not end in an attachment basename', () => {
     expect(projectLocalConversionPrompt('说明 yes/no 选项', [{
       index: 0, name: 'report.pdf', mimeType: 'application/pdf', byteSize: 12,

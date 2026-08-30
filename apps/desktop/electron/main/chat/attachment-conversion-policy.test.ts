@@ -210,7 +210,7 @@ describe('attachment conversion policy', () => {
         requestedOutput,
         attachmentKinds: ['file'],
       })
-      expect(access.decision === 'ordinary').toBe(requestedOutput === 'image')
+      expect(access.decision).toBe('ambiguous')
     },
   )
 
@@ -224,6 +224,29 @@ describe('attachment conversion policy', () => {
       requestedOutput,
       attachmentKinds: [],
     })).toMatchObject({ decision: 'ambiguous', allowProviderBytes: false })
+  })
+
+  it.each([
+    ['generate an image', 'image', 'audio'],
+    ['generate an image', 'image', 'video'],
+    ['generate an image', 'image', 'file'],
+    ['produce a video', 'video', 'audio'],
+    ['produce a video', 'video', 'video'],
+    ['produce a video', 'video', 'file'],
+  ] as const)('rejects incompatible %s attachments before routing declared %s output', (text, requestedOutput, attachmentKind) => {
+    expect(providerAttachmentAccess('ordinary', text, {
+      hasAttachments: true,
+      requestedOutput,
+      attachmentKinds: [attachmentKind],
+    })).toMatchObject({ decision: 'ambiguous', allowProviderBytes: false })
+  })
+
+  it('keeps an image attachment compatible with declared image generation', () => {
+    expect(providerAttachmentAccess('ordinary', 'generate an image', {
+      hasAttachments: true,
+      requestedOutput: 'image',
+      attachmentKinds: ['image'],
+    })).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
   })
 
   it.each([
@@ -249,7 +272,7 @@ describe('attachment conversion policy', () => {
     expect(providerAttachmentAccess('ordinary', text, {
       hasAttachments: true,
       requestedOutput,
-      attachmentKinds: ['file'],
+      attachmentKinds: ['image'],
     })).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
   })
 

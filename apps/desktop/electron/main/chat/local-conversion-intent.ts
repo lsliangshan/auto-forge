@@ -418,8 +418,12 @@ export function anonymizeAttachmentNames(
 
   const replacements: typeof basenameMatches = []
   const quoteCharacters = new Set(['"', "'", '“', '”', '‘', '’'])
+  const terminalPath = matches.length === 1
+    && /^[\s"'“”‘’\])}]*$/u.test(normalized.slice(matches[0]!.end))
   let quoteStart: number | undefined
+  let fieldStart = 0
   let tokenStart = 0
+  let inWhitespace = false
   let pathStart: number | undefined
   let matchIndex = 0
   for (let offset = 0; offset < normalized.length;) {
@@ -432,36 +436,54 @@ export function anonymizeAttachmentNames(
         text: match.text,
       })
       offset = match.end
+      fieldStart = offset
       tokenStart = offset
+      inWhitespace = false
       pathStart = undefined
       matchIndex += 1
       continue
     }
     const character = normalized[offset]!
-    if (quoteCharacters.has(character) && pathStart === undefined) {
+    const wordApostrophe = /['’]/u.test(character)
+      && /[\p{L}\p{N}]/u.test(normalized[offset - 1] ?? '')
+      && /[\p{L}\p{N}]/u.test(normalized[offset + 1] ?? '')
+    if (quoteCharacters.has(character) && !wordApostrophe && pathStart === undefined) {
       if (quoteStart === undefined) {
         quoteStart = offset + 1
-        tokenStart = quoteStart
+        fieldStart = offset
+        tokenStart = offset
+        inWhitespace = false
       } else {
         quoteStart = undefined
-        tokenStart = offset + 1
       }
     } else if (/[\\/]/u.test(character)) {
       const previous = normalized[offset - 1]
+      const quotedRootBoundary = quoteCharacters.has(previous ?? '')
+        && /[\s([{]/u.test(normalized[offset - 2] ?? '')
       const isAbsoluteUnixPath = character === '/'
-        && (offset === 0 || /[\s([{"'“‘]/u.test(previous ?? ''))
+        && (offset === 0 || /[\s([{]/u.test(previous ?? '') || quotedRootBoundary)
+      const isUncPath = character === '\\'
+        && normalized[offset + 1] === '\\'
+        && (offset === 0 || /[\s([{]/u.test(previous ?? '') || quotedRootBoundary)
       const isDrivePath = character === '\\'
         && offset >= 2
         && /[A-Za-z]:/u.test(normalized.slice(offset - 2, offset))
-      if (pathStart === undefined) {
+      if (pathStart === undefined || isAbsoluteUnixPath || isUncPath || isDrivePath) {
+        if (quotedRootBoundary && quoteStart === undefined) quoteStart = offset
         pathStart = quoteStart ?? (isAbsoluteUnixPath
           ? offset
-          : isDrivePath ? offset - 2 : tokenStart)
+          : isDrivePath ? offset - 2 : terminalPath ? fieldStart : tokenStart)
       }
     } else if (pathStart === undefined && /[([{]/u.test(character)) {
+      fieldStart = offset + 1
       tokenStart = offset + 1
+      inWhitespace = false
     } else if (pathStart === undefined && /\s/u.test(character)) {
-      tokenStart = offset + 1
+      if (!inWhitespace) tokenStart = offset + 1
+      inWhitespace = true
+    } else if (pathStart === undefined) {
+      if (inWhitespace) tokenStart = offset
+      inWhitespace = false
     }
     offset += 1
   }

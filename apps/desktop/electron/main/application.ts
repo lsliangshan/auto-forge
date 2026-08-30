@@ -88,6 +88,7 @@ import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrato
 import {
   AMBIGUOUS_CONVERSION_CLARIFICATION,
 } from './chat/local-conversion-intent.js'
+import { hasHighConfidenceMediaGenerationRequest } from './chat/attachment-conversion-policy.js'
 import {
   assertAttachmentByteAccess,
   createProviderAttachmentDisclosureAuthority,
@@ -3083,8 +3084,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const preferences = conversationGenerationPreferencesSchema.parse(
             conversation.generationPreferences ?? defaultGenerationPreferences,
           )
+          const declaredMediaOutput = hasHighConfidenceMediaGenerationRequest(input.content)
           const requestedOutput = input.outputType === 'auto'
-            ? preferences.outputType
+            ? declaredMediaOutput ?? preferences.outputType
             : input.outputType
           const resolved = await resolvedInput(input.conversationId, input.assetIds)
           const requestId = randomUUID()
@@ -3110,6 +3112,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               sourceFingerprint,
             }
           })
+          if ((declaredMediaOutput === 'image' || declaredMediaOutput === 'video')
+            && resolved.assets.some((asset) => asset.kind !== 'image')) {
+            throw failure('MODEL_MODALITY_UNSUPPORTED')
+          }
           const privacyPlan = attachmentDisclosureAuthority.createPlan({
             requestId,
             text: input.content,
@@ -3194,7 +3200,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             const resolvedRoute = resolveChatRoute({
                 provider: snapshot.activeProvider,
                 ...(input.model === undefined ? {} : { requestedModel: input.model }),
-                requestedOutput: metadataOnlyAttachments ? 'text' : input.outputType,
+                requestedOutput: metadataOnlyAttachments ? 'text' : requestedOutput,
                 requestedGeneration: input.generation,
                 defaults: snapshot.defaultModels,
                 conversationPreferences: preferences,

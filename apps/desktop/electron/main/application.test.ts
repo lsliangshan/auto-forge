@@ -5595,6 +5595,8 @@ describe('createApplicationRuntime', () => {
       ['Users', 'Alice', 'Private Files', "O'NEIL.PDF"]],
     ['O’Neil.pdf', String.raw`Convert [C:\Users\Alice\Private Files\O’NEIL.PDF] to PDF`, 2,
       ['Users', 'Alice', 'Private Files', 'O’NEIL.PDF']],
+    ['secret.pdf', `See yes/no first, then convert /Users/Alice/SECRET.PDF and Private\u00a0Folder/中文 空格/SECRET.PDF to PDF`, 2,
+      ['Users', 'Alice', 'Private Folder', '中文 空格', 'SECRET.PDF']],
   ] as const)('anonymizes exact attachment names in metadata-only main and title egress: %s', async (
     sourceName,
     content,
@@ -5658,6 +5660,7 @@ describe('createApplicationRuntime', () => {
     expect(payload).not.toContain(asset!.id)
     expect(payload).not.toContain(privateBytes.toString('base64'))
     expect(payload).not.toContain(createHash('sha256').update(privateBytes).digest('hex'))
+    if (content.startsWith('See yes/no first, then')) expect(payload).toContain('See yes/no first, then convert')
     if (expectedProviderCalls > 0) {
       expect(payload).toContain('文件-1')
       expect(JSON.stringify(captured.find(isConversationTitleRequest))).toContain('文件-1')
@@ -6795,11 +6798,29 @@ describe('createApplicationRuntime', () => {
       ]))
 
     const automaticConversation = await runtime.services.chat.createConversation()
+    const automaticImageCalls = generateImage.mock.calls.length
+    const automaticAudioCalls = stream.mock.calls.filter(([request]) => request.output?.type === 'audio').length
+    const automaticVideoCalls = submitVideo.mock.calls.length
     await runtime.services.chat.send({
-      ...chatInput(automaticConversation.id, 'make an automatic image'),
-      model: 'openrouter/image',
+      ...chatInput(automaticConversation.id, '生成一张图片'),
     })
-    await vi.waitFor(() => expect(generateImage).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(generateImage).toHaveBeenCalledTimes(automaticImageCalls + 1))
+    expect(stream.mock.calls.filter(([request]) => request.output?.type === 'audio')).toHaveLength(automaticAudioCalls)
+    expect(submitVideo).toHaveBeenCalledTimes(automaticVideoCalls)
+
+    const automaticAudioConversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(automaticAudioConversation.id, '创建一个音频'))
+    await vi.waitFor(() => expect(stream.mock.calls.filter(([request]) => (
+      request.output?.type === 'audio'
+    ))).toHaveLength(automaticAudioCalls + 1))
+    expect(generateImage).toHaveBeenCalledTimes(automaticImageCalls + 1)
+    expect(submitVideo).toHaveBeenCalledTimes(automaticVideoCalls)
+
+    const automaticVideoConversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(automaticVideoConversation.id, '制作一段视频'))
+    await vi.waitFor(() => expect(submitVideo).toHaveBeenCalledTimes(automaticVideoCalls + 1))
+    expect(generateImage).toHaveBeenCalledTimes(automaticImageCalls + 1)
+    expect(stream.mock.calls.filter(([request]) => request.output?.type === 'audio')).toHaveLength(automaticAudioCalls + 1)
 
     const preferredConversation = await runtime.services.chat.createConversation()
     await runtime.services.chat.updateGenerationPreferences(preferredConversation.id, {
@@ -6887,6 +6908,79 @@ describe('createApplicationRuntime', () => {
     })
 
     expect(provider.acquireSnapshot).not.toHaveBeenCalled()
+    expect(stream).not.toHaveBeenCalled()
+    expect(generateImage).not.toHaveBeenCalled()
+    expect(submitVideo).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it.each([
+    ['生成一张图片', 'image', 'input.mp3'],
+    ['生成一张图片', 'image', 'input.mp4'],
+    ['生成一张图片', 'image', 'input.pdf'],
+    ['制作一段视频', 'video', 'input.mp3'],
+    ['制作一段视频', 'video', 'input.mp4'],
+    ['制作一段视频', 'video', 'input.pdf'],
+  ] as const)('rejects incompatible attachment %s for declared %s output before Provider acquisition', async (
+    content,
+    outputType,
+    filename,
+  ) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-attachment-conflict-'))
+    directories.push(root)
+    const source = join(root, filename)
+    await writeFile(source, Buffer.from(filename.endsWith('.pdf') ? '%PDF-1.7' : 'PRIVATE_MEDIA_BYTES'))
+    const modelInput = vi.fn()
+    const createMediaAssetService = mediaAssetModule.createMediaAssetService
+    vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
+      const service = createMediaAssetService(createOptions)
+      modelInput.mockImplementation(service.modelInput.bind(service))
+      return { ...service, modelInput }
+    })
+    const stream = vi.fn(async function* () {
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const generateImage = vi.fn(async () => ({ outputs: [] }))
+    const submitVideo = vi.fn(async () => ({
+      providerJobId: 'provider_attachment_conflict', status: 'pending' as const,
+    }))
+    const listModels = vi.fn(async () => [
+      imageModelInfo('openrouter/image'), videoModelInfo('openrouter/video'),
+    ])
+    const provider = snapshotProvider('openrouter', {
+      listModels,
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream,
+      generateImage,
+      submitVideo,
+    })
+    const chatEvents: ChatEvent[] = []
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source],
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { image: 'openrouter/image', video: 'openrouter/video' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+
+    await expect(runtime.services.chat.send({
+      ...chatInput(conversation.id, content), outputType, assetIds: [asset!.id],
+    })).rejects.toMatchObject({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+
+    expect(provider.acquireSnapshot).not.toHaveBeenCalled()
+    expect(listModels).not.toHaveBeenCalled()
+    expect(modelInput).not.toHaveBeenCalled()
     expect(stream).not.toHaveBeenCalled()
     expect(generateImage).not.toHaveBeenCalled()
     expect(submitVideo).not.toHaveBeenCalled()
