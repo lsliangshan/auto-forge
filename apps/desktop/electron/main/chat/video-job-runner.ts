@@ -33,7 +33,7 @@ import type {
 import type { ResolvedChatRoute } from './multimodal-router.js'
 import {
   assertAttachmentByteAccess,
-  protectProviderSnapshot,
+  assertProtectedProviderSnapshot,
   type ProviderAttachmentDisclosure,
 } from './provider-attachment-disclosure.js'
 
@@ -56,8 +56,10 @@ export interface SubmitVideoInput extends UsageAttribution {
   prompt: string
   userBlocks: ChatBlock[]
   assetIds: string[]
+  attachmentFingerprints?: readonly string[]
   route: ResolvedChatRoute & { outputType: 'video' }
   attachmentDisclosure?: ProviderAttachmentDisclosure
+  providerSnapshot?: ModelProviderSnapshot
 }
 
 export interface VideoJobProviderRegistryPort {
@@ -274,7 +276,20 @@ export class VideoJobRunner {
         requestId: input.requestId,
         providerId: input.route.provider,
         assetIds: input.assetIds,
+        assetFingerprints: input.attachmentFingerprints ?? [],
       })
+      if (!input.providerSnapshot) throw new Error('Attachment provider snapshot is missing')
+      assertProtectedProviderSnapshot(input.providerSnapshot, input.attachmentDisclosure, {
+        requestId: input.requestId,
+        providerId: input.route.provider,
+        assetIds: input.assetIds,
+        assetFingerprints: input.attachmentFingerprints ?? [],
+        purpose: 'main',
+      })
+      if (input.assetIds.length !== input.route.assets.length
+        || input.assetIds.some((assetId, index) => input.route.assets[index]?.id !== assetId)) {
+        throw new Error('Attachment route binding is invalid')
+      }
     }
     const operation = this.submitInternal(input)
     this.submissions.add(operation)
@@ -358,10 +373,8 @@ export class VideoJobRunner {
 
       controller = new AbortController()
       this.controllers.set(input.requestId, controller)
-      const acquiredProviderSnapshot = await this.acquireSubmitSnapshot(input.route.provider)
-      const providerSnapshot = input.attachmentDisclosure === undefined
-        ? acquiredProviderSnapshot
-        : protectProviderSnapshot(acquiredProviderSnapshot, input.attachmentDisclosure)
+      const providerSnapshot = input.providerSnapshot
+        ?? await this.acquireSubmitSnapshot(input.route.provider)
       this.providerSnapshots.set(input.requestId, providerSnapshot)
       const provider = providerSnapshot.provider
       if (!provider.submitVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })

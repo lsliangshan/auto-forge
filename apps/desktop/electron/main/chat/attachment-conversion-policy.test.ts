@@ -39,6 +39,58 @@ describe('attachment conversion policy', () => {
   })
 
   it.each([
+    'reformat this attachment as PDF',
+    'encode this image as WebP',
+    'render this document to PDF',
+    'transform this file into DOCX',
+    'create a PDF version of this attachment',
+    '把这个附件变成PDF',
+    '请生成这个附件的PDF版本',
+  ])('defaults unknown attachment transformations to ambiguous: %s', (text) => {
+    const classified = classifyAttachmentConversionIntent(text, attachments)
+    expect(providerAttachmentAccess(classified, text, {
+      hasAttachments: true,
+      requestedOutput: 'text',
+      attachmentKinds: ['image'],
+    }).decision).toBe('ambiguous')
+  })
+
+  it.each([
+    'make this image cinematic',
+    'make this image watercolor',
+    'make this image look like sunset',
+    'create a new image based on this image',
+    '把这个图片做成水彩画',
+  ])('allows a positive reference-image edit as ordinary: %s', (text) => {
+    const classified = classifyAttachmentConversionIntent(text, attachments)
+    expect(providerAttachmentAccess(classified, text, {
+      hasAttachments: true,
+      requestedOutput: 'image',
+      attachmentKinds: ['image'],
+    })).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
+  })
+
+  it.each([
+    ['make image', 'image'],
+    ['make audio', 'audio'],
+    ['make video', 'video'],
+  ] as const)('treats an explicit %s output request as positive ordinary evidence', (text, requestedOutput) => {
+    expect(providerAttachmentAccess('ordinary', text, {
+      hasAttachments: true,
+      requestedOutput,
+      attachmentKinds: ['file'],
+    })).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
+  })
+
+  it('defaults an attached request without positive ordinary evidence to ambiguous', () => {
+    expect(providerAttachmentAccess('ordinary', 'please help', {
+      hasAttachments: true,
+      requestedOutput: 'text',
+      attachmentKinds: ['image'],
+    }).decision).toBe('ambiguous')
+  })
+
+  it.each([
     '总结这张图片',
     'Describe this image',
     '查看附件并告诉我主要内容',
@@ -60,6 +112,10 @@ describe('attachment conversion policy', () => {
     expect(providerAttachmentAccess('ordinary', '总结这张图片')).toEqual({
       decision: 'ordinary',
       allowProviderBytes: true,
+    })
+    expect(providerAttachmentAccess('ordinary', 'analyze this image, then reformat it as PDF')).toEqual({
+      decision: 'ambiguous',
+      allowProviderBytes: false,
     })
   })
 

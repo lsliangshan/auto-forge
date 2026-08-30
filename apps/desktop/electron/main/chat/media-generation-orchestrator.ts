@@ -30,7 +30,7 @@ import type {
 import type { ResolvedChatRoute } from './multimodal-router.js'
 import {
   assertAttachmentByteAccess,
-  protectProviderSnapshot,
+  assertProtectedProviderSnapshot,
   type ProviderAttachmentDisclosure,
 } from './provider-attachment-disclosure.js'
 
@@ -55,8 +55,10 @@ export interface MediaGenerationRunInput extends UsageAttribution {
   prompt: string
   userBlocks: ChatBlock[]
   assetIds: string[]
+  attachmentFingerprints?: readonly string[]
   route: ResolvedChatRoute
   attachmentDisclosure?: ProviderAttachmentDisclosure
+  providerSnapshot?: ModelProviderSnapshot
 }
 
 interface ActiveGeneration {
@@ -135,6 +137,15 @@ export class MediaGenerationOrchestrator {
         requestId: input.requestId,
         providerId: input.route.provider,
         assetIds: input.assetIds,
+        assetFingerprints: input.attachmentFingerprints ?? [],
+      })
+      if (!input.providerSnapshot) throw new Error('Attachment provider snapshot is missing')
+      assertProtectedProviderSnapshot(input.providerSnapshot, input.attachmentDisclosure, {
+        requestId: input.requestId,
+        providerId: input.route.provider,
+        assetIds: input.assetIds,
+        assetFingerprints: input.attachmentFingerprints ?? [],
+        purpose: 'main',
       })
     }
     if (input.route.outputType !== kind) {
@@ -146,7 +157,7 @@ export class MediaGenerationOrchestrator {
     }
     if (
       input.assetIds.length !== input.route.assets.length
-      || input.assetIds.some((assetId) => !input.route.assets.some((asset) => asset.id === assetId))
+      || input.assetIds.some((assetId, index) => input.route.assets[index]?.id !== assetId)
       || new Set(input.assetIds).size !== input.assetIds.length
     ) {
       return {
@@ -183,13 +194,11 @@ export class MediaGenerationOrchestrator {
         status: 'running',
       })
 
-      const acquiredProviderSnapshot = await this.dependencies.providers.acquire(input.route.provider)
-      if (acquiredProviderSnapshot.providerId !== input.route.provider) {
+      const providerSnapshot = input.providerSnapshot
+        ?? await this.dependencies.providers.acquire(input.route.provider)
+      if (providerSnapshot.providerId !== input.route.provider) {
         throw new ProviderUsageConsistencyError()
       }
-      const providerSnapshot = input.attachmentDisclosure === undefined
-        ? acquiredProviderSnapshot
-        : protectProviderSnapshot(acquiredProviderSnapshot, input.attachmentDisclosure)
 
       return kind === 'image'
         ? await this.generateImage(input, persisted, active, providerSnapshot)

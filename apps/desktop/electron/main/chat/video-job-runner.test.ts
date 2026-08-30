@@ -17,7 +17,11 @@ import type {
 } from '../media/media-asset-service.js'
 import type { ModelProvider, ModelProviderSnapshot } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
-import { createProviderAttachmentDisclosure } from './provider-attachment-disclosure.js'
+import { providerAttachmentAccess } from './attachment-conversion-policy.js'
+import {
+  createProviderAttachmentDisclosure,
+  protectProviderSnapshot,
+} from './provider-attachment-disclosure.js'
 import {
   VideoJobRunner,
   type VideoJobRunnerDependencies,
@@ -66,15 +70,24 @@ const submitInput = {
   route,
 }
 
-function ordinaryAttachmentDisclosure(assetIds: string[]) {
-  return createProviderAttachmentDisclosure({
+function ordinaryAttachmentAuthority(snapshot: ModelProviderSnapshot, assetIds: string[]) {
+  const attachmentFingerprints = assetIds.map(() => 'a'.repeat(64))
+  const attachmentDisclosure = createProviderAttachmentDisclosure({
     requestId: submitInput.requestId,
-    providerId: route.provider,
-    access: { decision: 'ordinary', allowProviderBytes: true },
+    providerSnapshot: snapshot,
+    credentialEpoch: 0,
+    access: providerAttachmentAccess('ordinary', '描述这个图片', {
+      hasAttachments: true, requestedOutput: 'video', attachmentKinds: ['image'],
+    }),
     assetIds,
-    assetFingerprints: assetIds.map(() => 'a'.repeat(64)),
+    assetFingerprints: attachmentFingerprints,
     forbiddenValues: [],
   })
+  return {
+    attachmentDisclosure,
+    attachmentFingerprints,
+    providerSnapshot: protectProviderSnapshot(snapshot, attachmentDisclosure, { purpose: 'main' }),
+  }
 }
 
 const submittedOutputAssetId = 'video_8072e20a4619b4b2251a7c9e4522ab22a9728450834087c29e18d2651db6f0c0'
@@ -291,6 +304,32 @@ async function flush(): Promise<void> {
 }
 
 describe('VideoJobRunner', () => {
+  it('rejects a changed attachment fingerprint before video Provider work', async () => {
+    const harness = createHarness()
+    const snapshot = await harness.dependencies.providers.acquire('openrouter')
+    const attachmentAuthority = ordinaryAttachmentAuthority(snapshot, ['reference_image'])
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit({
+      ...submitInput,
+      assetIds: ['reference_image'],
+      ...attachmentAuthority,
+      attachmentFingerprints: ['b'.repeat(64)],
+      route: {
+        ...route,
+        assets: [{
+          id: 'reference_image', kind: 'image', mimeType: 'image/png',
+          name: 'reference.png', byteSize: 12, conversationId: submitInput.conversationId,
+          absolutePath: '/managed/reference.png', relativePath: 'conversation_video_1/reference.png',
+          inlineSafe: true,
+        }],
+      },
+    })).rejects.toThrow('Attachment disclosure capability is missing or invalid')
+
+    expect(harness.media.modelInput).not.toHaveBeenCalled()
+    expect(harness.provider.submitVideo).not.toHaveBeenCalled()
+  })
+
   it('requests sync after the committed start and completed terminal mutations', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
@@ -1677,12 +1716,16 @@ describe('VideoJobRunner', () => {
       },
     ]
     const runner = new VideoJobRunner(harness.dependencies)
+    const attachmentAuthority = ordinaryAttachmentAuthority(
+      await harness.dependencies.providers.acquire('openrouter'),
+      ['reference_image'],
+    )
 
     await runner.submit({
       ...submitInput,
       userBlocks,
       assetIds: ['reference_image'],
-      attachmentDisclosure: ordinaryAttachmentDisclosure(['reference_image']),
+      ...attachmentAuthority,
       route: referencedRoute,
     })
 
@@ -1730,12 +1773,16 @@ describe('VideoJobRunner', () => {
       createdAt: 1,
     }, ['claimed_reference'])
     const runner = new VideoJobRunner(harness.dependencies)
+    const attachmentAuthority = ordinaryAttachmentAuthority(
+      await harness.dependencies.providers.acquire('openrouter'),
+      ['claimed_reference'],
+    )
 
     await expect(runner.submit({
       ...submitInput,
       userBlocks: [referenceBlock],
       assetIds: ['claimed_reference'],
-      attachmentDisclosure: ordinaryAttachmentDisclosure(['claimed_reference']),
+      ...attachmentAuthority,
       route: {
         ...route,
         assets: [{
@@ -1784,6 +1831,10 @@ describe('VideoJobRunner', () => {
       updatedAt: 1,
     })
     const mismatchedRunner = new VideoJobRunner(mismatched.dependencies)
+    const attachmentAuthority = ordinaryAttachmentAuthority(
+      await mismatched.dependencies.providers.acquire('openrouter'),
+      ['mismatched_reference'],
+    )
 
     await expect(mismatchedRunner.submit({
       ...submitInput,
@@ -1798,7 +1849,7 @@ describe('VideoJobRunner', () => {
         byteSize: 13,
       }],
       assetIds: ['mismatched_reference'],
-      attachmentDisclosure: ordinaryAttachmentDisclosure(['mismatched_reference']),
+      ...attachmentAuthority,
       route: {
         ...route,
         assets: [{

@@ -357,6 +357,18 @@ export function sanitizeDisplayName(value: string, index = 0): string {
   return name
 }
 
+export function anonymizeAttachmentNames(
+  text: string,
+  attachments: readonly LocalAttachmentProjection[],
+): string {
+  return [...attachments]
+    .filter(({ name }) => name.length > 0)
+    .sort((left, right) => right.name.length - left.name.length)
+    .reduce((value, attachment) => (
+      value.split(attachment.name).join(`文件-${attachment.index + 1}`)
+    ), text)
+}
+
 export function hasLocalConversionIntent(
   text: string,
   attachments: readonly LocalAttachmentProjection[],
@@ -488,19 +500,16 @@ export function projectLocalConversionPrompt(
   attachments: readonly LocalAttachmentProjection[],
 ): string {
   const lines = attachments.map((item) => (
-    `[附件 ${item.index}: ${sanitizeDisplayName(item.name, item.index)}, ${item.mimeType}, ${item.byteSize} bytes]`
+    `[附件 ${item.index}: 文件-${item.index + 1}, ${item.mimeType}, ${item.byteSize} bytes]`
   ))
-  return [text, ...lines].filter(Boolean).join('\n')
+  return [anonymizeAttachmentNames(text, attachments), ...lines].filter(Boolean).join('\n')
 }
 
-const AMBIGUOUS_CONVERSION_POLICY = [
-  '[附件隐私保护：未读取附件内容]',
-  '请只澄清用户要转换哪个附件以及目标格式；不要执行工具，也不要声称已读取或转换附件。',
-].join('\n')
+export const AMBIGUOUS_CONVERSION_CLARIFICATION = '请确认要转换哪个附件，以及希望转换成什么格式。我尚未读取或转换附件内容。'
 
 export function projectAmbiguousConversionPrompt(
   text: string,
   attachments: readonly LocalAttachmentProjection[],
 ): string {
-  return [AMBIGUOUS_CONVERSION_POLICY, projectLocalConversionPrompt(text, attachments)].join('\n')
+  return projectLocalConversionPrompt(text, attachments)
 }

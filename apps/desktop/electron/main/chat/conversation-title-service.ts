@@ -3,6 +3,7 @@ import { trackProviderStream } from '../billing/provider-usage-stream.js'
 import type { AppRepositories, Conversation, Message } from '../database/repositories.js'
 import { serializeHistoricalMessage } from './conversation-context.js'
 import type { ModelProviderSnapshot } from './model-provider.js'
+import type { ProviderAttachmentSafeText } from './provider-attachment-disclosure.js'
 
 const TITLE_SYSTEM_PROMPT = [
   '你正在为一段聊天生成简短的中文会话标题。',
@@ -25,6 +26,7 @@ export interface GenerateConversationTitleInput {
   providerSnapshot: ModelProviderSnapshot
   model?: string
   omitAttachmentProjections?: boolean
+  protectedTitleText?: ProviderAttachmentSafeText
   signal?: AbortSignal
 }
 
@@ -99,7 +101,9 @@ export class ConversationTitleService {
         input.conversationId,
         input.omitAttachmentProjections,
       )
-      if (!turn) throw new Error('The first completed turn is unavailable')
+      if (!turn && input.protectedTitleText === undefined) {
+        throw new Error('The first completed turn is unavailable')
+      }
       if (!input.model) throw new Error('The text model for conversation titles is unavailable')
       let response = ''
       let finishReason: string | undefined
@@ -118,9 +122,9 @@ export class ConversationTitleService {
             { role: 'system', content: TITLE_SYSTEM_PROMPT },
             {
               role: 'user',
-              content: turn.assistant === undefined
-                ? `用户：${turn.user}`
-                : `用户：${turn.user}\nAI：${turn.assistant}`,
+              content: input.protectedTitleText?.text ?? (turn!.assistant === undefined
+                ? `用户：${turn!.user}`
+                : `用户：${turn!.user}\nAI：${turn!.assistant}`),
             },
           ],
           maxOutputTokens: 64,

@@ -87,17 +87,19 @@ import { OpenRouterProvider } from './chat/openrouter-provider.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
 import { projectAttachmentInputs } from './chat/file-attachment-projection.js'
 import {
+  AMBIGUOUS_CONVERSION_CLARIFICATION,
+  anonymizeAttachmentNames,
   classifyAttachmentConversionIntent,
-  projectAmbiguousConversionPrompt,
   projectLocalConversionPrompt,
-  sanitizeDisplayName,
   type LocalAttachmentProjection,
 } from './chat/local-conversion-intent.js'
 import { providerAttachmentAccess } from './chat/attachment-conversion-policy.js'
 import {
   assertAttachmentByteAccess,
   createProviderAttachmentDisclosure,
+  createProviderAttachmentSafeText,
   protectProviderSnapshot,
+  type ProviderAttachmentSafeText,
 } from './chat/provider-attachment-disclosure.js'
 import { resolveChatRoute } from './chat/multimodal-router.js'
 import type { ModelContentPart } from './chat/model-provider.js'
@@ -2369,6 +2371,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerCredentialEpoch: number
     model?: string
     omitAttachmentProjections?: boolean
+    protectedTitleText?: ProviderAttachmentSafeText
   }>()
   let acceptingWork = true
   const failureRecorder = createApplicationFailureRecorder(() => { acceptingWork = false })
@@ -2561,6 +2564,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           providerSnapshot: context.providerSnapshot,
           ...(context.model === undefined ? {} : { model: context.model }),
           ...(context.omitAttachmentProjections ? { omitAttachmentProjections: true } : {}),
+          ...(context.protectedTitleText === undefined
+            ? {}
+            : { protectedTitleText: context.protectedTitleText }),
           signal: controller.signal,
         }).then(() => undefined).finally(() => {
           activeConversationTitleWork.delete(event.requestId)
@@ -3043,9 +3049,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             byteSize: asset.byteSize,
           }))
           const classifiedIntent = classifyAttachmentConversionIntent(input.content, localAttachments)
-          const attachmentAccess = localAttachments.length === 0
-            ? { decision: 'ordinary' as const, allowProviderBytes: true }
-            : providerAttachmentAccess(classifiedIntent, input.content)
+          const attachmentAccess = providerAttachmentAccess(classifiedIntent, input.content, {
+            hasAttachments: localAttachments.length > 0,
+            requestedOutput,
+            attachmentKinds: resolved.assets.map(({ kind }) => kind),
+          })
           const attachmentDecision = attachmentAccess.decision
           const metadataOnlyAttachments = attachmentDecision !== 'ordinary'
           const localConversionIntent = attachmentDecision === 'local'
@@ -3069,7 +3077,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           ) throw failure('MODEL_MODALITY_UNSUPPORTED')
           await requireValidCredential(providerSnapshot)
           const requestId = randomUUID()
-          const protectedAssets = resolved.assets.map((asset, index) => {
+          const protectedAssets = resolved.assets.map((asset) => {
             const record = chatDatabase.mediaAssets.get(asset.id)
             if (!record
               || record.conversationId !== input.conversationId
@@ -3087,56 +3095,91 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               asset,
               record,
               sourceFingerprint,
-              sanitizedName: sanitizeDisplayName(asset.name, index),
             }
           })
           const attachmentDisclosure = createProviderAttachmentDisclosure({
             requestId,
-            providerId: providerSnapshot.providerId,
+            providerSnapshot,
+            credentialEpoch,
             access: attachmentAccess,
             assetIds: resolved.assets.map(({ id }) => id),
-            assetFingerprints: protectedAssets.map(({ sourceFingerprint }) => sourceFingerprint),
+            assetFingerprints: protectedAssets.map(({ record }) => record.sha256!),
             forbiddenValues: protectedAssets.flatMap(({
-              asset, record, sourceFingerprint, sanitizedName,
+              asset, record, sourceFingerprint,
             }) => [
               asset.id,
               asset.absolutePath,
               asset.relativePath,
               record.sha256!,
               sourceFingerprint,
-              ...(asset.name === sanitizedName ? [] : [asset.name]),
+              asset.name,
             ]),
           })
-          const protectedProviderSnapshot = protectProviderSnapshot(
-            providerSnapshot,
-            attachmentDisclosure,
-          )
-          const route = resolveChatRoute({
-            provider: snapshot.activeProvider,
-            ...(input.model === undefined ? {} : { requestedModel: input.model }),
-            requestedOutput: metadataOnlyAttachments ? 'text' : input.outputType,
-            requestedGeneration: input.generation,
-            defaults: snapshot.defaultModels,
-            conversationPreferences: preferences,
-            models: await getModelCatalog(
-              snapshot.activeProvider,
-              false,
-              providerSnapshot,
-              credentialEpoch,
-            ),
-            assets: metadataOnlyAttachments ? [] : resolved.assets,
+          const redactedContent = metadataOnlyAttachments
+            ? anonymizeAttachmentNames(input.content, localAttachments)
+            : input.content
+          const protectedMainText = metadataOnlyAttachments
+            ? createProviderAttachmentSafeText(
+                attachmentDisclosure,
+                'main',
+                projectLocalConversionPrompt(redactedContent, localAttachments),
+              )
+            : undefined
+          const protectedProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+            purpose: 'main',
+            ...(protectedMainText === undefined ? {} : { safeText: protectedMainText }),
           })
+          const ambiguousModel = input.model
+            ?? preferences.models.text
+            ?? snapshot.defaultModels[providerSnapshot.providerId].text
+          const route = attachmentDecision === 'ambiguous'
+            ? {
+                provider: snapshot.activeProvider,
+                model: ambiguousModel ?? (() => { throw failure('INVALID_INPUT') })(),
+                supportsTools: false,
+                supportsImageInput: false,
+                outputType: 'text' as const,
+                assets: [],
+                generation: preferences.generation,
+              }
+            : resolveChatRoute({
+                provider: snapshot.activeProvider,
+                ...(input.model === undefined ? {} : { requestedModel: input.model }),
+                requestedOutput: metadataOnlyAttachments ? 'text' : input.outputType,
+                requestedGeneration: input.generation,
+                defaults: snapshot.defaultModels,
+                conversationPreferences: preferences,
+                models: await getModelCatalog(
+                  snapshot.activeProvider,
+                  false,
+                  providerSnapshot,
+                  credentialEpoch,
+                ),
+                assets: metadataOnlyAttachments ? [] : resolved.assets,
+              })
           if ('selectionRequired' in route || 'modelRequired' in route) {
             throw failure('INVALID_INPUT')
           }
           const titleModel = snapshot.defaultModels[providerSnapshot.providerId].text
+          const protectedTitleText = metadataOnlyAttachments
+            ? createProviderAttachmentSafeText(
+                attachmentDisclosure,
+                'title',
+                `用户：${redactedContent}`,
+              )
+            : undefined
+          const titleProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+            purpose: 'title',
+            ...(protectedTitleText === undefined ? {} : { safeText: protectedTitleText }),
+          })
           conversationTitleContexts.set(requestId, {
             conversationId: input.conversationId,
             userId: session.user.id,
-            providerSnapshot: protectedProviderSnapshot,
+            providerSnapshot: titleProviderSnapshot,
             providerCredentialEpoch: credentialEpoch,
             ...(titleModel === undefined ? {} : { model: titleModel }),
             ...(metadataOnlyAttachments ? { omitAttachmentProjections: true } : {}),
+            ...(protectedTitleText === undefined ? {} : { protectedTitleText }),
           })
           const userBlocks: ChatBlock[] = [
             ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
@@ -3148,8 +3191,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             prompt: input.content,
             userBlocks,
             assetIds: input.assetIds,
+            attachmentFingerprints: protectedAssets.map(({ record }) => record.sha256!),
             route,
             attachmentDisclosure,
+            providerSnapshot: protectedProviderSnapshot,
             userId: session.user.id,
           }
           if (route.outputType === 'text') {
@@ -3157,7 +3202,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             let currentMedia: CurrentMediaMetadata[]
             let attachmentBindings: readonly ExecutionAttachmentBinding[]
             if (localConversionIntent) {
-              modelContent = projectLocalConversionPrompt(input.content, localAttachments)
+              modelContent = protectedMainText!.text
               currentMedia = []
               attachmentBindings = Object.freeze(protectedAssets.map(({
                 asset, sourceFingerprint,
@@ -3174,7 +3219,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 })
               }))
             } else if (attachmentDecision === 'ambiguous') {
-              modelContent = projectAmbiguousConversionPrompt(input.content, localAttachments)
+              modelContent = protectedMainText!.text
               currentMedia = []
               attachmentBindings = Object.freeze([])
             } else {
@@ -3182,6 +3227,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 requestId,
                 providerId: route.provider,
                 assetIds: input.assetIds,
+                assetFingerprints: protectedAssets.map(({ record }) => record.sha256!),
               })
               const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
               const projectedAttachments = projectAttachmentInputs(route.provider, modelInputs)
@@ -3204,10 +3250,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             trackChatWork(requestId, input.conversationId, async () => {
               return agent.run({
                 conversationId: input.conversationId,
-                content: input.content,
+                content: redactedContent,
                 userBlocks,
                 modelContent,
                 assetIds: input.assetIds,
+                attachmentFingerprints: protectedAssets.map(({ record }) => record.sha256!),
                 currentMedia,
                 ...(metadataOnlyAttachments ? {
                   omitHistoricalAttachments: true,
@@ -3215,6 +3262,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 } : {}),
                 attachmentBindings,
                 allowTools: attachmentDecision === 'ambiguous' ? false : route.supportsTools,
+                ...(localConversionIntent ? { localConversionOnly: true } : {}),
+                ...(attachmentDecision === 'ambiguous'
+                  ? { fixedResponse: AMBIGUOUS_CONVERSION_CLARIFICATION }
+                  : {}),
                 supportsImageInput: route.supportsImageInput,
                 userId: session.user.id,
                 providerSnapshot: protectedProviderSnapshot,

@@ -448,12 +448,15 @@ export interface AgentRunInput extends UsageAttribution {
   userBlocks: ChatBlock[]
   modelContent: string | ModelContentPart[]
   assetIds: string[]
+  attachmentFingerprints?: readonly string[]
   contextLength?: number
   currentMedia: CurrentMediaMetadata[]
   omitHistoricalAttachments?: boolean
   omitConversationHistory?: boolean
   attachmentBindings?: readonly ExecutionAttachmentBinding[]
   attachmentDisclosure?: ProviderAttachmentDisclosure
+  fixedResponse?: string
+  localConversionOnly?: boolean
   allowTools: boolean
   readonly supportsImageInput: boolean
   provider: ModelProviderId
@@ -856,6 +859,8 @@ export class AgentOrchestrator {
           requestId,
           providerId: input.provider,
           assetIds: input.assetIds,
+          assetFingerprints: input.attachmentFingerprints ?? [],
+          purpose: 'main',
         })
       }
       const userMessageId = this.id()
@@ -928,8 +933,14 @@ export class AgentOrchestrator {
       }
       this.activeByRequest.set(requestId, active)
       this.activeByRun.set(runId, active)
+      if (input.fixedResponse !== undefined) {
+        this.appendText(active, input.fixedResponse)
+        return await this.terminalize(active, 'completed')
+      }
       const workflowToolsAllowed = input.allowTools && !EXPLICIT_WORKFLOW_OPTOUT.test(input.content)
-      const browserToolsAllowed = input.allowTools && !EXPLICIT_BROWSER_OPTOUT.test(input.content)
+      const browserToolsAllowed = input.allowTools
+        && !input.localConversionOnly
+        && !EXPLICIT_BROWSER_OPTOUT.test(input.content)
       active.browserToolsAllowed = browserToolsAllowed
       if (browserToolsAllowed && this.dependencies.browserContinuation) {
         active.browserCatalog = await this.dependencies.browserContinuation.catalog.create({
@@ -944,8 +955,15 @@ export class AgentOrchestrator {
           workflows: this.dependencies.workflows,
           selectorFor: this.dependencies.createSourceSelector,
         }).create({ developerMode: this.dependencies.developerMode?.() ?? false })
-        const exactCandidate = exactWorkflowCandidate(input.content, catalog)
-        const candidates = exactCandidate === undefined
+        const conversionCandidates = input.localConversionOnly
+          ? catalog.filter(({ workflow }) => workflow.permissions.some(({ capability }) => (
+              capability === 'file.convert'
+            )))
+          : undefined
+        const exactCandidate = conversionCandidates === undefined
+          ? exactWorkflowCandidate(input.content, catalog)
+          : undefined
+        const candidates = conversionCandidates ?? (exactCandidate === undefined
           ? await new WorkflowRouter().route({
               query: input.content,
               candidates: catalog,
@@ -953,7 +971,7 @@ export class AgentOrchestrator {
               select: (request) => this.selectWorkflowRouting(active!, request),
               signal: active.controller.signal,
             })
-          : [exactCandidate]
+          : [exactCandidate])
         active.workflowCatalogTools = candidates.map(({ tool }) => tool)
         active.initialWorkflowToolChoice = exactCandidate === undefined
           ? undefined

@@ -13,8 +13,10 @@ import type { ConversationHistoryPort } from '../chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from '../chat/model-provider.js'
 import {
   createProviderAttachmentDisclosure,
+  createProviderAttachmentSafeText,
   protectProviderSnapshot,
 } from '../chat/provider-attachment-disclosure.js'
+import { providerAttachmentAccess } from '../chat/attachment-conversion-policy.js'
 import {
   ProviderUsageConsistencyError,
   type Execution,
@@ -281,26 +283,39 @@ function protectedAttachmentRunInput(
   decision: 'local' | 'ordinary' = 'local',
 ): AgentRunInput {
   const requestId = input.requestId ?? 'request_attachment'
+  const provider = input.providerSnapshot.provider
+  const providerSnapshot = {
+    ...input.providerSnapshot,
+    provider: {
+      ...provider,
+      listModels: provider.listModels ?? (async () => []),
+      validateCredential: provider.validateCredential ?? (async () => ({ valid: true })),
+    },
+  }
+  const assetFingerprints = input.assetIds.map(() => 'b'.repeat(64))
   const attachmentDisclosure = createProviderAttachmentDisclosure({
     requestId,
-    providerId: input.provider,
-    access: { decision, allowProviderBytes: decision === 'ordinary' },
+    providerSnapshot,
+    credentialEpoch: 0,
+    access: providerAttachmentAccess(decision, decision === 'ordinary'
+      ? '描述这个附件'
+      : 'convert this attachment to PDF', {
+      hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['image'],
+    }),
     assetIds: input.assetIds,
-    assetFingerprints: input.assetIds.map(() => 'b'.repeat(64)),
+    assetFingerprints,
     forbiddenValues: [],
   })
-  const provider = input.providerSnapshot.provider
+  const safeText = decision === 'ordinary'
+    ? undefined
+    : createProviderAttachmentSafeText(attachmentDisclosure, 'main', String(input.modelContent))
   return {
     ...input,
     requestId,
-    providerSnapshot: protectProviderSnapshot({
-      ...input.providerSnapshot,
-      provider: {
-        ...provider,
-        listModels: provider.listModels ?? (async () => []),
-        validateCredential: provider.validateCredential ?? (async () => ({ valid: true })),
-      },
-    }, attachmentDisclosure),
+    attachmentFingerprints: assetFingerprints,
+    providerSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+      purpose: 'main', ...(safeText === undefined ? {} : { safeText }),
+    }),
     attachmentDisclosure,
   }
 }

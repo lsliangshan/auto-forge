@@ -30,7 +30,11 @@ import type {
 import { createMediaAssetService } from '../media/media-asset-service.js'
 import type { ModelProvider } from './model-provider.js'
 import { OpenRouterProvider } from './openrouter-provider.js'
-import { createProviderAttachmentDisclosure } from './provider-attachment-disclosure.js'
+import { providerAttachmentAccess } from './attachment-conversion-policy.js'
+import {
+  createProviderAttachmentDisclosure,
+  protectProviderSnapshot,
+} from './provider-attachment-disclosure.js'
 import {
   MediaGenerationOrchestrator,
   type MediaGenerationOrchestratorDependencies,
@@ -228,6 +232,50 @@ const input = {
 }
 
 describe('MediaGenerationOrchestrator', () => {
+  it.each([
+    ['image', imageRoute],
+    ['audio', audioRoute],
+  ] as const)('rejects changed attachment fingerprints before %s Provider work', async (kind, route) => {
+    const harness = createHarness()
+    const snapshot = await harness.providers.acquire('openrouter')
+    const attachmentDisclosure = createProviderAttachmentDisclosure({
+      requestId: input.requestId,
+      providerSnapshot: snapshot,
+      credentialEpoch: 0,
+      access: providerAttachmentAccess('ordinary', 'describe this image', {
+        hasAttachments: true, requestedOutput: kind, attachmentKinds: ['image'],
+      }),
+      assetIds: ['reference_image'],
+      assetFingerprints: ['a'.repeat(64)],
+      forbiddenValues: [],
+    })
+    const protectedSnapshot = protectProviderSnapshot(snapshot, attachmentDisclosure, { purpose: 'main' })
+    const boundRoute = {
+      ...route,
+      assets: [{
+        id: 'reference_image', kind: 'image' as const, mimeType: 'image/png',
+        name: 'reference.png', byteSize: 12, conversationId: input.conversationId,
+        absolutePath: '/managed/reference.png', relativePath: 'conversation_1/reference.png',
+        inlineSafe: true,
+      }],
+    }
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+    const run = kind === 'image' ? orchestrator.runImage.bind(orchestrator) : orchestrator.runAudio.bind(orchestrator)
+
+    await expect(run({
+      ...input,
+      assetIds: ['reference_image'],
+      attachmentFingerprints: ['b'.repeat(64)],
+      attachmentDisclosure,
+      providerSnapshot: protectedSnapshot,
+      route: boundRoute,
+    })).rejects.toThrow('Attachment disclosure capability is missing or invalid')
+
+    expect(harness.media.modelInput).not.toHaveBeenCalled()
+    expect(harness.provider.generateImage).not.toHaveBeenCalled()
+    expect(harness.provider.stream).not.toHaveBeenCalled()
+  })
+
   it('keeps image wire credentials and ledger attribution on one snapshot across a key switch', async () => {
     let apiKey = 'sk-image-a'
     const authorizations: string[] = []
@@ -963,9 +1011,10 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
       database.conversations.insert({ id: 'conversation_atomic', title: 'Atomic start' })
       database.mediaAssets.insert(asset)
       arrange(database)
+      const providerSnapshot = { providerId: 'openrouter' as const, provider }
       const harness = createHarness({
         providers: {
-          acquire: async (providerId) => ({ providerId, provider }),
+          acquire: async () => providerSnapshot,
         },
         persistence: createAgentPersistence(database),
         emit: (event) => { events.push(event) },
@@ -977,8 +1026,11 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
         : orchestrator.runAudio.bind(orchestrator)
       const attachmentDisclosure = createProviderAttachmentDisclosure({
         requestId: 'request_atomic',
-        providerId: 'openrouter',
-        access: { decision: 'ordinary', allowProviderBytes: true },
+        providerSnapshot,
+        credentialEpoch: 0,
+        access: providerAttachmentAccess('ordinary', '描述这个图片', {
+          hasAttachments: true, requestedOutput: kind, attachmentKinds: ['image'],
+        }),
         assetIds: [asset.id],
         assetFingerprints: [asset.sha256],
         forbiddenValues: [],
@@ -1002,7 +1054,11 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
           },
         ],
         assetIds: [asset.id],
+        attachmentFingerprints: [asset.sha256],
         attachmentDisclosure,
+        providerSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+          purpose: 'main',
+        }),
         route: {
           ...(kind === 'image' ? imageRoute : audioRoute),
           assets: [{

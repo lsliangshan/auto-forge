@@ -315,7 +315,7 @@ describe('local conversion intent', () => {
     expect(hasLocalConversionIntent(`${prefix}${targetQuestion}`, attachments)).toBe(false)
   })
 
-  it('projects only sanitized current metadata with stable zero-based indexes', () => {
+  it('projects only anonymous current metadata with stable zero-based indexes', () => {
     const prompt = projectLocalConversionPrompt('把附件转为 PDF', [
       { index: 0, name: '../../data:secret\nreport.pdf', mimeType: 'application/pdf', byteSize: 12 },
       { index: 1, name: 'C:\\private\\CON ', mimeType: 'application/octet-stream', byteSize: 34 },
@@ -323,10 +323,19 @@ describe('local conversion intent', () => {
 
     expect(prompt).toBe([
       '把附件转为 PDF',
-      '[附件 0: report.pdf, application/pdf, 12 bytes]',
+      '[附件 0: 文件-1, application/pdf, 12 bytes]',
       '[附件 1: 文件-2, application/octet-stream, 34 bytes]',
     ].join('\n'))
     expect(prompt).not.toMatch(/data:|secret|private|\\|\.\./i)
+  })
+
+  it('anonymizes an exact attachment name repeated in user text', () => {
+    const prompt = projectLocalConversionPrompt('请把 tax-return-secret.pdf 转成 PDF', [{
+      index: 0, name: 'tax-return-secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])
+
+    expect(prompt).toContain('请把 文件-1 转成 PDF')
+    expect(prompt).not.toContain('tax-return-secret.pdf')
   })
 
   it('keeps a long non-conversion attachment request non-local', () => {
