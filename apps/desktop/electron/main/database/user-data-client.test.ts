@@ -641,6 +641,21 @@ describe('UserDataStoreManager', () => {
     ['Convert this attachment and filename says save as PDF', 'pdf'],
     ['Convert this attachment while metadata says output as WEBP', 'webp'],
     ['转换这个附件且备注写着保存为 WEBP', 'webp'],
+    ['Convert this attachment because the note says save it as WEBP', 'webp'],
+    ['Convert this attachment with its note saying save it as WEBP', 'webp'],
+    ['Convert this attachment and a note indicates export as WEBP', 'webp'],
+    ['Convert this attachment and its metadata recommends WEBP', 'webp'],
+    ['Convert this attachment with filename: save as PDF', 'pdf'],
+    ['Convert this attachment while the metadata indicates output as WEBP', 'webp'],
+    ['Convert this attachment while its filename recommends PDF', 'pdf'],
+    ['Convert this attachment and the note says save as WEBP', 'webp'],
+    ['Convert this attachment and ｍｅｔａｄａｔａ indicates output as WEBP', 'webp'],
+    ['转换这个附件而备注注明保存为 WEBP', 'webp'],
+    ['转换这个附件且其元数据显示输出为 WEBP', 'webp'],
+    ['转换这个附件因为文件名建议导出为 PDF', 'pdf'],
+    ['转换这个附件并附带备注：保存为 WEBP', 'webp'],
+    ['转换这个附件同时其元数据推荐输出为 WEBP', 'webp'],
+    ['转换这个附件，而其文件名注明保存为 PDF', 'pdf'],
   ] as const)('discards a forged remote projection after Main reclassification: %s', (text, targetFormat) => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open(`projection-forged-${targetFormat}-${text.length}`)

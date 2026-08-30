@@ -17,12 +17,14 @@ const attachments = [{
 
 describe('local conversion intent', () => {
   it.each([
-    ['Convert this attachment to PDF', 'pdf'],
-    ['Convert /Users/Alice/PDF/secret.txt to WebP', 'webp'],
-    ['转换 /Users/张三/PDF/资料.txt 为 WebP', 'webp'],
-    ['把这个附件保存为 JPG', 'jpeg'],
-  ] as const)('extracts the one trusted supported target from %s', (text, targetFormat) => {
-    expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({
+    ['Convert this attachment to PDF', 'pdf', 'report.pdf'],
+    ['Convert /Users/Alice/PDF/secret.txt to WebP', 'webp', 'secret.txt'],
+    ['转换 /Users/张三/PDF/资料.txt 为 WebP', 'webp', '资料.txt'],
+    ['把这个附件保存为 JPG', 'jpeg', 'report.pdf'],
+    ['Convert report.pdf and REPORT.PDF to PDF', 'pdf', 'report.pdf'],
+    [String.raw`Convert /Users/A/report.pdf and C:\Private\REPORT.PDF to PDF`, 'pdf', 'report.pdf'],
+  ] as const)('extracts the one trusted supported target from %s', (text, targetFormat, name) => {
+    expect(classifyAttachmentConversionRequest(text, [{ ...attachments[0]!, name }])).toEqual({
       decision: 'local',
       targetFormat,
     })
@@ -49,6 +51,26 @@ describe('local conversion intent', () => {
     'Convert this attachment while metadata says output as WEBP',
     '转换这个附件且备注写着保存为 WEBP',
   ])('does not grant target authority to trailing notes or filename fields: %s', (text) => {
+    expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
+  })
+
+  it.each([
+    'Convert this attachment because the note says save it as WEBP',
+    'Convert this attachment with its note saying save it as WEBP',
+    'Convert this attachment and a note indicates export as WEBP',
+    'Convert this attachment and its metadata recommends WEBP',
+    'Convert this attachment with filename: save as PDF',
+    'Convert this attachment while the metadata indicates output as WEBP',
+    'Convert this attachment while its filename recommends PDF',
+    'Convert this attachment and the note says save as WEBP',
+    'Convert this attachment and ｍｅｔａｄａｔａ indicates output as WEBP',
+    '转换这个附件而备注注明保存为 WEBP',
+    '转换这个附件且其元数据显示输出为 WEBP',
+    '转换这个附件因为文件名建议导出为 PDF',
+    '转换这个附件并附带备注：保存为 WEBP',
+    '转换这个附件同时其元数据推荐输出为 WEBP',
+    '转换这个附件，而其文件名注明保存为 PDF',
+  ])('rejects an unconsumed reporting or metadata clause without deny-list matching: %s', (text) => {
     expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
   })
 
@@ -89,6 +111,8 @@ describe('local conversion intent', () => {
     ['No matter what this tool can convert then convert this attachment to PDF', 'local'],
     ['How do I convert PNG then convert this attachment to PDF', 'local'],
     ['How do I convert PNG then directly convert this attachment to PDF', 'local'],
+    ['Can it save PNG? Then convert this attachment to PDF', 'local'],
+    ['这个工具能保存 PNG 吗？然后请把这个附件转换为 PDF', 'local'],
     ['如何把图片转换为 PNG 然后请导出为 PDF', 'local'],
     ['Convert this conversation as well as this attachment to PDF', 'local'],
     ['Convert this conversation together with this attachment to PDF', 'local'],
