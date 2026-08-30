@@ -18,7 +18,7 @@ import type {
   LegacyImportBatchResult,
 } from './legacy-user-data-import.js'
 
-const SYNC_PROTOCOL_VERSION = 2 as const
+const SYNC_PROTOCOL_VERSION = 3 as const
 const LEGACY_IMPORT_PROTOCOL_VERSION = 1 as const
 const BATCH_LIMIT = 100
 const MAX_EVENT_BYTES = 1_048_576

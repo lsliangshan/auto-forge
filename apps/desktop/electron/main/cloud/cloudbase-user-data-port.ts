@@ -19,7 +19,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import type { CloudBaseFunctionPort } from '../auth/cloudbase-auth-port.js'
 
-const syncProtocolVersionSchema = z.union([z.literal(1), z.literal(2)])
+const syncProtocolVersionSchema = z.union([z.literal(1), z.literal(2), z.literal(3)])
 const legacyProtocolVersionSchema = z.literal(1)
 const identifierSchema = z.string().min(1).max(128).refine((value) => value.trim() === value)
 export const maximumUserDataCallBytes = 1_048_576
@@ -243,7 +243,7 @@ export class CloudBaseUserDataPort {
       if (!hasStrictShape(input, ['action', 'protocolVersion', 'deviceId', 'mutations'])) {
         throw toSafeAppError({ code: 'INVALID_INPUT' })
       }
-      if (input.protocolVersion !== 1 && input.protocolVersion !== 2) {
+      if (input.protocolVersion !== 1 && input.protocolVersion !== 2 && input.protocolVersion !== 3) {
         throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
       }
       if (typeof input.deviceId !== 'string'
@@ -262,7 +262,7 @@ export class CloudBaseUserDataPort {
         ['action', 'protocolVersion', 'deviceId'],
         ['cursor', 'limit'],
       )) throw toSafeAppError({ code: 'INVALID_INPUT' })
-      if (input.protocolVersion !== 1 && input.protocolVersion !== 2) {
+      if (input.protocolVersion !== 1 && input.protocolVersion !== 2 && input.protocolVersion !== 3) {
         throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
       }
     } else if (input.action === 'importLegacyBatch') {

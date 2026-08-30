@@ -35,6 +35,10 @@ import {
   createRepositories,
   type AppRepositories,
 } from './repositories.js'
+import {
+  classifyAttachmentConversionRequest,
+  type LocalAttachmentProjection,
+} from '../chat/local-conversion-intent.js'
 
 const OUTBOX_LIMIT = 10_000
 
@@ -50,13 +54,13 @@ const outboxMetadataSchema = z.object({
 }).strict()
 
 const checkpointSchema = z.object({
-  protocolVersion: z.union([z.literal(1), z.literal(2)]),
+  protocolVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
   remoteCursor: opaqueCursorSchema.optional(),
   updatedAt: z.number().int().nonnegative(),
 }).strict()
 
 const remotePageEnvelopeSchema = z.object({
-  protocolVersion: z.union([z.literal(1), z.literal(2)]),
+  protocolVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
   cursor: opaqueCursorSchema.nullable(),
   mutations: z.array(pulledMutationSchema).max(100),
 }).strict()
@@ -488,8 +492,67 @@ function projectPreferences(
   `).run({ ...value, updatedAt: timestamp(value.updatedAt) })
 }
 
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function trustedRemoteProviderProjection(payload: Record<string, unknown>) {
+  const candidate = messageProviderProjectionSchema.safeParse(payload.providerProjection)
+  const blocks = chatBlockSchema.array().safeParse(payload.blocks)
+  if (!candidate.success || !blocks.success || payload.role !== 'user') return undefined
+  const inputBlocks = blocks.data.filter((block): block is Extract<ChatBlock, { type: 'media' }> => (
+    block.type === 'media' && block.purpose === 'input'
+  ))
+  const attachments: LocalAttachmentProjection[] = inputBlocks.map((block, index) => ({
+    index,
+    name: block.name,
+    mimeType: block.mimeType,
+    byteSize: block.byteSize,
+  }))
+  const text = blocks.data
+    .filter((block): block is Extract<ChatBlock, { type: 'text' }> => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n')
+  const classification = classifyAttachmentConversionRequest(text, attachments)
+  return classification.decision === 'local'
+    && classification.targetFormat === candidate.data.targetFormat
+    && attachments.length === candidate.data.attachmentCount
+    ? candidate.data
+    : undefined
+}
+
+function discardUntrustedRemoteProviderProjections(value: unknown): unknown {
+  const page = record(value)
+  if (!page || !Array.isArray(page.mutations)) return value
+  return {
+    ...page,
+    mutations: page.mutations.map((mutationValue) => {
+      const mutation = record(mutationValue)
+      const payload = record(mutation?.payload)
+      if (!mutation || mutation.kind !== 'message.append' || mutation.compacted === true || !payload
+        || !Object.prototype.hasOwnProperty.call(payload, 'providerProjection')) return mutationValue
+      const payloadWithoutProjection = { ...payload }
+      delete payloadWithoutProjection.providerProjection
+      const providerProjection = page.protocolVersion === 3
+        ? trustedRemoteProviderProjection(payload)
+        : undefined
+      return {
+        ...mutation,
+        payload: {
+          ...payloadWithoutProjection,
+          ...(providerProjection === undefined ? {} : { providerProjection }),
+        },
+      }
+    }),
+  }
+}
+
 function parseRemotePage(value: unknown): RemoteMutationPage {
-  return parsePersisted(() => remotePageEnvelopeSchema.parse(value))
+  return parsePersisted(() => remotePageEnvelopeSchema.parse(
+    discardUntrustedRemoteProviderProjections(value),
+  ))
 }
 
 function encodeCursor(value: Record<string, string | number>): string {

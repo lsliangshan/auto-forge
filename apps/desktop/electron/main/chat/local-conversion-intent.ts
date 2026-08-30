@@ -113,7 +113,10 @@ const TRUSTED_TARGET_CONTEXT = new RegExp([
 ].join('|'), 'giu')
 const GENERIC_TARGET_CONTEXT = /(?:(?:\b(?:to|into|as)\s+(?!(?:well|this|the|that|current)\b)(?:an?\s+)?)|(?:(?:转换成|转换为|转成|转为|另存为|保存为|保存成|导出为|输出为|做成|制作成?|改成|改为|换成|换为|变成|生成为?|格式为|目标格式\s*[:：]?|为)\s*)(?:一(?:个|份|张)\s*)?|(?:\bbut\b|\binstead\b|而是)\s*(?:an?\s+)?)(?<target>\.?[A-Za-z0-9][A-Za-z0-9._+-]{1,15})/giu
 const NEGATED_TARGET_PREFIX = /(?:不要|不用|别|请勿|并非|不是)|\b(?:not|don't|do\s+not|never)\b/iu
-const TARGET_AUTHORITY_BOUNDARY = /[;；]\s*(?:note(?:\s+says)?|file\s*name|filename|target\s*format(?:\s+field)?|备注|文件名(?:字)?字段|目标格式字段)\s*(?::|：|says\b|field\b|写着)?/iu
+const FINAL_TARGET_SUFFIX = /^(?:\s*(?:formats?|files?|格式|文件))?\s*[。.!！？?]*\s*$/iu
+const EXECUTABLE_TARGET_SEGMENT = /^(?:(?:please\s*,?\s*)|(?:请\s*))?(?:(?:not\s+\.?[A-Za-z0-9][A-Za-z0-9._+-]{1,15}\s*$)|(?:不要\s*\.?[A-Za-z0-9][A-Za-z0-9._+-]{1,15}\s*$)|(?:转换|转成|转为|另存|保存|导出|输出|制作|做成|变成|生成)|\b(?:convert|transcode|reformat|encode|render|transform|create|make|turn|change|save|export)\b|(?:把|将)\s*(?:(?:这个|这张|该|当前)?(?:附件|文件|图片|图像|照片|文档|视频|音频)|文件-\d+)[^,;，；—]{0,32}(?:转换|转成|转为|另存|保存|导出|输出|制作|做成|变成|生成)[^,;，；—]{0,24}$)/iu
+const EXECUTABLE_TARGET_RESTART = /(?:\b(?:then|just|directly|otherwise|and|but)\b[^,;.!?]{0,64}\b(?:convert|transcode|reformat|encode|render|transform|create|make|turn|change|save|export)\b|(?:然后|随后|直接|请|并|以及|但是|但)[^，,；;。.!！？?]{0,48}(?:转换|转成|转为|另存|保存|导出|输出|制作|做成|变成|生成))/iu
+const TARGET_SEGMENT_BOUNDARY = /[,;，；—]+|\.(?=\s+(?:[A-Z]|\p{Script=Han}))/gu
 
 function conversionActionIsNegated(
   clause: string,
@@ -711,25 +714,86 @@ function targetMatchIsNegated(text: string, index: number): boolean {
   return actions.length < 2
 }
 
-function trustedUniqueTargetFormat(text: string): ConversionTargetFormat | undefined {
-  const normalizedText = text.normalize('NFKC').replace(/[‘’]/gu, "'")
-  const authorityBoundary = TARGET_AUTHORITY_BOUNDARY.exec(normalizedText)
-  const normalized = authorityBoundary?.index === undefined
-    ? normalizedText
-    : normalizedText.slice(0, authorityBoundary.index)
+function finalTargetBelongsToExecutableCommand(text: string, matchIndex: number, matchEnd: number): boolean {
+  let start = 0
+  for (const boundary of text.slice(0, matchIndex).matchAll(TARGET_SEGMENT_BOUNDARY)) {
+    if (boundary.index !== undefined) start = boundary.index + boundary[0].length
+  }
+  const segment = text.slice(start, matchEnd).trimStart()
+  return EXECUTABLE_TARGET_SEGMENT.test(segment)
+    || EXECUTABLE_TARGET_RESTART.test(segment)
+}
+
+function targetIsSupersededByExplicitAction(text: string, end: number): boolean {
+  return /^(?:\s*(?:how\s+(?:do|can|could|would|should)\b|no\s+matter\s+what\b|如何|怎么))/iu
+    .test(text.slice(0, end))
+    && EXECUTABLE_TARGET_RESTART.test(text.slice(end))
+}
+
+function originalTextHasExecutableFinalTarget(text: string, expectedToken: string): boolean {
+  const normalized = text.normalize('NFKC').replace(/[‘’]/gu, "'")
+  for (const pattern of [TRUSTED_TARGET_CONTEXT, GENERIC_TARGET_CONTEXT]) {
+    for (const match of normalized.matchAll(pattern)) {
+      if (match.index === undefined) continue
+      const token = (pattern === GENERIC_TARGET_CONTEXT
+        ? match.groups?.target
+        : Object.values(match.groups ?? {}).find((value) => value !== undefined))
+        ?.replace(/^\./u, '')
+        .toLocaleLowerCase('und')
+      const end = match.index + match[0].length
+      if (token === expectedToken
+        && FINAL_TARGET_SUFFIX.test(normalized.slice(end))
+        && finalTargetBelongsToExecutableCommand(normalized, match.index, end)) return true
+    }
+  }
+  return false
+}
+
+function trustedUniqueTargetFormat(
+  text: string,
+  attachments: readonly LocalAttachmentProjection[],
+): ConversionTargetFormat | undefined {
+  const normalized = anonymizeAttachmentNames(
+    text.normalize('NFKC').replace(/[‘’]/gu, "'"),
+    attachments,
+  )
   const targets = new Set<ConversionTargetFormat>()
   let unknown = false
   for (const match of normalized.matchAll(TRUSTED_TARGET_CONTEXT)) {
     if (match.index === undefined || targetMatchIsNegated(normalized, match.index)) continue
+    const end = match.index + match[0].length
+    if (!FINAL_TARGET_SUFFIX.test(normalized.slice(end))) {
+      if (targetIsSupersededByExplicitAction(normalized, end)) continue
+      unknown = true
+      continue
+    }
     const token = Object.values(match.groups ?? {}).find((value) => value !== undefined)
       ?.replace(/^\./u, '')
       .toLocaleLowerCase('und')
+    if (token !== undefined
+      && !finalTargetBelongsToExecutableCommand(normalized, match.index, end)
+      && !originalTextHasExecutableFinalTarget(text, token)) {
+      unknown = true
+      continue
+    }
     const target = token === undefined ? undefined : TRUSTED_TARGET_ALIASES.get(token)
     if (target !== undefined) targets.add(target)
   }
   for (const match of normalized.matchAll(GENERIC_TARGET_CONTEXT)) {
     if (match.index === undefined || targetMatchIsNegated(normalized, match.index)) continue
+    const end = match.index + match[0].length
+    if (!FINAL_TARGET_SUFFIX.test(normalized.slice(end))) {
+      if (targetIsSupersededByExplicitAction(normalized, end)) continue
+      unknown = true
+      continue
+    }
     const token = match.groups?.target?.replace(/^\./u, '').toLocaleLowerCase('und')
+    if (token !== undefined
+      && !finalTargetBelongsToExecutableCommand(normalized, match.index, end)
+      && !originalTextHasExecutableFinalTarget(text, token)) {
+      unknown = true
+      continue
+    }
     if (token !== undefined && !TRUSTED_TARGET_ALIASES.has(token)) unknown = true
   }
   return !unknown && targets.size === 1 ? [...targets][0] : undefined
@@ -741,7 +805,7 @@ export function classifyAttachmentConversionRequest(
 ): AttachmentConversionClassification {
   const decision = baseAttachmentConversionIntent(text, attachments)
   if (decision !== 'local') return Object.freeze({ decision })
-  const targetFormat = trustedUniqueTargetFormat(text)
+  const targetFormat = trustedUniqueTargetFormat(text, attachments)
   return targetFormat === undefined
     ? Object.freeze({ decision: 'ambiguous' })
     : Object.freeze({ decision: 'local', targetFormat })

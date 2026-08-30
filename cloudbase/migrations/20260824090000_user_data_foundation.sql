@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS app_messages (
   ordinal bigint NOT NULL CHECK (ordinal > 0),
   role varchar(16) NOT NULL CHECK (role IN ('user', 'assistant')),
   blocks jsonb NOT NULL CHECK (jsonb_typeof(blocks) = 'array'),
+  provider_projection jsonb,
   execution_id varchar(128) CHECK (execution_id IS NULL OR length(execution_id) BETWEEN 1 AND 128),
   created_at timestamptz NOT NULL,
   received_at timestamptz NOT NULL DEFAULT now(),
@@ -144,6 +145,61 @@ CREATE INDEX IF NOT EXISTS app_conversations_owner_activity_idx
   ON app_conversations(owner_user_id, last_activity_at DESC, id);
 CREATE UNIQUE INDEX IF NOT EXISTS app_messages_conversation_ordinal_key
   ON app_messages(owner_user_id, conversation_id, ordinal);
+
+CREATE OR REPLACE FUNCTION autoforge_apply_message_provider_projection()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  payload jsonb;
+  projection jsonb;
+  stored_projection jsonb;
+BEGIN
+  IF NEW.kind <> 'message.append' OR NEW.status NOT IN ('applied', 'duplicate') THEN
+    RETURN NEW;
+  END IF;
+  payload := NEW.mutation_payload->'payload';
+  projection := payload->'providerProjection';
+  SELECT message.provider_projection INTO stored_projection
+  FROM app_messages message
+  WHERE message.owner_user_id = NEW.owner_user_id AND message.id = NEW.entity_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  IF projection IS NULL THEN
+    IF stored_projection IS NOT NULL THEN
+      RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF jsonb_typeof(projection) <> 'object'
+    OR (SELECT count(*) FROM jsonb_object_keys(projection)) <> 3
+    OR projection->>'kind' <> 'local_conversion'
+    OR projection->>'targetFormat' NOT IN (
+      'png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif', 'ico', 'icns', 'pdf', 'xlsx',
+      'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'mp4', 'webm', 'mov'
+    )
+    OR jsonb_typeof(projection->'attachmentCount') <> 'number'
+    OR projection->>'attachmentCount' !~ '^[1-5]$'
+    OR payload->>'role' <> 'user'
+    OR (SELECT count(*) FROM jsonb_array_elements(payload->'blocks') block
+        WHERE block->>'type' = 'media' AND block->>'purpose' = 'input')
+      <> (projection->>'attachmentCount')::integer
+    OR stored_projection IS NOT NULL AND stored_projection IS DISTINCT FROM projection THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  UPDATE app_messages SET provider_projection = projection
+  WHERE owner_user_id = NEW.owner_user_id AND id = NEW.entity_id;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS app_sync_message_provider_projection ON app_sync_mutations;
+CREATE TRIGGER app_sync_message_provider_projection
+BEFORE INSERT ON app_sync_mutations
+FOR EACH ROW EXECUTE FUNCTION autoforge_apply_message_provider_projection();
 CREATE UNIQUE INDEX IF NOT EXISTS app_active_run_per_conversation
   ON app_model_runs(owner_user_id, conversation_id)
   WHERE status IN ('queued', 'running', 'cancelling');
@@ -1123,6 +1179,7 @@ BEGIN
       'conversationId', page.conversation_id,
       'role', page.role,
       'blocks', page.blocks,
+      'providerProjection', page.provider_projection,
       'executionId', page.execution_id,
       'createdAt', autoforge_iso_timestamp(page.created_at)
     ) ORDER BY page.ordinal), '[]'::jsonb),

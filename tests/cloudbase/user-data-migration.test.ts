@@ -17,6 +17,14 @@ const conversionAdditiveUrl = new URL(
   '../../cloudbase/migrations/20260829000000_conversion_block_terminal.sql',
   import.meta.url,
 )
+const projectionAdditiveUrl = new URL(
+  '../../cloudbase/migrations/20260830190000_message_provider_projection.sql',
+  import.meta.url,
+)
+const projectionFeatureUrl = new URL(
+  '../../cloudbase/user-data/migrations/0002_message_provider_projection.sql',
+  import.meta.url,
+)
 
 const tableNames = [
   'app_conversations',
@@ -66,6 +74,31 @@ describe('CloudBase user data migration', () => {
     ])
 
     expect(canonical).toBe(featureCopy)
+  })
+
+  it('stores only constrained canonical projections and returns them from push/list/bootstrap', async () => {
+    const [canonical, additive, featureAdditive] = await Promise.all([
+      readFile(canonicalUrl, 'utf8'),
+      readFile(projectionAdditiveUrl, 'utf8'),
+      readFile(projectionFeatureUrl, 'utf8'),
+    ])
+    expect(additive).toBe(featureAdditive)
+    for (const sql of [canonical, additive]) {
+      expect(sql).toContain('provider_projection jsonb')
+      expect(sql).toContain("projection->>'kind' <> 'local_conversion'")
+      expect(sql).toContain("projection->>'targetFormat'")
+      expect(sql).toContain("projection->>'attachmentCount'")
+      expect(sql).toContain("payload->'providerProjection'")
+      expect(sql).toContain("'providerProjection', page.provider_projection")
+    }
+    const projectionTrigger = extractFunction(additive, 'autoforge_apply_message_provider_projection')
+    const list = extractFunction(additive, 'autoforge_list_messages')
+    expect(projectionTrigger).toContain('provider_projection')
+    expect(projectionTrigger).toContain("jsonb_object_keys(projection)")
+    expect(projectionTrigger).toContain('stored_projection IS DISTINCT FROM projection')
+    expect(list).toContain("'providerProjection', page.provider_projection")
+    expect(additive.indexOf('ALTER TABLE app_messages ADD COLUMN IF NOT EXISTS provider_projection'))
+      .toBeLessThan(additive.indexOf('CREATE OR REPLACE FUNCTION autoforge_apply_message_provider_projection('))
   })
 
   it('defines owner-bound revisioned records, tombstones, idempotency, and ordering', async () => {

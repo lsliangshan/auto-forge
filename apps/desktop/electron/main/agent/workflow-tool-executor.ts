@@ -236,6 +236,38 @@ function validSourceFingerprint(value: unknown): value is string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
 }
 
+function canonicalFileConversionInput(
+  workflow: WorkflowDetail,
+  value: unknown,
+): { files: number[]; targetFormat: unknown } | ToolError | undefined {
+  if (!workflow.permissions.some(({ capability }) => capability === 'file.convert')) return undefined
+  if (!isRecord(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    return toolError('INVALID_INPUT')
+  }
+  const inputKeys = Reflect.ownKeys(value)
+  if (inputKeys.length !== 2
+    || !inputKeys.every((key) => key === 'files' || key === 'targetFormat')
+    || !Object.prototype.propertyIsEnumerable.call(value, 'files')
+    || !Object.prototype.propertyIsEnumerable.call(value, 'targetFormat')) {
+    return toolError('INVALID_INPUT')
+  }
+  const files = value.files
+  if (!Array.isArray(files) || Object.getPrototypeOf(files) !== Array.prototype) {
+    return toolError('INVALID_INPUT')
+  }
+  const keys = Reflect.ownKeys(files)
+  if (keys.length !== files.length + 1 || keys.at(-1) !== 'length') return toolError('INVALID_INPUT')
+  const indexes = new Set<number>()
+  for (let index = 0; index < files.length; index += 1) {
+    if (keys[index] !== String(index)
+      || !Object.prototype.propertyIsEnumerable.call(files, index)) return toolError('INVALID_INPUT')
+    const item = files[index]
+    if (!Number.isInteger(item) || item < 0 || indexes.has(item)) return toolError('INVALID_INPUT')
+    indexes.add(item)
+  }
+  return { files: [...files] as number[], targetFormat: value.targetFormat }
+}
+
 function bindFileConversion(
   workflow: WorkflowDetail,
   input: unknown,
@@ -371,10 +403,14 @@ export class WorkflowToolExecutor {
     try { parsed = parseArguments(input.candidate, input.arguments) } catch { return toolError('INVALID_INPUT') }
     if ('kind' in parsed) return parsed
 
+    const canonicalFileInput = canonicalFileConversionInput(input.candidate.workflow, parsed.input)
+    if (canonicalFileInput && 'kind' in canonicalFileInput) return canonicalFileInput
+    const rawInput = canonicalFileInput ?? parsed.input
+
     let validatedInput: unknown
     let inputFingerprint: string
     try {
-      validatedInput = structuredClone(parsed.input)
+      validatedInput = structuredClone(rawInput)
       const validation = validateWorkflowInput(input.candidate.workflow.inputSchema, validatedInput)
       if (!validation.valid) return toolError('INVALID_INPUT', validation.message.slice(0, 500))
       inputFingerprint = canonicalJson(validatedInput)

@@ -464,6 +464,49 @@ describe('WorkflowToolExecutor', () => {
     expect(test.executions.startReserved).not.toHaveBeenCalled()
   })
 
+  it.each([
+    ['enumerable array property', () => Object.assign([0], { extra: 'hidden' })],
+    ['array symbol property', () => {
+      const files = [0]
+      Object.defineProperty(files, Symbol('hidden'), { value: 'command', enumerable: true })
+      return files
+    }],
+    ['custom array prototype', () => {
+      const files = [0]
+      Object.setPrototypeOf(files, Object.create(Array.prototype))
+      return files
+    }],
+    ['sparse array', () => {
+      const files = new Array<number>(1)
+      return files
+    }],
+    ['duplicate indexes', () => [0, 0]],
+    ['string coercion', () => ['0']],
+  ])('rejects non-canonical file conversion arrays before approval: %s', async (_label, files) => {
+    const detail = workflow({
+      cities: [],
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf'] } }],
+      inputSchema: {
+        type: 'object', additionalProperties: true, required: ['files', 'targetFormat'],
+        properties: {
+          files: { type: 'array' },
+          targetFormat: { type: 'string' },
+        },
+      },
+    })
+    const test = harness({ detail })
+
+    await expect(test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { input: { files: files(), targetFormat: 'pdf' } },
+      developerMode: true,
+      attachmentBindings: conversionBindings().slice(0, 1),
+    })).resolves.toEqual({ kind: 'tool_error', code: 'INVALID_INPUT' })
+    expect(test.executions.reserve).not.toHaveBeenCalled()
+    expect(test.policy.evaluate).not.toHaveBeenCalled()
+    expect(test.executions.startReserved).not.toHaveBeenCalled()
+  })
+
   it('fails unsupported and unknown capabilities before reserving or recording grants', async () => {
     for (const capability of ['network.fetch', 'future.unknown'] as const) {
       const test = harness({

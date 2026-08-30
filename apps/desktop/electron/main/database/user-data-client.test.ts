@@ -7,6 +7,7 @@ import Database from 'better-sqlite3'
 import type { PulledMutation, SyncMutation, SyncMutationResult } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { UserDataStoreManager, type UserDataStore } from './user-data-client.js'
+import { serializeHistoricalMessage } from '../chat/conversation-context.js'
 
 const temporaryDirectories: string[] = []
 
@@ -578,7 +579,7 @@ describe('UserDataStoreManager', () => {
 
     const remote = manager.open('projection-remote')
     remote.sync.applyRemotePage({
-      protocolVersion: 1,
+      protocolVersion: 3,
       cursor: 'projection_remote_cursor',
       mutations: [pulledMutation(create, 1), pulledMutation(append, 2)],
     }, 1)
@@ -597,10 +598,78 @@ describe('UserDataStoreManager', () => {
         providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 0 },
       },
     } as unknown as Extract<SyncMutation, { kind: 'message.append' }>, 3)
-    expect(() => remote.sync.applyRemotePage({
-      protocolVersion: 1, cursor: 'projection_spoof_cursor', mutations: [malformed],
-    }, 2)).toThrow()
-    expect(remote.messages.get('projection_spoof_message')).toBeUndefined()
+    remote.sync.applyRemotePage({
+      protocolVersion: 3, cursor: 'projection_spoof_cursor', mutations: [malformed],
+    }, 2)
+    expect(remote.messages.get('projection_spoof_message')?.providerProjection).toBeUndefined()
+    expect(serializeHistoricalMessage(remote.messages.get('projection_spoof_message')!)).toBeUndefined()
+
+    const unknownVersion = pulledMutation({
+      ...append,
+      id: 'projection_unknown_version_append',
+      entityId: 'projection_unknown_version_message',
+      baseRevision: 3,
+      payload: {
+        ...append.payload,
+        id: 'projection_unknown_version_message',
+        providerProjection: {
+          version: 99, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        },
+      },
+    } as unknown as Extract<SyncMutation, { kind: 'message.append' }>, 4)
+    remote.sync.applyRemotePage({
+      protocolVersion: 3, cursor: 'projection_unknown_version_cursor', mutations: [unknownVersion],
+    }, 3)
+    expect(remote.messages.get('projection_unknown_version_message')?.providerProjection).toBeUndefined()
+
+    const legacyRemote = manager.open('projection-legacy-remote')
+    legacyRemote.sync.applyRemotePage({
+      protocolVersion: 2,
+      cursor: 'projection_legacy_remote_cursor',
+      mutations: [pulledMutation(create, 1), pulledMutation(append, 2)],
+    }, 1)
+    expect(legacyRemote.messages.get(append.payload.id)?.providerProjection).toBeUndefined()
+    expect(serializeHistoricalMessage(legacyRemote.messages.get(append.payload.id)!)).toBeUndefined()
+    manager.close()
+  })
+
+  it.each([
+    ['Describe this PDF', 'pdf'],
+    ['Convert this image to WEBP', 'pdf'],
+    ['Convert this attachment to PDF', 'webp'],
+  ] as const)('discards a forged remote projection after Main reclassification: %s', (text, targetFormat) => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open(`projection-forged-${targetFormat}-${text.length}`)
+    const conversationId = `projection_forged_conversation_${targetFormat}_${text.length}`
+    const create = createConversationMutation(`projection_forged_create_${text.length}`, conversationId)
+    const append = {
+      ...appendMessageMutation(
+        `projection_forged_append_${text.length}`, conversationId, `projection_forged_message_${text.length}`,
+      ),
+      payload: {
+        ...appendMessageMutation(
+          `projection_forged_append_${text.length}`, conversationId, `projection_forged_message_${text.length}`,
+        ).payload,
+        blocks: [
+          { type: 'text' as const, text },
+          {
+            type: 'media' as const, blockId: `projection_forged_block_${text.length}`,
+            assetId: `projection_forged_asset_${text.length}`, kind: 'file' as const,
+            purpose: 'input' as const, name: 'private.pdf', mimeType: 'application/pdf', byteSize: 12,
+          },
+        ],
+        providerProjection: {
+          kind: 'local_conversion' as const, targetFormat, attachmentCount: 1,
+        },
+      },
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 3, cursor: `projection_forged_cursor_${text.length}`,
+      mutations: [pulledMutation(create, 1), pulledMutation(append, 2)],
+    }, 1)
+    const stored = store.messages.get(append.payload.id)
+    expect(stored?.providerProjection).toBeUndefined()
+    expect(stored && serializeHistoricalMessage(stored)).toBeUndefined()
     manager.close()
   })
 

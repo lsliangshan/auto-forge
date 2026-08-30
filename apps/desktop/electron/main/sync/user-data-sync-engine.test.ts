@@ -274,11 +274,11 @@ describe('UserDataSyncEngine', () => {
 
     expect(calls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
     expect(calls.filter((call) => call.action === 'syncPush' || call.action === 'syncPull')
-      .every(({ protocolVersion }) => protocolVersion === 2)).toBe(true)
+      .every(({ protocolVersion }) => protocolVersion === 3)).toBe(true)
     expect(store.outbox.find(pending.id)).toBeUndefined()
     expect(engine.status()).toEqual({ state: 'idle' })
     expect(store.sync.getCheckpoint()).toMatchObject({
-      protocolVersion: 2,
+      protocolVersion: 3,
       remoteCursor: 'cursor_bind_drain_pull',
     })
   })
@@ -405,7 +405,7 @@ describe('UserDataSyncEngine', () => {
       syncState: 'synced',
     })
     expect(store.sync.getCheckpoint()).toMatchObject({
-      protocolVersion: 2,
+      protocolVersion: 3,
       remoteCursor: 'duplicate_base_pull',
     })
     expect(engine.status()).toEqual({ state: 'idle' })
@@ -905,7 +905,7 @@ describe('UserDataSyncEngine', () => {
     expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
       expect.objectContaining({ id: mutation.entityId, revision: 1, syncState: 'synced' }),
     )
-    expect(store.sync.getCheckpoint()).toMatchObject({ protocolVersion: 2, remoteCursor: 'cursor_pull_0001' })
+    expect(store.sync.getCheckpoint()).toMatchObject({ protocolVersion: 3, remoteCursor: 'cursor_pull_0001' })
     expect(calls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
     expect(engine.status()).toEqual({ state: 'idle' })
   })

@@ -5641,6 +5641,18 @@ describe('createApplicationRuntime', () => {
     ['Convert this attachment; targetFormat field says WEBP', 'ambiguous', 'text'],
     ['转换这个附件；备注：目标格式为 WEBP', 'ambiguous', 'text'],
     ['转换这个附件；文件名字字段写着保存为 PDF', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF, note says WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF — metadata: WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF footer=WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF and WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF or WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF & WEBP', 'ambiguous', 'text'],
+    ['Convert /tmp/report to PDF .txt to PDF, note: WEBP', 'ambiguous', 'text'],
+    ['Convert report to PDF .txt to PDF — WEBP', 'ambiguous', 'text'],
+    ['Convert save as WEBP.pdf to PDF, metadata says WEBP', 'ambiguous', 'text'],
+    ['把这个附件转为 PDF，备注：WEBP', 'ambiguous', 'text'],
+    ['把这个附件转为 PDF——元数据：WEBP', 'ambiguous', 'text'],
+    ['把这个附件转为 PDF 或 WEBP', 'ambiguous', 'text'],
   ] as const)(
     'enforces the final attachment disclosure boundary for %s as %s from %s output',
     async (content, expectedDecision, requestedOutput) => {
@@ -9987,7 +9999,7 @@ describe('createApplicationRuntime', () => {
       expect(calls.every((call) => (
         call.action !== 'syncPush' && call.action !== 'syncPull'
           ? true
-          : call.protocolVersion === 2
+          : call.protocolVersion === 3
       ))).toBe(true)
       expect(withUserData(root, session.user.id, (store) => store.outbox.countPending())).toBe(0)
 

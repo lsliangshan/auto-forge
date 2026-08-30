@@ -183,28 +183,30 @@ describe('CloudBaseUserDataPort', () => {
     const port = new CloudBaseUserDataPort({ callFunction })
 
     await expect(port.call({
-      action: 'syncPull', protocolVersion: 3, deviceId: 'device-a', limit: 100,
+      action: 'syncPull', protocolVersion: 4, deviceId: 'device-a', limit: 100,
     } as never)).rejects.toMatchObject({ code: 'UPGRADE_REQUIRED' })
     expect(callFunction).not.toHaveBeenCalled()
   })
 
-  it.each(['syncPush', 'syncPull'] as const)(
-    'accepts and forwards protocol v2 for %s while retaining v1 compatibility',
-    async (action) => {
-      const response = action === 'syncPush'
-        ? { results: [{ id: mutation.id, status: 'applied', revision: 1 }] }
-        : { mutations: [], cursor: null }
-      const callFunction = vi.fn().mockResolvedValue({ result: { ok: true, data: response } })
-      const port = new CloudBaseUserDataPort({ callFunction })
-      const input: CloudBaseUserDataCall = action === 'syncPush'
-        ? { action, protocolVersion: 2, deviceId: 'device-a', mutations: [mutation] }
-        : { action, protocolVersion: 2, deviceId: 'device-a', limit: 100 }
+  it.each([2, 3] as const)(
+    'accepts and forwards protocol v%s while retaining v1 compatibility',
+    async (protocolVersion) => {
+      for (const action of ['syncPush', 'syncPull'] as const) {
+        const response = action === 'syncPush'
+          ? { results: [{ id: mutation.id, status: 'applied', revision: 1 }] }
+          : { mutations: [], cursor: null }
+        const callFunction = vi.fn().mockResolvedValue({ result: { ok: true, data: response } })
+        const port = new CloudBaseUserDataPort({ callFunction })
+        const input: CloudBaseUserDataCall = action === 'syncPush'
+          ? { action, protocolVersion, deviceId: 'device-a', mutations: [mutation] }
+          : { action, protocolVersion, deviceId: 'device-a', limit: 100 }
 
-      await expect(port.call(input)).resolves.toMatchObject({ ok: true })
-      expect(callFunction).toHaveBeenCalledWith({
-        name: 'autoforge-user-data',
-        data: input,
-      })
+        await expect(port.call(input)).resolves.toMatchObject({ ok: true })
+        expect(callFunction).toHaveBeenCalledWith({
+          name: 'autoforge-user-data',
+          data: input,
+        })
+      }
     },
   )
 

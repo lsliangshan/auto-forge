@@ -49,6 +49,39 @@ describe('local conversion intent', () => {
   })
 
   it.each([
+    'Convert this attachment to PDF, note says WEBP',
+    'Convert this attachment to PDF — metadata: WEBP',
+    'Convert this attachment to PDF footer=WEBP',
+    'Convert this attachment to PDF and WEBP',
+    'Convert this attachment to PDF or WEBP',
+    'Convert this attachment to PDF & WEBP',
+    'Convert /tmp/report to PDF .txt to PDF, note: WEBP',
+    'Convert report to PDF .txt to PDF — WEBP',
+    'Convert save as WEBP.pdf to PDF, metadata says WEBP',
+    '把这个附件转为 PDF，备注：WEBP',
+    '把这个附件转为 PDF——元数据：WEBP',
+    '把这个附件转为 PDF 或 WEBP',
+  ])('requires one final direct target in a wholly consumed primary command: %s', (text) => {
+    expect(classifyAttachmentConversionRequest(text, [{
+      ...attachments[0]!, name: text.includes('save as') ? 'save as WEBP.pdf' : 'report to PDF .txt',
+    }])).toEqual({ decision: 'ambiguous' })
+  })
+
+  it.each([
+    'Convert /Users/Alice/Tax Returns/SECRET.PDF to PDF',
+    'Convert Tax Return Records/SECRET.PDF to PDF',
+    '转换 中文 三词 目录/SECRET.PDF 为 PDF',
+    'Convert Private/Private Folder/SECRET.PDF to PDF',
+    'See yes/no first, then convert SECRET.PDF to PDF',
+    'Read https://example.test/ordinary/path then convert SECRET.PDF to PDF',
+    'ordinary/path note. Convert SECRET.PDF to PDF',
+  ])('accepts one fully consumed command after shielding its attachment path: %s', (text) => {
+    expect(classifyAttachmentConversionRequest(text, [{
+      ...attachments[0]!, name: 'secret.pdf', mimeType: 'application/pdf',
+    }])).toEqual({ decision: 'local', targetFormat: 'pdf' })
+  })
+
+  it.each([
     ['No matter what this tool can convert then convert this attachment to PDF', 'local'],
     ['How do I convert PNG then convert this attachment to PDF', 'local'],
     ['How do I convert PNG then directly convert this attachment to PDF', 'local'],
