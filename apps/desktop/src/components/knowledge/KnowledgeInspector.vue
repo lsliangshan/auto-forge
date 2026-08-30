@@ -327,7 +327,14 @@ async function purgeDocument() {
     await ElMessageBox.confirm(
       `永久删除“${selected.name}”及其全部版本？此操作无法撤销。`,
       '永久删除文档',
-      { type: 'warning', confirmButtonText: '永久删除', cancelButtonText: '取消' },
+      {
+        type: 'error',
+        customClass: 'knowledge-purge-message-box',
+        modalClass: 'knowledge-purge-message-box-overlay',
+        confirmButtonType: 'danger',
+        confirmButtonText: '永久删除',
+        cancelButtonText: '取消',
+      },
     )
     if (!store.isOwnerTokenCurrent(ownerToken) || store.selectedDocumentId !== documentId) return
     await store.runDocumentAction('purge')
@@ -398,6 +405,22 @@ dt { color: var(--af-text-muted); font-size: var(--af-knowledge-font-small); } d
 .empty-icon { display: grid; width: 48px; height: 48px; place-items: center; border: 1px solid var(--af-border); border-radius: 14px; color: var(--af-text-muted); background: var(--af-surface); box-shadow: 0 5px 18px rgb(32 36 43 / 5%); font-size: 1.25rem; }
 .spin { animation: spin 1s linear infinite; }
 .workbench-statusbar { display: flex; min-height: 29px; flex: none; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid var(--af-border); padding: 5px 12px; color: var(--af-text-muted); background: var(--af-surface); font-size: var(--af-knowledge-font-caption); }
+:global(.knowledge-purge-message-box-overlay) { background: rgb(15 23 42 / 50%); backdrop-filter: blur(3px); }
+:global(.knowledge-purge-message-box) { --el-messagebox-width: 520px; --el-messagebox-border-radius: 18px; --el-messagebox-padding-primary: 0; border: 1px solid color-mix(in srgb, var(--af-danger) 16%, var(--af-border)); background: var(--af-surface); box-shadow: 0 28px 80px rgb(15 23 42 / 28%), 0 8px 24px rgb(15 23 42 / 12%); }
+:global(.knowledge-purge-message-box .el-message-box__header) { min-height: 72px; border-bottom: 1px solid color-mix(in srgb, var(--af-danger) 12%, var(--af-border)); padding: 23px 64px 19px 24px; background: linear-gradient(135deg, var(--af-surface) 58%, color-mix(in srgb, var(--af-danger-soft) 78%, var(--af-surface))); }
+:global(.knowledge-purge-message-box .el-message-box__title) { color: var(--af-graphite); font-size: 1.0625rem; font-weight: 720; line-height: 1.35; }
+:global(.knowledge-purge-message-box .el-message-box__headerbtn) { top: 14px; right: 14px; width: 36px; height: 36px; border-radius: 10px; transition: color .15s ease, background .15s ease; }
+:global(.knowledge-purge-message-box .el-message-box__headerbtn:hover) { background: color-mix(in srgb, var(--af-danger-soft) 72%, var(--af-surface)); }
+:global(.knowledge-purge-message-box .el-message-box__headerbtn .el-message-box__close) { color: var(--af-text-muted); }
+:global(.knowledge-purge-message-box .el-message-box__headerbtn:hover .el-message-box__close) { color: var(--af-danger); }
+:global(.knowledge-purge-message-box .el-message-box__content) { padding: 24px; color: var(--af-text); }
+:global(.knowledge-purge-message-box .el-message-box__container) { align-items: flex-start; gap: 14px; }
+:global(.knowledge-purge-message-box .el-message-box__status) { display: grid; width: 44px; height: 44px; flex: 0 0 44px; place-items: center; border: 1px solid color-mix(in srgb, var(--af-danger) 18%, var(--af-border)); border-radius: 13px; color: var(--af-danger); background: var(--af-danger-soft); font-size: 1.25rem; }
+:global(.knowledge-purge-message-box .el-message-box__message) { padding-top: 1px; }
+:global(.knowledge-purge-message-box .el-message-box__message p) { color: var(--af-text); font-size: 0.8125rem; line-height: 1.65; }
+:global(.knowledge-purge-message-box .el-message-box__btns) { gap: 9px; border-top: 1px solid var(--af-border); padding: 14px 24px; background: color-mix(in srgb, var(--af-surface-muted) 86%, var(--af-surface)); }
+:global(.knowledge-purge-message-box .el-message-box__btns .el-button) { min-width: 84px; min-height: 38px; margin-left: 0; border-radius: 9px; padding: 8px 15px; font-size: 0.75rem; font-weight: 680; }
+:global(.knowledge-purge-message-box .el-message-box__btns .el-button--danger) { min-width: 104px; box-shadow: 0 5px 14px color-mix(in srgb, var(--af-danger) 22%, transparent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 950px) { .workbench-toolbar { align-items: flex-start; flex-direction: column; }.document-actions { justify-content: flex-start; }.preview-sheet { width: 96%; }.information-panel, .versions-panel { width: calc(100% - 24px); margin: 12px auto; } }
 </style>

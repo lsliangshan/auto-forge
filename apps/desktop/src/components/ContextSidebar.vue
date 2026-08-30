@@ -50,17 +50,17 @@
         {{ chat.syncRetryError }}
       </div>
       <div
+        v-if="chat.conversationListError"
+        class="sidebar-error"
+        role="alert"
+      >
+        {{ chat.conversationListError }}
+      </div>
+      <div
         v-if="chat.loading"
         class="sidebar-state"
       >
         正在加载会话…
-      </div>
-      <div
-        v-else-if="chat.error"
-        class="sidebar-error"
-        role="alert"
-      >
-        {{ chat.error }}
       </div>
       <div
         v-else-if="!chat.conversations.length"
@@ -406,6 +406,8 @@ async function renameConversation(id: string, title: string) {
     const result = await ElMessageBox.prompt('输入新的会话名称', '重命名会话', {
       inputValue: title, inputPattern: /\S+/, inputErrorMessage: '会话名称不能为空',
       confirmButtonText: '保存', cancelButtonText: '取消',
+      customClass: 'conversation-message-box conversation-rename-message-box',
+      modalClass: 'conversation-message-box-overlay',
     })
     await chat.renameConversation(id, result.value)
   } catch { /* Cancelled prompts do not change local data. */ }
@@ -413,7 +415,10 @@ async function renameConversation(id: string, title: string) {
 async function deleteConversation(id: string, title: string) {
   try {
     await ElMessageBox.confirm(`确认删除“${title}”及其消息记录？`, '删除会话', {
-      type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消',
+      type: 'error', confirmButtonText: '确认删除', cancelButtonText: '取消',
+      confirmButtonType: 'danger',
+      customClass: 'conversation-message-box conversation-delete-message-box',
+      modalClass: 'conversation-message-box-overlay',
     })
     await chat.deleteConversation(id)
   } catch { /* Cancelled confirmations do not change local data. */ }
@@ -463,4 +468,32 @@ onBeforeUnmount(detachSettingsScrollSync)
 .settings-section-link { width: 100%; min-height: 38px; border: 0; border-radius: 9px; padding: 9px 11px; color: var(--af-text); background: transparent; font: inherit; font-size: 0.8125rem; line-height: 1.4; cursor: pointer; text-align: left; transition: color .16s ease, background-color .16s ease, box-shadow .16s ease; }
 .settings-section-link:hover, .settings-section-link.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 .settings-section-link.active { padding-left: 14px; box-shadow: inset 3px 0 var(--af-cobalt); font-weight: 680; }
+:global(.conversation-message-box-overlay) { background: rgb(15 23 42 / 50%); backdrop-filter: blur(4px); }
+:global(.conversation-message-box) { --el-messagebox-width: 500px; --el-messagebox-border-radius: 18px; --el-messagebox-padding-primary: 0; border: 1px solid var(--af-border); background: var(--af-surface); box-shadow: 0 28px 80px rgb(15 23 42 / 28%), 0 8px 24px rgb(15 23 42 / 12%); }
+:global(.conversation-message-box .el-message-box__header) { min-height: 70px; border-bottom: 1px solid var(--af-border); padding: 23px 64px 19px 24px; }
+:global(.conversation-rename-message-box .el-message-box__header) { background: linear-gradient(135deg, var(--af-surface) 58%, color-mix(in srgb, var(--af-cobalt-soft) 76%, var(--af-surface))); }
+:global(.conversation-delete-message-box) { border-color: color-mix(in srgb, var(--af-danger) 16%, var(--af-border)); }
+:global(.conversation-delete-message-box .el-message-box__header) { border-bottom-color: color-mix(in srgb, var(--af-danger) 12%, var(--af-border)); background: linear-gradient(135deg, var(--af-surface) 58%, color-mix(in srgb, var(--af-danger-soft) 78%, var(--af-surface))); }
+:global(.conversation-message-box .el-message-box__title) { color: var(--af-graphite); font-size: 1.0625rem; font-weight: 720; line-height: 1.35; }
+:global(.conversation-message-box .el-message-box__headerbtn) { top: 14px; right: 14px; width: 36px; height: 36px; border-radius: 10px; transition: color .15s ease, background .15s ease; }
+:global(.conversation-message-box .el-message-box__headerbtn:hover) { background: var(--af-surface-muted); }
+:global(.conversation-message-box .el-message-box__headerbtn .el-message-box__close) { color: var(--af-text-muted); }
+:global(.conversation-rename-message-box .el-message-box__headerbtn:hover .el-message-box__close) { color: var(--af-cobalt); }
+:global(.conversation-delete-message-box .el-message-box__headerbtn:hover) { background: color-mix(in srgb, var(--af-danger-soft) 72%, var(--af-surface)); }
+:global(.conversation-delete-message-box .el-message-box__headerbtn:hover .el-message-box__close) { color: var(--af-danger); }
+:global(.conversation-message-box .el-message-box__content) { padding: 22px 24px 24px; color: var(--af-text); }
+:global(.conversation-message-box .el-message-box__message p) { color: var(--af-text-muted); font-size: 0.8125rem; line-height: 1.6; }
+:global(.conversation-rename-message-box .el-message-box__input) { padding-top: 12px; }
+:global(.conversation-rename-message-box .el-input__wrapper) { min-height: 42px; border-radius: 10px; background: var(--af-surface); box-shadow: 0 0 0 1px var(--af-border-strong) inset; transition: box-shadow .16s ease; }
+:global(.conversation-rename-message-box .el-input__wrapper:hover) { box-shadow: 0 0 0 1px var(--af-cobalt) inset; }
+:global(.conversation-rename-message-box .el-input__wrapper.is-focus) { box-shadow: 0 0 0 1px var(--af-cobalt) inset, var(--af-focus); }
+:global(.conversation-rename-message-box .el-message-box__errormsg) { margin-top: 7px; color: var(--af-danger); font-size: 0.6875rem; }
+:global(.conversation-delete-message-box .el-message-box__container) { align-items: flex-start; gap: 14px; }
+:global(.conversation-delete-message-box .el-message-box__status) { display: grid; width: 44px; height: 44px; flex: 0 0 44px; place-items: center; border: 1px solid color-mix(in srgb, var(--af-danger) 18%, var(--af-border)); border-radius: 13px; color: var(--af-danger); background: var(--af-danger-soft); font-size: 1.25rem; }
+:global(.conversation-delete-message-box .el-message-box__message) { padding-top: 1px; }
+:global(.conversation-delete-message-box .el-message-box__message p) { color: var(--af-text); }
+:global(.conversation-message-box .el-message-box__btns) { gap: 9px; border-top: 1px solid var(--af-border); padding: 14px 24px; background: color-mix(in srgb, var(--af-surface-muted) 86%, var(--af-surface)); }
+:global(.conversation-message-box .el-message-box__btns .el-button) { min-width: 84px; min-height: 38px; margin-left: 0; border-radius: 9px; padding: 8px 15px; font-size: 0.75rem; font-weight: 680; }
+:global(.conversation-message-box .el-message-box__btns .el-button--primary) { box-shadow: 0 5px 14px color-mix(in srgb, var(--af-cobalt) 20%, transparent); }
+:global(.conversation-message-box .el-message-box__btns .el-button--danger) { min-width: 104px; box-shadow: 0 5px 14px color-mix(in srgb, var(--af-danger) 22%, transparent); }
 </style>

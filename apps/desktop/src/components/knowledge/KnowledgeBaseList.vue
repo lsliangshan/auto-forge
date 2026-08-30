@@ -77,7 +77,11 @@
             <span
               class="file-kind"
               :class="fileTone(document.mimeType)"
-            >{{ fileExtension(document.name) }}</span>
+              aria-hidden="true"
+            >
+              <el-icon><Document /></el-icon>
+              <small>{{ fileExtension(document.name) }}</small>
+            </span>
             <span class="node-copy">
               <strong class="af-truncate">{{ document.name }}</strong>
               <small :class="statusTone(document.status)">{{ document.readOnly ? '只读' : documentStatusLabel(document.status) }}</small>
@@ -290,6 +294,7 @@ import {
   ArrowRight,
   Close,
   Delete,
+  Document,
   Download,
   Folder,
   FolderAdd,
@@ -446,11 +451,13 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .node-count { padding-right: 2px; }
 .tree-children { position: relative; }
 .tree-children::before { position: absolute; top: 0; bottom: 7px; left: 19px; width: 1px; background: var(--af-border); content: ''; }
-.document-row { min-height: 43px; padding-left: 7px; }
+.document-row { min-height: 49px; grid-template-columns: 16px 34px minmax(0, 1fr) auto; padding-left: 7px; }
 .tree-guide { position: relative; width: 16px; height: 100%; }
 .tree-guide::after { position: absolute; top: 50%; left: 12px; width: 10px; height: 1px; background: var(--af-border); content: ''; }
-.file-kind { display: grid; width: 24px; height: 27px; place-items: center; border-radius: 5px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: var(--af-knowledge-font-caption); font-weight: 800; }
-.file-kind.pdf { color: var(--af-danger); background: var(--af-danger-soft); }.file-kind.word { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
+.file-kind { --file-accent: var(--af-text-muted); display: grid; width: 32px; height: 38px; grid-template-rows: 23px 15px; place-items: center; overflow: hidden; border: 1px solid color-mix(in srgb, var(--file-accent) 24%, var(--af-border)); border-radius: 7px; color: var(--file-accent); background: color-mix(in srgb, var(--file-accent) 7%, var(--af-surface)); box-shadow: 0 2px 6px rgb(32 36 43 / 5%); }
+.file-kind .el-icon { align-self: end; margin-bottom: 3px; font-size: 0.8125rem; }
+.file-kind small { display: grid; width: 100%; height: 15px; place-items: center; overflow: hidden; padding: 0 2px; color: white; background: var(--file-accent); font-size: 0.4375rem; font-weight: 850; letter-spacing: .015em; line-height: 15px; text-overflow: clip; white-space: nowrap; }
+.file-kind.pdf { --file-accent: var(--af-danger); }.file-kind.word { --file-accent: var(--af-cobalt); }.file-kind.markdown { --file-accent: var(--af-graphite); }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--af-text-muted); }
 .success { color: var(--af-success) !important; }.status-dot.success { background: var(--af-success); }.active { color: var(--af-cobalt) !important; }.status-dot.active { background: var(--af-cobalt); }.warning { color: var(--af-warning) !important; }.status-dot.warning { background: var(--af-warning); }.danger { color: var(--af-danger) !important; }.status-dot.danger { background: var(--af-danger); }
 .tree-message, .tree-empty { display: flex; min-height: 54px; align-items: center; justify-content: center; gap: 7px; margin-left: 19px; color: var(--af-text-muted); font-size: var(--af-knowledge-font-small); }

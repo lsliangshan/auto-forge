@@ -59,4 +59,11 @@ describe('global font scale layout contracts', () => {
     expect(billingPanel).toContain('font-size: var(--af-settings-font-body);')
     expect(billingPanel).toContain('line-height: var(--af-settings-line-body);')
   })
+
+  it('keeps chat generation values aligned with compact controls at enlarged scales', () => {
+    const composer = readSource('components/chat/ChatComposer.vue')
+
+    expect(composer).toMatch(/\.generation-value strong\s*\{[^}]*font-size: 0\.6875rem;/s)
+    expect(composer).toMatch(/\.generation-control select\s*\{[^}]*font-size: 0\.6875rem;/s)
+  })
 })

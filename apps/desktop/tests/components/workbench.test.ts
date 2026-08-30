@@ -1225,6 +1225,37 @@ describe('workbench', () => {
     expect(store.nextConversationCursor).toBeUndefined()
   })
 
+  it('keeps the conversation list visible when the current request fails', async () => {
+    const api = createApi()
+    let listener!: Parameters<DesktopAPI['chat']['onEvent']>[0]
+    vi.mocked(api.chat.onEvent).mockImplementation((value) => { listener = value; return vi.fn() })
+    vi.mocked(api.chat.listConversations).mockResolvedValue({
+      items: [{
+        ...conversationSummary('conversation_1', '2026-08-30T14:44:22.000Z'),
+        title: '北京工作居住证查询',
+      }],
+    })
+    const { wrapper } = await mountApp('/chat', api)
+
+    await vi.waitFor(() => expect(wrapper.get('.conversation-select').text())
+      .toContain('北京工作居住证查询'))
+    listener({
+      type: 'status',
+      conversationId: 'conversation_1',
+      requestId: 'request_failed',
+      status: 'failed',
+      error: {
+        code: 'MODEL_PROVIDER_INVALID_REQUEST',
+        message: 'The model provider rejected the request.',
+      },
+    })
+
+    await vi.waitFor(() => expect(wrapper.get('.chat-view .af-error').text())
+      .toContain('供应商拒绝了当前请求'))
+    expect(wrapper.get('.conversation-select').text()).toContain('北京工作居住证查询')
+    expect(wrapper.find('.context-sidebar > .sidebar-error').exists()).toBe(false)
+  })
+
   it('hides completed sync state while preserving actionable states and targeted retry', async () => {
     const api = createApi()
     const failed = { ...conversationSummary('failed-conversation', '2026-07-20T00:00:00.000Z', 'failed'), title: '需重试' }
@@ -1264,6 +1295,40 @@ describe('workbench', () => {
     await retry.trigger('click')
     await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith('failed-conversation'))
     expect(wrapper.html()).not.toContain('userId')
+  })
+
+  it('uses branded conversation dialogs and a destructive delete action', async () => {
+    const api = createApi()
+    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [{
+      ...conversationSummary('conversation-1', '2026-07-20T00:00:00.000Z'),
+      title: '班级名称查询',
+    }] })
+    const prompt = vi.spyOn(ElMessageBox, 'prompt').mockRejectedValue('cancel')
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockRejectedValue('cancel')
+    const { wrapper } = await mountApp('/chat', api)
+
+    await vi.waitFor(() => expect(wrapper.find('.conversation-action').exists()).toBe(true))
+    await wrapper.get('[aria-label="重命名班级名称查询"]').trigger('click')
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledWith(
+      '输入新的会话名称',
+      '重命名会话',
+      expect.objectContaining({
+        customClass: 'conversation-message-box conversation-rename-message-box',
+        modalClass: 'conversation-message-box-overlay',
+      }),
+    ))
+
+    await wrapper.get('[aria-label="删除班级名称查询"]').trigger('click')
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledWith(
+      '确认删除“班级名称查询”及其消息记录？',
+      '删除会话',
+      expect.objectContaining({
+        type: 'error',
+        customClass: 'conversation-message-box conversation-delete-message-box',
+        modalClass: 'conversation-message-box-overlay',
+        confirmButtonType: 'danger',
+      }),
+    ))
   })
 
   it('reports when a targeted sync retry finishes without recovering', async () => {

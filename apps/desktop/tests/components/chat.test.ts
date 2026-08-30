@@ -679,6 +679,25 @@ describe('conversation knowledge selection', () => {
     ))
   })
 
+  it('closes the knowledge popover when clicking anywhere outside it', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(KnowledgeSelector, {
+      props: { disabled: false },
+      attachTo: document.body,
+    })
+    const selector = wrapper.get('[data-testid="knowledge-selector"]')
+    const details = selector.element as HTMLDetailsElement
+    details.open = true
+
+    await wrapper.get('.knowledge-selector-popover').trigger('click')
+    expect(details.open).toBe(true)
+
+    document.body.click()
+    expect(details.open).toBe(false)
+    wrapper.unmount()
+  })
+
   it('offers only published ready searchable bases and blocks disabled keyboard activation', async () => {
     const { api } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -1112,6 +1131,21 @@ describe('chat interactions', () => {
     expect(wrapper.get('strong').text()).toBe('重点')
     expect(wrapper.findAll('li').map((item) => item.text())).toEqual(['第一项', '第二项'])
     expect(wrapper.get('p code').text()).toBe('pnpm test')
+  })
+
+  it('does not render leaked internal knowledge status lines from persisted text', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message_1:block_text',
+        type: 'text',
+        text: '[个人知识库: insufficient]\n我是 AutoForge AI 助手。',
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.text()).toBe('我是 AutoForge AI 助手。')
+    expect(wrapper.text()).not.toContain('个人知识库')
+    expect(wrapper.text()).not.toContain('insufficient')
   })
 
   it('repairs legacy knowledge answers whose list markers and bold labels were split across lines', () => {
@@ -4473,8 +4507,42 @@ describe('chat interactions', () => {
       'openai/sora-2-pro',
     )
     expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
-      .toContain('当前模型不支持已添加的附件')
+      .toContain('当前模型最多支持 1 张参考图片')
     expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('explains that text output still requires a model that can read the attachment', () => {
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.draftsByConversation.conversation_1 = [mediaAsset('image_input')]
+    store.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'text',
+      models: { text: 'text-only/model' },
+    })
+    const textOnly = modelInfo('text-only/model', ['text'])
+    textOnly.inputModalities = ['text']
+    const vision = modelInfo('vision/model', ['text'])
+    vision.inputModalities = ['text', 'image']
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [textOnly, vision],
+        defaultModel: 'text-only/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
+      .toContain('文本输出仍需要模型支持图片输入')
+    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
+      .toContain('切换模型或移除附件')
+    expect(wrapper.get('[data-testid="model-select"] option[value="text-only/model"]').attributes('disabled'))
+      .toBeDefined()
+    expect(wrapper.get('[data-testid="model-select"] option[value="text-only/model"]').text())
+      .toContain('不支持当前附件')
+    expect(wrapper.get('[data-testid="model-select"] option[value="vision/model"]').attributes('disabled'))
+      .toBeUndefined()
   })
 
   it('disables unsupported outputs and cannot send without a compatible model', async () => {
@@ -4570,6 +4638,13 @@ describe('chat interactions', () => {
 
     await wrapper.get('[data-testid="output-type"]').setValue('image')
     await vi.waitFor(() => expect(store.preferences.outputType).toBe('image'))
+    const imageOptions = wrapper.get('[data-testid="image-options"]')
+    expect(imageOptions.text()).toContain('图片设置')
+    expect(imageOptions.text()).toContain('数量1 张')
+    expect(imageOptions.text()).toContain('分辨率')
+    expect(imageOptions.text()).toContain('画幅')
+    expect(wrapper.get('[data-testid="image-aspect-ratio"] option[value="auto"]').text())
+      .toBe('自动')
     expect(store.preferences.generation.image).toEqual({
       count: 1,
       resolution: '1K',

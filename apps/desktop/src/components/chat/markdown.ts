@@ -36,8 +36,17 @@ const markdown = new MarkdownIt({
   highlight: highlightCode,
 })
 
-function normalizeMarkdownLayout(text: string): string {
+const INTERNAL_KNOWLEDGE_STATUS_LINE = /^\s*\[个人知识库:\s*(?:已找到依据\s+\d+\s+条|searching|found|consent_required|consent_denied|insufficient|source_unavailable|failed)\]\s*$/u
+
+function stripInternalKnowledgeStatusLines(text: string): string {
   return text
+    .split(/\r?\n/u)
+    .filter(line => !INTERNAL_KNOWLEDGE_STATUS_LINE.test(line))
+    .join('\n')
+}
+
+function normalizeMarkdownLayout(text: string): string {
+  return stripInternalKnowledgeStatusLines(text)
     .replace(/^([ \t]*\d+[.)])[ \t]*\r?\n(?=[ \t]*\S)/gmu, '$1 ')
     .replace(/^([ \t]*\*\*[^*\r\n]+)\r?\n[ \t]*\*\*[ \t]*$/gmu, '\n$1**')
 }

@@ -291,6 +291,7 @@ export const useChatStore = defineStore('chat', {
     _cancelRequestedByConversation: {} as Record<string, true>,
     _terminalRequests: {} as Record<string, true>,
     loading: false,
+    conversationListError: '' as string,
     error: '' as string,
     _loadVersion: 0,
     _selectionVersion: 0,
@@ -365,6 +366,7 @@ export const useChatStore = defineStore('chat', {
       this._preferenceVersions = {}
       closedMediaAdmissions.delete(this)
       this.loading = false
+      this.conversationListError = ''
       this.error = ''
     },
     ensureSubscriptions() {
@@ -394,7 +396,7 @@ export const useChatStore = defineStore('chat', {
       const conversationEventVersion = this._conversationEventVersion
       this._conversationPageRequests[requestKey] = requestToken
       this.loading = true
-      this.error = ''
+      this.conversationListError = ''
       try {
         const page = await getDesktopApi().chat.listConversations({ limit: 50 })
         if (version !== this._loadVersion
@@ -428,7 +430,7 @@ export const useChatStore = defineStore('chat', {
         if (version === this._loadVersion
           && dataGeneration === this._dataGeneration
           && this._conversationPageRequests[requestKey] === requestToken) {
-          this.error = displayError(error, '会话加载失败')
+          this.conversationListError = displayError(error, '会话加载失败')
         }
       } finally {
         const requestIsCurrent = dataGeneration === this._dataGeneration
@@ -462,7 +464,7 @@ export const useChatStore = defineStore('chat', {
       } catch (error) {
         if (dataGeneration === this._dataGeneration
           && this._conversationPageRequests[cursor] === requestToken) {
-          this.error = displayError(error, '会话加载失败')
+          this.conversationListError = displayError(error, '会话加载失败')
         }
       } finally {
         if (dataGeneration === this._dataGeneration

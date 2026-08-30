@@ -409,6 +409,15 @@ describe('personal knowledge workspace', () => {
     expect(client.knowledge.purgeBase).toHaveBeenCalledOnce()
     expect(client.knowledge.purgeDocument).toHaveBeenCalledOnce()
     expect(confirm).toHaveBeenCalledTimes(3)
+    expect(confirm).toHaveBeenLastCalledWith(
+      '永久删除“doc_deleted.txt”及其全部版本？此操作无法撤销。',
+      '永久删除文档',
+      expect.objectContaining({
+        type: 'error',
+        customClass: 'knowledge-purge-message-box',
+        confirmButtonType: 'danger',
+      }),
+    )
   })
 
   it('disables permanent deletion when local knowledge is unavailable', async () => {

@@ -4111,6 +4111,59 @@ describe('AgentOrchestrator', () => {
     expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain(finalText)
   })
 
+  it('keeps knowledge and browser tools hidden when a bare confirmation executes a workflow', async () => {
+    const finalText = '已完成北京工作居住证查询。'
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: finalText },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [{
+      ...workflow,
+      name: '北京工作居住证',
+      activationExamples: ['查询北京工作居住证'],
+    }]
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+    const knowledgeSearch = vi.fn()
+    Object.assign(dependencies, {
+      knowledge: {
+        search: knowledgeSearch,
+        getProviderConsent: vi.fn(async () => 'granted' as const),
+      },
+    })
+    const liveBindings: BrowserContinuationBinding[] = []
+    const browser = attachBrowserContinuation(dependencies, { bindings: liveBindings })
+    const startReserved = dependencies.executions.startReserved
+    dependencies.executions.startReserved = async (reservation, input) => {
+      liveBindings.push(continuationBinding({ conversationId: 'workflow_confirmation' }))
+      return startReserved(reservation, input)
+    }
+
+    await expect(new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'workflow_confirmation', content: '是的',
+        provider: 'openrouter', model: 'model', requestId: 'workflow_confirmation_request',
+      }),
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' },
+    })).resolves.toMatchObject({ status: 'completed' })
+
+    expect(knowledgeSearch).not.toHaveBeenCalled()
+    const requests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls
+      .map(([request]) => request)
+    expect(requests).toHaveLength(2)
+    for (const request of requests) {
+      const offeredTools = (request.tools ?? []).map(tool => tool.function.name)
+      expect(offeredTools).not.toContain('knowledge_search')
+      expect(offeredTools.filter(name => name.startsWith('browser_session_'))).toEqual([])
+    }
+    expect(browser.create).not.toHaveBeenCalled()
+    expect(browser.executor.execute).not.toHaveBeenCalled()
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('workflow_status')
+    expect(terminal).toContain(finalText)
+    expect(terminal).not.toContain('knowledge_status')
+    expect(terminal).not.toContain('browser_status')
+  })
+
   it('makes a binding created by a workflow available in the same user turn', async () => {
     const dependencies = harness([
       toolTurn,
@@ -6603,6 +6656,38 @@ describe('AgentOrchestrator knowledge grounding', () => {
     return { search }
   }
 
+  it.each(['mixed', 'strict'] as const)(
+    'short-circuits a pure greeting before knowledge, workflow, or browser routing in %s mode',
+    async (mode) => {
+      const dependencies = harness([[
+        { type: 'text_delta', choiceIndex: 0, text: '你好！有什么我可以帮你的吗？' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ]])
+      const knowledge = attachKnowledge(dependencies, { keepWorkflows: true })
+      const workflowList = vi.spyOn(dependencies.workflows, 'list')
+      const browser = attachBrowserContinuation(dependencies, {
+        bindings: [continuationBinding({ conversationId: 'knowledge_conversation' })],
+      })
+
+      await new AgentOrchestrator(dependencies).run(Object.assign(knowledgeRunInput('你好'), {
+        knowledgeSelection: { baseIds: ['base_selected'], mode },
+      }))
+
+      expect(knowledge.search).not.toHaveBeenCalled()
+      expect(workflowList).not.toHaveBeenCalled()
+      expect(browser.create).not.toHaveBeenCalled()
+      const request = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0]
+      expect(request?.tools ?? []).toHaveLength(0)
+      expect(request?.toolChoice).toBeUndefined()
+      expect(dependencies.records.starts).toHaveLength(0)
+      expect(browser.executor.execute).not.toHaveBeenCalled()
+      expect(dependencies.records.terminal.at(-1)).toMatchObject({
+        status: 'completed',
+        blocks: [expect.objectContaining({ type: 'text', text: '你好！有什么我可以帮你的吗？' })],
+      })
+    },
+  )
+
   it('captures Main scope, retrieves after routing, and persists validated citations', async () => {
     const dependencies = harness([[
       { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
@@ -6716,15 +6801,104 @@ describe('AgentOrchestrator knowledge grounding', () => {
     })
   })
 
-  it('requires a selected mixed knowledge base to retrieve before answering', async () => {
+  it('uses a silent relevance probe without showing knowledge status for an unrelated mixed-mode question', async () => {
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: '二进制使用 0 和 1 表示信息。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const knowledge = attachKnowledge(dependencies)
+    knowledge.search.mockResolvedValue({ kind: 'results', strategy: 'trigram', evidence: [] })
+
+    await new AgentOrchestrator(dependencies).run(Object.assign(knowledgeRunInput('什么是二进制？'), {
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
+    }))
+
+    const firstRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0]
+    expect(firstRequest?.tools?.map(tool => tool.function.name) ?? []).not.toContain('knowledge_search')
+    expect(firstRequest?.toolChoice).toBeUndefined()
+    expect(knowledge.search).toHaveBeenCalledOnce()
+    expect(knowledge.search).toHaveBeenCalledWith(expect.objectContaining({ query: '什么是二进制？' }))
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      status: 'completed',
+      blocks: [expect.objectContaining({ type: 'text', text: '二进制使用 0 和 1 表示信息。' })],
+    })
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).not.toContain('knowledge_status')
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).not.toContain('依据不足')
+  })
+
+  it('falls through to workflow execution without a knowledge status when the probe has no evidence', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '已完成百度搜索。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const knowledge = attachKnowledge(dependencies, { keepWorkflows: true })
+    knowledge.search.mockResolvedValue({ kind: 'results', strategy: 'trigram', evidence: [] })
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+
+    await new AgentOrchestrator(dependencies).run(Object.assign(
+      knowledgeRunInput('使用百度搜索今日天气'),
+      { knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const } },
+    ))
+
+    expect(knowledge.search).toHaveBeenCalledOnce()
+    const requests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls.map(([request]) => request)
+    const firstRequest = requests[0]
+    expect(firstRequest?.tools?.map(tool => tool.function.name) ?? []).not.toContain('knowledge_search')
+    expect(firstRequest?.toolChoice).toEqual({ type: 'function', function: { name: 'workflow_1' } })
+    expect(requests.every(request => (
+      !(request.tools?.some(tool => tool.function.name === 'knowledge_search') ?? false)
+    ))).toBe(true)
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('workflow_status')
+    expect(terminal).not.toContain('knowledge_status')
+    expect(terminal).not.toContain('依据不足')
+  })
+
+  it('answers from knowledge before an exact workflow when the probe finds evidence', async () => {
     const dependencies = harness([[
       {
-        type: 'tool_call', choiceIndex: 0, index: 0, id: 'mixed_knowledge_call',
-        name: 'knowledge_search', arguments: { query: '班级名称' },
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_before_exact_workflow',
+        name: 'knowledge_search', arguments: { query: '今日天气' },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
-      { type: 'text_delta', choiceIndex: 0, text: '班级名称是高一（3）班。[[kb:evidence:class-name]]' },
+      { type: 'text_delta', choiceIndex: 0, text: '知识库记录今日天气晴。[[kb:evidence:weather]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const knowledge = attachKnowledge(dependencies, { keepWorkflows: true })
+    knowledge.search.mockResolvedValue({
+      kind: 'results', strategy: 'trigram', evidence: [{
+        ...retrievedEvidence,
+        id: 'evidence:weather', snippet: '知识库记录今日天气晴。',
+        citation: { ...retrievedEvidence.citation, evidenceId: 'evidence:weather' },
+      }],
+    })
+
+    await new AgentOrchestrator(dependencies).run(Object.assign(
+      knowledgeRunInput('使用百度搜索今日天气'),
+      { knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const } },
+    ))
+
+    const firstRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0]
+    expect(firstRequest?.toolChoice).toEqual({
+      type: 'function', function: { name: 'knowledge_search' },
+    })
+    expect(knowledge.search).toHaveBeenCalledOnce()
+    expect(dependencies.records.starts).toHaveLength(0)
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('知识库记录今日天气晴。')
+    expect(terminal).not.toContain('workflow_status')
+  })
+
+  it('forces knowledge search when the mixed-mode relevance probe finds selected content', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'mixed_knowledge_call',
+        name: 'knowledge_search', arguments: { query: '春游时间' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '春游时间是 4 月 18 日。[[kb:evidence:spring-trip]]' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     const knowledge = attachKnowledge(dependencies)
@@ -6733,13 +6907,13 @@ describe('AgentOrchestrator knowledge grounding', () => {
       strategy: 'trigram',
       evidence: [{
         ...retrievedEvidence,
-        id: 'evidence:class-name',
-        snippet: '班级名称是高一（3）班。',
-        citation: { ...retrievedEvidence.citation, evidenceId: 'evidence:class-name' },
+        id: 'evidence:spring-trip',
+        snippet: '春游时间是 4 月 18 日。',
+        citation: { ...retrievedEvidence.citation, evidenceId: 'evidence:spring-trip' },
       }],
     })
 
-    await new AgentOrchestrator(dependencies).run(Object.assign(knowledgeRunInput('班级名称是？'), {
+    await new AgentOrchestrator(dependencies).run(Object.assign(knowledgeRunInput('春游时间是？'), {
       knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
     }))
 
@@ -6747,13 +6921,44 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(firstRequest?.toolChoice).toEqual({
       type: 'function', function: { name: 'knowledge_search' },
     })
+    expect(knowledge.search).toHaveBeenCalledOnce()
     expect(dependencies.knowledge?.search).toHaveBeenCalledWith(expect.objectContaining({
-      baseIds: ['base_selected'], query: '班级名称是？',
+      baseIds: ['base_selected'], query: '春游时间是？',
     }))
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
-    expect(terminal).toContain('班级名称是高一（3）班。')
+    expect(terminal).toContain('春游时间是 4 月 18 日。')
     expect(terminal).not.toContain('【知识库依据】')
     expect(terminal).not.toContain('【一般信息】')
+  })
+
+  it('does not route or publish a late mixed-mode relevance probe after cancellation', async () => {
+    const pendingProbe = deferred<{
+      kind: 'results'; strategy: 'trigram'; evidence: Array<typeof retrievedEvidence>
+    }>()
+    const dependencies = harness([])
+    dependencies.workflows.list = async () => []
+    Object.assign(dependencies, {
+      knowledge: {
+        search: vi.fn(() => pendingProbe.promise),
+        getProviderConsent: vi.fn(async () => 'granted' as const),
+        sourceVerifiable: vi.fn(async () => true),
+      },
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const run = orchestrator.run({
+      ...knowledgeRunInput('春游时间是？'),
+      requestId: 'cancel_knowledge_probe',
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
+    })
+    await vi.waitFor(() => expect(dependencies.knowledge?.search).toHaveBeenCalledOnce())
+
+    await orchestrator.cancel('cancel_knowledge_probe')
+    pendingProbe.resolve({ kind: 'results', strategy: 'trigram', evidence: [retrievedEvidence] })
+
+    await expect(run).resolves.toMatchObject({ status: 'cancelled' })
+    expect(dependencies.providerInstances.openrouter.stream).not.toHaveBeenCalled()
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).not.toContain('knowledge_status')
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).not.toContain('knowledge_citation')
   })
 
   it('forces selected knowledge before passive workflow candidates', async () => {

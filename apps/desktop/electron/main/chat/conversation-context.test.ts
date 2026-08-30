@@ -134,9 +134,24 @@ describe('conversation context primitives', () => {
 
     expect(serialized).toEqual({
       role: 'assistant',
-      content: '[个人知识库: 已找到依据 1 条]\n[知识库引用: text 第 8 行]',
+      content: '[知识库引用: text 第 8 行]',
     })
     expect(JSON.stringify(serialized)).not.toMatch(/隐藏正文|private|signed|https?:|\/Users\/|preview|evidence|document|version/i)
+  })
+
+  it('omits knowledge status cards and leaked internal status lines from history', () => {
+    const serialized = serializeHistoricalMessage({
+      id: 'knowledge_status_message', conversationId: 'c1', role: 'assistant', ordinal: 5, createdAt: 5,
+      blocks: [
+        { type: 'text', text: '[个人知识库: insufficient]\n我是 AutoForge AI 助手。' },
+        {
+          type: 'knowledge_status', blockId: 'knowledge_status_insufficient', status: 'insufficient',
+          searchIndex: 2, searchLimit: 3, evidenceCount: 0,
+        },
+      ],
+    })
+
+    expect(serialized).toEqual({ role: 'assistant', content: '我是 AutoForge AI 助手。' })
   })
 
   it('upgrades legacy citation previews to an unavailable handle without re-disclosure', () => {

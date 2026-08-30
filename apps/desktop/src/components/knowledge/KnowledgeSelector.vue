@@ -1,5 +1,6 @@
 <template>
   <details
+    ref="selector"
     class="knowledge-selector"
     data-testid="knowledge-selector"
     :aria-disabled="disabled"
@@ -50,7 +51,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useAuthStore } from '../../stores/auth'
 import { useChatStore } from '../../stores/chat'
 import { useKnowledgeStore } from '../../stores/knowledge'
@@ -59,12 +60,23 @@ const props = defineProps<{ disabled: boolean }>()
 const auth = useAuthStore()
 const chat = useChatStore()
 const store = useKnowledgeStore()
+const selector = ref<globalThis.HTMLDetailsElement | null>(null)
 const selectedIds = computed(() => chat.preferences.knowledgeBaseIds ?? [])
 const mode = computed(() => chat.preferences.knowledgeMode ?? 'mixed')
 const selectableBases = computed(() => store.bases.filter(base => base.status === 'ready' && base.searchable))
 
-onMounted(() => store.bindOwner(auth.session?.user.id))
+onMounted(() => {
+  store.bindOwner(auth.session?.user.id)
+  globalThis.document.addEventListener('click', closeOnOutsideClick)
+})
+onBeforeUnmount(() => globalThis.document.removeEventListener('click', closeOnOutsideClick))
 watch(() => auth.session?.user.id, ownerId => store.bindOwner(ownerId))
+
+function closeOnOutsideClick(event: globalThis.MouseEvent) {
+  const element = selector.value
+  if (!element?.open || element.contains(event.target as globalThis.Node)) return
+  element.open = false
+}
 
 function save(baseIds: string[], knowledgeMode = mode.value) {
   const conversationId = chat.selectedConversationId

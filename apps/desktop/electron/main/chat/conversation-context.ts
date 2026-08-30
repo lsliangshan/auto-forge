@@ -89,10 +89,19 @@ function unexpectedBlock(block: never): never {
   throw new Error(`Historical block type is invalid: ${String(block)}`)
 }
 
+const INTERNAL_KNOWLEDGE_STATUS_LINE = /^\s*\[个人知识库:\s*(?:已找到依据\s+\d+\s+条|searching|found|consent_required|consent_denied|insufficient|source_unavailable|failed)\]\s*$/u
+
+function stripInternalKnowledgeStatusLines(value: string): string {
+  return value
+    .split(/\r?\n/u)
+    .filter(line => !INTERNAL_KNOWLEDGE_STATUS_LINE.test(line))
+    .join('\n')
+}
+
 function serializeBlock(block: ChatBlock): string[] {
   switch (block.type) {
     case 'text':
-      return block.text ? [block.text] : []
+      return block.text ? [stripInternalKnowledgeStatusLines(block.text)] : []
     case 'reasoning_status':
       return []
     case 'media':
@@ -112,9 +121,7 @@ function serializeBlock(block: ChatBlock): string[] {
     case 'browser_status':
       return [`[浏览器页面: ${block.siteLabel}; 来源: ${block.origin}; 操作: ${block.actionSummary ?? '无'}; 状态: ${block.state}]`]
     case 'knowledge_status':
-      return block.status === 'found'
-        ? [`[个人知识库: 已找到依据 ${block.evidenceCount} 条]`]
-        : [`[个人知识库: ${block.status}]`]
+      return []
     case 'knowledge_citation': {
       const coordinate = block.coordinate.kind === 'pdf'
         ? `pdf 第 ${block.coordinate.page} 页`
