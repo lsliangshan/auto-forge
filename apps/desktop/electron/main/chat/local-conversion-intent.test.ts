@@ -348,6 +348,21 @@ describe('local conversion intent', () => {
     expect(prompt.normalize('NFKC').toLocaleLowerCase('und')).not.toContain('secret-file.pdf')
   })
 
+  it.each([
+    ['Straße.pdf', 'STRASSE.PDF straße.pdf ẞTRASSE.PDF'],
+    ['İnvoice.pdf', 'invoice.pdf İNVOICE.PDF i\u0307nvoice.pdf'],
+    ['ΟΣ.pdf', 'οσ.pdf ος.pdf ΟΣ.PDF'],
+    ['oﬃce.pdf', 'OFFICE.PDF oﬃce.pdf office.pdf'],
+  ])('anonymizes full NFKC-casefold equivalent names for %s', (name, mentions) => {
+    const prompt = projectLocalConversionPrompt(
+      `转换 ${mentions}`,
+      [{ index: 0, name, mimeType: 'application/pdf', byteSize: 12 }],
+    )
+
+    expect(prompt.match(/文件-1/gu)).toHaveLength(4)
+    expect(prompt).not.toMatch(/strasse|straße|invoice|i\u0307nvoice|οσ|ος|office|oﬃce/iu)
+  })
+
   it('keeps a long non-conversion attachment request non-local', () => {
     const text = `总结这段对话 ${'ordinary context '.repeat(2_000)} 并描述附件`
     expect(hasLocalConversionIntent(text, attachments)).toBe(false)

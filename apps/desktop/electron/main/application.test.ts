@@ -4682,6 +4682,9 @@ describe('createApplicationRuntime', () => {
   it('bills real context-summary streams through the Application-supplied provider snapshot', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-summary-billing-'))
     directories.push(root)
+    const pdfSource = join(root, 'history-summary.pdf')
+    const pdfBytes = Buffer.from('%PDF-1.7\nPRIVATE_SUMMARY_ATTACHMENT')
+    await writeFile(pdfSource, pdfBytes)
     const userId = 'test_user_testuser'
     withUserData(root, userId, (store) => {
       store.conversations.insert({
@@ -4699,7 +4702,9 @@ describe('createApplicationRuntime', () => {
       }
     })
     let summaryCalls = 0
+    const requests: ModelStreamRequest[] = []
     const stream = vi.fn(async function* (request: ModelStreamRequest) {
+      requests.push(request)
       const summary = request.maxOutputTokens !== undefined
       if (summary) summaryCalls += 1
       yield { type: 'generation' as const, id: summary ? `generation_summary_${summaryCalls}` : 'generation_answer' }
@@ -4715,12 +4720,13 @@ describe('createApplicationRuntime', () => {
     })
     const emitChat = vi.fn()
     const provider = snapshotProvider('openrouter', {
-      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 1_000 }]),
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 8_000 }]),
       validateCredential: vi.fn(async () => ({ valid: true })),
       stream,
     })
     const runtime = createApplicationRuntime(options(root, {
       modelProviders: { openrouter: provider },
+      chooseMediaFiles: async () => [pdfSource],
       emitChat,
     }))
     const session = await authenticate(runtime)
@@ -4734,11 +4740,26 @@ describe('createApplicationRuntime', () => {
       },
     })
 
-    const sent = await runtime.services.chat.send(chatInput('conversation_summary_billing', '继续'))
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: 'conversation_summary_billing', existingAssetIds: [],
+    })
+    const sent = await runtime.services.chat.send({
+      ...chatInput('conversation_summary_billing', 'read this PDF'), assetIds: [asset!.id],
+    })
     await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
       type: 'status', requestId: sent.requestId, status: 'completed',
     })))
     await runtime.close()
+
+    const summaryRequest = requests.find((request) => (
+      request.maxOutputTokens !== undefined && !isConversationTitleRequest(request)
+    ))
+    expect(summaryRequest).toBeDefined()
+    expect(JSON.stringify(summaryRequest)).not.toContain(pdfBytes.toString('base64'))
+    expect(JSON.stringify(summaryRequest)).not.toContain('history-summary.pdf')
+    expect(summaryRequest?.messages.every(({ content }) => (
+      !Array.isArray(content) || content.every((part) => part.type === 'text')
+    ))).toBe(true)
 
     const sqlite = new Database(userCachePath(root, userId), { readonly: true })
     try {
@@ -5466,15 +5487,20 @@ describe('createApplicationRuntime', () => {
   )
 
   it.each([
-    ['Convert Secret-Ｆile.PDF and secret-file.pdf and SECRET-FILE.PDF to PDF', 2],
-    ['reformat Secret-Ｆile.PDF as PDF', 0],
+    ['Secret-Ｆile.PDF', 'Convert Secret-Ｆile.PDF and secret-file.pdf and SECRET-FILE.PDF to PDF', 2,
+      ['secret-file.pdf']],
+    ['Secret-Ｆile.PDF', 'reformat Secret-Ｆile.PDF as PDF', 0, ['secret-file.pdf']],
+    ['Straße.pdf', 'Convert STRASSE.PDF and Straße.pdf to PDF', 2, ['STRASSE.PDF', 'Straße.pdf']],
+    ['İnvoice.pdf', 'Convert invoice.pdf and İNVOICE.PDF to PDF', 2, ['invoice.pdf', 'İNVOICE.PDF']],
   ] as const)('anonymizes exact attachment names in metadata-only main and title egress: %s', async (
+    sourceName,
     content,
     expectedProviderCalls,
+    forbiddenMentions,
   ) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-private-name-'))
     directories.push(root)
-    const source = join(root, 'Secret-Ｆile.PDF')
+    const source = join(root, sourceName)
     await writeFile(source, Buffer.from('%PDF-1.7 PRIVATE_TAX_CONTENT'))
     const captured: ModelStreamRequest[] = []
     const chatEvents: ChatEvent[] = []
@@ -5523,7 +5549,7 @@ describe('createApplicationRuntime', () => {
 
     expect(captured).toHaveLength(expectedProviderCalls)
     const payload = JSON.stringify(captured)
-    expect(payload.normalize('NFKC').toLocaleLowerCase('und')).not.toContain('secret-file.pdf')
+    for (const mention of forbiddenMentions) expect(payload).not.toContain(mention)
     expect(payload).not.toContain(source)
     expect(payload).not.toContain(asset!.id)
     if (expectedProviderCalls > 0) {
@@ -5774,6 +5800,86 @@ describe('createApplicationRuntime', () => {
     },
   )
 
+  it.each(['save', 'clear', 'save-failure'] as const)(
+    'admits a new attachment chat only after the credential %s transition settles',
+    async (credentialChange) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-attachment-transition-'))
+      directories.push(root)
+      const source = join(root, 'transition.png')
+      await writeFile(source, Buffer.concat([
+        Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('PRIVATE_TRANSITION_CONTENT'),
+      ]))
+      const stream = vi.fn<ModelProvider['stream']>(async function* (request) {
+        yield {
+          type: 'text_delta' as const, choiceIndex: 0,
+          text: isConversationTitleRequest(request) ? '安全标题' : '完成',
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      })
+      const provider = snapshotProvider('openrouter', {
+        listModels: async () => [visionTextModelInfo('openrouter/transition')],
+        validateCredential: async () => ({ valid: true }),
+        stream,
+      })
+      const acquireEntered = deferred<void>()
+      const acquireSnapshot = vi.mocked(provider.acquireSnapshot).getMockImplementation()!
+      vi.mocked(provider.acquireSnapshot).mockImplementation(async () => {
+        acquireEntered.resolve()
+        return acquireSnapshot()
+      })
+      const runtime = createApplicationRuntime(options(root, {
+        chooseMediaFiles: async () => [source], modelProviders: { openrouter: provider },
+      }))
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-before')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' },
+          openrouter: { text: 'openrouter/transition' },
+        },
+      })
+      const conversation = await runtime.services.chat.createConversation()
+      const [asset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id, existingAssetIds: [],
+      })
+      const entered = deferred<void>()
+      const release = deferred<void>()
+      if (credentialChange === 'clear') {
+        vi.spyOn(SecretStore.prototype, 'delete').mockImplementation((() => {
+          entered.resolve()
+          return release.promise
+        }) as never)
+      } else {
+        vi.spyOn(SecretStore.prototype, 'set').mockImplementation(async () => {
+          entered.resolve()
+          await release.promise
+          if (credentialChange === 'save-failure') throw new Error('secret write failed')
+        })
+      }
+
+      const transition = credentialChange === 'clear'
+        ? runtime.services.settings.clearProviderApiKey('openrouter')
+        : runtime.services.settings.saveProviderApiKey('openrouter', 'sk-after')
+      await entered.promise
+      const sending = runtime.services.chat.send({
+        ...chatInput(conversation.id, 'describe this image'), assetIds: [asset!.id], outputType: 'text',
+      })
+      const admission = await Promise.race([
+        acquireEntered.promise.then(() => 'acquired' as const),
+        new Promise<'blocked'>((resolve) => { setTimeout(() => resolve('blocked'), 100) }),
+      ])
+      expect(admission).toBe('blocked')
+      expect(stream).not.toHaveBeenCalled()
+      release.resolve()
+      if (credentialChange === 'save-failure') await expect(transition).rejects.toThrow('secret write failed')
+      else await transition
+      await expect(sending).resolves.toEqual({ requestId: expect.any(String) })
+      await vi.waitFor(() => expect(stream).toHaveBeenCalled())
+      await runtime.close()
+    },
+  )
+
   it('preserves ordinary attachment metadata in first-turn title generation', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-attachment-title-'))
     directories.push(root)
@@ -5782,6 +5888,7 @@ describe('createApplicationRuntime', () => {
     await writeFile(source, content)
     const captured: ModelStreamRequest[] = []
     const chatEvents: ChatEvent[] = []
+    let activeDisclosureCount = () => -1
     const provider = snapshotProvider('openrouter', {
       listModels: async () => [modelInfo('openrouter/attachment-title', 'Attachment title')],
       validateCredential: async () => ({ valid: true }),
@@ -5799,6 +5906,9 @@ describe('createApplicationRuntime', () => {
       chooseMediaFiles: async () => [source],
       modelProviders: { openrouter: provider },
       emitChat: (event) => { chatEvents.push(event) },
+      inspectAttachmentDisclosureAuthority: (authority) => {
+        activeDisclosureCount = () => authority.activeCount('openrouter')
+      },
     }))
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -5824,10 +5934,117 @@ describe('createApplicationRuntime', () => {
     expect(captured).toHaveLength(2)
     expect(JSON.stringify(agentRequests(captured)[0])).toContain(content)
     const titlePayload = JSON.stringify(captured.find(isConversationTitleRequest))
-    expect(titlePayload).toContain('这是附件内容的总结。')
-    expect(titlePayload).toContain(
-      '[历史附件: file; 名称: ordinary-title.txt; MIME: text/plain; 大小: 33 bytes]',
-    )
+    expect(titlePayload).toContain('用户：总结这个附件')
+    expect(titlePayload).not.toContain('这是附件内容的总结。')
+    expect(titlePayload).not.toContain('ordinary-title.txt')
+    expect(titlePayload).not.toContain(content)
+    expect(activeDisclosureCount()).toBe(0)
+    await runtime.close()
+  })
+
+  it.each(['failed', 'cancelled', 'title-skipped', 'shutdown'] as const)(
+    'releases the attachment disclosure lease after %s termination',
+    async (termination) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-disclosure-release-'))
+      directories.push(root)
+      const source = join(root, 'release.png')
+      await writeFile(source, Buffer.from('89504e470d0a1a0a', 'hex'))
+      const entered = deferred<void>()
+      const chatEvents: ChatEvent[] = []
+      let activeDisclosureCount = () => -1
+      const provider = snapshotProvider('openrouter', {
+        listModels: async () => [visionTextModelInfo('openrouter/release')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* (request) {
+          if (isConversationTitleRequest(request)) {
+            yield { type: 'text_delta' as const, choiceIndex: 0, text: '安全标题' }
+            yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+            return
+          }
+          entered.resolve()
+          if (termination === 'failed') throw new Error('provider failure')
+          if (termination === 'cancelled' || termination === 'shutdown') {
+            await new Promise<void>((_resolve, reject) => {
+              request.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+            })
+          }
+          yield { type: 'text_delta' as const, choiceIndex: 0, text: '完成' }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      })
+      const runtime = createApplicationRuntime(options(root, {
+        chooseMediaFiles: async () => [source], modelProviders: { openrouter: provider },
+        emitChat: (event) => { chatEvents.push(event) },
+        inspectAttachmentDisclosureAuthority: (authority) => {
+          activeDisclosureCount = () => authority.activeCount('openrouter')
+        },
+      }))
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' }, openrouter: { text: 'openrouter/release' },
+        },
+      })
+      const conversation = await runtime.services.chat.createConversation()
+      if (termination === 'title-skipped') {
+        await runtime.services.chat.renameConversation(conversation.id, '用户标题')
+      }
+      const [asset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id, existingAssetIds: [],
+      })
+      const sent = await runtime.services.chat.send({
+        ...chatInput(conversation.id, 'describe this image'), assetIds: [asset!.id], outputType: 'text',
+      })
+      await entered.promise
+      expect(activeDisclosureCount()).toBe(1)
+      if (termination === 'cancelled') await runtime.services.chat.cancel(sent.requestId)
+      if (termination === 'shutdown') {
+        await runtime.close()
+      } else {
+        await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+          type: 'status', requestId: sent.requestId,
+          status: termination === 'failed' ? 'failed' : termination === 'cancelled' ? 'cancelled' : 'completed',
+        })))
+        if (termination === 'title-skipped') {
+          await vi.waitFor(() => expect(activeDisclosureCount()).toBe(0))
+        }
+        await runtime.close()
+      }
+      expect(activeDisclosureCount()).toBe(0)
+    },
+  )
+
+  it('releases an attachment disclosure when Provider preflight fails before title ownership', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-disclosure-preflight-'))
+    directories.push(root)
+    const source = join(root, 'preflight.png')
+    await writeFile(source, Buffer.from('89504e470d0a1a0a', 'hex'))
+    let activeDisclosureCount = () => -1
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source],
+      modelProviders: { openrouter: snapshotProvider('openrouter', {
+        listModels: async () => [visionTextModelInfo('openrouter/preflight')],
+        validateCredential: async () => ({ valid: false, reason: 'invalid' }),
+        stream: vi.fn(async function* () {}),
+      }) },
+      inspectAttachmentDisclosureAuthority: (authority) => {
+        activeDisclosureCount = () => authority.activeCount('openrouter')
+      },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-invalid')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+
+    await expect(runtime.services.chat.send({
+      ...chatInput(conversation.id, 'describe this image'), assetIds: [asset!.id], outputType: 'text',
+    })).rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' })
+    expect(activeDisclosureCount()).toBe(0)
     await runtime.close()
   })
 

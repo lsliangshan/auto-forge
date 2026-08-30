@@ -13,6 +13,7 @@ import {
   assertAttachmentByteAccess,
   assertProtectedProviderSnapshot,
   createProviderAttachmentDisclosureAuthority,
+  createProviderMediaProjection,
   createProviderAttachmentProjection,
   protectProviderSnapshot,
   type ProviderAttachmentPurpose,
@@ -65,6 +66,36 @@ function protectedFixture(
   }
 }
 
+function protectedMediaFixture(
+  purpose: 'image' | 'video',
+  provider: ModelProvider,
+) {
+  let epoch = 3
+  const prompt = purpose === 'image'
+    ? 'make this image cinematic'
+    : 'make a short harbor video'
+  const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => epoch })
+  const snapshot = sourceSnapshot(provider)
+  const plan = authority.createPlan({
+    requestId: `request_${purpose}`, text: prompt,
+    context: { hasAttachments: true, requestedOutput: purpose, attachmentKinds: ['image'] },
+    attachments: [{
+      index: 0, id: 'asset_private', name: 'private.png', mimeType: 'image/png',
+      byteSize: bytesA.length, fingerprint: fingerprintA,
+    }],
+  })
+  const disclosure = authority.bindProvider(plan, snapshot)
+  const projection = createProviderMediaProjection(disclosure, 'openrouter', purpose, prompt, [{
+    assetId: 'asset_private', kind: 'image', mimeType: 'image/png', name: 'private.png',
+    dataBase64: bytesA.toString('base64'),
+  }])
+  return {
+    authority, disclosure, projection, prompt,
+    protectedSnapshot: protectProviderSnapshot(snapshot, disclosure, { purpose: 'main' }),
+    setEpoch: (value: number) => { epoch = value },
+  }
+}
+
 function binding(overrides: Partial<{
   requestId: string
   providerId: 'openrouter' | 'deepseek'
@@ -88,6 +119,101 @@ async function consume(iterable: AsyncIterable<unknown>): Promise<void> {
 }
 
 describe('provider attachment disclosure', () => {
+  it('requires an issued purpose-bound media projection before image or video Provider work', async () => {
+    const generateImage = vi.fn<NonNullable<ModelProvider['generateImage']>>(async () => ({ outputs: [] }))
+    const submitVideo = vi.fn<NonNullable<ModelProvider['submitVideo']>>(async () => ({
+      providerJobId: 'job_1', status: 'pending',
+    }))
+    const provider = {
+      listModels: async () => [], validateCredential: async () => ({ valid: true }),
+      stream: async function* () {}, generateImage, submitVideo,
+    }
+    const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 1 })
+    const snapshot = sourceSnapshot(provider)
+    const plan = authority.createPlan({
+      requestId: 'request_media_projection', text: 'make this image cinematic',
+      context: { hasAttachments: true, requestedOutput: 'image', attachmentKinds: ['image'] },
+      attachments: [{
+        index: 0, id: 'asset_private', name: 'private.png', mimeType: 'image/png',
+        byteSize: bytesA.length, fingerprint: fingerprintA,
+      }],
+    })
+    const disclosure = authority.bindProvider(plan, snapshot)
+    const protectedSnapshot = protectProviderSnapshot(snapshot, disclosure, { purpose: 'main' })
+    const inputs = [{
+      assetId: 'asset_private', kind: 'image' as const, mimeType: 'image/png', name: 'private.png',
+      dataBase64: bytesA.toString('base64'),
+    }]
+    const projection = createProviderMediaProjection(
+      disclosure, 'openrouter', 'image', 'make this image cinematic', inputs,
+    )
+    await protectedSnapshot.provider.generateImage!({
+      model: 'image-model', prompt: projection.prompt, options: {}, parameterSupport: {},
+      references: projection.references,
+    } as unknown as ModelImageRequest)
+
+    await expect(protectedSnapshot.provider.generateImage!({
+      model: 'image-model', prompt: 'changed prompt', options: {}, parameterSupport: {},
+      references: projection.references,
+    } as unknown as ModelImageRequest)).rejects.toThrow()
+    await expect(protectedSnapshot.provider.generateImage!({
+      model: 'image-model', prompt: projection.prompt, options: {}, parameterSupport: {},
+      references: [{ mimeType: 'image/jpeg', dataBase64: bytesA.toString('base64') }],
+    } as unknown as ModelImageRequest)).rejects.toThrow()
+    await expect(protectedSnapshot.provider.submitVideo!({
+      model: 'video-model', prompt: projection.prompt, options: {}, frameImages: [],
+      references: projection.references,
+    } as unknown as ModelVideoRequest)).rejects.toThrow()
+    expect(generateImage).toHaveBeenCalledOnce()
+    expect(submitVideo).not.toHaveBeenCalled()
+  })
+
+  it('makes ordinary title and summary capabilities text-only and purpose-separated', async () => {
+    const stream = vi.fn<ModelProvider['stream']>(async function* () {})
+    const value = fixture('ordinary', {
+      listModels: async () => [], validateCredential: async () => ({ valid: true }), stream,
+    })
+    const title = protectProviderSnapshot(value.snapshot, value.disclosure, { purpose: 'title' })
+    expect(() => title.provider.stream(request([{
+      type: 'media', kind: 'image', mimeType: 'image/png', dataBase64: bytesA.toString('base64'),
+    }]))).toThrow()
+    await consume(title.provider.stream(request(value.disclosure.titleSafeText.text)))
+
+    const summary = protectProviderSnapshot(value.snapshot, value.disclosure, { purpose: 'summary' })
+    await consume(summary.provider.stream({
+      model: 'model',
+      messages: [
+        { role: 'system', content: 'Summarize prior context.' },
+        { role: 'user', content: 'The prior request described an image.' },
+      ],
+      maxOutputTokens: 64,
+    }))
+    expect(() => summary.provider.stream(request([{
+      type: 'file', file: { filename: 'private.pdf', file_data: 'data:application/pdf;base64,QQ==' },
+    }] as never))).toThrow()
+    expect(() => assertProtectedProviderSnapshot(summary, value.disclosure, {
+      ...binding(), purpose: 'main',
+    })).toThrow()
+    expect(stream).toHaveBeenCalledTimes(2)
+  })
+
+  it('releases one disclosure lease only after main and title work, then rejects every reuse', async () => {
+    const stream = vi.fn<ModelProvider['stream']>(async function* () {})
+    const value = fixture('local', {
+      listModels: async () => [], validateCredential: async () => ({ valid: true }), stream,
+    })
+    const main = protectProviderSnapshot(value.snapshot, value.disclosure, { purpose: 'main' })
+    const title = protectProviderSnapshot(value.snapshot, value.disclosure, { purpose: 'title' })
+    expect(value.authority.activeCount('openrouter')).toBe(1)
+    await consume(main.provider.stream(request(value.disclosure.mainSafeText.text)))
+    await consume(title.provider.stream(request(value.disclosure.titleSafeText.text)))
+    value.authority.release(value.disclosure)
+    value.authority.release(value.disclosure)
+    expect(value.authority.activeCount('openrouter')).toBe(0)
+    expect(() => main.provider.stream(request(value.disclosure.mainSafeText.text))).toThrow()
+    expect(() => title.provider.stream(request(value.disclosure.titleSafeText.text))).toThrow()
+  })
+
   it('keeps an attachment-free ordinary Provider snapshot usable for context compression', async () => {
     const stream = vi.fn<ModelProvider['stream']>(async function* () {
       yield { type: 'text_delta', choiceIndex: 0, text: 'summary' }
@@ -273,22 +399,23 @@ describe('provider attachment disclosure', () => {
         return { providerJobId: 'job_1', status: 'pending' }
       }),
     }
-    const value = protectedFixture('ordinary', provider)
+    const imageValue = protectedMediaFixture('image', provider)
+    const videoValue = protectedMediaFixture('video', provider)
     const imageRequest = {
-      model: 'image-model', prompt: 'paint', options: {}, parameterSupport: {},
-      references: [{ mimeType: 'image/png', dataBase64: bytesA.toString('base64') }],
+      model: 'image-model', prompt: imageValue.prompt, options: {}, parameterSupport: {},
+      references: imageValue.projection.references,
     } as unknown as ModelImageRequest
     const videoRequest = {
-      model: 'video-model', prompt: 'animate', options: {}, frameImages: [],
-      references: [{ mimeType: 'image/png', dataBase64: bytesA.toString('base64') }],
+      model: 'video-model', prompt: videoValue.prompt, options: {}, frameImages: [],
+      references: videoValue.projection.references,
     } as unknown as ModelVideoRequest
     await Promise.all([
-      value.protectedSnapshot.provider.generateImage!(imageRequest),
-      value.protectedSnapshot.provider.submitVideo!(videoRequest),
+      imageValue.protectedSnapshot.provider.generateImage!(imageRequest),
+      videoValue.protectedSnapshot.provider.submitVideo!(videoRequest),
     ])
     expect(Object.isFrozen(outboundImage?.references)).toBe(true)
     expect(Object.isFrozen(outboundVideo?.references)).toBe(true)
-    await expect(value.protectedSnapshot.provider.generateImage!({
+    await expect(imageValue.protectedSnapshot.provider.generateImage!({
       ...imageRequest,
       references: [{ mimeType: 'image/png', dataBase64: bytesB.toString('base64') }],
     })).rejects.toThrow()
@@ -303,13 +430,13 @@ describe('provider attachment disclosure', () => {
       providerSignal = request.signal
       return pending
     })
-    const value = protectedFixture('ordinary', {
+    const value = protectedMediaFixture('image', {
       listModels: async () => [], validateCredential: async () => ({ valid: true }),
       stream: async function* () {}, generateImage,
     })
     const generating = value.protectedSnapshot.provider.generateImage!({
-      model: 'image-model', prompt: 'paint', options: {}, parameterSupport: {},
-      references: [{ mimeType: 'image/png', dataBase64: bytesA.toString('base64') }],
+      model: 'image-model', prompt: value.prompt, options: {}, parameterSupport: {},
+      references: value.projection.references,
     } as unknown as ModelImageRequest)
     expect(providerSignal).toBeDefined()
     value.authority.revokeProvider('openrouter')

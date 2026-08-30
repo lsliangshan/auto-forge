@@ -32,6 +32,7 @@ import {
   assertAttachmentByteAccess,
   assertProtectedProviderSnapshot,
   createProviderAttachmentProjection,
+  createProviderMediaProjection,
   type ProviderAttachmentDisclosure,
 } from './provider-attachment-disclosure.js'
 
@@ -297,12 +298,18 @@ export class MediaGenerationOrchestrator {
       input.conversationId,
       input.route.assets.map((asset) => asset.id),
     )
-    if (input.attachmentDisclosure) {
-      createProviderAttachmentProjection(input.attachmentDisclosure, input.route.provider, modelInputs)
-    }
     if (modelInputs.some((asset) => asset.kind !== 'image')) {
       throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
     }
+    const protectedProjection = input.attachmentDisclosure === undefined
+      ? undefined
+      : createProviderMediaProjection(
+          input.attachmentDisclosure,
+          input.route.provider,
+          'image',
+          input.prompt,
+          modelInputs,
+        )
     const operationKey = `image:${input.requestId}`
     const recordsProviderUsage = providerSnapshot.providerId === 'openrouter'
     let costReported = false
@@ -326,10 +333,11 @@ export class MediaGenerationOrchestrator {
     try {
       result = await provider.generateImage({
         model: input.route.model,
-        prompt: input.prompt,
+        prompt: protectedProjection?.prompt ?? input.prompt,
         options: input.route.generation.image,
         parameterSupport: input.route.imageParameterSupport,
-        references: modelInputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
+        references: protectedProjection?.references
+          ?? modelInputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
         signal: active.controller.signal,
       })
       if (recordsProviderUsage && result.usage?.costUsd !== undefined) {

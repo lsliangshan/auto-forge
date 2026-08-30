@@ -362,14 +362,52 @@ export function anonymizeAttachmentNames(
   text: string,
   attachments: readonly LocalAttachmentProjection[],
 ): string {
-  return [...attachments]
-    .map((attachment) => ({ ...attachment, name: attachment.name.normalize('NFKC') }))
-    .filter(({ name }) => name.length > 0)
-    .sort((left, right) => right.name.length - left.name.length)
-    .reduce((value, attachment) => value.replace(
-      new RegExp(attachment.name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'giu'),
-      `文件-${attachment.index + 1}`,
-    ), text.normalize('NFKC'))
+  const normalized = text.normalize('NFKC')
+  const fold = (value: string): string => value
+    .normalize('NFKD')
+    .toLocaleLowerCase('und')
+    .replace(/ß/gu, 'ss')
+    .replace(/ς/gu, 'σ')
+    .replace(/\p{Mark}/gu, '')
+  const foldedParts: string[] = []
+  const starts: number[] = []
+  const ends: number[] = []
+  let sourceOffset = 0
+  for (const scalar of normalized) {
+    const foldedScalar = fold(scalar)
+    for (let index = 0; index < foldedScalar.length; index += 1) {
+      foldedParts.push(foldedScalar[index]!)
+      starts.push(sourceOffset)
+      ends.push(sourceOffset + scalar.length)
+    }
+    sourceOffset += scalar.length
+  }
+  const foldedText = foldedParts.join('')
+  const replacements: Array<{ start: number; end: number; text: string }> = []
+  for (const attachment of [...attachments].sort((left, right) => (
+    fold(right.name).length - fold(left.name).length
+  ))) {
+    const foldedName = fold(attachment.name.normalize('NFKC'))
+    if (!foldedName) continue
+    let searchFrom = 0
+    while (searchFrom <= foldedText.length - foldedName.length) {
+      const found = foldedText.indexOf(foldedName, searchFrom)
+      if (found === -1) break
+      const start = starts[found]
+      const end = ends[found + foldedName.length - 1]
+      if (start !== undefined && end !== undefined && !replacements.some((replacement) => (
+        replacement.start < end && replacement.end > start
+      ))) {
+        replacements.push({ start, end, text: `文件-${attachment.index + 1}` })
+      }
+      searchFrom = found + Math.max(1, foldedName.length)
+    }
+  }
+  return replacements
+    .sort((left, right) => right.start - left.start)
+    .reduce((value, replacement) => (
+      value.slice(0, replacement.start) + replacement.text + value.slice(replacement.end)
+    ), normalized)
 }
 
 export function hasLocalConversionIntent(

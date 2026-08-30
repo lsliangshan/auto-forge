@@ -34,7 +34,7 @@ import type { ResolvedChatRoute } from './multimodal-router.js'
 import {
   assertAttachmentByteAccess,
   assertProtectedProviderSnapshot,
-  createProviderAttachmentProjection,
+  createProviderMediaProjection,
   type ProviderAttachmentDisclosure,
 } from './provider-attachment-disclosure.js'
 
@@ -383,9 +383,6 @@ export class VideoJobRunner {
         input.conversationId,
         input.assetIds,
       )
-      if (input.attachmentDisclosure) {
-        createProviderAttachmentProjection(input.attachmentDisclosure, input.route.provider, inputs)
-      }
       if (this.stopped || controller.signal.aborted) {
         throw toSafeAppError({ code: 'CANCELLED' })
       }
@@ -395,6 +392,15 @@ export class VideoJobRunner {
           asset.assetId !== input.assetIds[index] || asset.kind !== 'image'
         ))
       ) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+      const protectedProjection = input.attachmentDisclosure === undefined
+        ? undefined
+        : createProviderMediaProjection(
+            input.attachmentDisclosure,
+            input.route.provider,
+            'video',
+            input.prompt,
+            inputs,
+          )
       const operationKey = `video:${input.requestId}`
       if (input.route.provider === 'openrouter') {
         if (providerSnapshot.apiKeyFingerprint === undefined) {
@@ -416,9 +422,10 @@ export class VideoJobRunner {
       }
       const submitted = await provider.submitVideo({
         model: input.route.model,
-        prompt: input.prompt,
+        prompt: protectedProjection?.prompt ?? input.prompt,
         options: input.route.generation.video,
-        references: inputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
+        references: protectedProjection?.references
+          ?? inputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
         frameImages: input.route.videoFrameImages ?? [],
         ...(input.route.videoUsesInputReferences ? { useInputReferences: true } : {}),
         signal: controller.signal,

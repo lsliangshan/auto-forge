@@ -463,6 +463,7 @@ export interface AgentRunInput extends UsageAttribution {
   model: string
   requestId?: string
   providerSnapshot?: ModelProviderSnapshot
+  summaryProviderSnapshot?: ModelProviderSnapshot
 }
 
 export interface AgentRunResult {
@@ -863,6 +864,14 @@ export class AgentOrchestrator {
           assetFingerprints: input.attachmentFingerprints ?? [],
           purpose: 'main',
         })
+        if (!input.summaryProviderSnapshot) throw appFailure('CONFLICT')
+        assertProtectedProviderSnapshot(input.summaryProviderSnapshot, input.attachmentDisclosure, {
+          requestId,
+          providerId: input.provider,
+          assetIds: input.assetIds,
+          assetFingerprints: input.attachmentFingerprints ?? [],
+          purpose: 'summary',
+        })
       }
       const userMessageId = this.id()
       const runId = this.id()
@@ -991,7 +1000,7 @@ export class AgentOrchestrator {
       const historyMessages = await this.dependencies.history.prepare({
         conversationId: input.conversationId,
         beforeOrdinal: userPosition.ordinal,
-        providerSnapshot,
+        providerSnapshot: input.summaryProviderSnapshot ?? providerSnapshot,
         callIdentity: { requestId, chatRunId: runId, userId: input.userId },
         model: input.model,
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),

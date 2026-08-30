@@ -94,6 +94,7 @@ import {
   createProviderAttachmentProjection,
   protectProviderSnapshot,
   type ProviderAttachmentDisclosure,
+  type ProviderAttachmentDisclosureAuthority,
   type ProviderAttachmentSafeText,
 } from './chat/provider-attachment-disclosure.js'
 import { resolveChatRoute } from './chat/multimodal-router.js'
@@ -306,6 +307,10 @@ export interface ApplicationRuntimeOptions {
   applyTheme?(theme: AppSettings['theme']): void
   /** @internal Test-only observation hook for the Main-owned Agent instance. */
   inspectAgent?(agent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'>): void
+  /** @internal Test-only observation hook for attachment disclosure lease cleanup. */
+  inspectAttachmentDisclosureAuthority?(
+    authority: Pick<ProviderAttachmentDisclosureAuthority, 'activeCount'>,
+  ): void
   /** @internal Test-only hooks for deterministic project mutation races. */
   projectServiceOptions?: WorkflowProjectServiceOptions
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
@@ -2190,13 +2195,50 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     cancel: (jobId) => currentConversion().runner.cancel(jobId),
   }
   const providerCredentialEpoch = new Map<ModelProviderId, number>()
+  const providerCredentialTransitions = new Map<ModelProviderId, Promise<void>>()
   const attachmentDisclosureAuthority = createProviderAttachmentDisclosureAuthority({
     currentCredentialEpoch: (provider) => providerCredentialEpoch.get(provider) ?? 0,
+    isCredentialTransitionActive: (provider) => providerCredentialTransitions.has(provider),
   })
+  options.inspectAttachmentDisclosureAuthority?.(attachmentDisclosureAuthority)
   const modelCatalog = new Map<ModelProviderId, {
     credentialEpoch: number
     promise: Promise<Awaited<ReturnType<ModelProvider['listModels']>>>
   }>()
+  const invalidateProviderCredential = (provider: ModelProviderId): void => {
+    attachmentDisclosureAuthority.revokeProvider(provider)
+    providerCredentialEpoch.set(provider, (providerCredentialEpoch.get(provider) ?? 0) + 1)
+    modelCatalog.delete(provider)
+  }
+  const waitForProviderCredentialTransition = async (provider: ModelProviderId): Promise<void> => {
+    while (true) {
+      const transition = providerCredentialTransitions.get(provider)
+      if (!transition) return
+      await transition
+    }
+  }
+  const mutateProviderCredential = <Value>(
+    provider: ModelProviderId,
+    operation: () => Value | Promise<Value>,
+  ): Promise<Value> => {
+    const previous = providerCredentialTransitions.get(provider)
+    invalidateProviderCredential(provider)
+    const transitionRef: { marker?: Promise<void> } = {}
+    const result = (async () => {
+      if (previous) await previous
+      return operation()
+    })()
+    const admitted = result.finally(() => {
+      invalidateProviderCredential(provider)
+      if (providerCredentialTransitions.get(provider) === transitionRef.marker) {
+        providerCredentialTransitions.delete(provider)
+      }
+    })
+    const marker = admitted.then(() => undefined, () => undefined)
+    transitionRef.marker = marker
+    providerCredentialTransitions.set(provider, marker)
+    return admitted
+  }
   const getModelCatalog = (
     provider: ModelProviderId,
     refresh = false,
@@ -2370,7 +2412,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     model?: string
     omitAttachmentProjections?: boolean
     protectedTitleText?: ProviderAttachmentSafeText
+    attachmentDisclosure?: ProviderAttachmentDisclosure
   }>()
+  const releaseConversationTitleContext = (requestId: string): void => {
+    const context = conversationTitleContexts.get(requestId)
+    conversationTitleContexts.delete(requestId)
+    if (context?.attachmentDisclosure) attachmentDisclosureAuthority.release(context.attachmentDisclosure)
+  }
   let acceptingWork = true
   const failureRecorder = createApplicationFailureRecorder(() => { acceptingWork = false })
   const recordFailure = failureRecorder.record
@@ -2542,7 +2590,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
       const context = conversationTitleContexts.get(event.requestId)
       conversationTitleContexts.delete(event.requestId)
-      if (event.status !== 'completed') return
+      if (event.status !== 'completed') {
+        if (context?.attachmentDisclosure) attachmentDisclosureAuthority.release(context.attachmentDisclosure)
+        return
+      }
       const run = chatDatabase.chatRuns.getByRequestId(event.requestId)
       if (
         context
@@ -2568,6 +2619,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           signal: controller.signal,
         }).then(() => undefined).finally(() => {
           activeConversationTitleWork.delete(event.requestId)
+          if (context.attachmentDisclosure) attachmentDisclosureAuthority.release(context.attachmentDisclosure)
         })
         activeConversationTitleWork.set(event.requestId, {
           conversationId: event.conversationId,
@@ -2576,6 +2628,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         })
       } else {
         chatDatabase.conversations.failPendingTitleGeneration(event.conversationId)
+        if (context?.attachmentDisclosure) attachmentDisclosureAuthority.release(context.attachmentDisclosure)
       }
     }
   }
@@ -3034,6 +3087,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             : input.outputType
           const resolved = await resolvedInput(input.conversationId, input.assetIds)
           const requestId = randomUUID()
+          let requestAttachmentDisclosure: ProviderAttachmentDisclosure | undefined
+          try {
           const protectedAssets = resolved.assets.map((asset) => {
             const record = chatDatabase.mediaAssets.get(asset.id)
             if (!record
@@ -3097,6 +3152,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             ?? snapshot.defaultModels[snapshot.activeProvider].text
           let attachmentDisclosure: ProviderAttachmentDisclosure | undefined
           let protectedProviderSnapshot: ModelProviderSnapshot | undefined
+          let summaryProviderSnapshot: ModelProviderSnapshot | undefined
           const route = attachmentDecision === 'ambiguous' ? {
             provider: snapshot.activeProvider,
             model: ambiguousModel ?? (() => { throw failure('INVALID_INPUT') })(),
@@ -3106,16 +3162,33 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             assets: [],
             generation: preferences.generation,
           } : await (async () => {
-            const providerSnapshot = await providerRegistry.acquire(snapshot.activeProvider)
+            let providerSnapshot: ModelProviderSnapshot
+            while (true) {
+              await waitForProviderCredentialTransition(snapshot.activeProvider)
+              const credentialEpoch = providerCredentialEpoch.get(snapshot.activeProvider) ?? 0
+              const acquired = await providerRegistry.acquire(snapshot.activeProvider)
+              if (providerCredentialTransitions.has(snapshot.activeProvider)
+                || credentialEpoch !== (providerCredentialEpoch.get(snapshot.activeProvider) ?? 0)) {
+                continue
+              }
+              providerSnapshot = acquired
+              break
+            }
             if (providerSnapshot.providerId !== snapshot.activeProvider) {
               const error = new ProviderUsageConsistencyError()
               recordFailure(error, 'preflight')
               throw error
             }
             attachmentDisclosure = attachmentDisclosureAuthority.bindProvider(privacyPlan, providerSnapshot)
+            requestAttachmentDisclosure = attachmentDisclosure
             protectedProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
               purpose: 'main',
             })
+            if (resolved.assets.length > 0) {
+              summaryProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+                purpose: 'summary',
+              })
+            }
             await requireValidCredential(providerSnapshot)
             const resolvedRoute = resolveChatRoute({
                 provider: snapshot.activeProvider,
@@ -3136,17 +3209,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               throw failure('INVALID_INPUT')
             }
             const titleModel = snapshot.defaultModels[providerSnapshot.providerId].text
-            const titleProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
-              purpose: 'title',
-            })
+            const titleProviderSnapshot = resolved.assets.length > 0
+              ? protectProviderSnapshot(providerSnapshot, attachmentDisclosure, { purpose: 'title' })
+              : providerSnapshot
             conversationTitleContexts.set(requestId, {
               conversationId: input.conversationId,
               userId: session.user.id,
               providerSnapshot: titleProviderSnapshot,
               providerCredentialEpoch: attachmentDisclosure.credentialEpoch,
+              attachmentDisclosure,
               ...(titleModel === undefined ? {} : { model: titleModel }),
-              ...(metadataOnlyAttachments ? { omitAttachmentProjections: true } : {}),
-              ...(metadataOnlyAttachments
+              ...(resolved.assets.length > 0 ? { omitAttachmentProjections: true } : {}),
+              ...(resolved.assets.length > 0
                 ? { protectedTitleText: attachmentDisclosure.titleSafeText }
                 : {}),
             })
@@ -3241,6 +3315,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 supportsImageInput: route.supportsImageInput,
                 userId: session.user.id,
                 ...(protectedProviderSnapshot === undefined ? {} : { providerSnapshot: protectedProviderSnapshot }),
+                ...(summaryProviderSnapshot === undefined ? {} : { summaryProviderSnapshot }),
                 ...(attachmentDisclosure === undefined ? {} : { attachmentDisclosure }),
                 provider: route.provider,
                 model: route.model,
@@ -3263,7 +3338,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 route: { ...route, outputType: 'video' },
               })
             } catch (error) {
-              conversationTitleContexts.delete(requestId)
+              releaseConversationTitleContext(requestId)
               if (error instanceof ProviderUsageConsistencyError) {
                 recordFailure(error, 'video-submit')
               }
@@ -3271,6 +3346,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             }
           }
           return { requestId }
+          } catch (error) {
+            releaseConversationTitleContext(requestId)
+            if (requestAttachmentDisclosure) {
+              attachmentDisclosureAuthority.release(requestAttachmentDisclosure)
+            }
+            throw error
+          }
         } finally {
           releaseStart()
           activeChatAdmissions.delete(admission)
@@ -3954,19 +4036,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         settingsUpdateTail = transaction.then(() => undefined, () => undefined)
         return transaction
       },
-      saveProviderApiKey: async (provider, apiKey) => {
-        attachmentDisclosureAuthority.revokeProvider(provider)
+      saveProviderApiKey: (provider, apiKey) => mutateProviderCredential(provider, async () => {
         await secretStore.set(credentialKeyForProvider(provider), apiKey)
-        providerCredentialEpoch.set(provider, (providerCredentialEpoch.get(provider) ?? 0) + 1)
-        modelCatalog.delete(provider)
         return { provider, configured: true, validation: 'unchecked' as const }
-      },
-      clearProviderApiKey: async (provider) => {
-        attachmentDisclosureAuthority.revokeProvider(provider)
-        secretStore.delete(credentialKeyForProvider(provider))
-        providerCredentialEpoch.set(provider, (providerCredentialEpoch.get(provider) ?? 0) + 1)
-        modelCatalog.delete(provider)
-      },
+      }),
+      clearProviderApiKey: (provider) => mutateProviderCredential(provider, async () => {
+        await secretStore.delete(credentialKeyForProvider(provider))
+      }),
       validateProviderCredential: credentialStatus,
       listProviderModels: (provider, refresh = false) => getModelCatalog(provider, refresh),
       getTokenUsage: async () => {
@@ -4356,7 +4432,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           for (const result of titleResults) if (result.status === 'rejected') {
             recordFailure(result.reason, 'chat-drain')
           }
-          conversationTitleContexts.clear()
+          for (const requestId of conversationTitleContexts.keys()) {
+            releaseConversationTitleContext(requestId)
+          }
         })
         await capture('execution-shutdown', () => executions.shutdown())
         await capture('conversion-stop', () => pauseUserConversion())

@@ -76,7 +76,7 @@ function ordinaryAttachmentAuthority(snapshot: ModelProviderSnapshot, assetIds: 
   const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
   const plan = authority.createPlan({
     requestId: submitInput.requestId,
-    text: '描述这个图片',
+    text: submitInput.prompt,
     context: {
       hasAttachments: true, requestedOutput: 'video', attachmentKinds: assetIds.map(() => 'image'),
     },

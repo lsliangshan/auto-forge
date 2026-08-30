@@ -24,7 +24,8 @@ import type {
   ModelVideoRequest,
 } from './model-provider.js'
 
-export type ProviderAttachmentPurpose = 'main' | 'title'
+export type ProviderAttachmentPurpose = 'main' | 'title' | 'summary'
+export type ProviderMediaPurpose = 'image' | 'video'
 
 export interface ProviderAttachmentSafeText {
   readonly text: string
@@ -32,6 +33,11 @@ export interface ProviderAttachmentSafeText {
 
 export interface ProviderAttachmentProjection {
   readonly content: string | ModelContentPart[]
+}
+
+export interface ProviderMediaProjection {
+  readonly prompt: string
+  readonly references: Array<{ mimeType: string; dataBase64: string }>
 }
 
 export interface AttachmentPrivacyPlan {
@@ -71,6 +77,8 @@ export interface ProviderAttachmentDisclosureAuthority {
     providerSnapshot: ModelProviderSnapshot,
   ): ProviderAttachmentDisclosure
   revokeProvider(providerId: ModelProviderId): void
+  release(disclosure: ProviderAttachmentDisclosure): void
+  activeCount(providerId?: ModelProviderId): number
 }
 
 interface PrivacyPlanAuthority {
@@ -78,6 +86,7 @@ interface PrivacyPlanAuthority {
   readonly originalTextHash: string
   readonly attachments: readonly AttachmentDisclosurePlanAsset[]
   readonly attachmentKinds: readonly ProviderAttachmentAccessContext['attachmentKinds'][number][]
+  readonly requestedOutput: ProviderAttachmentAccessContext['requestedOutput']
 }
 
 interface DisclosureAuthority extends PrivacyPlanAuthority {
@@ -86,6 +95,7 @@ interface DisclosureAuthority extends PrivacyPlanAuthority {
   readonly currentCredentialEpoch: () => number
   readonly credentialProtected: boolean
   readonly revocation: AbortController
+  readonly mediaProjectionReferences: Set<object>
 }
 
 interface AttachmentDisclosureBinding {
@@ -109,6 +119,12 @@ const issuedSafeTexts = new WeakMap<object, {
   purpose: ProviderAttachmentPurpose
 }>()
 const disclosureProjectionPayloads = new WeakMap<object, Set<string>>()
+const issuedMediaProjectionReferences = new WeakMap<object, {
+  disclosure: ProviderAttachmentDisclosure
+  purpose: ProviderMediaPurpose
+  prompt: string
+  references: readonly { mimeType: string; dataBase64: string; fingerprint: string; kind: 'image' }[]
+}>()
 const protectedSnapshots = new WeakMap<object, ProtectedSnapshotBinding>()
 
 function sameValues(left: readonly string[], right: readonly string[]): boolean {
@@ -162,6 +178,7 @@ function issueSafeText(
 
 export function createProviderAttachmentDisclosureAuthority(input: {
   currentCredentialEpoch(providerId: ModelProviderId): number
+  isCredentialTransitionActive?(providerId: ModelProviderId): boolean
 }): ProviderAttachmentDisclosureAuthority {
   const active = new Map<ModelProviderId, Set<ProviderAttachmentDisclosure>>()
   const authority: ProviderAttachmentDisclosureAuthority = {
@@ -208,6 +225,7 @@ export function createProviderAttachmentDisclosureAuthority(input: {
         originalTextHash: sha256(normalizedText),
         attachments,
         attachmentKinds: Object.freeze([...value.context.attachmentKinds]),
+        requestedOutput: value.context.requestedOutput,
       })
       return plan
     },
@@ -215,6 +233,9 @@ export function createProviderAttachmentDisclosureAuthority(input: {
       const planAuthority = privacyPlanAuthorities.get(plan)
       if (!issuedPrivacyPlans.has(plan) || !planAuthority || plan.access.decision === 'ambiguous') {
         throw new Error('Attachment privacy plan cannot be bound to a Provider')
+      }
+      if (input.isCredentialTransitionActive?.(providerSnapshot.providerId) === true) {
+        throw new Error('Attachment disclosure cannot bind during a credential transition')
       }
       const credentialEpoch = input.currentCredentialEpoch(providerSnapshot.providerId)
       if (!Number.isSafeInteger(credentialEpoch) || credentialEpoch < 0) {
@@ -241,6 +262,7 @@ export function createProviderAttachmentDisclosureAuthority(input: {
         currentCredentialEpoch: () => input.currentCredentialEpoch(providerSnapshot.providerId),
         credentialProtected: planAuthority.attachments.length > 0,
         revocation,
+        mediaProjectionReferences: new Set(),
       })
       disclosureProjectionPayloads.set(disclosure, new Set())
       if (planAuthority.attachments.length > 0) {
@@ -255,6 +277,25 @@ export function createProviderAttachmentDisclosureAuthority(input: {
       if (!plans) return
       active.delete(providerId)
       for (const disclosure of plans) disclosureAuthorities.get(disclosure)?.revocation.abort()
+    },
+    release(disclosure: ProviderAttachmentDisclosure) {
+      const disclosureAuthority = disclosureAuthorities.get(disclosure)
+      if (!disclosureAuthority) return
+      disclosureAuthority.revocation.abort()
+      active.get(disclosure.providerId)?.delete(disclosure)
+      if (active.get(disclosure.providerId)?.size === 0) active.delete(disclosure.providerId)
+      for (const references of disclosureAuthority.mediaProjectionReferences) {
+        issuedMediaProjectionReferences.delete(references)
+      }
+      issuedSafeTexts.delete(disclosure.mainSafeText)
+      issuedSafeTexts.delete(disclosure.titleSafeText)
+      disclosureProjectionPayloads.delete(disclosure)
+      disclosureAuthorities.delete(disclosure)
+      issuedDisclosures.delete(disclosure)
+    },
+    activeCount(providerId?: ModelProviderId) {
+      if (providerId !== undefined) return active.get(providerId)?.size ?? 0
+      return [...active.values()].reduce((count, values) => count + values.size, 0)
     },
   }
   return Object.freeze(authority)
@@ -309,6 +350,36 @@ export function createProviderAttachmentProjection(
   deepFreezeRequestValue(content)
   const projection = Object.freeze({ content })
   disclosureProjectionPayloads.get(disclosure)!.add(JSON.stringify(content))
+  return projection
+}
+
+export function createProviderMediaProjection(
+  disclosure: ProviderAttachmentDisclosure,
+  provider: ModelProviderId,
+  purpose: ProviderMediaPurpose,
+  prompt: string,
+  inputs: readonly ModelMediaInput[],
+): ProviderMediaProjection {
+  const authority = assertLive(disclosure)
+  if (provider !== disclosure.providerId
+    || (authority.requestedOutput !== purpose && authority.requestedOutput !== 'auto')
+    || prompt.normalize('NFKC') !== authority.originalText
+    || inputs.some(({ kind }) => kind !== 'image')) {
+    throw new Error('Media projection plan does not match the request')
+  }
+  assertInputsMatchPlan(disclosure, inputs)
+  const references = inputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 }))
+  deepFreezeRequestValue(references)
+  const projection = Object.freeze({ prompt: authority.originalText, references })
+  issuedMediaProjectionReferences.set(references, {
+    disclosure,
+    purpose,
+    prompt: authority.originalText,
+    references: Object.freeze(inputs.map(({ kind, mimeType, dataBase64 }) => Object.freeze({
+      kind: kind as 'image', mimeType, dataBase64, fingerprint: sha256(decodeCanonicalBase64(dataBase64)),
+    }))),
+  })
+  authority.mediaProjectionReferences.add(references)
   return projection
 }
 
@@ -387,6 +458,25 @@ function assertSafeStreamRequest(
   request: ModelStreamRequest,
 ): void {
   assertLive(disclosure)
+  if (purpose === 'title') {
+    assertSafeText(disclosure, purpose, request)
+    if (request.output?.type === 'audio'
+      || (request.tools?.length ?? 0) > 0
+      || request.toolChoice !== undefined
+      || request.messages.some(hasStructuredAttachment)) {
+      throw new Error('Attachment title request must be text-only')
+    }
+    return
+  }
+  if (purpose === 'summary') {
+    if (request.output?.type === 'audio'
+      || (request.tools?.length ?? 0) > 0
+      || request.toolChoice !== undefined
+      || request.messages.some(hasStructuredAttachment)) {
+      throw new Error('Attachment summary request must be text-only')
+    }
+    return
+  }
   if (disclosure.access.decision === 'ordinary') {
     if (purpose === 'main') assertOrdinaryProjection(disclosure, request)
     return
@@ -408,6 +498,28 @@ function assertSafeStreamRequest(
   }
   if (disclosure.forbiddenValues.some((value) => payload.includes(value))) {
     throw new Error('Protected attachment request contains tainted attachment data')
+  }
+}
+
+function assertIssuedMediaProjection(
+  disclosure: ProviderAttachmentDisclosure,
+  purpose: ProviderMediaPurpose,
+  prompt: string,
+  references: Array<{ mimeType: string; dataBase64: string }>,
+): void {
+  const binding = issuedMediaProjectionReferences.get(references)
+  if (!binding
+    || binding.disclosure !== disclosure
+    || binding.purpose !== purpose
+    || binding.prompt !== prompt
+    || binding.references.length !== references.length
+    || binding.references.some((reference, index) => (
+      reference.kind !== 'image'
+      || reference.mimeType !== references[index]?.mimeType
+      || reference.dataBase64 !== references[index]?.dataBase64
+      || reference.fingerprint !== sha256(decodeCanonicalBase64(references[index]!.dataBase64))
+    ))) {
+    throw new Error('Provider media request is missing an issued projection')
   }
 }
 
@@ -485,6 +597,7 @@ export function protectProviderSnapshot(
         if (!disclosure.access.allowProviderBytes || input.purpose !== 'main') {
           throw new Error('Protected attachment request cannot generate image output')
         }
+        assertIssuedMediaProjection(disclosure, 'image', request.prompt, request.references)
         const outbound = cloneAndFreezeRequest(request, authority.revocation.signal)
         assertReferenceHashes(disclosure, outbound.references)
         const result = await source.generateImage!(outbound)
@@ -497,6 +610,7 @@ export function protectProviderSnapshot(
         if (!disclosure.access.allowProviderBytes || input.purpose !== 'main') {
           throw new Error('Protected attachment request cannot submit video output')
         }
+        assertIssuedMediaProjection(disclosure, 'video', request.prompt, request.references)
         const outbound = cloneAndFreezeRequest(request, authority.revocation.signal)
         assertReferenceHashes(disclosure, outbound.references)
         const result = await source.submitVideo!(outbound)

@@ -72,6 +72,29 @@ describe('attachment conversion policy', () => {
   })
 
   it.each([
+    'describe this image while rasterizing it',
+    '描述这个附件同时压缩它',
+  ])('requires the entire ordinary-understanding request to match the allow grammar: %s', (text) => {
+    expect(providerAttachmentAccess('ordinary', text, {
+      hasAttachments: true,
+      requestedOutput: 'text',
+      attachmentKinds: ['image'],
+    }).decision).toBe('ambiguous')
+  })
+
+  it.each([
+    'describe this image as bullet points',
+    'describe this image as accurately as possible',
+    'read this PDF as text',
+  ])('allows a controlled ordinary output modifier without treating it as a format target: %s', (text) => {
+    expect(providerAttachmentAccess('ordinary', text, {
+      hasAttachments: true,
+      requestedOutput: 'text',
+      attachmentKinds: ['file'],
+    })).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
+  })
+
+  it.each([
     'read this PDF',
     'describe this JPG',
     'summarize this PDF',

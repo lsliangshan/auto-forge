@@ -330,6 +330,9 @@ function protectedAttachmentRunInput(
     providerSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
       purpose: 'main',
     }),
+    summaryProviderSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+      purpose: 'summary',
+    }),
     attachmentDisclosure,
   }
 }
