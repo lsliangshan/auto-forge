@@ -1024,6 +1024,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
+    fontSize: 'normal',
     language: 'zh-CN',
     dataDirectory: options.paths.data,
     logDirectory: options.paths.logs,

@@ -87,7 +87,7 @@ const coordinateLabel = computed(() => {
 </script>
 
 <style scoped>
-.knowledge-citation { max-width: 680px; border-left: 2px solid var(--af-cobalt); padding: 8px 10px; background: var(--af-surface-muted); font-size: 12px; }
+.knowledge-citation { max-width: 680px; border-left: 2px solid var(--af-cobalt); padding: 8px 10px; background: var(--af-surface-muted); font-size: 0.75rem; }
 .knowledge-citation header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .knowledge-citation button { border: 0; padding: 0; color: var(--af-cobalt); background: transparent; cursor: pointer; }
 .source-unavailable { color: var(--af-text-muted); }

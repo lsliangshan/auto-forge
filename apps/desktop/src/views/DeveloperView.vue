@@ -20,5 +20,5 @@ onBeforeUnmount(() => { void developer.flushPendingSaves() })
 </script>
 
 <style scoped>
-.developer-workbench { height: 100%; min-height: 480px; background: var(--af-surface); }.developer-state { display: grid; min-height: 100%; place-content: center; gap: 7px; padding: 32px; color: var(--af-text-muted); text-align: center; }.developer-state h2 { margin: 0; color: var(--af-graphite); font-size: 19px; }.developer-state p { max-width: 500px; margin: 0; font-size: 13px; line-height: 1.6; }.developer-state.error { color: var(--af-danger); }
+.developer-workbench { height: 100%; min-height: 480px; background: var(--af-surface); }.developer-state { display: grid; min-height: 100%; place-content: center; gap: 7px; padding: 32px; color: var(--af-text-muted); text-align: center; }.developer-state h2 { margin: 0; color: var(--af-graphite); font-size: 1.1875rem; }.developer-state p { max-width: 500px; margin: 0; font-size: 0.8125rem; line-height: 1.6; }.developer-state.error { color: var(--af-danger); }
 </style>

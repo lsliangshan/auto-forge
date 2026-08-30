@@ -1,4 +1,5 @@
 import {
+  appFontSizeSchema,
   normalizeProxySettings,
   type AppSettings,
   type AppSettingsPatch,
@@ -60,6 +61,9 @@ export class SettingsService {
     const storedDefaults = stored.defaultModels
     return {
       theme: stored.theme ?? this.defaults.theme,
+      fontSize: appFontSizeSchema.safeParse(stored.fontSize).data
+        ?? this.defaults.fontSize
+        ?? 'normal',
       language: stored.language ?? this.defaults.language,
       dataDirectory: this.defaults.dataDirectory,
       logDirectory: this.defaults.logDirectory,

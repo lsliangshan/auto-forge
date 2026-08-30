@@ -1245,6 +1245,15 @@ export type PermissionGrant = z.infer<typeof permissionGrantSchema>
 export const modelProviderIdSchema = z.enum(['deepseek', 'openrouter'])
 export type ModelProviderId = z.infer<typeof modelProviderIdSchema>
 
+export const appFontSizeSchema = z.enum([
+  'extra-small',
+  'small',
+  'normal',
+  'large',
+  'extra-large',
+])
+export type AppFontSize = z.infer<typeof appFontSizeSchema>
+
 export const accountDataPreferencesDefaults = {
   timezone: 'Asia/Shanghai',
   displayCurrency: 'CNY',
@@ -1275,6 +1284,7 @@ export type ProviderDefaultModels = z.infer<typeof providerDefaultModelsSchema>
 
 export const appSettingsSchema = z.object({
   theme: z.enum(['light', 'dark', 'system']),
+  fontSize: appFontSizeSchema.optional(),
   language: z.enum(['zh-CN', 'en-US']),
   dataDirectory: nonEmptyStringSchema,
   logDirectory: nonEmptyStringSchema,

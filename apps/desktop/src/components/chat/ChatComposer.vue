@@ -719,13 +719,13 @@ function removeDraft(assetId: string) {
 <style scoped>
 .composer { border-top: 1px solid var(--af-border); padding: 12px 16px 14px; background: var(--af-surface); }
 .composer-tools, .generation-options { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 9px; }
-.composer-tools label, .generation-options label { display: inline-flex; align-items: center; gap: 5px; color: var(--af-text-muted); font-size: 11px; }
+.composer-tools label, .generation-options label { display: inline-flex; align-items: center; gap: 5px; color: var(--af-text-muted); font-size: 0.6875rem; }
 .tool-button, select, .remove-draft { border: 1px solid var(--af-border-strong); border-radius: 6px; padding: 6px 9px; color: var(--af-text); background: var(--af-surface); font: inherit; }
 .tool-button, .remove-draft { cursor: pointer; }
 .tool-button:disabled, .remove-draft:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
-.choice-required { margin-bottom: 9px; border-left: 3px solid var(--af-warning, #d89018); padding: 7px 9px; color: var(--af-text); background: var(--af-surface-muted); font-size: 12px; }
+.choice-required { margin-bottom: 9px; border-left: 3px solid var(--af-warning, #d89018); padding: 7px 9px; color: var(--af-text); background: var(--af-surface-muted); font-size: 0.75rem; }
 .draft-list { display: grid; gap: 6px; margin-bottom: 9px; }
-.draft-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; border: 1px solid var(--af-border); border-radius: 7px; padding: 7px 9px; background: var(--af-surface-muted); font-size: 12px; }
+.draft-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; border: 1px solid var(--af-border); border-radius: 7px; padding: 7px 9px; background: var(--af-surface-muted); font-size: 0.75rem; }
 .draft-kind, .draft-size { color: var(--af-text-muted); }
 .draft-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .remove-draft { padding: 3px 7px; color: var(--af-danger, #b42318); }
@@ -733,5 +733,5 @@ textarea { display: block; width: 100%; min-height: 66px; max-height: 180px; res
 textarea:hover:not(:disabled) { border-color: var(--af-control-hover); }
 textarea:disabled { cursor: not-allowed; background: var(--af-surface-muted); }
 .composer-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
-.composer-footer span { color: var(--af-text-muted); font-size: 11px; }
+.composer-footer span { color: var(--af-text-muted); font-size: 0.6875rem; }
 </style>

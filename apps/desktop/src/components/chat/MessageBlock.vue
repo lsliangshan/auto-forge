@@ -122,16 +122,16 @@ const messageErrorText = computed(() => props.block.type === 'error'
 .message-markdown :deep(a) { color: var(--af-cobalt); }
 .message-markdown :deep(code) { border-radius: 4px; padding: 2px 5px; background: var(--af-surface-muted); font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: .92em; }
 .message-markdown :deep(pre) { max-width: 100%; margin: 10px 0; overflow-x: auto; border-radius: 8px; padding: 14px 16px; color: #e6edf3; background: #0d1117; }
-.message-markdown :deep(pre code) { display: block; overflow-wrap: normal; border-radius: 0; padding: 0; color: inherit; background: transparent; font-size: 12px; line-height: 1.6; white-space: pre; word-break: normal; }
+.message-markdown :deep(pre code) { display: block; overflow-wrap: normal; border-radius: 0; padding: 0; color: inherit; background: transparent; font-size: 0.75rem; line-height: 1.6; white-space: pre; word-break: normal; }
 .message-markdown :deep(table) { display: block; max-width: 100%; margin: 10px 0; overflow-x: auto; border-collapse: collapse; }
 .message-markdown :deep(th),
 .message-markdown :deep(td) { border: 1px solid var(--af-border); padding: 6px 10px; text-align: left; }
 .message-markdown :deep(th) { background: var(--af-surface-muted); }
-.reasoning { display: flex; align-items: center; gap: 7px; color: var(--af-text-muted); font-size: 12px; }
+.reasoning { display: flex; align-items: center; gap: 7px; color: var(--af-text-muted); font-size: 0.75rem; }
 .proposal, .result { display: grid; gap: 5px; max-width: 640px; border: 1px solid var(--af-border); padding: 12px 14px; background: var(--af-surface-muted); }
 .proposal strong { color: var(--af-cobalt); }.result p, .af-error p { margin: 4px 0 0; }
 .message-error { max-width: 680px; }
 .message-error-inline { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 9px; border: 0; border-top: 1px solid var(--af-danger-border); border-radius: 0; padding: 10px 2px 0; background: transparent; }
-.message-error-icon { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; color: var(--af-danger); background: var(--af-danger-soft); font-size: 12px; }
-.message-error strong { color: var(--af-danger); font-size: 11px; }.message-error p { margin: 2px 0 0; color: var(--af-text-muted); font-size: 12px; line-height: 1.5; }
+.message-error-icon { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; color: var(--af-danger); background: var(--af-danger-soft); font-size: 0.75rem; }
+.message-error strong { color: var(--af-danger); font-size: 0.6875rem; }.message-error p { margin: 2px 0 0; color: var(--af-text-muted); font-size: 0.75rem; line-height: 1.5; }
 </style>

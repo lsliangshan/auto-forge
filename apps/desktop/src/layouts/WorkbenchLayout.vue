@@ -58,8 +58,8 @@ watch(() => route.name, () => {
 .workbench { display: flex; width: 100%; height: 100%; overflow: hidden; background: var(--af-canvas); }
 .workspace { display: flex; min-width: 0; flex: 1; flex-direction: column; }
 .workspace-header { display: flex; min-height: 58px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 8px 18px; background: var(--af-surface); -webkit-app-region: drag; }
-.workspace-header h1 { margin: 0; color: var(--af-graphite); font-size: 18px; font-weight: 680; }
-.workspace-eyebrow { display: block; margin-bottom: 1px; color: var(--af-text-muted); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+.workspace-header h1 { margin: 0; color: var(--af-graphite); font-size: 1.125rem; font-weight: 680; }
+.workspace-eyebrow { display: block; margin-bottom: 1px; color: var(--af-text-muted); font-size: 0.625rem; letter-spacing: .12em; text-transform: uppercase; }
 .inspector-toggle { -webkit-app-region: no-drag; }
 .workspace-content { min-height: 0; flex: 1; overflow: auto; }
 </style>

@@ -326,7 +326,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   align-items: center;
   gap: 9px;
   color: var(--af-graphite);
-  font-size: 16px;
+  font-size: 1rem;
   font-weight: 700;
   letter-spacing: -.01em;
 }
@@ -349,7 +349,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 .billing-header p {
   margin: 6px 0 0 12px;
-  font-size: 12px;
+  font-size: 0.75rem;
   line-height: 1.55;
 }
 
@@ -370,7 +370,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 .billing-period {
   margin-bottom: 14px;
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 
 .billing-summary {
@@ -396,7 +396,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 .remote-usage-summary dt {
   color: var(--af-text-muted);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 .remote-usage-summary dd {
@@ -416,7 +416,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   align-items: center;
   gap: 6px;
   color: var(--af-text-muted);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 .billing-summary-marker {
@@ -428,14 +428,14 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 .billing-summary dd {
   margin: 6px 0 0;
-  font-size: 20px;
+  font-size: 1.25rem;
   font-weight: 700;
 }
 
 .billing-summary p {
   margin: 6px 0 0;
   color: var(--af-text-muted);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 
 .billing-summary .billing-cost-warning {
@@ -462,7 +462,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 .billing-chart-section h3 {
   margin: 0 0 8px;
   color: var(--af-graphite);
-  font-size: 14px;
+  font-size: 0.875rem;
 }
 
 .billing-table-wrap {

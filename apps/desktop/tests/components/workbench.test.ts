@@ -2593,6 +2593,28 @@ describe('workbench', () => {
     }))
   })
 
+  it('applies and persists the global font size selected in settings', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.update).mockImplementation(async (patch) => ({
+      ...await api.settings.get(),
+      ...patch,
+    }))
+    const { wrapper } = await mountApp('/settings', api)
+
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="font-size-select"]').exists())
+      .toBe(true))
+    await wrapper.get('[data-testid="font-size-select"]').trigger('click')
+    const option = [...document.body.querySelectorAll<HTMLElement>('.el-select-dropdown__item')]
+      .find((item) => item.textContent?.trim() === '超大')
+    expect(option).toBeDefined()
+    option!.click()
+
+    await vi.waitFor(() => expect(api.settings.update).toHaveBeenCalledWith({
+      fontSize: 'extra-large',
+    }))
+    expect(document.documentElement.dataset.fontSize).toBe('extra-large')
+  })
+
   it('accepts enabling while the address blur save is still pending', async () => {
     const api = createApi()
     let finishFirst!: (settings: AppSettings) => void

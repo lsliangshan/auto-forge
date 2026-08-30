@@ -223,16 +223,16 @@ const consentDescription = computed(() => {
 .knowledge-status-content { padding-top: 1px; padding-bottom: 16px; }
 .knowledge-consent-panel { border: 1px solid var(--af-border); border-radius: 11px; padding: 12px; background: transparent; }
 .knowledge-consent-heading { display: flex; align-items: center; gap: 9px; }
-.knowledge-consent-icon { display: grid; width: 28px; height: 28px; flex: 0 0 28px; place-items: center; border-radius: 8px; color: var(--operation-accent); background: var(--operation-soft); font-size: 13px; }
+.knowledge-consent-icon { display: grid; width: 28px; height: 28px; flex: 0 0 28px; place-items: center; border-radius: 8px; color: var(--operation-accent); background: var(--operation-soft); font-size: 0.8125rem; }
 .knowledge-consent-heading div { display: grid; gap: 1px; }
-.knowledge-consent-heading span:not(.knowledge-consent-icon) { color: var(--af-text-muted); font-size: 9px; font-weight: 700; letter-spacing: .06em; }
-.knowledge-consent-heading strong { color: var(--af-graphite); font-size: 12px; font-weight: 680; }
-.knowledge-consent-panel > p { margin: 9px 0 0; color: var(--af-text-muted); font-size: 11px; line-height: 1.55; }
+.knowledge-consent-heading span:not(.knowledge-consent-icon) { color: var(--af-text-muted); font-size: 0.5625rem; font-weight: 700; letter-spacing: .06em; }
+.knowledge-consent-heading strong { color: var(--af-graphite); font-size: 0.75rem; font-weight: 680; }
+.knowledge-consent-panel > p { margin: 9px 0 0; color: var(--af-text-muted); font-size: 0.6875rem; line-height: 1.55; }
 .knowledge-consent-actions { margin-top: 12px; border-top: 1px solid var(--af-border); padding-top: 12px; }
 .knowledge-consent-actions :deep(.el-button) { min-width: 72px; border-radius: 8px; font-weight: 650; }
 .knowledge-consent-actions :deep(.el-button--primary) { min-width: 112px; box-shadow: 0 4px 10px color-mix(in srgb, var(--af-cobalt) 18%, transparent); }
 .knowledge-consent-feedback,
-.knowledge-consent-error { display: flex; align-items: flex-start; gap: 7px; margin: 11px 0 0; border-left: 2px solid currentcolor; padding: 2px 0 2px 9px; font-size: 11px; line-height: 1.5; }
+.knowledge-consent-error { display: flex; align-items: flex-start; gap: 7px; margin: 11px 0 0; border-left: 2px solid currentcolor; padding: 2px 0 2px 9px; font-size: 0.6875rem; line-height: 1.5; }
 .knowledge-consent-feedback { color: var(--af-success); }
 .knowledge-consent-error { color: var(--af-danger); }
 .knowledge-consent-feedback .el-icon,

@@ -253,12 +253,12 @@ onBeforeUnmount(() => {
 h1 {
   margin: 0;
   color: var(--af-graphite);
-  font-size: 26px;
+  font-size: 1.625rem;
 }
 .auth-description {
   margin: 8px 0 24px;
   color: var(--af-text-muted);
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.55;
 }
 .login-methods {
@@ -292,7 +292,7 @@ h1 {
   background: transparent;
   color: var(--af-text-muted);
   font: inherit;
-  font-size: 13px;
+  font-size: 0.8125rem;
   cursor: pointer;
 }
 .login-methods button.active {
@@ -315,7 +315,7 @@ h1 {
 .auth-form label {
   margin-top: 6px;
   color: var(--af-text);
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 650;
 }
 .auth-form .el-button {
@@ -334,13 +334,13 @@ h1 {
 .auth-error {
   margin: 2px 0 0;
   color: var(--af-danger);
-  font-size: 13px;
+  font-size: 0.8125rem;
   line-height: 1.45;
 }
 .auth-switch {
   margin: 22px 0 0;
   color: var(--af-text-muted);
-  font-size: 13px;
+  font-size: 0.8125rem;
   text-align: center;
 }
 .auth-switch a {

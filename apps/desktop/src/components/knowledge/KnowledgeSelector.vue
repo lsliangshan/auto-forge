@@ -95,7 +95,7 @@ function guardDisabled(event: { preventDefault(): void; stopPropagation(): void 
 </script>
 
 <style scoped>
-.knowledge-selector { position: relative; color: var(--af-text-muted); font-size: 11px; }
+.knowledge-selector { position: relative; color: var(--af-text-muted); font-size: 0.6875rem; }
 summary { list-style: none; border: 1px solid var(--af-border); border-radius: 7px; padding: 5px 8px; color: var(--af-text); background: var(--af-surface); cursor: pointer; }
 summary::-webkit-details-marker { display: none; }
 summary.disabled { opacity: .55; pointer-events: none; }

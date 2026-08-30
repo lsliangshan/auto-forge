@@ -42,6 +42,7 @@ import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
 import JsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker'
 import CssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker'
 import TypeScriptWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker'
+import { currentAppFontScale } from '../../services/font-size'
 import { useDeveloperStore } from '../../stores/developer'
 
 const workers = new Map<string, globalThis.Worker>()
@@ -77,6 +78,10 @@ const colorSchemeMedia = typeof window.matchMedia === 'function'
 const handleColorScheme = (event: { matches: boolean }) => {
   monaco.editor.setTheme(event.matches ? 'vs-dark' : 'vs')
 }
+const applyEditorFontSize = () => {
+  const scale = currentAppFontScale()
+  editor?.updateOptions({ fontSize: 13 * scale, lineHeight: 21 * scale })
+}
 
 const modelKey = computed(() => developer.selectedProjectId && developer.selectedPath
   ? `${developer.selectedProjectId}/${developer.selectedPath}` : '')
@@ -110,8 +115,8 @@ function ensureEditor() {
   editor = monaco.editor.create(container.value, {
     automaticLayout: true,
     minimap: { enabled: false },
-    fontSize: 13,
-    lineHeight: 21,
+    fontSize: 13 * currentAppFontScale(),
+    lineHeight: 21 * currentAppFontScale(),
     scrollBeyondLastLine: false,
     tabSize: 2,
     theme: colorSchemeMedia?.matches ? 'vs-dark' : 'vs',
@@ -176,10 +181,12 @@ watch(() => developer.diagnostics, applyMarkers, { deep: true })
 
 onMounted(() => {
   colorSchemeMedia?.addEventListener('change', handleColorScheme)
+  window.addEventListener('autoforge:font-size-change', applyEditorFontSize)
   void activateModel()
 })
 onBeforeUnmount(() => {
   colorSchemeMedia?.removeEventListener('change', handleColorScheme)
+  window.removeEventListener('autoforge:font-size-change', applyEditorFontSize)
   void developer.flushPendingSaves()
   contentListener?.dispose()
   editor?.dispose()
@@ -195,8 +202,8 @@ onBeforeUnmount(() => {
 .editor-tab.active { color: var(--af-text); background: var(--af-surface); box-shadow: inset 0 2px var(--af-cobalt); }
 .tab-select, .tab-close { border: 0; color: inherit; background: transparent; cursor: pointer; }
 .tab-select { display: flex; min-width: 0; flex: 1; align-items: center; gap: 6px; padding: 9px 6px 8px 10px; text-align: left; }.editor-tab.dirty .tab-select::before { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--af-danger); content: ''; }
-.tab-close { margin-right: 4px; border-radius: 3px; padding: 2px 5px; font-size: 14px; line-height: 1; }.tab-close:hover { background: var(--af-border); }
-.editor-status { display: flex; min-height: 34px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 0 12px; color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 11px; }
+.tab-close { margin-right: 4px; border-radius: 3px; padding: 2px 5px; font-size: 0.875rem; line-height: 1; }.tab-close:hover { background: var(--af-border); }
+.editor-status { display: flex; min-height: 34px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 0 12px; color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 0.6875rem; }
 .editor-context { display: flex; min-width: 0; align-items: center; gap: 10px; }.chat-availability { color: var(--af-warning-text); white-space: nowrap; }
 .editor-tools { display: flex; align-items: center; gap: 5px; }.editor-tools button { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 4px; padding: 5px; color: var(--af-text-muted); background: transparent; cursor: pointer; }.editor-tools button:hover { color: var(--af-cobalt); background: var(--af-cobalt-soft); }.editor-tools svg { width: 14px; height: 14px; }
 .save-state { white-space: nowrap; }.is-dirty, .is-error { color: var(--af-danger); }.is-saving { color: var(--af-warning); }.is-saved { color: var(--af-success); }

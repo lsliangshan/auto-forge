@@ -196,17 +196,17 @@ const formatData = (value: unknown) => {
 .inspector { display: none; width: 320px; min-width: 320px; height: 100%; border-left: 1px solid var(--af-border); background: var(--af-surface); }
 .inspector.open { display: block; }
 .inspector header { display: flex; min-height: 58px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 9px 14px; }
-.inspector header > div { display: grid; gap: 2px; }.inspector header strong { font-size: 14px; }
+.inspector header > div { display: grid; gap: 2px; }.inspector header strong { font-size: 0.875rem; }
 .inspector header button { display: grid; width: 30px; height: 30px; place-items: center; border: 0; border-radius: 5px; color: var(--af-text-muted); background: transparent; cursor: pointer; }
 .inspector-content { height: calc(100% - 58px); padding: 16px; overflow: auto; }
 .inspector section { border-bottom: 1px solid var(--af-border); padding: 2px 0 14px; }.inspector section + section { padding-top: 14px; }
-.inspector p { margin: 7px 0 0; font-size: 13px; line-height: 1.5; }.muted { color: var(--af-text-muted); }.breakable { overflow-wrap: anywhere; }
-.step-list { display: grid; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }.step-list li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.logs { max-height: 240px; margin-top: 8px; overflow: auto; color: #cfd7e3; background: #242a32; }.logs p { margin: 0; border-bottom: 1px solid #353d48; padding: 7px 8px; font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }.logs b { color: #8fb4ff; }
-.data-preview { max-height: 220px; margin: 8px 0 0; padding: 8px; overflow: auto; color: var(--af-text); background: var(--af-surface-muted); font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }.execution-error, .inspector-error { color: var(--af-danger); }.inspector-error { padding: 18px 10px; font-size: 12px; }
-.permission-list { display: grid; gap: 8px; margin: 9px 0 0; padding: 0; list-style: none; }.permission-list li { font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }.permission-list small { display: block; margin-top: 2px; color: var(--af-text-muted); font-family: inherit; }
-.hash { font-family: ui-monospace, monospace; font-size: 10px !important; }.recent-list { display: grid; gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }.recent-list li { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }.recent-list small { color: var(--af-text-muted); }
-.inspector-state { padding: 36px 10px; color: var(--af-text-muted); font-size: 13px; line-height: 1.6; text-align: center; }
+.inspector p { margin: 7px 0 0; font-size: 0.8125rem; line-height: 1.5; }.muted { color: var(--af-text-muted); }.breakable { overflow-wrap: anywhere; }
+.step-list { display: grid; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }.step-list li { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; }
+.logs { max-height: 240px; margin-top: 8px; overflow: auto; color: #cfd7e3; background: #242a32; }.logs p { margin: 0; border-bottom: 1px solid #353d48; padding: 7px 8px; font-family: ui-monospace, monospace; font-size: 0.6875rem; overflow-wrap: anywhere; }.logs b { color: #8fb4ff; }
+.data-preview { max-height: 220px; margin: 8px 0 0; padding: 8px; overflow: auto; color: var(--af-text); background: var(--af-surface-muted); font-family: ui-monospace, monospace; font-size: 0.6875rem; white-space: pre-wrap; overflow-wrap: anywhere; }.execution-error, .inspector-error { color: var(--af-danger); }.inspector-error { padding: 18px 10px; font-size: 0.75rem; }
+.permission-list { display: grid; gap: 8px; margin: 9px 0 0; padding: 0; list-style: none; }.permission-list li { font-family: ui-monospace, monospace; font-size: 0.6875rem; overflow-wrap: anywhere; }.permission-list small { display: block; margin-top: 2px; color: var(--af-text-muted); font-family: inherit; }
+.hash { font-family: ui-monospace, monospace; font-size: 0.625rem !important; }.recent-list { display: grid; gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }.recent-list li { display: flex; justify-content: space-between; gap: 8px; font-size: 0.6875rem; }.recent-list small { color: var(--af-text-muted); }
+.inspector-state { padding: 36px 10px; color: var(--af-text-muted); font-size: 0.8125rem; line-height: 1.6; text-align: center; }
 @media (max-width: 1179px) {
   .inspector { position: fixed; z-index: 25; top: 0; right: 0; box-shadow: -12px 0 28px rgb(25 32 44 / 16%); }
   .inspector.open { display: block; }

@@ -273,9 +273,9 @@ function outcomeLabel(outcome: BrowserActionAuditEntry['outcome']): string {
 
 <style scoped>
 .status-error { color: var(--af-danger); }
-.browser-audit { margin-top: 10px; border-top: 1px solid var(--af-border); padding-top: 9px; font-size: 12px; }
+.browser-audit { margin-top: 10px; border-top: 1px solid var(--af-border); padding-top: 9px; font-size: 0.75rem; }
 .browser-audit summary { width: fit-content; cursor: pointer; color: var(--af-cobalt); }
-.browser-audit p { margin: 8px 0 0; color: var(--af-text-muted); font-size: 12px; overflow-wrap: anywhere; }
+.browser-audit p { margin: 8px 0 0; color: var(--af-text-muted); font-size: 0.75rem; overflow-wrap: anywhere; }
 .browser-audit ol { display: grid; gap: 8px; margin: 9px 0 0; padding-left: 20px; }
 .browser-audit li { overflow-wrap: anywhere; }
 .browser-audit li span { display: block; margin-top: 2px; color: var(--af-text-muted); }

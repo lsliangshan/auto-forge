@@ -130,6 +130,6 @@ function entryTone(status: ExecutionStatus): string {
 .provenance-entry-marker.tone-success { background: var(--af-success); }
 .provenance-entry-marker.tone-danger { background: var(--af-danger); }
 .provenance-entry-copy { display: grid; min-width: 0; gap: 2px; }
-.provenance-entry-copy strong { overflow-wrap: anywhere; color: var(--af-text); font-size: 11px; font-weight: 650; }
-.provenance-entry-copy span { color: var(--af-text-muted); font-size: 10px; }
+.provenance-entry-copy strong { overflow-wrap: anywhere; color: var(--af-text); font-size: 0.6875rem; font-weight: 650; }
+.provenance-entry-copy span { color: var(--af-text-muted); font-size: 0.625rem; }
 </style>

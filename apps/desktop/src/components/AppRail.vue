@@ -180,7 +180,7 @@ watch(
   overflow: hidden;
   border-radius: 7px;
   color: inherit;
-  font-size: 9px;
+  font-size: 0.5625rem;
   line-height: 1.15;
   text-align: center;
   text-decoration: none;
@@ -219,7 +219,7 @@ watch(
   width: 18px;
   height: 18px;
   flex: none;
-  font-size: 18px;
+  font-size: 1.125rem;
   filter: drop-shadow(0 1px 1px rgb(0 0 0 / 16%));
 }
 .rail-item-label {
@@ -282,14 +282,14 @@ watch(
 .rail-avatar-fallback {
   color: white;
   background: #334158;
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 750;
 }
 .rail-account-name {
   width: 40px;
   overflow: hidden;
   color: #d7deea;
-  font-size: 9px;
+  font-size: 0.5625rem;
   font-weight: 560;
   text-align: center;
   text-overflow: ellipsis;
@@ -331,7 +331,7 @@ watch(
   padding: 8px 10px;
   color: var(--af-danger);
   background: var(--af-danger-soft);
-  font-size: 12px;
+  font-size: 0.75rem;
   box-shadow: 0 6px 20px rgb(32 36 43 / 12%);
 }
 </style>

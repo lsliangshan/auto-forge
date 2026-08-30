@@ -982,6 +982,29 @@ describe('cross-process contracts', () => {
     expect(() => appSettingsSchema.parse({ ...settings, activeProvider: 'custom' })).toThrow()
   })
 
+  it('accepts only the five supported application font sizes', () => {
+    const settings = {
+      theme: 'system',
+      language: 'zh-CN',
+      dataDirectory: '/data',
+      logDirectory: '/logs',
+      activeProvider: 'deepseek',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openai/gpt-4.1-mini' },
+      },
+      showCosts: true,
+      developerMode: false,
+      permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
+    } as const
+
+    for (const fontSize of ['extra-small', 'small', 'normal', 'large', 'extra-large']) {
+      expect(appSettingsSchema.parse({ ...settings, fontSize }).fontSize).toBe(fontSize)
+    }
+    expect(() => appSettingsSchema.parse({ ...settings, fontSize: 'huge' })).toThrow()
+  })
+
   it('validates and normalizes strict proxy settings', () => {
     const proxy = {
       enabled: true,

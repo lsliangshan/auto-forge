@@ -332,7 +332,7 @@ onMounted(async () => {
   align-items: center;
   gap: 7px;
   color: var(--af-text-muted);
-  font-size: 10px;
+  font-size: 0.625rem;
   font-weight: 750;
   letter-spacing: 0.045em;
   text-transform: uppercase;
@@ -354,12 +354,12 @@ onMounted(async () => {
 .message-time {
   flex: none;
   color: var(--af-text-muted);
-  font-size: 11px;
+  font-size: 0.6875rem;
   font-variant-numeric: tabular-nums;
 }
 .message-body {
   min-width: 0;
-  font-size: 14px;
+  font-size: 0.875rem;
 }
 .message.assistant .message-body {
   margin-left: 32px;
@@ -369,7 +369,7 @@ onMounted(async () => {
   align-items: center;
   gap: 7px;
   color: var(--af-text-muted);
-  font-size: 12px;
+  font-size: 0.75rem;
 }
 .chat-empty {
   padding: 56px 20px;
@@ -378,17 +378,17 @@ onMounted(async () => {
 }
 .chat-empty h2 {
   color: var(--af-text);
-  font-size: 18px;
+  font-size: 1.125rem;
 }
 .chat-empty p {
-  font-size: 13px;
+  font-size: 0.8125rem;
 }
 .af-empty > div {
   max-width: 420px;
 }
 .af-empty h2 {
   color: var(--af-graphite);
-  font-size: 19px;
+  font-size: 1.1875rem;
 }
 .af-empty p {
   line-height: 1.6;

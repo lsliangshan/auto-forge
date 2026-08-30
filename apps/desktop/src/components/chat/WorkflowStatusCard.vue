@@ -160,7 +160,7 @@ const statusMessage = computed(() => props.block.errorCode === 'RESULT_TOO_LARGE
 
 <style scoped>
 .workflow-progress { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 2px 0 12px; padding: 0; list-style: none; }
-.workflow-progress-step { position: relative; display: grid; min-width: 0; justify-items: start; gap: 5px; color: var(--af-text-muted); font-size: 9px; line-height: 1.35; }
+.workflow-progress-step { position: relative; display: grid; min-width: 0; justify-items: start; gap: 5px; color: var(--af-text-muted); font-size: 0.5625rem; line-height: 1.35; }
 .workflow-progress-step::before { position: absolute; top: 5px; right: calc(100% - 1px); width: calc(100% - 10px); height: 1px; background: var(--af-border); content: ''; }
 .workflow-progress-step:first-child::before { display: none; }
 .workflow-progress-node { position: relative; z-index: 1; width: 10px; height: 10px; border: 2px solid var(--af-border-strong); border-radius: 50%; background: var(--af-surface); }

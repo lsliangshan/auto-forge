@@ -32,6 +32,15 @@ function settingsRepository(initial?: unknown): AppRepositories['appSettings'] {
 }
 
 describe('SettingsService', () => {
+  it('defaults missing or invalid font sizes to normal and persists supported values', () => {
+    const repository = settingsRepository({ fontSize: 'huge' })
+    const service = new SettingsService(repository, defaults)
+
+    expect(service.get().fontSize).toBe('normal')
+    expect(service.update({ fontSize: 'extra-large' }).fontSize).toBe('extra-large')
+    expect(service.get().fontSize).toBe('extra-large')
+  })
+
   it('migrates a legacy defaultModel to the OpenRouter default', () => {
     const repository = settingsRepository({
       theme: 'dark',
@@ -47,6 +56,7 @@ describe('SettingsService', () => {
 
     expect(service.get()).toEqual({
       theme: 'dark',
+      fontSize: 'normal',
       language: 'zh-CN',
       dataDirectory: '/data',
       logDirectory: '/logs',
