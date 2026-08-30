@@ -8,6 +8,7 @@ import {
   chatBlockSchema,
   chatMessageSchema,
   messageProviderProjectionSchema,
+  messageAppendMutationPayloadSchema,
   conversationGenerationPreferencesSchema,
   conversationSummarySchema,
   conversationTitleStateSchema,
@@ -864,13 +865,25 @@ function validateOutboxReceipt(
   return local
 }
 
+function storedMutationPayload(kind: unknown, payloadJson: unknown): unknown {
+  const payload = JSON.parse(z.string().parse(payloadJson)) as unknown
+  if (kind !== 'message.append') return payload
+  const exact = messageAppendMutationPayloadSchema.safeParse(payload)
+  if (exact.success) return exact.data
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return payload
+  const withoutProjection = { ...payload }
+  delete (withoutProjection as { providerProjection?: unknown }).providerProjection
+  const fallback = messageAppendMutationPayloadSchema.safeParse(withoutProjection)
+  return fallback.success ? fallback.data : payload
+}
+
 function evidenceFromRow(row: Query): SyncMutation {
   return parsePersisted(() => syncMutationSchema.parse({
     id: row.id,
     kind: row.kind,
     entityId: row.entityId,
     baseRevision: row.baseRevision,
-    payload: JSON.parse(z.string().parse(row.payloadJson)),
+    payload: storedMutationPayload(row.kind, row.payloadJson),
     occurredAt: isoTimestamp(z.number().int().nonnegative().parse(row.occurredAt)),
   }))
 }
@@ -1543,7 +1556,7 @@ function outboxFromRow(row: Query): OutboxMutationRecord {
       kind: row.kind,
       entityId: row.entityId,
       baseRevision: row.baseRevision,
-      payload: JSON.parse(z.string().parse(row.payloadJson)),
+      payload: storedMutationPayload(row.kind, row.payloadJson),
       occurredAt: isoTimestamp(z.number().int().nonnegative().parse(row.occurredAt)),
     })
     const metadata = outboxMetadataSchema.parse({

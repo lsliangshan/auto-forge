@@ -3081,14 +3081,142 @@ describe('UserDataStoreManager', () => {
         mutation_id, kind, entity_id, base_revision, payload_json, occurred_at, created_at
       ) VALUES ('legacy_projection_receipt', 'message.append', ?, 1, ?, 1, 1)
     `).run(payload.id, JSON.stringify(payload))
+
+    const validV2Mutation: Extract<SyncMutation, { kind: 'message.append' }> = {
+      id: 'valid_v2_receipt',
+      kind: 'message.append',
+      entityId: 'valid_v2_message',
+      baseRevision: 1,
+      occurredAt: '2026-08-24T00:02:00.000Z',
+      payload: {
+        id: 'valid_v2_message',
+        conversationId: payload.conversationId,
+        role: 'user',
+        blocks: [
+          { type: 'text', text: 'Convert secret.pdf to PDF' },
+          {
+            type: 'media', blockId: 'valid_v2_block', assetId: 'valid_v2_asset', kind: 'file',
+            purpose: 'input', name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+          },
+        ],
+        providerProjection: {
+          version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+          selectedAttachmentIndexes: [0],
+        },
+        createdAt: '2026-08-24T00:02:00.000Z',
+      },
+    }
+    sqlite.prepare(`
+      INSERT INTO messages (
+        id, conversation_id, role, blocks_json, provider_projection_json, ordinal, created_at
+      ) VALUES (?, ?, 'user', ?, ?, 2, 2)
+    `).run(
+      validV2Mutation.payload.id,
+      validV2Mutation.payload.conversationId,
+      JSON.stringify(validV2Mutation.payload.blocks),
+      JSON.stringify(validV2Mutation.payload.providerProjection),
+    )
+    sqlite.prepare(`
+      INSERT INTO outbox_mutations (
+        id, kind, entity_id, base_revision, payload_json, state, attempts,
+        occurred_at, created_at, enqueue_sequence
+      ) VALUES ('valid_v2_outbox', 'message.append', ?, 1, ?, 'pending', 0, 2, 2, 2)
+    `).run(validV2Mutation.entityId, JSON.stringify(validV2Mutation.payload))
+    sqlite.prepare(`
+      INSERT INTO sync_receipt_evidence (
+        mutation_id, kind, entity_id, base_revision, payload_json, occurred_at, created_at
+      ) VALUES (?, 'message.append', ?, 1, ?, 2, 2)
+    `).run(validV2Mutation.id, validV2Mutation.entityId, JSON.stringify(validV2Mutation.payload))
+
+    const malformedV2Payload = {
+      ...validV2Mutation.payload,
+      id: 'malformed_v2_message',
+      providerProjection: {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+      },
+      createdAt: '2026-08-24T00:03:00.000Z',
+    }
+    sqlite.prepare(`
+      INSERT INTO messages (
+        id, conversation_id, role, blocks_json, provider_projection_json, ordinal, created_at
+      ) VALUES (?, ?, 'user', ?, NULL, 3, 3)
+    `).run(
+      malformedV2Payload.id,
+      malformedV2Payload.conversationId,
+      JSON.stringify(malformedV2Payload.blocks),
+    )
+    sqlite.prepare(`
+      INSERT INTO outbox_mutations (
+        id, kind, entity_id, base_revision, payload_json, state, attempts,
+        occurred_at, created_at, enqueue_sequence
+      ) VALUES ('malformed_v2_outbox', 'message.append', ?, 2, ?, 'pending', 0, 3, 3, 3)
+    `).run(malformedV2Payload.id, JSON.stringify(malformedV2Payload))
+    sqlite.prepare(`
+      INSERT INTO sync_receipt_evidence (
+        mutation_id, kind, entity_id, base_revision, payload_json, occurred_at, created_at
+      ) VALUES ('malformed_v2_receipt', 'message.append', ?, 2, ?, 3, 3)
+    `).run(malformedV2Payload.id, JSON.stringify(malformedV2Payload))
     sqlite.close()
 
     const manager = new UserDataStoreManager(root)
     const store = manager.open('cloud-alice')
-    expect(store.outbox.listReady(Date.now(), 10)).toContainEqual(expect.objectContaining({
+    const ready = store.outbox.listReady(Date.now(), 10)
+    expect(ready).toContainEqual(expect.objectContaining({
       id: 'legacy_projection_outbox',
       payload: expect.not.objectContaining({ providerProjection: expect.anything() }),
     }))
+    expect(ready).toContainEqual(expect.objectContaining({
+      id: 'valid_v2_outbox',
+      payload: expect.objectContaining({ providerProjection: validV2Mutation.payload.providerProjection }),
+    }))
+    expect(ready).toContainEqual(expect.objectContaining({
+      id: 'malformed_v2_outbox',
+      payload: expect.not.objectContaining({ providerProjection: expect.anything() }),
+    }))
+
+    const postMigration = new Database(path, { readonly: true })
+    for (const [table, id] of [
+      ['outbox_mutations', 'valid_v2_outbox'],
+      ['sync_receipt_evidence', validV2Mutation.id],
+      ['outbox_mutations', 'malformed_v2_outbox'],
+      ['sync_receipt_evidence', 'malformed_v2_receipt'],
+    ] as const) {
+      const column = table === 'outbox_mutations' ? 'id' : 'mutation_id'
+      const row = postMigration.prepare(
+        `SELECT payload_json AS payloadJson FROM ${table} WHERE ${column} = ?`,
+      ).get(id) as { payloadJson: string }
+      expect(JSON.parse(row.payloadJson)).toHaveProperty('providerProjection.version', 2)
+    }
+    postMigration.close()
+
+    store.sync.applyRemotePage({
+      protocolVersion: 3,
+      cursor: 'valid_v2_receipt_cursor',
+      mutations: [pulledMutation(validV2Mutation, 2)],
+    }, 4)
+    const malformedPayloadWithoutProjection: Extract<
+      SyncMutation,
+      { kind: 'message.append' }
+    >['payload'] = {
+      id: malformedV2Payload.id,
+      conversationId: malformedV2Payload.conversationId,
+      role: malformedV2Payload.role,
+      blocks: malformedV2Payload.blocks,
+      createdAt: malformedV2Payload.createdAt,
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 3,
+      cursor: 'malformed_v2_receipt_cursor',
+      mutations: [pulledMutation({
+        id: 'malformed_v2_receipt',
+        kind: 'message.append',
+        entityId: malformedV2Payload.id,
+        baseRevision: 2,
+        occurredAt: '2026-08-24T00:03:00.000Z',
+        payload: malformedPayloadWithoutProjection,
+      }, 3)],
+    }, 5)
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('malformed_v2_receipt_cursor')
     manager.close()
 
     const inspection = new Database(path, { readonly: true })
@@ -3105,6 +3233,16 @@ describe('UserDataStoreManager', () => {
         .get(id) as { payloadJson: string }
       expect(JSON.parse(row.payloadJson)).not.toHaveProperty('providerProjection')
     }
+    expect(JSON.parse((inspection.prepare(`
+      SELECT payload_json AS payloadJson FROM outbox_mutations WHERE id = 'valid_v2_outbox'
+    `).get() as { payloadJson: string }).payloadJson)).toHaveProperty(
+      'providerProjection',
+      validV2Mutation.payload.providerProjection,
+    )
+    expect(inspection.prepare(`
+      SELECT mutation_id AS mutationId FROM sync_receipt_evidence
+      WHERE mutation_id IN ('valid_v2_receipt', 'malformed_v2_receipt')
+    `).all()).toEqual([])
     inspection.close()
   })
 

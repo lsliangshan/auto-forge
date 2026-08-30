@@ -120,6 +120,16 @@ describe('local conversion intent', () => {
   })
 
   it.each([
+    'Convert report.pdf to WebP. note: PDF',
+    'Convert report.pdf to WebP. metadata says PDF',
+    'Convert report.pdf to WebP. targetFormat: PDF',
+    'Convert report.pdf to WebP. footer=PDF',
+    '把 report.pdf 转换为 WebP。备注：PDF',
+  ])('does not ignore a target-like note after a sentence boundary: %s', (text) => {
+    expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
+  })
+
+  it.each([
     ['Convert both files to PDF', 1],
     ['Convert both files to PDF', 3],
     ['Convert these files to PDF', 1],

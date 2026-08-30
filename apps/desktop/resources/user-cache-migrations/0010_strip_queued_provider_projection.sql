@@ -11,10 +11,20 @@ UPDATE outbox_mutations
 SET payload_json = json_remove(payload_json, '$.providerProjection')
 WHERE kind = 'message.append'
   AND json_valid(payload_json)
-  AND json_type(payload_json, '$.providerProjection') IS NOT NULL;
+  AND json_type(payload_json, '$.providerProjection') IS NOT NULL
+  AND CASE
+    WHEN json_type(payload_json, '$.providerProjection') = 'object'
+      THEN COALESCE(json_extract(payload_json, '$.providerProjection.version'), -1) <> 2
+    ELSE 1
+  END;
 
 UPDATE sync_receipt_evidence
 SET payload_json = json_remove(payload_json, '$.providerProjection')
 WHERE kind = 'message.append'
   AND json_valid(payload_json)
-  AND json_type(payload_json, '$.providerProjection') IS NOT NULL;
+  AND json_type(payload_json, '$.providerProjection') IS NOT NULL
+  AND CASE
+    WHEN json_type(payload_json, '$.providerProjection') = 'object'
+      THEN COALESCE(json_extract(payload_json, '$.providerProjection.version'), -1) <> 2
+    ELSE 1
+  END;

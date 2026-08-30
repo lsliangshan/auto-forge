@@ -820,6 +820,13 @@ function authoritySegments(text: string): Array<{ prefix: string; segment: strin
   return segments
 }
 
+function hasAuthorityTargetRisk(segment: string): boolean {
+  const withoutIssuedReferences = segment.replace(AUTHORITY_SENTINEL_PATTERN, '')
+  return hasConversionRiskSignal(segment)
+    || FORMAT_LIKE_REFERENCE.test(withoutIssuedReferences)
+    || UPPERCASE_FORMAT_REFERENCE.test(withoutIssuedReferences)
+}
+
 function replaceAuthorityAttachmentBasenames(
   text: string,
   attachments: readonly LocalAttachmentProjection[],
@@ -925,7 +932,7 @@ function trustedUniqueTargetFormat(
         authorityAntecedent,
       )
     if (authority === undefined) {
-      if (hasConversionRiskSignal(segment)
+      if (hasAuthorityTargetRisk(segment)
         && !AUTHORITY_INFORMATION_SEGMENT.test(segment)
         && !AUTHORITY_NEGATED_SEGMENT.test(segment)) {
         hasUntrustedExecutableSegment = true
