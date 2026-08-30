@@ -1,5 +1,6 @@
 import { CONVERSION_TARGET_FORMATS } from '@autoforge/shared'
 import {
+  hasHighConfidenceMediaGenerationRequest,
   hasHighConfidenceOrdinaryAttachmentRequest,
   hasConversionRiskSignal,
   type AttachmentConversionIntent,
@@ -384,21 +385,7 @@ export function anonymizeAttachmentNames(
     sourceOffset += scalar.length
   }
   const foldedText = foldedParts.join('')
-  const replacements: Array<{ start: number; end: number; text: string }> = []
-  const expandedPathSpan = (start: number, end: number): { start: number; end: number } | undefined => {
-    if (start === 0 || !/[\\/]/u.test(normalized[start - 1]!)) return undefined
-    const prefix = normalized.slice(0, start)
-    let boundary = 0
-    for (const match of prefix.matchAll(/[,，;；。!?！？\n\r"'“”‘’]/gu)) {
-      boundary = Math.max(boundary, (match.index ?? 0) + match[0].length)
-    }
-    for (const match of prefix.matchAll(/(?:\b(?:convert|transcode|save|export|reformat|encode|render|transform|create|generate|make|turn|change|process|use|read|open|describe|summari[sz]e)\b|(?:请把|转换|转成|转为|保存|导出|生成|创建|制作|处理|读取|查看|打开|把))\s+|\s+\b(?:and|or)\b\s+|(?:和|及|以及)\s*/giu)) {
-      boundary = Math.max(boundary, (match.index ?? 0) + match[0].length)
-    }
-    while (/\s/u.test(normalized[boundary] ?? '')) boundary += 1
-    const candidate = normalized.slice(boundary, end)
-    return /[\\/]/u.test(candidate) ? { start: boundary, end } : undefined
-  }
+  const basenameMatches: Array<{ start: number; end: number; text: string }> = []
   const candidates = [...attachments].map((attachment) => ({
     attachment,
     basename: attachment.name.normalize('NFKC').split(/[\\/]/u).at(-1) ?? '',
@@ -414,22 +401,69 @@ export function anonymizeAttachmentNames(
       if (found === -1) break
       const start = starts[found]
       const end = ends[found + foldedName.length - 1]
-      const span = start === undefined || end === undefined
-        ? undefined
-        : expandedPathSpan(start, end) ?? { start, end }
-      if (span !== undefined && !replacements.some((replacement) => (
-        replacement.start < span.end && replacement.end > span.start
-      ))) {
-        replacements.push({ ...span, text: `文件-${attachment.index + 1}` })
+      if (start !== undefined && end !== undefined) {
+        basenameMatches.push({ start, end, text: `文件-${attachment.index + 1}` })
       }
       searchFrom = found + Math.max(1, foldedName.length)
     }
   }
-  return replacements
-    .sort((left, right) => right.start - left.start)
-    .reduce((value, replacement) => (
-      value.slice(0, replacement.start) + replacement.text + value.slice(replacement.end)
-    ), normalized)
+  basenameMatches.sort((left, right) => left.start - right.start || right.end - left.end)
+  const matches: typeof basenameMatches = []
+  let matchedUntil = -1
+  for (const match of basenameMatches) {
+    if (match.start < matchedUntil) continue
+    matches.push(match)
+    matchedUntil = match.end
+  }
+
+  const replacements: typeof basenameMatches = []
+  const quoteCharacters = new Set(['"', "'", '“', '”', '‘', '’'])
+  let quoteStart: number | undefined
+  let tokenStart = 0
+  let pathStart: number | undefined
+  let matchIndex = 0
+  for (let offset = 0; offset < normalized.length;) {
+    const match = matches[matchIndex]
+    if (match !== undefined && offset === match.start) {
+      replacements.push({
+        start: pathStart ?? match.start,
+        end: match.end,
+        text: match.text,
+      })
+      offset = match.end
+      tokenStart = offset
+      pathStart = undefined
+      matchIndex += 1
+      continue
+    }
+    const character = normalized[offset]!
+    if (quoteCharacters.has(character)) {
+      if (quoteStart === undefined) {
+        quoteStart = offset + 1
+        tokenStart = quoteStart
+      } else {
+        quoteStart = undefined
+        tokenStart = offset + 1
+      }
+      pathStart = undefined
+    } else if (pathStart === undefined && /[\\/]/u.test(character)) {
+      const isAbsoluteUnixPath = character === '/'
+        && (offset === 0 || /\s/u.test(normalized[offset - 1]!))
+      pathStart = quoteStart ?? (isAbsoluteUnixPath ? offset : tokenStart)
+    } else if (pathStart === undefined && /\s/u.test(character)) {
+      tokenStart = offset + 1
+    }
+    offset += 1
+  }
+
+  const output: string[] = []
+  let outputOffset = 0
+  for (const replacement of replacements) {
+    output.push(normalized.slice(outputOffset, replacement.start), replacement.text)
+    outputOffset = replacement.end
+  }
+  output.push(normalized.slice(outputOffset))
+  return output.join('')
 }
 
 export function hasLocalConversionIntent(
@@ -551,6 +585,7 @@ export function classifyAttachmentConversionIntent(
   const normalized = text.trim().normalize('NFKC').replace(/[‘’]/gu, "'")
   if (hasHighConfidenceOrdinaryAttachmentRequest(normalized)) return 'ordinary'
   if (REFERENCE_IMAGE_STYLE_EDIT.test(normalized)) return 'ordinary'
+  if (hasHighConfidenceMediaGenerationRequest(normalized)) return 'ordinary'
   const informationalScope = /^\s*(?:(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b|(?:如何|怎么))/iu.test(normalized)
   const explicitRestart = /\b(?:otherwise|then|directly|just|please)\b[^,;.!?]{0,48}\b(?:convert|transcode|save|export)\b|\b(?:i\s+(?:would|want|need)|(?:can|could|would)\s+you)\b[^,;.!?]{0,48}\b(?:convert|transcode|save|export)\b|(?:然后|但是|但|请|直接|立即|马上)[^，,；;。.!！？?]{0,32}(?:转换|转成|转为|另存|保存|导出|输出)/iu.test(normalized)
   if (informationalScope && !explicitRestart && hasConversionRiskSignal(normalized)) {

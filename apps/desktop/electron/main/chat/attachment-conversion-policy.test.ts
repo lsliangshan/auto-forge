@@ -162,6 +162,34 @@ describe('attachment conversion policy', () => {
   })
 
   it.each([
+    ['生成一张图片', 'image'],
+    ['制作一段视频', 'video'],
+  ] as const)('classifies a strict Chinese %s generation request as ordinary positive evidence', (text, requestedOutput) => {
+    const classified = classifyAttachmentConversionIntent(text, attachments)
+    expect(classified).toBe('ordinary')
+    expect(providerAttachmentAccess(classified, text, {
+      hasAttachments: true,
+      requestedOutput,
+      attachmentKinds: ['image'],
+    })).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
+  })
+
+  it.each([
+    '生成一张图片，格式为PNG',
+    '制作一段视频，格式为任意',
+    '生成一张图片并转换这个附件',
+    '制作一段视频，然后描述附件',
+  ])('does not classify a formatted or multi-predicate Chinese media request as ordinary: %s', (text) => {
+    const classified = classifyAttachmentConversionIntent(text, attachments)
+    expect(classified).not.toBe('ordinary')
+    expect(providerAttachmentAccess(classified, text, {
+      hasAttachments: true,
+      requestedOutput: text.includes('视频') ? 'video' : 'image',
+      attachmentKinds: ['image'],
+    }).allowProviderBytes).toBe(false)
+  })
+
+  it.each([
     ['make image', 'image'],
     ['make audio', 'audio'],
     ['make video', 'video'],

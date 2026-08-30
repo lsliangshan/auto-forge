@@ -2673,6 +2673,7 @@ describe('createApplicationRuntime', () => {
     'make this image look like sunset',
     'create a new image based on this image',
     '把这个图片做成水彩画',
+    '生成一张图片',
   ])('keeps a positive reference-image edit on the ordinary image Provider path: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-reference-edit-'))
     directories.push(root)
@@ -5436,6 +5437,10 @@ describe('createApplicationRuntime', () => {
     ['create this image with png output', 'ambiguous', 'image'],
     ['generate an image with this image in foo format', 'ambiguous', 'image'],
     ['生成这个图片，格式为任意', 'ambiguous', 'image'],
+    ['生成一张图片，格式为PNG', 'ambiguous', 'image'],
+    ['制作一段视频，格式为任意', 'local', 'video'],
+    ['生成一张图片并转换这个附件', 'local', 'image'],
+    ['制作一段视频，然后描述附件', 'local', 'video'],
     ['edit this image and export it as png', 'local', 'text'],
   ] as const)(
     'enforces the final attachment disclosure boundary for %s as %s from %s output',
@@ -5576,6 +5581,8 @@ describe('createApplicationRuntime', () => {
       ['Users', 'alice', 'Tax', 'Private', 'server', 'share', 'STRASSE.PDF', 'Straße.pdf']],
     ['Straße.pdf', String.raw`Convert "/Users/alice/Tax Returns/STRASSE.PDF" and C:\Private Files\Straße.pdf and \\server\Private Share\STRASSE.PDF to PDF`, 2,
       ['Users', 'alice', 'Tax Returns', 'Private Files', 'server', 'Private Share', 'STRASSE.PDF', 'Straße.pdf']],
+    ['secret.pdf', String.raw`Convert "/Users/Alice/Export Data/SECRET.PDF" and C:\Windows Open Files\SECRET.PDF and \\server\UNC Save As\SECRET.PDF and 资料/中文 转换 资料/SECRET.PDF and "/Users/Alice/Tax, Returns/SECRET.PDF" to PDF`, 2,
+      ['Users', 'Alice', 'Export Data', 'Windows Open Files', 'server', 'UNC Save As', '资料/中文', '中文 转换 资料', 'Tax, Returns', 'SECRET.PDF']],
   ] as const)('anonymizes exact attachment names in metadata-only main and title egress: %s', async (
     sourceName,
     content,
@@ -5585,7 +5592,8 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-private-name-'))
     directories.push(root)
     const source = join(root, sourceName)
-    await writeFile(source, Buffer.from('%PDF-1.7 PRIVATE_TAX_CONTENT'))
+    const privateBytes = Buffer.from('%PDF-1.7 PRIVATE_TAX_CONTENT')
+    await writeFile(source, privateBytes)
     const captured: ModelStreamRequest[] = []
     const chatEvents: ChatEvent[] = []
     const provider = snapshotProvider('openrouter', {
@@ -5636,6 +5644,8 @@ describe('createApplicationRuntime', () => {
     for (const mention of forbiddenMentions) expect(payload).not.toContain(mention)
     expect(payload).not.toContain(source)
     expect(payload).not.toContain(asset!.id)
+    expect(payload).not.toContain(privateBytes.toString('base64'))
+    expect(payload).not.toContain(createHash('sha256').update(privateBytes).digest('hex'))
     if (expectedProviderCalls > 0) {
       expect(payload).toContain('文件-1')
       expect(JSON.stringify(captured.find(isConversationTitleRequest))).toContain('文件-1')
@@ -6737,12 +6747,18 @@ describe('createApplicationRuntime', () => {
     })))
 
     const videoConversation = await runtime.services.chat.createConversation()
+    const [videoAsset] = await runtime.services.media.pickFiles({
+      conversationId: videoConversation.id,
+      existingAssetIds: [],
+    })
     await runtime.services.chat.send({
-      ...chatInput(videoConversation.id, 'make a video'),
+      ...chatInput(videoConversation.id, '制作一段视频'),
+      assetIds: [videoAsset!.id],
       outputType: 'video',
     })
     expect(submitVideo).toHaveBeenCalledWith(expect.objectContaining({
       model: 'openrouter/video',
+      prompt: '制作一段视频',
       options: expect.objectContaining({ durationSeconds: 5, resolution: '720p' }),
     }))
 

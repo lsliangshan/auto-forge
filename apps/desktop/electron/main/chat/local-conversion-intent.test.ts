@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  anonymizeAttachmentNames,
   classifyAttachmentConversionIntent,
   hasLocalConversionIntent,
   projectLocalConversionPrompt,
@@ -409,6 +410,36 @@ describe('local conversion intent', () => {
 
     expect(prompt).toMatch(/转换 ["'“]文件-1["'”]/u)
     expect(prompt).not.toMatch(/users|alice|tax|returns|private|folder|relative|strasse|straße/iu)
+  })
+
+  it.each([
+    ['/Users/Alice/Export Data/SECRET.PDF', 'Convert /Users/Alice/Export Data/SECRET.PDF to PDF'],
+    ['/Volumes/Read Only/SECRET.PDF', 'Open /Volumes/Read Only/SECRET.PDF'],
+    ['/srv/Research and Legal/SECRET.PDF', 'Convert /srv/Research and Legal/SECRET.PDF to PDF'],
+    [String.raw`C:\Windows Open Files\SECRET.PDF`, String.raw`Convert C:\Windows Open Files\SECRET.PDF to PDF`],
+    [String.raw`\\server\UNC Save As\SECRET.PDF`, String.raw`Convert \\server\UNC Save As\SECRET.PDF to PDF`],
+    ['资料/中文 转换 资料/SECRET.PDF', '转换 资料/中文 转换 资料/SECRET.PDF 为 PDF'],
+    ['"/Users/Alice/Tax\u00a0Returns/SECRET.PDF"', 'Convert "/Users/Alice/Tax\u00a0Returns/SECRET.PDF" to PDF'],
+    ['"/Users/Alice/Tax, Returns/SECRET.PDF"', 'Convert "/Users/Alice/Tax, Returns/SECRET.PDF" to PDF'],
+  ])('treats action, conjunction, punctuation, and Unicode spaces inside %s as path data', (mention, request) => {
+    const prompt = projectLocalConversionPrompt(request, [{
+      index: 0, name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])
+
+    expect(prompt).toContain(request.replace(mention, mention.startsWith('"') ? '"文件-1"' : '文件-1'))
+    expect(prompt).not.toMatch(/users|alice|export data|read only|research|legal|windows open|unc save|中文|资料|tax|returns|secret\.pdf/iu)
+  })
+
+  it('indexes path boundaries once and scales with many repeated path occurrences', () => {
+    const occurrence = '/Users/Alice/Research and Legal/SECRET.PDF'
+    const prompt = anonymizeAttachmentNames(
+      Array.from({ length: 512 }, () => occurrence).join(' '),
+      [{ index: 0, name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12 }],
+    )
+
+    expect(prompt.match(/文件-1/gu)).toHaveLength(512)
+    expect(prompt).not.toMatch(/users|alice|research|legal|secret\.pdf/iu)
+    expect(anonymizeAttachmentNames.toString()).not.toMatch(/prefix\.matchAll|replacements\.some/u)
   })
 
   it('keeps ordinary slash-separated prose that does not end in an attachment basename', () => {

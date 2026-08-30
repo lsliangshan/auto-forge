@@ -47,6 +47,11 @@ export function hasHighConfidenceOrdinaryAttachmentRequest(text: string): boolea
     || /^(?:请)?(?:查看|读取|阅读)(?:一下)?(?:这个|这张|该|当前)?(?:附件|文件|图片|图像|照片|文档|PDF|JPE?G|PNG)(?:的)?(?:内容)?(?:，)?(?:并|然后)?(?:请)?告诉我(?:它的)?主要内容[。！？]?$/iu.test(normalized)
 }
 
+export function hasHighConfidenceMediaGenerationRequest(text: string): boolean {
+  const normalized = text.trim().normalize('NFKC')
+  return MEDIA_OUTPUT_REQUEST.test(normalized) && !MEDIA_FORMAT_TARGET.test(normalized)
+}
+
 export function providerAttachmentAccess(
   decision: AttachmentConversionIntent,
   text: string,
@@ -67,8 +72,7 @@ export function providerAttachmentAccess(
   const explicitMediaOutput = decision === 'ordinary'
     && context.requestedOutput !== 'auto'
     && context.requestedOutput !== 'text'
-    && MEDIA_OUTPUT_REQUEST.test(text)
-    && !MEDIA_FORMAT_TARGET.test(text)
+    && hasHighConfidenceMediaGenerationRequest(text)
   if (explicitMediaOutput) return issueAccessDecision('ordinary')
   if (decision === 'ordinary' && hasHighConfidenceOrdinaryAttachmentRequest(text)) {
     return issueAccessDecision('ordinary')
