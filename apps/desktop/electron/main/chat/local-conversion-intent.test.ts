@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  classifyAttachmentConversionIntent,
   hasLocalConversionIntent,
   projectLocalConversionPrompt,
   sanitizeDisplayName,
@@ -13,6 +14,21 @@ const attachments = [{
 }]
 
 describe('local conversion intent', () => {
+  it.each([
+    ['No matter what this tool can convert then convert this attachment to PDF', 'local'],
+    ['How do I convert PNG then convert this attachment to PDF', 'local'],
+    ['How do I convert PNG then directly convert this attachment to PDF', 'local'],
+    ['如何把图片转换为 PNG 然后请导出为 PDF', 'local'],
+    ['Convert this conversation as well as this attachment to PDF', 'local'],
+    ['Convert this conversation together with this attachment to PDF', 'local'],
+    ['Can this tool convert this attachment or save this image as JPG?', 'ambiguous'],
+    ['Could it convert PDF or export this document as DOCX?', 'ambiguous'],
+    ['怎么把这个图片保存为WebP或导出为PNG？', 'ambiguous'],
+    ['Check the chat history containing this image, then export it as PDF', 'ambiguous'],
+  ] as const)('classifies final attachment review case %s as %s', (text, expected) => {
+    expect(classifyAttachmentConversionIntent(text, attachments)).toBe(expected)
+  })
+
   it.each([
     '把附件转换成 PDF',
     '请将这个文件转为 webp',

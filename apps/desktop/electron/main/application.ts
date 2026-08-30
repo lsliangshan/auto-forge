@@ -87,10 +87,18 @@ import { OpenRouterProvider } from './chat/openrouter-provider.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
 import { projectAttachmentInputs } from './chat/file-attachment-projection.js'
 import {
-  hasLocalConversionIntent,
+  classifyAttachmentConversionIntent,
+  projectAmbiguousConversionPrompt,
   projectLocalConversionPrompt,
+  sanitizeDisplayName,
   type LocalAttachmentProjection,
 } from './chat/local-conversion-intent.js'
+import { providerAttachmentAccess } from './chat/attachment-conversion-policy.js'
+import {
+  assertAttachmentByteAccess,
+  createProviderAttachmentDisclosure,
+  protectProviderSnapshot,
+} from './chat/provider-attachment-disclosure.js'
 import { resolveChatRoute } from './chat/multimodal-router.js'
 import type { ModelContentPart } from './chat/model-provider.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
@@ -3034,30 +3042,79 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             mimeType: asset.mimeType,
             byteSize: asset.byteSize,
           }))
-          const localConversionIntent = hasLocalConversionIntent(input.content, localAttachments)
+          const classifiedIntent = classifyAttachmentConversionIntent(input.content, localAttachments)
+          const attachmentAccess = localAttachments.length === 0
+            ? { decision: 'ordinary' as const, allowProviderBytes: true }
+            : providerAttachmentAccess(classifiedIntent, input.content)
+          const attachmentDecision = attachmentAccess.decision
+          const metadataOnlyAttachments = attachmentDecision !== 'ordinary'
+          const localConversionIntent = attachmentDecision === 'local'
           if (
-            !localConversionIntent
+            !metadataOnlyAttachments
             &&
             resolved.assets.some((asset) => asset.kind === 'file')
             && requestedOutput !== 'auto'
             && requestedOutput !== 'text'
           ) throw failure('MODEL_MODALITY_UNSUPPORTED')
-          if (!localConversionIntent && resolved.assets.some((asset) => (
+          if (!metadataOnlyAttachments && resolved.assets.some((asset) => (
             asset.kind === 'file'
             && chatFileSupport(snapshot.activeProvider, asset.name, asset.mimeType).mode === 'unsupported'
           ))) throw failure('MODEL_MODALITY_UNSUPPORTED')
           if (
-            !localConversionIntent
+            !metadataOnlyAttachments
             &&
             snapshot.activeProvider === 'deepseek'
             && (resolved.assets.some((asset) => asset.kind !== 'file')
               || (requestedOutput !== 'auto' && requestedOutput !== 'text'))
           ) throw failure('MODEL_MODALITY_UNSUPPORTED')
           await requireValidCredential(providerSnapshot)
+          const requestId = randomUUID()
+          const protectedAssets = resolved.assets.map((asset, index) => {
+            const record = chatDatabase.mediaAssets.get(asset.id)
+            if (!record
+              || record.conversationId !== input.conversationId
+              || record.status !== 'ready'
+              || record.sha256 === undefined) throw failure('MEDIA_ASSET_UNAVAILABLE')
+            const sourceFingerprint = createHash('sha256')
+              .update('autoforge-file-conversion-source-v1\0')
+              .update(session.user.id)
+              .update('\0')
+              .update(asset.id)
+              .update('\0')
+              .update(record.sha256)
+              .digest('hex')
+            return {
+              asset,
+              record,
+              sourceFingerprint,
+              sanitizedName: sanitizeDisplayName(asset.name, index),
+            }
+          })
+          const attachmentDisclosure = createProviderAttachmentDisclosure({
+            requestId,
+            providerId: providerSnapshot.providerId,
+            access: attachmentAccess,
+            assetIds: resolved.assets.map(({ id }) => id),
+            assetFingerprints: protectedAssets.map(({ sourceFingerprint }) => sourceFingerprint),
+            forbiddenValues: protectedAssets.flatMap(({
+              asset, record, sourceFingerprint, sanitizedName,
+            }) => [
+              asset.id,
+              asset.absolutePath,
+              asset.relativePath,
+              record.sha256!,
+              sourceFingerprint,
+              ...(asset.name === sanitizedName ? [] : [asset.name]),
+            ]),
+          })
+          const protectedProviderSnapshot = protectProviderSnapshot(
+            providerSnapshot,
+            attachmentDisclosure,
+          )
           const route = resolveChatRoute({
             provider: snapshot.activeProvider,
             ...(input.model === undefined ? {} : { requestedModel: input.model }),
-            requestedOutput: localConversionIntent ? 'text' : input.outputType,
+            requestedOutput: metadataOnlyAttachments ? 'text' : input.outputType,
             requestedGeneration: input.generation,
             defaults: snapshot.defaultModels,
             conversationPreferences: preferences,
@@ -3067,20 +3124,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               providerSnapshot,
               credentialEpoch,
             ),
-            assets: localConversionIntent ? [] : resolved.assets,
+            assets: metadataOnlyAttachments ? [] : resolved.assets,
           })
           if ('selectionRequired' in route || 'modelRequired' in route) {
             throw failure('INVALID_INPUT')
           }
-          const requestId = randomUUID()
           const titleModel = snapshot.defaultModels[providerSnapshot.providerId].text
           conversationTitleContexts.set(requestId, {
             conversationId: input.conversationId,
             userId: session.user.id,
-            providerSnapshot,
+            providerSnapshot: protectedProviderSnapshot,
             providerCredentialEpoch: credentialEpoch,
             ...(titleModel === undefined ? {} : { model: titleModel }),
-            ...(localConversionIntent ? { omitAttachmentProjections: true } : {}),
+            ...(metadataOnlyAttachments ? { omitAttachmentProjections: true } : {}),
           })
           const userBlocks: ChatBlock[] = [
             ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
@@ -3093,6 +3149,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             userBlocks,
             assetIds: input.assetIds,
             route,
+            attachmentDisclosure,
             userId: session.user.id,
           }
           if (route.outputType === 'text') {
@@ -3102,20 +3159,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             if (localConversionIntent) {
               modelContent = projectLocalConversionPrompt(input.content, localAttachments)
               currentMedia = []
-              attachmentBindings = Object.freeze(resolved.assets.map((asset, index) => {
-                const record = chatDatabase.mediaAssets.get(asset.id)
-                if (!record
-                  || record.conversationId !== input.conversationId
-                  || record.status !== 'ready'
-                  || record.sha256 === undefined) throw failure('MEDIA_ASSET_UNAVAILABLE')
-                const sourceFingerprint = createHash('sha256')
-                  .update('autoforge-file-conversion-source-v1\0')
-                  .update(session.user.id)
-                  .update('\0')
-                  .update(asset.id)
-                  .update('\0')
-                  .update(record.sha256)
-                  .digest('hex')
+              attachmentBindings = Object.freeze(protectedAssets.map(({
+                asset, sourceFingerprint,
+              }, index) => {
                 return Object.freeze({
                   attachmentIndex: index,
                   ownerUserId: session.user.id,
@@ -3127,7 +3173,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                   sourceFingerprint,
                 })
               }))
+            } else if (attachmentDecision === 'ambiguous') {
+              modelContent = projectAmbiguousConversionPrompt(input.content, localAttachments)
+              currentMedia = []
+              attachmentBindings = Object.freeze([])
             } else {
+              assertAttachmentByteAccess(attachmentDisclosure, {
+                requestId,
+                providerId: route.provider,
+                assetIds: input.assetIds,
+              })
               const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
               const projectedAttachments = projectAttachmentInputs(route.provider, modelInputs)
               modelContent = projectedAttachments.length === 0
@@ -3154,12 +3209,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 modelContent,
                 assetIds: input.assetIds,
                 currentMedia,
-                ...(localConversionIntent ? { omitHistoricalAttachments: true } : {}),
+                ...(metadataOnlyAttachments ? {
+                  omitHistoricalAttachments: true,
+                  omitConversationHistory: true,
+                } : {}),
                 attachmentBindings,
-                allowTools: route.supportsTools,
+                allowTools: attachmentDecision === 'ambiguous' ? false : route.supportsTools,
                 supportsImageInput: route.supportsImageInput,
                 userId: session.user.id,
-                providerSnapshot,
+                providerSnapshot: protectedProviderSnapshot,
+                attachmentDisclosure,
                 provider: route.provider,
                 model: route.model,
                 ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),

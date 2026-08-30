@@ -17,6 +17,7 @@ import type {
 } from '../media/media-asset-service.js'
 import type { ModelProvider, ModelProviderSnapshot } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
+import { createProviderAttachmentDisclosure } from './provider-attachment-disclosure.js'
 import {
   VideoJobRunner,
   type VideoJobRunnerDependencies,
@@ -63,6 +64,17 @@ const submitInput = {
   userBlocks: [{ type: 'text', text: 'make a short harbor video' }] satisfies ChatBlock[],
   assetIds: [] as string[],
   route,
+}
+
+function ordinaryAttachmentDisclosure(assetIds: string[]) {
+  return createProviderAttachmentDisclosure({
+    requestId: submitInput.requestId,
+    providerId: route.provider,
+    access: { decision: 'ordinary', allowProviderBytes: true },
+    assetIds,
+    assetFingerprints: assetIds.map(() => 'a'.repeat(64)),
+    forbiddenValues: [],
+  })
 }
 
 const submittedOutputAssetId = 'video_8072e20a4619b4b2251a7c9e4522ab22a9728450834087c29e18d2651db6f0c0'
@@ -177,7 +189,13 @@ function createHarness(
 ) {
   const database = overrides.database ?? createDatabase()
   const events: ChatEvent[] = []
-  const provider: Pick<ModelProvider, 'submitVideo' | 'pollVideo' | 'downloadVideo'> = {
+  const provider: Pick<
+    ModelProvider,
+    'listModels' | 'validateCredential' | 'stream' | 'submitVideo' | 'pollVideo' | 'downloadVideo'
+  > = {
+    listModels: vi.fn(async () => []),
+    validateCredential: vi.fn(async () => ({ valid: true })),
+    stream: vi.fn(async function* () {}),
     submitVideo: vi.fn(async () => ({
       providerJobId: 'provider_job_1',
       status: 'pending' as const,
@@ -1664,6 +1682,7 @@ describe('VideoJobRunner', () => {
       ...submitInput,
       userBlocks,
       assetIds: ['reference_image'],
+      attachmentDisclosure: ordinaryAttachmentDisclosure(['reference_image']),
       route: referencedRoute,
     })
 
@@ -1716,6 +1735,7 @@ describe('VideoJobRunner', () => {
       ...submitInput,
       userBlocks: [referenceBlock],
       assetIds: ['claimed_reference'],
+      attachmentDisclosure: ordinaryAttachmentDisclosure(['claimed_reference']),
       route: {
         ...route,
         assets: [{
@@ -1778,6 +1798,7 @@ describe('VideoJobRunner', () => {
         byteSize: 13,
       }],
       assetIds: ['mismatched_reference'],
+      attachmentDisclosure: ordinaryAttachmentDisclosure(['mismatched_reference']),
       route: {
         ...route,
         assets: [{

@@ -1,4 +1,8 @@
 import { CONVERSION_TARGET_FORMATS } from '@autoforge/shared'
+import {
+  hasConversionRiskSignal,
+  type AttachmentConversionIntent,
+} from './attachment-conversion-policy.js'
 
 export interface LocalAttachmentProjection {
   index: number
@@ -43,7 +47,7 @@ const ENGLISH_OPEN_FORMAT_QUESTION = /\b(?:what|which)\s+formats?\b(?:(?!\b(?:an
 const ENGLISH_NO_MATTER_CAPABILITY = /^\s*no\s+matter\s+what\s+(?:this\s+(?:tool|converter)|it)\s+(?:can|could|does|will|would)\b[^,;.!?]{0,64}/giu
 const ENGLISH_HOW_TO_QUESTION = /^\s*how\s+(?:do|can|could|would|should)\s+(?:i|we|you)\b[^,;.!?]{0,96}/giu
 const CHINESE_HOW_TO_QUESTION = /^\s*(?:如何|怎么)[^，,；;。.!！？?]{0,96}/giu
-const ENGLISH_ACTION_MOOD = /(?<capability>\b(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b)|(?<executable>\b(?:can|could|would)\s+you\b|\bi\s+(?:would|want|need)\b|\b(?:just|please|otherwise)\b)/giu
+const ENGLISH_ACTION_MOOD = /(?<capability>\b(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b)|(?<executable>\b(?:can|could|would)\s+you\b|\bi\s+(?:would|want|need)\b|\b(?:just|please|otherwise|then|directly)\b)/giu
 const CHINESE_COMMAND_MOOD = /(?:然后|但是|但|请|直接|立即|马上)/gu
 const BARE_TARGET_PATTERN = `(?:${[
   ...CONVERSION_TARGET_FORMATS,
@@ -209,7 +213,7 @@ function directObjectSpan(context: ActionOperandContext): string {
     const candidate = shieldFilenameEntities(
       context.text.slice(context.actionStart)
         .replace(/^\s*(?:convert|transcode|save|export|process|make|turn|change)\b/iu, ''),
-    )
+    ).replace(/\b(?:as\s+well\s+as|together\s+with)\b/giu, ' and ')
     const boundary = candidate.search(/\b(?:to|into|as|from|about|with|containing|including|convert|transcode|save|export|process|make|turn|change)\b/iu)
     return boundary < 0 ? candidate : candidate.slice(0, boundary)
   }
@@ -285,7 +289,7 @@ function clauseAntecedentSpan(clause: string): string {
   const english = /\b(?:review|check|read|describe|summari[sz]e|explain)\b/iu.exec(clause)
   if (english?.index !== undefined) {
     const candidate = clause.slice(english.index + english[0].length)
-    const boundary = candidate.search(/\b(?:in|from|about|with|inside|within)\b/iu)
+    const boundary = candidate.search(/\b(?:in|from|about|with|inside|within|containing|including)\b/iu)
     return boundary < 0 ? candidate : candidate.slice(0, boundary)
   }
   const chinese = /(?:查看|读取|描述|总结|概括|说明)/u.exec(clause)
@@ -304,15 +308,30 @@ function weakActionHasConversionContext(context: string): boolean {
     || /万象转换/u.test(context)
 }
 
+interface InformationRangeCursor {
+  readonly ranges: readonly RegExpMatchArray[]
+  index: number
+}
+
+function informationRangeCursor(ranges: readonly RegExpMatchArray[]): InformationRangeCursor {
+  return {
+    ranges: [...ranges].sort((left, right) => (left.index ?? 0) - (right.index ?? 0)),
+    index: 0,
+  }
+}
+
 function actionFallsInsideInformationQuestion(
   actionIndex: number,
-  informationRanges: readonly RegExpMatchArray[],
+  cursor: InformationRangeCursor,
 ): boolean {
-  return informationRanges.some((information) => (
-    information.index !== undefined
-    && information.index <= actionIndex
-    && actionIndex < information.index + information[0].length
-  ))
+  while (cursor.index < cursor.ranges.length) {
+    const range = cursor.ranges[cursor.index]!
+    const start = range.index ?? 0
+    const end = start + range[0].length
+    if (actionIndex < end) return start <= actionIndex
+    cursor.index += 1
+  }
+  return false
 }
 
 export function sanitizeDisplayName(value: string, index = 0): string {
@@ -364,6 +383,8 @@ export function hasLocalConversionIntent(
       ...clause.matchAll(CHINESE_HOW_TO_QUESTION),
       ...restartableInformationRanges,
     ]
+    const informationCursor = informationRangeCursor(informationRanges)
+    const restartableInformationCursor = informationRangeCursor(restartableInformationRanges)
     let previousActionEnd = 0
     let previousActionWasNegated = false
     let previousActionWasEmbedded = false
@@ -381,11 +402,13 @@ export function hasLocalConversionIntent(
       )
       if (objectSummary.lastKind !== undefined) previousExplicitObject = objectSummary.lastKind
       const hasAttachmentObject = objectSummary.kinds.has('attachment')
+      const hasAttachmentContext = hasAttachmentObject
+        || previousExplicitObject === 'attachment'
       const explicitCommandMood = actionHasExplicitCommandMood(
         clause,
         previousActionEnd,
         actionIndex,
-        hasAttachmentObject,
+        hasAttachmentContext,
       )
       const capabilityInformation = actionHasInformationalCapabilityMood(
         clause,
@@ -399,10 +422,10 @@ export function hasLocalConversionIntent(
       const informational: boolean = !explicitCommandMood && !explicitObjectRestart && (
         capabilityInformation
         || coordinatedInformation
-        || actionFallsInsideInformationQuestion(actionIndex, informationRanges)
+        || actionFallsInsideInformationQuestion(actionIndex, informationCursor)
       )
       const restartableInformation = capabilityInformation
-        || actionFallsInsideInformationQuestion(actionIndex, restartableInformationRanges)
+        || actionFallsInsideInformationQuestion(actionIndex, restartableInformationCursor)
       const embedded: boolean = !explicitCommandMood && !restartableInformation && (
         actionIsEmbeddedInOtherIntent(clause, previousActionEnd, actionIndex)
         || (previousActionWasEmbedded && (
@@ -445,6 +468,21 @@ export function hasLocalConversionIntent(
   return false
 }
 
+export function classifyAttachmentConversionIntent(
+  text: string,
+  attachments: readonly LocalAttachmentProjection[],
+): AttachmentConversionIntent {
+  if (attachments.length === 0) return 'ordinary'
+  const normalized = text.trim().normalize('NFKC').replace(/[‘’]/gu, "'")
+  const informationalScope = /^\s*(?:(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b|(?:如何|怎么))/iu.test(normalized)
+  const explicitRestart = /\b(?:otherwise|then|directly|just|please)\b[^,;.!?]{0,48}\b(?:convert|transcode|save|export)\b|\b(?:i\s+(?:would|want|need)|(?:can|could|would)\s+you)\b[^,;.!?]{0,48}\b(?:convert|transcode|save|export)\b|(?:然后|但是|但|请|直接|立即|马上)[^，,；;。.!！？?]{0,32}(?:转换|转成|转为|另存|保存|导出|输出)/iu.test(normalized)
+  if (informationalScope && !explicitRestart && hasConversionRiskSignal(normalized)) {
+    return 'ambiguous'
+  }
+  if (hasLocalConversionIntent(text, attachments)) return 'local'
+  return hasConversionRiskSignal(text) ? 'ambiguous' : 'ordinary'
+}
+
 export function projectLocalConversionPrompt(
   text: string,
   attachments: readonly LocalAttachmentProjection[],
@@ -453,4 +491,16 @@ export function projectLocalConversionPrompt(
     `[附件 ${item.index}: ${sanitizeDisplayName(item.name, item.index)}, ${item.mimeType}, ${item.byteSize} bytes]`
   ))
   return [text, ...lines].filter(Boolean).join('\n')
+}
+
+const AMBIGUOUS_CONVERSION_POLICY = [
+  '[附件隐私保护：未读取附件内容]',
+  '请只澄清用户要转换哪个附件以及目标格式；不要执行工具，也不要声称已读取或转换附件。',
+].join('\n')
+
+export function projectAmbiguousConversionPrompt(
+  text: string,
+  attachments: readonly LocalAttachmentProjection[],
+): string {
+  return [AMBIGUOUS_CONVERSION_POLICY, projectLocalConversionPrompt(text, attachments)].join('\n')
 }

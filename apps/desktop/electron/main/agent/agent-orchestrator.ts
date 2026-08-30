@@ -29,6 +29,10 @@ import type {
   ModelStreamRequest,
   ModelTool,
 } from '../chat/model-provider.js'
+import {
+  assertProtectedProviderSnapshot,
+  type ProviderAttachmentDisclosure,
+} from '../chat/provider-attachment-disclosure.js'
 import type { ConversationHistoryPort, CurrentMediaMetadata } from '../chat/conversation-context.js'
 import { createWorkflowCatalog, type WorkflowCandidate } from './workflow-catalog.js'
 import { classifyCapability } from './capability-risk.js'
@@ -447,7 +451,9 @@ export interface AgentRunInput extends UsageAttribution {
   contextLength?: number
   currentMedia: CurrentMediaMetadata[]
   omitHistoricalAttachments?: boolean
+  omitConversationHistory?: boolean
   attachmentBindings?: readonly ExecutionAttachmentBinding[]
+  attachmentDisclosure?: ProviderAttachmentDisclosure
   allowTools: boolean
   readonly supportsImageInput: boolean
   provider: ModelProviderId
@@ -845,6 +851,13 @@ export class AgentOrchestrator {
     this.activeByConversation.set(input.conversationId, requestId)
     let active: ActiveAgentRun | undefined
     try {
+      if (input.assetIds.length > 0) {
+        assertProtectedProviderSnapshot(input.providerSnapshot, input.attachmentDisclosure, {
+          requestId,
+          providerId: input.provider,
+          assetIds: input.assetIds,
+        })
+      }
       const userMessageId = this.id()
       const runId = this.id()
       const messageId = this.id()
@@ -972,6 +985,7 @@ export class AgentOrchestrator {
         tools: active.tools,
         currentMedia: input.currentMedia,
         ...(input.omitHistoricalAttachments ? { omitHistoricalAttachments: true } : {}),
+        ...(input.omitConversationHistory ? { omitConversationHistory: true } : {}),
         signal: active.controller.signal,
       })
       active.messages = [

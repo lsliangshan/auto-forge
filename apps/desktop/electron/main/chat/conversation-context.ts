@@ -60,6 +60,7 @@ export interface PrepareConversationContextInput {
   tools: ModelTool[]
   currentMedia: CurrentMediaMetadata[]
   omitHistoricalAttachments?: boolean
+  omitConversationHistory?: boolean
   signal: AbortSignal
 }
 
@@ -383,6 +384,7 @@ export function createConversationContextManager(
       if (requestTokens([], input) > chatBudget) {
         throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
       }
+      if (input.omitConversationHistory) return []
 
       let summary = repositories.conversationContexts.get(input.conversationId)
       const persistedHistory = repositories.messages

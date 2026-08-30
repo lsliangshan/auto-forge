@@ -30,6 +30,7 @@ import type {
 import { createMediaAssetService } from '../media/media-asset-service.js'
 import type { ModelProvider } from './model-provider.js'
 import { OpenRouterProvider } from './openrouter-provider.js'
+import { createProviderAttachmentDisclosure } from './provider-attachment-disclosure.js'
 import {
   MediaGenerationOrchestrator,
   type MediaGenerationOrchestratorDependencies,
@@ -974,6 +975,14 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
       const run = kind === 'image'
         ? orchestrator.runImage.bind(orchestrator)
         : orchestrator.runAudio.bind(orchestrator)
+      const attachmentDisclosure = createProviderAttachmentDisclosure({
+        requestId: 'request_atomic',
+        providerId: 'openrouter',
+        access: { decision: 'ordinary', allowProviderBytes: true },
+        assetIds: [asset.id],
+        assetFingerprints: [asset.sha256],
+        forbiddenValues: [],
+      })
       const result = await run({
         userId: 'user_atomic',
         requestId: 'request_atomic',
@@ -993,6 +1002,7 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
           },
         ],
         assetIds: [asset.id],
+        attachmentDisclosure,
         route: {
           ...(kind === 'image' ? imageRoute : audioRoute),
           assets: [{

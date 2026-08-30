@@ -12,6 +12,10 @@ import { scopeHash } from '../permissions/policy-engine.js'
 import type { ConversationHistoryPort } from '../chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from '../chat/model-provider.js'
 import {
+  createProviderAttachmentDisclosure,
+  protectProviderSnapshot,
+} from '../chat/provider-attachment-disclosure.js'
+import {
   ProviderUsageConsistencyError,
   type Execution,
   type ProviderUsageRepository,
@@ -269,6 +273,35 @@ function textRunInput(
     attachmentBindings: [],
     allowTools: true,
     supportsImageInput: false,
+  }
+}
+
+function protectedAttachmentRunInput(
+  input: AgentRunInput,
+  decision: 'local' | 'ordinary' = 'local',
+): AgentRunInput {
+  const requestId = input.requestId ?? 'request_attachment'
+  const attachmentDisclosure = createProviderAttachmentDisclosure({
+    requestId,
+    providerId: input.provider,
+    access: { decision, allowProviderBytes: decision === 'ordinary' },
+    assetIds: input.assetIds,
+    assetFingerprints: input.assetIds.map(() => 'b'.repeat(64)),
+    forbiddenValues: [],
+  })
+  const provider = input.providerSnapshot.provider
+  return {
+    ...input,
+    requestId,
+    providerSnapshot: protectProviderSnapshot({
+      ...input.providerSnapshot,
+      provider: {
+        ...provider,
+        listModels: provider.listModels ?? (async () => []),
+        validateCredential: provider.validateCredential ?? (async () => ({ valid: true })),
+      },
+    }, attachmentDisclosure),
+    attachmentDisclosure,
   }
 }
 
@@ -1420,7 +1453,7 @@ describe('AgentOrchestrator', () => {
     ]
     const orchestrator = new AgentOrchestrator(dependencies)
 
-    const result = await orchestrator.run({
+    const result = await orchestrator.run(protectedAttachmentRunInput({
       userId: 'user_1',
       providerSnapshot: {
         providerId: 'openrouter', provider: dependencies.providerInstances.openrouter as ModelProvider,
@@ -1436,7 +1469,7 @@ describe('AgentOrchestrator', () => {
       supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
-    })
+    }, 'ordinary'))
 
     expect(result.status).toBe('completed')
     expect(dependencies.records.users).toEqual([
@@ -2833,7 +2866,7 @@ describe('AgentOrchestrator', () => {
       }
     }
     const orchestrator = new AgentOrchestrator(dependencies)
-    const runInput = {
+    const runInput = protectedAttachmentRunInput({
       ...textRunInput({
         conversationId: 'conversion_conversation', content: '将附件转换成 PDF',
         provider: 'openrouter', model: 'model',
@@ -2841,7 +2874,7 @@ describe('AgentOrchestrator', () => {
       modelContent: '将附件转换成 PDF\n[附件 0: report.pdf, application/pdf, 12 bytes]',
       assetIds: ['media_private_0'],
       attachmentBindings: currentConversionAttachments(),
-    }
+    })
 
     const pending = await orchestrator.run(runInput)
 
@@ -2938,7 +2971,7 @@ describe('AgentOrchestrator', () => {
         }
       }
       const orchestrator = new AgentOrchestrator(dependencies)
-      const pending = await orchestrator.run({
+      const pending = await orchestrator.run(protectedAttachmentRunInput({
         ...textRunInput({
           conversationId: 'conversion_conversation', content: '将附件转换成 PDF',
           provider: 'openrouter', model: 'model',
@@ -2946,7 +2979,7 @@ describe('AgentOrchestrator', () => {
         modelContent: '将附件转换成 PDF\n[附件 0: report.pdf, application/pdf, 12 bytes]',
         assetIds: ['media_private_0'],
         attachmentBindings: currentConversionAttachments(),
-      })
+      }))
 
       await orchestrator.resumeApproval({
         executionId: pending.executionId!,

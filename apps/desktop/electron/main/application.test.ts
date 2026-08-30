@@ -45,6 +45,8 @@ import {
   observeAuthService,
 } from './application.js'
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
+import { WorkflowRouter } from './agent/workflow-router.js'
+import { BrowserContinuationCatalog } from './agent/browser-continuation-catalog.js'
 import type { AuthService } from './auth/auth-service.js'
 import type { BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
@@ -4869,6 +4871,7 @@ describe('createApplicationRuntime', () => {
     let selectedFiles = [summaryHistoricalSource]
     const captured: ModelStreamRequest[] = []
     const chatEvents: ChatEvent[] = []
+    let ordinaryAssistantIndex = 0
     const modelInput = vi.fn()
     const createMediaAssetService = mediaAssetModule.createMediaAssetService
     vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
@@ -4896,21 +4899,38 @@ describe('createApplicationRuntime', () => {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
           return
         }
+        if (!isConversationTitleRequest(request)) {
+          ordinaryAssistantIndex += 1
+          yield {
+            type: 'text_delta' as const,
+            choiceIndex: 0,
+            text: `PAIRED_ASSISTANT_PRIVATE_MARKER_${ordinaryAssistantIndex}`,
+          }
+        }
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
       }),
     })
+    const deepSeekProvider = snapshotProvider('deepseek', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('deepseek/local-conversion', 'Local conversion'),
+        supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: provider.stream,
+    })
     const runtime = createApplicationRuntime(options(root, {
       chooseMediaFiles: async () => selectedFiles,
-      modelProviders: { openrouter: provider },
+      modelProviders: { openrouter: provider, deepseek: deepSeekProvider },
       emitChat: (event) => { chatEvents.push(event) },
     }))
     try {
       const session = await authenticate(runtime)
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
       await runtime.services.settings.update({
         activeProvider: 'openrouter',
         defaultModels: {
-          deepseek: { text: 'deepseek-v4-flash' },
+          deepseek: { text: 'deepseek/local-conversion' },
           openrouter: { text: 'openrouter/local-conversion' },
         },
       })
@@ -4954,6 +4974,8 @@ describe('createApplicationRuntime', () => {
       })))
       expect(modelInput).toHaveBeenCalledTimes(2)
 
+      await runtime.services.settings.update({ activeProvider: 'deepseek' })
+
       selectedFiles = [currentSource]
       const [currentAsset] = await runtime.services.media.pickFiles({
         conversationId: conversation.id, existingAssetIds: [],
@@ -4994,6 +5016,7 @@ describe('createApplicationRuntime', () => {
       expect(providerPayload).not.toContain(rawHistoricalBytes.toString())
       expect(providerPayload).not.toContain(summaryHistoricalBytes.toString('base64'))
       expect(providerPayload).not.toContain(rawHistoricalBytes.toString('base64'))
+      expect(providerPayload).not.toMatch(/PAIRED_ASSISTANT_PRIVATE_MARKER_[12]/)
 
       const approval = [...chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
         event.type === 'block' && event.block.type === 'approval'
@@ -5211,6 +5234,131 @@ describe('createApplicationRuntime', () => {
   })
 
   it.each([
+    ['No matter what this tool can convert then convert this attachment to PDF', 'local', 'text'],
+    ['How do I convert PNG then convert this attachment to PDF', 'local', 'image'],
+    ['How do I convert PNG then directly convert this attachment to PDF', 'local', 'audio'],
+    ['如何把图片转换为 PNG 然后请导出为 PDF', 'local', 'video'],
+    ['Convert this conversation as well as this attachment to PDF', 'local', 'text'],
+    ['Convert this conversation together with this attachment to PDF', 'local', 'image'],
+    ['Can this tool convert this attachment or save this image as JPG?', 'ambiguous', 'text'],
+    ['Could it convert PDF or export this document as DOCX?', 'ambiguous', 'image'],
+    ['怎么把这个图片保存为WebP或导出为PNG？', 'ambiguous', 'audio'],
+    ['Check the chat history containing this image, then export it as PDF', 'ambiguous', 'video'],
+  ] as const)(
+    'enforces the final attachment disclosure boundary for %s as %s from %s output',
+    async (content, expectedDecision, requestedOutput) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-attachment-disclosure-'))
+      directories.push(root)
+      const source = join(root, '附件 9：private-source.png')
+      const privateContent = 'FINAL_ATTACHMENT_DISCLOSURE_PRIVATE_UTF8'
+      const privateBytes = Buffer.concat([
+        Buffer.from('89504e470d0a1a0a', 'hex'),
+        Buffer.from(privateContent),
+      ])
+      await writeFile(source, privateBytes)
+      const captured: ModelStreamRequest[] = []
+      const chatEvents: ChatEvent[] = []
+      const modelInput = vi.fn()
+      const run = vi.spyOn(AgentOrchestrator.prototype, 'run')
+      const workflowRoute = vi.spyOn(WorkflowRouter.prototype, 'route')
+      const browserCatalog = vi.spyOn(BrowserContinuationCatalog.prototype, 'create')
+      const generateImage = vi.fn(async () => ({ outputs: [] }))
+      const submitVideo = vi.fn(async () => ({
+        providerJobId: 'provider_attachment_disclosure', status: 'pending' as const,
+      }))
+      const createMediaAssetService = mediaAssetModule.createMediaAssetService
+      vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
+        const service = createMediaAssetService(createOptions)
+        modelInput.mockImplementation(service.modelInput.bind(service))
+        return { ...service, modelInput }
+      })
+      const provider = snapshotProvider('openrouter', {
+        listModels: async () => [
+          visionTextModelInfo('openrouter/attachment-disclosure'),
+          imageModelInfo('openrouter/attachment-disclosure-image'),
+          audioModelInfo('openrouter/attachment-disclosure-audio'),
+          videoModelInfo('openrouter/attachment-disclosure-video'),
+        ],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* (request) {
+          captured.push(request)
+          yield {
+            type: 'text_delta' as const,
+            choiceIndex: 0,
+            text: isConversationTitleRequest(request) ? '附件请求' : '请确认要转换的附件和目标格式。',
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+        generateImage,
+        submitVideo,
+      })
+      const runtime = createApplicationRuntime(options(root, {
+        chooseMediaFiles: async () => [source],
+        modelProviders: { openrouter: provider },
+        emitChat: (event) => { chatEvents.push(event) },
+      }))
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' },
+          openrouter: {
+            text: 'openrouter/attachment-disclosure',
+            image: 'openrouter/attachment-disclosure-image',
+            audio: 'openrouter/attachment-disclosure-audio',
+            video: 'openrouter/attachment-disclosure-video',
+          },
+        },
+      })
+      await installConversionWorkflow(runtime)
+      const conversation = await runtime.services.chat.createConversation()
+      const [asset] = await runtime.services.media.pickFiles({
+        conversationId: conversation.id, existingAssetIds: [],
+      })
+
+      const sent = await runtime.services.chat.send({
+        ...chatInput(conversation.id, content), assetIds: [asset!.id], outputType: requestedOutput,
+      })
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'status', requestId: sent.requestId, status: 'completed',
+      })))
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'conversation_title_updated', conversationId: conversation.id,
+      })))
+
+      expect(modelInput).not.toHaveBeenCalled()
+      expect(generateImage).not.toHaveBeenCalled()
+      expect(submitVideo).not.toHaveBeenCalled()
+      expect(captured.every((request) => request.output?.type !== 'audio')).toBe(true)
+      const agentInput = run.mock.calls.find(([input]) => input.requestId === sent.requestId)?.[0]
+      expect(agentInput).toBeDefined()
+      expect(agentInput?.attachmentBindings).toHaveLength(expectedDecision === 'local' ? 1 : 0)
+      const payload = JSON.stringify(captured)
+      expect(payload).not.toContain(privateContent)
+      expect(payload).not.toContain(privateBytes.toString('base64'))
+      expect(payload).not.toContain(asset!.id)
+      expect(payload).not.toContain(source)
+      expect(payload).not.toMatch(/dataBase64|mediaAssetId|sourceId|absolutePath|relativePath|file:\/\//i)
+      const agentRequest = agentRequests(captured)[0]
+      expect(JSON.stringify(agentRequest)).toContain('[附件 0: 文件-1, image/png,')
+      if (expectedDecision === 'ambiguous') {
+        expect(agentInput?.allowTools).toBe(false)
+        expect(agentRequest?.tools ?? []).toHaveLength(0)
+        expect(JSON.stringify(agentRequest)).toContain('只澄清用户要转换哪个附件以及目标格式')
+        expect(workflowRoute).not.toHaveBeenCalled()
+        expect(browserCatalog).not.toHaveBeenCalled()
+      }
+      const titlePayload = JSON.stringify(captured.find(isConversationTitleRequest))
+      expect(titlePayload).not.toMatch(/private-source|image\/png|bytes|AI：/i)
+      expect(chatEvents).not.toContainEqual(expect.objectContaining({
+        type: 'block', block: expect.objectContaining({ type: 'approval' }),
+      }))
+      await runtime.close()
+    },
+  )
+
+  it.each([
     '不要把图片做成 ICO，只需总结它',
     '不要把图片做成 ICO，而是总结它',
     '请勿保存为 WebP，我只是问它是什么格式',
@@ -5240,7 +5388,6 @@ describe('createApplicationRuntime', () => {
     'save this conversation',
     'export chat history',
     '解释一下转换率',
-    'process the conversation',
     "don't convert or save this file",
     "don't convert and save this file",
     '不要转换或导出这个附件',
@@ -5305,7 +5452,7 @@ describe('createApplicationRuntime', () => {
     'Could this converter save images as PNG or export documents as PDF?',
     '如何把这个文件转换为PDF？',
     '怎么把这个图片保存为WebP？',
-  ])('keeps negated or informational attachment requests on the normal provider route: %s', async (content) => {
+  ])('keeps conversion-risk uncertainty metadata-only on the Provider route: %s', async (content) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-non-conversion-intent-'))
     directories.push(root)
     const source = join(root, 'ordinary-source.png')
@@ -5366,9 +5513,14 @@ describe('createApplicationRuntime', () => {
       type: 'conversation_title_updated', conversationId: conversation.id,
     })))
 
-    expect(modelInput).toHaveBeenCalledTimes(1)
+    expect(modelInput).not.toHaveBeenCalled()
     expect(captured).toHaveLength(2)
-    expect(JSON.stringify(agentRequests(captured)[0])).toContain(bytes.toString('base64'))
+    const providerPayload = JSON.stringify(captured)
+    expect(providerPayload).not.toContain(bytes.toString('base64'))
+    expect(providerPayload).not.toContain('ORDINARY_IMAGE_PRIVATE_CONTENT_MARKER')
+    expect(JSON.stringify(agentRequests(captured)[0])).toContain('只澄清用户要转换哪个附件以及目标格式')
+    expect(agentRequests(captured)[0]?.tools ?? []).toHaveLength(0)
+    expect(JSON.stringify(captured.find(isConversationTitleRequest))).not.toContain('AI：')
     expect(chatEvents).not.toContainEqual(expect.objectContaining({
       type: 'block',
       block: expect.objectContaining({ type: 'approval', capability: 'file.convert' }),

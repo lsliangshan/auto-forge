@@ -31,6 +31,11 @@ import type {
   ModelProviderSnapshotSource,
 } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
+import {
+  assertAttachmentByteAccess,
+  protectProviderSnapshot,
+  type ProviderAttachmentDisclosure,
+} from './provider-attachment-disclosure.js'
 
 const VIDEO_TIMEOUT_MS = 60 * 60 * 1_000
 const CREDENTIAL_RETRY_MS = 2_000
@@ -52,6 +57,7 @@ export interface SubmitVideoInput extends UsageAttribution {
   userBlocks: ChatBlock[]
   assetIds: string[]
   route: ResolvedChatRoute & { outputType: 'video' }
+  attachmentDisclosure?: ProviderAttachmentDisclosure
 }
 
 export interface VideoJobProviderRegistryPort {
@@ -263,6 +269,13 @@ export class VideoJobRunner {
   }
 
   async submit(input: SubmitVideoInput): Promise<SubmittedVideoJob> {
+    if (input.assetIds.length > 0) {
+      assertAttachmentByteAccess(input.attachmentDisclosure, {
+        requestId: input.requestId,
+        providerId: input.route.provider,
+        assetIds: input.assetIds,
+      })
+    }
     const operation = this.submitInternal(input)
     this.submissions.add(operation)
     try {
@@ -345,7 +358,10 @@ export class VideoJobRunner {
 
       controller = new AbortController()
       this.controllers.set(input.requestId, controller)
-      const providerSnapshot = await this.acquireSubmitSnapshot(input.route.provider)
+      const acquiredProviderSnapshot = await this.acquireSubmitSnapshot(input.route.provider)
+      const providerSnapshot = input.attachmentDisclosure === undefined
+        ? acquiredProviderSnapshot
+        : protectProviderSnapshot(acquiredProviderSnapshot, input.attachmentDisclosure)
       this.providerSnapshots.set(input.requestId, providerSnapshot)
       const provider = providerSnapshot.provider
       if (!provider.submitVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })

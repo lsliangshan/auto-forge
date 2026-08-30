@@ -28,6 +28,11 @@ import type {
   ModelProviderSnapshotSource,
 } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
+import {
+  assertAttachmentByteAccess,
+  protectProviderSnapshot,
+  type ProviderAttachmentDisclosure,
+} from './provider-attachment-disclosure.js'
 
 export interface MediaGenerationOrchestratorDependencies {
   providers: ModelProviderSnapshotSource
@@ -51,6 +56,7 @@ export interface MediaGenerationRunInput extends UsageAttribution {
   userBlocks: ChatBlock[]
   assetIds: string[]
   route: ResolvedChatRoute
+  attachmentDisclosure?: ProviderAttachmentDisclosure
 }
 
 interface ActiveGeneration {
@@ -124,6 +130,13 @@ export class MediaGenerationOrchestrator {
     input: MediaGenerationRunInput,
     kind: 'image' | 'audio',
   ): Promise<AgentRunResult> {
+    if (input.assetIds.length > 0) {
+      assertAttachmentByteAccess(input.attachmentDisclosure, {
+        requestId: input.requestId,
+        providerId: input.route.provider,
+        assetIds: input.assetIds,
+      })
+    }
     if (input.route.outputType !== kind) {
       return {
         requestId: input.requestId,
@@ -170,10 +183,13 @@ export class MediaGenerationOrchestrator {
         status: 'running',
       })
 
-      const providerSnapshot = await this.dependencies.providers.acquire(input.route.provider)
-      if (providerSnapshot.providerId !== input.route.provider) {
+      const acquiredProviderSnapshot = await this.dependencies.providers.acquire(input.route.provider)
+      if (acquiredProviderSnapshot.providerId !== input.route.provider) {
         throw new ProviderUsageConsistencyError()
       }
+      const providerSnapshot = input.attachmentDisclosure === undefined
+        ? acquiredProviderSnapshot
+        : protectProviderSnapshot(acquiredProviderSnapshot, input.attachmentDisclosure)
 
       return kind === 'image'
         ? await this.generateImage(input, persisted, active, providerSnapshot)
