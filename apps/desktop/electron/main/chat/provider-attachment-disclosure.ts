@@ -54,6 +54,7 @@ export interface AttachmentPrivacyPlan {
   readonly mainText: string
   readonly titleText: string
   readonly targetFormat?: ConversionTargetFormat
+  readonly selectedAttachmentIndexes?: readonly number[]
 }
 
 export interface ProviderAttachmentDisclosure extends AttachmentPrivacyPlan {
@@ -211,17 +212,19 @@ export function createProviderAttachmentDisclosureAuthority(input: {
         normalizedText,
         value.context,
       )
-      if (access.decision === 'local' && classification.targetFormat === undefined) {
+      if (access.decision === 'local' && (classification.targetFormat === undefined
+        || classification.selectedAttachmentIndexes === undefined
+        || classification.selectedAttachmentIndexes.length === 0)) {
         throw new Error('Local conversion target authority is missing')
       }
       const providerText = access.decision === 'local'
         ? {
             mainText: canonicalLocalConversionProviderPrompt(
-              attachments.length,
+              classification.selectedAttachmentIndexes!,
               classification.targetFormat!,
             ),
             titleText: canonicalLocalConversionProviderTitle(
-              attachments.length,
+              classification.selectedAttachmentIndexes!,
               classification.targetFormat!,
             ),
           }
@@ -242,7 +245,10 @@ export function createProviderAttachmentDisclosureAuthority(input: {
         ]).filter(Boolean))]),
         mainText: providerText.mainText,
         titleText: providerText.titleText,
-        ...(access.decision === 'local' ? { targetFormat: classification.targetFormat } : {}),
+        ...(access.decision === 'local' ? {
+          targetFormat: classification.targetFormat,
+          selectedAttachmentIndexes: Object.freeze([...classification.selectedAttachmentIndexes!]),
+        } : {}),
       })
       issuedPrivacyPlans.add(plan)
       privacyPlanAuthorities.set(plan, {

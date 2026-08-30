@@ -166,7 +166,7 @@ export function serializeHistoricalMessage(
     return {
       role: 'user',
       content: canonicalLocalConversionProviderPrompt(
-        message.providerProjection.attachmentCount,
+        message.providerProjection.selectedAttachmentIndexes,
         message.providerProjection.targetFormat,
       ),
     }

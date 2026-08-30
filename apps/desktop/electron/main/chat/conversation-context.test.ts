@@ -41,7 +41,10 @@ describe('conversation context primitives', () => {
     ].join('\n')
     const message: Message = {
       id: 'm_local', conversationId: 'c1', role: 'user', ordinal: 1, createdAt: 1,
-      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
+      providerProjection: {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        selectedAttachmentIndexes: [0],
+      },
       blocks: [
         { type: 'text', text: `Convert ${rawPath} to PDF` },
         {
@@ -418,7 +421,10 @@ describe('conversation context manager', () => {
     const rawPath = '/Users/Alice/Tax Return Records/secret.pdf'
     const messages = Array.from({ length: 12 }, (_, index): Message => index % 2 === 0 ? {
       id: `local_${index}`, conversationId: 'c1', role: 'user', ordinal: index + 1, createdAt: index + 1,
-      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
+      providerProjection: {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        selectedAttachmentIndexes: [0],
+      },
       blocks: [{ type: 'text', text: `Convert ${rawPath} to PDF ${'private '.repeat(80)}` }],
     } : assistant(index + 1, `ack ${index}`))
     const { manager, provider } = contextHarness({ messages })

@@ -329,6 +329,7 @@ function protectedAttachmentRunInput(
       modelContent: attachmentDisclosure.mainSafeText.text,
       localConversionOnly: true,
       localConversionTarget: plan.targetFormat,
+      localConversionAttachmentIndexes: plan.selectedAttachmentIndexes,
     } : {}),
     attachmentFingerprints: assetFingerprints,
     providerSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {

@@ -290,9 +290,10 @@ function bindFileConversion(
   const current = bindings ?? []
   if (current.length === 0 || current.length > 5) return toolError('CAPABILITY_SCOPE_DENIED')
   const attachmentBindings: ExecutionAttachmentBinding[] = []
+  let previousAttachmentIndex = -1
   for (let index = 0; index < current.length; index += 1) {
     const binding = current[index]!
-    if (binding.attachmentIndex !== index
+    if (binding.attachmentIndex <= previousAttachmentIndex
       || binding.source.kind !== 'media'
       || !binding.source.mediaAssetId.trim()
       || !binding.ownerUserId.trim()
@@ -304,17 +305,18 @@ function bindFileConversion(
       || !validSourceFingerprint(binding.sourceFingerprint)) {
       return toolError('CAPABILITY_SCOPE_DENIED')
     }
+    previousAttachmentIndex = binding.attachmentIndex
     attachmentBindings.push(deepFreeze(structuredClone(binding)))
   }
-  if (input.files.length === 0 || input.files.length > 5) return toolError('CAPABILITY_SCOPE_DENIED')
+  if (input.files.length !== attachmentBindings.length) return toolError('CAPABILITY_SCOPE_DENIED')
   const indexes = new Set<number>()
   const attachments: Array<{ index: number; sourceFingerprint: string }> = []
-  for (const value of input.files) {
-    if (!Number.isInteger(value) || value < 0 || indexes.has(value)) {
+  for (const [position, value] of input.files.entries()) {
+    if (!Number.isInteger(value) || value < 0 || indexes.has(value)
+      || value !== attachmentBindings[position]!.attachmentIndex) {
       return toolError('CAPABILITY_SCOPE_DENIED')
     }
-    const binding = attachmentBindings[value]
-    if (!binding || binding.attachmentIndex !== value) return toolError('CAPABILITY_SCOPE_DENIED')
+    const binding = attachmentBindings[position]!
     indexes.add(value)
     attachments.push(Object.freeze({ index: value, sourceFingerprint: binding.sourceFingerprint }))
   }
@@ -370,8 +372,9 @@ function createFileConversionActionSummary(
   request: ExactFileConvertRequest,
   bindings: readonly ExecutionAttachmentBinding[],
 ): string {
+  const bindingsByIndex = new Map(bindings.map((binding) => [binding.attachmentIndex, binding]))
   const attachments = request.attachments.map(({ index }) => {
-    const name = sanitizeDisplayName(bindings[index]!.displayName, index).slice(0, 60)
+    const name = sanitizeDisplayName(bindingsByIndex.get(index)!.displayName, index).slice(0, 60)
     return `附件 ${index}：${name}`
   }).join('、')
   return `${workflow.name} · file.convert · ${attachments} · 目标格式：${request.targetFormat}`

@@ -539,12 +539,22 @@ function validateMessage(
       value.role === 'user'
       && hasStrictShape(
         value.providerProjection,
-        ['kind', 'targetFormat', 'attachmentCount'],
+        ['version', 'kind', 'targetFormat', 'attachmentCount', 'selectedAttachmentIndexes'],
       )
+      && value.providerProjection.version === 2
       && value.providerProjection.kind === 'local_conversion'
       && conversionTargetFormats.has(value.providerProjection.targetFormat)
       && positiveInteger(value.providerProjection.attachmentCount)
       && value.providerProjection.attachmentCount <= 5
+      && Array.isArray(value.providerProjection.selectedAttachmentIndexes)
+      && value.providerProjection.selectedAttachmentIndexes.length >= 1
+      && value.providerProjection.selectedAttachmentIndexes.length <= 5
+      && value.providerProjection.selectedAttachmentIndexes.every((index, position, indexes) => (
+        Number.isInteger(index)
+        && index >= 0
+        && index < value.providerProjection.attachmentCount
+        && (position === 0 || index > indexes[position - 1])
+      ))
       && value.blocks.filter((block) => (
         block.type === 'media' && block.purpose === 'input'
       )).length === value.providerProjection.attachmentCount

@@ -241,9 +241,11 @@ describe('cross-process contracts', () => {
       ...messageAppend, payload: { ...messageAppend.payload, userId: 'forged' },
     }).success).toBe(false)
     const canonicalProjection = {
+      version: 2 as const,
       kind: 'local_conversion' as const,
       targetFormat: 'pdf' as const,
       attachmentCount: 1,
+      selectedAttachmentIndexes: [0],
     }
     expect(syncMutationSchema.parse({
       ...messageAppend,
@@ -262,8 +264,10 @@ describe('cross-process contracts', () => {
     for (const providerProjection of [
       { ...canonicalProjection, targetFormat: 'docx' },
       { ...canonicalProjection, attachmentCount: 0 },
+      { ...canonicalProjection, selectedAttachmentIndexes: [] },
+      { ...canonicalProjection, selectedAttachmentIndexes: [1] },
       { ...canonicalProjection, content: 'RAW_BASE64_CANARY' },
-      { kind: 'ordinary', targetFormat: 'pdf', attachmentCount: 1 },
+      { version: 2, kind: 'ordinary', targetFormat: 'pdf', attachmentCount: 1, selectedAttachmentIndexes: [0] },
     ]) {
       expect(syncMutationSchema.safeParse({
         ...messageAppend,

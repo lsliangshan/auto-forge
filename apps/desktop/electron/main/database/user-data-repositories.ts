@@ -518,6 +518,10 @@ function trustedRemoteProviderProjection(payload: Record<string, unknown>) {
   const classification = classifyAttachmentConversionRequest(text, attachments)
   return classification.decision === 'local'
     && classification.targetFormat === candidate.data.targetFormat
+    && classification.selectedAttachmentIndexes?.length === candidate.data.selectedAttachmentIndexes.length
+    && classification.selectedAttachmentIndexes.every((index, position) => (
+      index === candidate.data.selectedAttachmentIndexes[position]
+    ))
     && attachments.length === candidate.data.attachmentCount
     ? candidate.data
     : undefined

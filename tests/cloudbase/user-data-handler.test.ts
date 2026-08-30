@@ -125,7 +125,8 @@ function fileInputMutation(extraBlock: Record<string, unknown> = {}) {
 
 function projectedConversionMessageMutation(
   providerProjection: unknown = {
-    kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+    version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+    selectedAttachmentIndexes: [0],
   },
 ) {
   const mutation = fileInputMutation()
@@ -524,7 +525,8 @@ describe('CloudBase user data function', () => {
       p_mutations: [expect.objectContaining({
         payload: expect.objectContaining({
           providerProjection: {
-            kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+            version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+            selectedAttachmentIndexes: [0],
           },
         }),
       })],
@@ -542,6 +544,14 @@ describe('CloudBase user data function', () => {
       { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1, content: 'raw' },
       { kind: 'ordinary', targetFormat: 'pdf', attachmentCount: 1 },
       { version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
+      {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        selectedAttachmentIndexes: [1],
+      },
+      {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 2,
+        selectedAttachmentIndexes: [1, 0],
+      },
     ]) {
       await expect(handler({
         action: 'syncPush', protocolVersion: 3, deviceId: 'dev_1',
@@ -1042,7 +1052,8 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
     const projectedMessage = {
       ...projectedPayload,
       providerProjection: {
-        kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        selectedAttachmentIndexes: [0],
       },
     }
     for (const [name, output] of [

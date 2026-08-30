@@ -2932,12 +2932,17 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
 
     const persisted = new Database(userCachePath(root, session.user.id), { readonly: true })
-    expect(persisted.prepare(`
+    const persistedProjection = persisted.prepare(`
       SELECT provider_projection_json AS providerProjectionJson
       FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY ordinal LIMIT 1
-    `).get(conversation.id)).toEqual(expect.objectContaining({
-      providerProjectionJson: expect.stringContaining('"targetFormat":"pdf"'),
-    }))
+    `).get(conversation.id) as { providerProjectionJson: string }
+    expect(JSON.parse(persistedProjection.providerProjectionJson)).toEqual({
+      version: 2,
+      kind: 'local_conversion',
+      targetFormat: 'pdf',
+      attachmentCount: 1,
+      selectedAttachmentIndexes: [0],
+    })
     persisted.close()
 
     withUserData(root, session.user.id, (store) => {
@@ -5605,6 +5610,20 @@ describe('createApplicationRuntime', () => {
     [String.raw`转换 C:\Private\PDF\附件 9：private-source.png 为 WebP`, 'local', 'text'],
     ['Convert this attachment not to PDF', 'ambiguous', 'text'],
     ['Convert this attachment to PDF, then save it as WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF, then convert this attachment to WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment to PDF, then convert this attachment to PDF', 'ambiguous', 'text'],
+    ['把这个附件转换为PDF，然后把这个附件转换为WEBP', 'ambiguous', 'text'],
+    ['把这个附件转换为PDF，然后把这个附件转换为PDF', 'ambiguous', 'text'],
+    ['Convert /tmp/附件 9：private-source.png to PDF, then convert 附件 9：private-source.png to WEBP', 'ambiguous', 'text'],
+    ['Convert 文件-1 to PDF', 'ambiguous', 'text'],
+    ['Convert 文件-999 to PDF', 'ambiguous', 'text'],
+    ['Convert \uE000AF-1\uE001 to PDF', 'ambiguous', 'text'],
+    ['Convert these attachments to PDF', 'local', 'text', 2, [0, 1]],
+    ['Convert all files to WEBP', 'local', 'text', 2, [0, 1]],
+    ['Convert both attachments to JPG', 'local', 'text', 2, [0, 1]],
+    ['Convert 附件 9：private-source.png to PDF', 'local', 'text', 2, [0]],
+    ['Convert 附件 10：private-source-2.png to PDF', 'local', 'text', 2, [1]],
+    ['Convert this attachment to PDF', 'ambiguous', 'text', 2],
     ['Convert this attachment to DOCX', 'ambiguous', 'text'],
     ['reformat this attachment as PDF', 'ambiguous', 'text'],
     ['encode this image as WebP', 'ambiguous', 'text'],
@@ -5676,16 +5695,28 @@ describe('createApplicationRuntime', () => {
     ['把这个附件转为 PDF 或 WEBP', 'ambiguous', 'text'],
   ] as const)(
     'enforces the final attachment disclosure boundary for %s as %s from %s output',
-    async (content, expectedDecision, requestedOutput) => {
+    async (
+      content: string,
+      expectedDecision: 'local' | 'ambiguous',
+      requestedOutput: 'text' | 'image' | 'audio' | 'video',
+      attachmentCount: number = 1,
+      selectedAttachmentIndexes?: readonly number[],
+    ) => {
+      const expectedSelected = expectedDecision === 'local'
+        ? selectedAttachmentIndexes ?? Array.from({ length: attachmentCount }, (_, index) => index)
+        : []
       const root = await mkdtemp(join(tmpdir(), 'autoforge-application-attachment-disclosure-'))
       directories.push(root)
-      const source = join(root, '附件 9：private-source.png')
+      const sources = Array.from({ length: attachmentCount }, (_, index) => join(
+        root,
+        index === 0 ? '附件 9：private-source.png' : `附件 ${index + 9}：private-source-${index + 1}.png`,
+      ))
       const privateContent = 'FINAL_ATTACHMENT_DISCLOSURE_PRIVATE_UTF8'
       const privateBytes = Buffer.concat([
         Buffer.from('89504e470d0a1a0a', 'hex'),
         Buffer.from(privateContent),
       ])
-      await writeFile(source, privateBytes)
+      await Promise.all(sources.map((source) => writeFile(source, privateBytes)))
       const captured: ModelStreamRequest[] = []
       const chatEvents: ChatEvent[] = []
       const modelInput = vi.fn()
@@ -5723,7 +5754,7 @@ describe('createApplicationRuntime', () => {
         submitVideo,
       })
       const runtime = createApplicationRuntime(options(root, {
-        chooseMediaFiles: async () => [source],
+        chooseMediaFiles: async () => sources,
         modelProviders: { openrouter: provider },
         emitChat: (event) => { chatEvents.push(event) },
       }))
@@ -5743,12 +5774,12 @@ describe('createApplicationRuntime', () => {
       })
       await installConversionWorkflow(runtime)
       const conversation = await runtime.services.chat.createConversation()
-      const [asset] = await runtime.services.media.pickFiles({
+      const assets = await runtime.services.media.pickFiles({
         conversationId: conversation.id, existingAssetIds: [],
       })
 
       const sent = await runtime.services.chat.send({
-        ...chatInput(conversation.id, content), assetIds: [asset!.id], outputType: requestedOutput,
+        ...chatInput(conversation.id, content), assetIds: assets.map((asset) => asset.id), outputType: requestedOutput,
       })
       await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
         type: 'status', requestId: sent.requestId, status: 'completed',
@@ -5767,12 +5798,18 @@ describe('createApplicationRuntime', () => {
       expect(provider.acquireSnapshot).toHaveBeenCalledTimes(expectedDecision === 'local' ? 1 : 0)
       const agentInput = run.mock.calls.find(([input]) => input.requestId === sent.requestId)?.[0]
       expect(agentInput).toBeDefined()
-      expect(agentInput?.attachmentBindings).toHaveLength(expectedDecision === 'local' ? 1 : 0)
+      expect(agentInput?.attachmentBindings).toHaveLength(expectedSelected.length)
+      if (expectedDecision === 'local') {
+        expect(agentInput?.attachmentBindings?.map((binding) => binding.attachmentIndex)).toEqual(
+          expectedSelected,
+        )
+        expect(agentInput?.localConversionAttachmentIndexes).toEqual(expectedSelected)
+      }
       const payload = JSON.stringify(captured)
       expect(payload).not.toContain(privateContent)
       expect(payload).not.toContain(privateBytes.toString('base64'))
-      expect(payload).not.toContain(asset!.id)
-      expect(payload).not.toContain(source)
+      for (const asset of assets) expect(payload).not.toContain(asset.id)
+      for (const source of sources) expect(payload).not.toContain(source)
       expect(payload).not.toMatch(/dataBase64|mediaAssetId|sourceId|absolutePath|relativePath|file:\/\//i)
       if (expectedDecision === 'ambiguous') {
         expect(agentInput?.allowTools).toBe(false)
@@ -5792,9 +5829,21 @@ describe('createApplicationRuntime', () => {
       } else {
         const agentPayload = JSON.stringify(agentRequests(captured)[0])
         expect(agentPayload).toContain('任务：选择并调用具备 file.convert 能力的本地工作流。')
-        expect(agentPayload).toContain('附件数量：1')
-        expect(agentPayload).toContain('附件索引：0')
+        expect(agentPayload).toContain(`附件数量：${expectedSelected.length}`)
+        expect(agentPayload).toContain(`附件索引：${expectedSelected.join(', ')}`)
         expect(agentPayload).not.toContain(content.normalize('NFKC'))
+        const fileSchema = agentRequests(captured)[0]?.tools?.[0]?.function.parameters as {
+          properties?: { input?: { properties?: { files?: {
+            items?: { enum?: number[] }
+            minItems?: number
+            maxItems?: number
+          } } } }
+        }
+        expect(fileSchema.properties?.input?.properties?.files).toMatchObject({
+          items: { enum: expectedSelected },
+          minItems: expectedSelected.length,
+          maxItems: expectedSelected.length,
+        })
       }
       const titlePayload = JSON.stringify(captured.find(isConversationTitleRequest))
       if (titlePayload !== undefined) {
@@ -5808,26 +5857,26 @@ describe('createApplicationRuntime', () => {
   )
 
   it.each([
-    ['Secret-Ｆile.PDF', 'Convert Secret-Ｆile.PDF and secret-file.pdf and SECRET-FILE.PDF to PDF', 2,
+    ['Secret-Ｆile.PDF', 'Convert Secret-Ｆile.PDF and secret-file.pdf and SECRET-FILE.PDF to PDF', 0,
       ['secret-file.pdf']],
     ['Secret-Ｆile.PDF', 'reformat Secret-Ｆile.PDF as PDF', 0, ['secret-file.pdf']],
-    ['Straße.pdf', 'Convert STRASSE.PDF and Straße.pdf to PDF', 2, ['STRASSE.PDF', 'Straße.pdf']],
-    ['İnvoice.pdf', 'Convert invoice.pdf and İNVOICE.PDF to PDF', 2, ['invoice.pdf', 'İNVOICE.PDF']],
-    ['Straße.pdf', String.raw`Convert /Users/alice/Tax/STRASSE.PDF and C:\Private\Straße.pdf and \\server\share\STRASSE.PDF to PDF`, 2,
+    ['Straße.pdf', 'Convert STRASSE.PDF and Straße.pdf to PDF', 0, ['STRASSE.PDF', 'Straße.pdf']],
+    ['İnvoice.pdf', 'Convert invoice.pdf and İNVOICE.PDF to PDF', 0, ['invoice.pdf', 'İNVOICE.PDF']],
+    ['Straße.pdf', String.raw`Convert /Users/alice/Tax/STRASSE.PDF and C:\Private\Straße.pdf and \\server\share\STRASSE.PDF to PDF`, 0,
       ['Users', 'alice', 'Tax', 'Private', 'server', 'share', 'STRASSE.PDF', 'Straße.pdf']],
-    ['Straße.pdf', String.raw`Convert "/Users/alice/Tax Returns/STRASSE.PDF" and C:\Private Files\Straße.pdf and \\server\Private Share\STRASSE.PDF to PDF`, 2,
+    ['Straße.pdf', String.raw`Convert "/Users/alice/Tax Returns/STRASSE.PDF" and C:\Private Files\Straße.pdf and \\server\Private Share\STRASSE.PDF to PDF`, 0,
       ['Users', 'alice', 'Tax Returns', 'Private Files', 'server', 'Private Share', 'STRASSE.PDF', 'Straße.pdf']],
-    ['secret.pdf', String.raw`Convert "/Users/Alice/Export Data/SECRET.PDF" and C:\Windows Open Files\SECRET.PDF and \\server\UNC Save As\SECRET.PDF and 资料/中文 转换 资料/SECRET.PDF and "/Users/Alice/Tax, Returns/SECRET.PDF" to PDF`, 2,
+    ['secret.pdf', String.raw`Convert "/Users/Alice/Export Data/SECRET.PDF" and C:\Windows Open Files\SECRET.PDF and \\server\UNC Save As\SECRET.PDF and 资料/中文 转换 资料/SECRET.PDF and "/Users/Alice/Tax, Returns/SECRET.PDF" to PDF`, 0,
       ['Users', 'Alice', 'Export Data', 'Windows Open Files', 'server', 'UNC Save As', '资料/中文', '中文 转换 资料', 'Tax, Returns', 'SECRET.PDF']],
-    ['secret.pdf', String.raw`See yes/no first. Convert ("/Users/O'Neil/Quoted "Draft"/SECRET.PDF") and [C:\O’Neil\Unpaired 'Draft\SECRET.PDF] to PDF`, 2,
+    ['secret.pdf', String.raw`See yes/no first. Convert ("/Users/O'Neil/Quoted "Draft"/SECRET.PDF") and [C:\O’Neil\Unpaired 'Draft\SECRET.PDF] to PDF`, 0,
       ['Users', "O'Neil", 'O’Neil', 'Quoted', 'Draft', 'SECRET.PDF']],
     ["O'Neil.pdf", String.raw`Convert "/Users/Alice/Private Files/O'NEIL.PDF" to PDF`, 2,
       ['Users', 'Alice', 'Private Files', "O'NEIL.PDF"]],
     ['O’Neil.pdf', String.raw`Convert [C:\Users\Alice\Private Files\O’NEIL.PDF] to PDF`, 2,
       ['Users', 'Alice', 'Private Files', 'O’NEIL.PDF']],
-    ['secret.pdf', `See yes/no first, then convert /Users/Alice/SECRET.PDF and Private\u00a0Folder/中文 空格/SECRET.PDF to PDF`, 2,
+    ['secret.pdf', `See yes/no first, then convert /Users/Alice/SECRET.PDF and Private\u00a0Folder/中文 空格/SECRET.PDF to PDF`, 0,
       ['Users', 'Alice', 'Private Folder', '中文 空格', 'SECRET.PDF']],
-    ['secret.pdf', `Please convert Private\u00a0Folder/中文 空格/SECRET.PDF and /Users/Alice/SECRET.PDF to PDF`, 2,
+    ['secret.pdf', `Please convert Private\u00a0Folder/中文 空格/SECRET.PDF and /Users/Alice/SECRET.PDF to PDF`, 0,
       ['Private Folder', '中文 空格', 'Users', 'Alice', 'SECRET.PDF']],
     ['secret.pdf', 'Convert /Users/Alice/Tax Returns/SECRET.PDF to PDF', 2,
       ['Users', 'Alice', 'Tax Returns', 'SECRET.PDF']],

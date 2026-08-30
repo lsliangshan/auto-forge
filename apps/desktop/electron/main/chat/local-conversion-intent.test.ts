@@ -21,12 +21,11 @@ describe('local conversion intent', () => {
     ['Convert /Users/Alice/PDF/secret.txt to WebP', 'webp', 'secret.txt'],
     ['转换 /Users/张三/PDF/资料.txt 为 WebP', 'webp', '资料.txt'],
     ['把这个附件保存为 JPG', 'jpeg', 'report.pdf'],
-    ['Convert report.pdf and REPORT.PDF to PDF', 'pdf', 'report.pdf'],
-    [String.raw`Convert /Users/A/report.pdf and C:\Private\REPORT.PDF to PDF`, 'pdf', 'report.pdf'],
   ] as const)('extracts the one trusted supported target from %s', (text, targetFormat, name) => {
     expect(classifyAttachmentConversionRequest(text, [{ ...attachments[0]!, name }])).toEqual({
       decision: 'local',
       targetFormat,
+      selectedAttachmentIndexes: [0],
     })
   })
 
@@ -38,6 +37,115 @@ describe('local conversion intent', () => {
     '转换这个附件，不要转为 PDF',
   ])('does not grant target authority to absent, unknown, conflicting, or negated targets: %s', (text) => {
     expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
+  })
+
+  it.each([
+    'Convert this attachment to PDF, then convert this attachment to WEBP',
+    'Convert this attachment to PDF, then convert this attachment to PDF',
+    '把这个附件转换为PDF，然后把这个附件转换为WEBP',
+    '把这个附件转换为PDF，然后把这个附件转换为PDF',
+    'Convert /tmp/report.pdf to PDF, then convert report.pdf to WEBP',
+    'Convert this attachment to PDF; convert this attachment to WEBP',
+    'Convert this attachment to PDF. Convert this attachment to PDF',
+    '把这个附件转换为PDF；把这个附件转换为WEBP',
+    '把这个附件转换为PDF。把这个附件转换为PDF',
+    'Convert this attachment to DOCX, then convert this attachment to PDF',
+    'Convert this attachment, then convert this attachment to PDF',
+  ])('rejects every request containing more than one executable conversion command: %s', (text) => {
+    expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
+  })
+
+  it.each([
+    'Convert 文件-1 to PDF',
+    'Convert 文件-2 to PDF',
+    'Convert 文件-999 to PDF',
+    'Convert \uE000AF-1\uE001 to PDF',
+    'Convert 文仵-1 to PDF',
+    'Convert prefix文件-1suffix to PDF',
+    'Convert report.pd to PDF',
+  ])('does not trust a user-authored attachment placeholder or inexact filename: %s', (text) => {
+    expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
+  })
+
+  it('maps every exact filename in a multi-attachment source list to one issued reference', () => {
+    const projected = [
+      { ...attachments[0]!, index: 0, name: 'alpha.pdf' },
+      { ...attachments[0]!, index: 1, name: 'beta.pdf' },
+    ]
+    expect(classifyAttachmentConversionRequest(
+      'Convert /tmp/ALPHA.PDF and C:\\Private\\beta.pdf to PDF',
+      projected,
+    )).toEqual({ decision: 'local', targetFormat: 'pdf', selectedAttachmentIndexes: [0, 1] })
+    expect(classifyAttachmentConversionRequest(
+      'Convert C:\\Private\\beta.pdf and /tmp/ALPHA.PDF to PDF',
+      projected,
+    )).toEqual({ decision: 'local', targetFormat: 'pdf', selectedAttachmentIndexes: [0, 1] })
+    expect(classifyAttachmentConversionRequest(
+      'Convert /tmp/ALPHA.PDF and C:\\Private\\wrong.pdf to PDF',
+      projected,
+    )).toEqual({ decision: 'ambiguous' })
+    expect(classifyAttachmentConversionRequest(
+      'Convert /tmp/ALPHA.PDF and /tmp/ALPHA.PDF to PDF',
+      projected,
+    )).toEqual({ decision: 'ambiguous' })
+  })
+
+  it.each([
+    ['Convert these attachments to PDF', 2, 'pdf'],
+    ['Convert all files to WEBP', 2, 'webp'],
+    ['Convert both attachments to JPG', 2, 'jpeg'],
+    ['把这些附件转换为 PDF', 2, 'pdf'],
+    ['把所有文件转换为 WEBP', 3, 'webp'],
+    ['把两个附件转换为 JPG', 2, 'jpeg'],
+  ] as const)('binds a controlled plural source to the actual attachment set: %s', (text, count, targetFormat) => {
+    const projected = Array.from({ length: count }, (_, index) => ({
+      ...attachments[0]!, index, name: `report-${index + 1}.pdf`,
+    }))
+    expect(classifyAttachmentConversionRequest(text, projected)).toEqual({
+      decision: 'local',
+      targetFormat,
+      selectedAttachmentIndexes: Array.from({ length: count }, (_, index) => index),
+    })
+  })
+
+  it.each([
+    ['Convert both files to PDF', 1],
+    ['Convert both files to PDF', 3],
+    ['Convert these files to PDF', 1],
+    ['把两个附件转换为 PDF', 1],
+    ['把两个附件转换为 PDF', 3],
+    ['把这些附件转换为 PDF', 1],
+  ] as const)('rejects plural source/count mismatches: %s with %s attachments', (text, count) => {
+    const projected = Array.from({ length: count }, (_, index) => ({
+      ...attachments[0]!, index, name: `report-${index + 1}.pdf`,
+    }))
+    expect(classifyAttachmentConversionRequest(text, projected)).toEqual({ decision: 'ambiguous' })
+  })
+
+  it('returns the exact selected attachment indexes and refuses ambiguous selection', () => {
+    const projected = [
+      { ...attachments[0]!, index: 0, name: 'report.pdf' },
+      { ...attachments[0]!, index: 1, name: 'photo.png', mimeType: 'image/png' },
+    ]
+    expect(classifyAttachmentConversionRequest('Convert report.pdf to PDF', projected)).toEqual({
+      decision: 'local', targetFormat: 'pdf', selectedAttachmentIndexes: [0],
+    })
+    expect(classifyAttachmentConversionRequest('Convert photo.png to WEBP', projected)).toEqual({
+      decision: 'local', targetFormat: 'webp', selectedAttachmentIndexes: [1],
+    })
+    expect(classifyAttachmentConversionRequest('Convert all files to PDF', projected)).toEqual({
+      decision: 'local', targetFormat: 'pdf', selectedAttachmentIndexes: [0, 1],
+    })
+    for (const text of [
+      'Convert this attachment to PDF',
+      'Convert report.pdf or photo.png to PDF',
+      'Convert report.pdf and REPORT.PDF to PDF',
+    ]) {
+      expect(classifyAttachmentConversionRequest(text, projected)).toEqual({ decision: 'ambiguous' })
+    }
+    expect(classifyAttachmentConversionRequest('Convert report.pdf to PDF', projected.map((item) => ({
+      ...item, name: 'report.pdf',
+    })))).toEqual({ decision: 'ambiguous' })
   })
 
   it.each([
@@ -104,7 +212,7 @@ describe('local conversion intent', () => {
   ])('accepts one fully consumed command after shielding its attachment path: %s', (text) => {
     expect(classifyAttachmentConversionRequest(text, [{
       ...attachments[0]!, name: 'secret.pdf', mimeType: 'application/pdf',
-    }])).toEqual({ decision: 'local', targetFormat: 'pdf' })
+    }])).toEqual({ decision: 'local', targetFormat: 'pdf', selectedAttachmentIndexes: [0] })
   })
 
   it.each([

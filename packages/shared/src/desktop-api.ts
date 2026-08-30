@@ -452,10 +452,23 @@ export const messagePageSchema = z.object({
 export type MessagePage = Omit<z.infer<typeof messagePageSchema>, 'items'> & { items: ChatMessage[] }
 
 export const messageProviderProjectionSchema = z.object({
+  version: z.literal(2),
   kind: z.literal('local_conversion'),
   targetFormat: conversionTargetFormatSchema,
   attachmentCount: z.number().int().min(1).max(5),
-}).strict()
+  selectedAttachmentIndexes: z.array(z.number().int().min(0).max(4)).min(1).max(5),
+}).strict().superRefine((value, context) => {
+  if (value.selectedAttachmentIndexes.some((index, position) => (
+    index >= value.attachmentCount
+    || (position > 0 && index <= value.selectedAttachmentIndexes[position - 1]!)
+  ))) {
+    context.addIssue({
+      code: 'custom',
+      path: ['selectedAttachmentIndexes'],
+      message: 'Selected attachment indexes must be unique, ordered, and in range.',
+    })
+  }
+})
 export type MessageProviderProjection = z.infer<typeof messageProviderProjectionSchema>
 
 export const messageAppendMutationPayloadSchema = chatMessageSchema.extend({

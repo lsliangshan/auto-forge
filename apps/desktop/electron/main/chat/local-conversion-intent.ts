@@ -17,10 +17,10 @@ export interface LocalAttachmentProjection {
 }
 
 const CHINESE_ATTACHMENT_REFERENCE = `(?:(?:(?:这|这个|该|当前|那|那个)?(?:张|个|份)?(?:附件|文件|图片|图像|照片|文档|视频|音频))|它们?)`
-const ENGLISH_ATTACHMENT_REFERENCE = `\\b(?:(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:attachment|file|image|photo|picture|document|video|audio)|it|them)\\b`
-const ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE = `\\b(?:(?:this|the|that|current|my|your|an?)\\s+(?:attachment|file|image|photo|picture|document|video|audio)|it|them)\\b`
-const CHINESE_NAMED_ATTACHMENT_REFERENCE = `(?:(?:这|这个|该|当前|那|那个)?(?:张|个|份)?(?:附件|文件|图片|图像|照片|文档|视频|音频))`
-const ENGLISH_NAMED_ATTACHMENT_REFERENCE = `\\b(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:attachment|file|image|photo|picture|document|video|audio)\\b`
+const ENGLISH_ATTACHMENT_REFERENCE = `\\b(?:(?:(?:this|the|that|current|my|your|an?|these|all|both)\\s+)?(?:attachments?|files?|images?|photos?|pictures?|documents?|videos?|audios?)|it|them)\\b`
+const ENGLISH_EXPLICIT_ATTACHMENT_REFERENCE = `\\b(?:(?:this|the|that|current|my|your|an?|these|all|both)\\s+(?:attachments?|files?|images?|photos?|pictures?|documents?|videos?|audios?)|it|them)\\b`
+const CHINESE_NAMED_ATTACHMENT_REFERENCE = `(?:(?:(?:这些|所有|两个|这两个)(?:附件|文件))|(?:(?:这|这个|该|当前|那|那个)?(?:张|个|份)?(?:附件|文件|图片|图像|照片|文档|视频|音频)))`
+const ENGLISH_NAMED_ATTACHMENT_REFERENCE = `\\b(?:(?:this|the|that|current|my|your|an?|these|all|both)\\s+)?(?:attachments?|files?|images?|photos?|pictures?|documents?|videos?|audios?)\\b`
 const FILENAME_REFERENCE_PATTERN = `[\\p{L}\\p{N}_+-][\\p{L}\\p{N}._+-]{0,63}\\.[A-Za-z0-9]{1,12}`
 const STRONG_CONVERSION_ACTION = [
   `(?<!万象)(?:转换|转成|转为)(?!率|器)`,
@@ -105,23 +105,21 @@ const TRUSTED_TARGET_ALIASES = new Map<string, ConversionTargetFormat>([
 ])
 const TRUSTED_TARGET_TOKEN = `(?:${[...TRUSTED_TARGET_ALIASES.keys()].join('|')})`
 const AUTHORITY_TARGET = `\\.?(?<target>${TRUSTED_TARGET_TOKEN})`
-const AUTHORITY_FILE_REFERENCE = `(?:[([]?\\s*["'“”]?(?:(?:[A-Za-z]:)?[\\\\/]|\\\\\\\\)?(?:[\\p{L}\\p{N}._+,'"’“” \\u00a0-]+[\\\\/])*文件-\\d+["'“”]?\\s*[)\\]]?)`
-const AUTHORITY_FILE_LIST = `${AUTHORITY_FILE_REFERENCE}(?:\\s+(?:and|or|和|与|及|以及)\\s+${AUTHORITY_FILE_REFERENCE})+`
+const AUTHORITY_SENTINEL_PREFIX = '\uE000AF-'
+const AUTHORITY_SENTINEL_SUFFIX = '\uE001'
+const AUTHORITY_SENTINEL = `${AUTHORITY_SENTINEL_PREFIX}\\d+${AUTHORITY_SENTINEL_SUFFIX}`
+const AUTHORITY_SENTINEL_PATTERN = /\uE000AF-(\d+)\uE001/gu
+const AUTHORITY_FILE_REFERENCE = `(?:[([]?\\s*["'“”]?(?:(?:[A-Za-z]:)?[\\\\/]|\\\\\\\\)?(?:[\\p{L}\\p{N}._+,'"’“” \\u00a0-]+[\\\\/])*${AUTHORITY_SENTINEL}["'“”]?\\s*[)\\]]?)`
+const AUTHORITY_FILE_LIST = `${AUTHORITY_FILE_REFERENCE}(?:\\s+(?:and|和|与|及|以及)\\s+${AUTHORITY_FILE_REFERENCE})+`
 const AUTHORITY_ENGLISH_REFERENCE = `(?:${AUTHORITY_FILE_REFERENCE}|(?:(?:this|the|that|current|my|your|an?)\\s+)?(?:attachment|file|image|photo|picture|document|video|audio))`
-const AUTHORITY_ENGLISH_SOURCE = `(?:${AUTHORITY_FILE_LIST}|${AUTHORITY_ENGLISH_REFERENCE}(?:\\s+from\\s+this\\s+conversation)?|(?:this\\s+)?(?:conversation|chat\\s+history)\\s+(?:(?:and|or|as\\s+well\\s+as|together\\s+with)\\s+${AUTHORITY_ENGLISH_REFERENCE})|${AUTHORITY_ENGLISH_REFERENCE}\\s+(?:and|or)\\s+(?:this\\s+)?(?:conversation|chat\\s+history)|(?:the\\s+)?attached\\s+文件-\\d+)`
 const AUTHORITY_CHINESE_REFERENCE = `(?:${AUTHORITY_FILE_REFERENCE}|(?:(?:这|这个|该|当前|那|那个)?(?:张|个|份)?(?:附件|文件|图片|图像|照片|文档|视频|音频)))`
-const AUTHORITY_CHINESE_SOURCE = `(?:${AUTHORITY_FILE_LIST}|${AUTHORITY_CHINESE_REFERENCE}|(?:这段|该段|当前)?(?:对话|聊天记录)(?:中(?:的)?)${AUTHORITY_CHINESE_REFERENCE}|(?:这段|该段|当前)?(?:对话|聊天记录)\\s*(?:和|与|及|以及)\\s*${AUTHORITY_CHINESE_REFERENCE}|${AUTHORITY_CHINESE_REFERENCE}\\s*(?:和|与|及|以及)\\s*(?:这段|该段|当前)?(?:对话|聊天记录))`
 const AUTHORITY_ENGLISH_POLITE = `(?:(?:please\\s*,?\\s*)|(?:(?:can|could|would)\\s+you\\s+)|(?:i\\s+(?:want|need|would\\s+like)\\s+you\\s+to\\s+))?(?:(?:just|directly)\\s+)?`
 const AUTHORITY_TERMINAL = `(?:\\s+(?:formats?|files?))?\\s*[.!?]*`
 const AUTHORITY_CHINESE_TERMINAL = `(?:\\s*(?:格式|文件))?\\s*[。！!？?]*`
-const AUTHORITY_COMMANDS = [
-  new RegExp(`^${AUTHORITY_ENGLISH_POLITE}(?:convert|transcode|reformat|encode|render|transform)\\s+${AUTHORITY_ENGLISH_SOURCE}\\s+(?:to|into|as)\\s+(?:an?\\s+)?${AUTHORITY_TARGET}${AUTHORITY_TERMINAL}$`, 'iu'),
-  new RegExp(`^${AUTHORITY_ENGLISH_POLITE}(?:save|export)\\s+${AUTHORITY_ENGLISH_SOURCE}\\s+as\\s+(?:an?\\s+)?${AUTHORITY_TARGET}${AUTHORITY_TERMINAL}$`, 'iu'),
-  new RegExp(`^${AUTHORITY_ENGLISH_POLITE}(?:make|turn|change)\\s+${AUTHORITY_ENGLISH_SOURCE}\\s+(?:to|into|as|an?)\\s+${AUTHORITY_TARGET}${AUTHORITY_TERMINAL}$`, 'iu'),
-  new RegExp(`^(?:请\\s*)?(?:(?:把|将)\\s*)?${AUTHORITY_CHINESE_SOURCE}\\s*(?:转换成|转换为|转成|转为|另存为|保存为|保存成|导出为|输出为|做成|制作成|改成|改为|换成|换为|变成|生成为)\\s*(?:一(?:个|份|张)\\s*)?${AUTHORITY_TARGET}${AUTHORITY_CHINESE_TERMINAL}$`, 'iu'),
-  new RegExp(`^(?:请\\s*)?(?:转换|保存|导出|输出)\\s*${AUTHORITY_CHINESE_SOURCE}\\s*(?:成|为)\\s*(?:一(?:个|份|张)\\s*)?${AUTHORITY_TARGET}${AUTHORITY_CHINESE_TERMINAL}$`, 'iu'),
-]
-const AUTHORITY_SEGMENT_RESTART = /(?:\bthen\b|然后|随后|[;；。.!！？?])\s*/giu
+const AUTHORITY_SEGMENT_SEPARATOR = /(?:[,，]\s*)?(?:\bthen\b|然后|随后)|[;；。.!！？?]/giu
+const AUTHORITY_INFORMATION_SEGMENT = /^\s*(?:no\s+matter\s+what\b|how\s+(?:do|can|could|would|should)\b|(?:what|which)\s+formats?\b|(?:can|could|does|do|will|would)\s+(?:this\s+(?:tool|converter)|it)\b|如何|怎么|(?:(?:这个工具|该工具|它|你)\s*)?(?:支持|能否|能不能|能|可以|能够))/iu
+const AUTHORITY_NEGATED_SEGMENT = /^\s*(?:不要|不用|不需要|无需|不必|别|禁止|请勿|do\s+not\b|don't\b|never\b|no\s+need\s+to\b|need\s+not\b|needn't\b)/iu
+const AUTHORITY_COMMAND_CACHE = new Map<number, readonly RegExp[]>()
 
 function conversionActionIsNegated(
   clause: string,
@@ -683,36 +681,87 @@ function baseAttachmentConversionIntent(
 export interface AttachmentConversionClassification {
   readonly decision: AttachmentConversionIntent
   readonly targetFormat?: ConversionTargetFormat
+  readonly selectedAttachmentIndexes?: readonly number[]
 }
 
 export function canonicalLocalConversionProviderPrompt(
-  attachmentCount: number,
+  selectedAttachmentIndexes: readonly number[],
   targetFormat: ConversionTargetFormat,
 ): string {
-  const indexes = Array.from({ length: attachmentCount }, (_, index) => index)
   return [
     '任务：选择并调用具备 file.convert 能力的本地工作流。',
-    `附件数量：${attachmentCount}`,
-    `附件索引：${indexes.join(', ')}`,
+    `附件数量：${selectedAttachmentIndexes.length}`,
+    `附件索引：${selectedAttachmentIndexes.join(', ')}`,
     `目标格式：${targetFormat}`,
     '禁止读取附件内容或调用非 file.convert 工具。',
   ].join('\n')
 }
 
 export function canonicalLocalConversionProviderTitle(
-  attachmentCount: number,
+  selectedAttachmentIndexes: readonly number[],
   targetFormat: ConversionTargetFormat,
 ): string {
-  return `本地文件转换 · ${attachmentCount} 个附件 · ${targetFormat.toUpperCase()}`
+  return `本地文件转换 · ${selectedAttachmentIndexes.length} 个附件 · ${targetFormat.toUpperCase()}`
 }
 
-function authorityTargetFromSegment(segment: string): ConversionTargetFormat | undefined {
-  for (const command of AUTHORITY_COMMANDS) {
+function authorityCommands(attachmentCount: number): readonly RegExp[] {
+  const cached = AUTHORITY_COMMAND_CACHE.get(attachmentCount)
+  if (cached !== undefined) return cached
+  const englishPlural = attachmentCount === 1
+    ? '(?:all\\s+(?:attachments|files))'
+    : attachmentCount === 2
+      ? '(?:(?:these|all|both)\\s+(?:attachments|files))'
+      : '(?:(?:these|all)\\s+(?:attachments|files))'
+  const chinesePlural = attachmentCount === 1
+    ? '(?:所有(?:附件|文件))'
+    : attachmentCount === 2
+      ? '(?:(?:这些|所有|两个|这两个)(?:附件|文件))'
+      : '(?:(?:这些|所有)(?:附件|文件))'
+  const englishSource = `(?:${AUTHORITY_FILE_LIST}|${englishPlural}|${AUTHORITY_ENGLISH_REFERENCE}(?:\\s+from\\s+this\\s+conversation)?|(?:this\\s+)?(?:conversation|chat\\s+history)\\s+(?:(?:and|or|as\\s+well\\s+as|together\\s+with)\\s+${AUTHORITY_ENGLISH_REFERENCE})|${AUTHORITY_ENGLISH_REFERENCE}\\s+(?:and|or)\\s+(?:this\\s+)?(?:conversation|chat\\s+history)|(?:the\\s+)?attached\\s+${AUTHORITY_SENTINEL})`
+  const chineseSource = `(?:${AUTHORITY_FILE_LIST}|${chinesePlural}|${AUTHORITY_CHINESE_REFERENCE}|(?:这段|该段|当前)?(?:对话|聊天记录)(?:中(?:的)?)${AUTHORITY_CHINESE_REFERENCE}|(?:这段|该段|当前)?(?:对话|聊天记录)\\s*(?:和|与|及|以及)\\s*${AUTHORITY_CHINESE_REFERENCE}|${AUTHORITY_CHINESE_REFERENCE}\\s*(?:和|与|及|以及)\\s*(?:这段|该段|当前)?(?:对话|聊天记录))`
+  const commands = Object.freeze([
+    new RegExp(`^${AUTHORITY_ENGLISH_POLITE}(?:convert|transcode|reformat|encode|render|transform)\\s+${englishSource}\\s+(?:to|into|as)\\s+(?:an?\\s+)?${AUTHORITY_TARGET}${AUTHORITY_TERMINAL}$`, 'iu'),
+    new RegExp(`^${AUTHORITY_ENGLISH_POLITE}(?:save|export)\\s+${englishSource}\\s+as\\s+(?:an?\\s+)?${AUTHORITY_TARGET}${AUTHORITY_TERMINAL}$`, 'iu'),
+    new RegExp(`^${AUTHORITY_ENGLISH_POLITE}(?:make|turn|change)\\s+${englishSource}\\s+(?:to|into|as|an?)\\s+${AUTHORITY_TARGET}${AUTHORITY_TERMINAL}$`, 'iu'),
+    new RegExp(`^(?:请\\s*)?(?:(?:把|将)\\s*)?${chineseSource}\\s*(?:转换成|转换为|转成|转为|另存为|保存为|保存成|导出为|输出为|做成|制作成|改成|改为|换成|换为|变成|生成为)\\s*(?:一(?:个|份|张)\\s*)?${AUTHORITY_TARGET}${AUTHORITY_CHINESE_TERMINAL}$`, 'iu'),
+    new RegExp(`^(?:请\\s*)?(?:转换|保存|导出|输出)\\s*${chineseSource}\\s*(?:成|为)\\s*(?:一(?:个|份|张)\\s*)?${AUTHORITY_TARGET}${AUTHORITY_CHINESE_TERMINAL}$`, 'iu'),
+  ])
+  AUTHORITY_COMMAND_CACHE.set(attachmentCount, commands)
+  return commands
+}
+
+function authoritySelectedAttachmentIndexes(
+  segment: string,
+  attachmentCount: number,
+): readonly number[] | undefined {
+  const signedIndexes = [...segment.matchAll(AUTHORITY_SENTINEL_PATTERN)]
+    .map((match) => Number(match[1]))
+  if (signedIndexes.length > 0) {
+    const unique = new Set(signedIndexes)
+    return unique.size === signedIndexes.length
+      && signedIndexes.every((index) => Number.isSafeInteger(index) && index >= 0 && index < attachmentCount)
+      ? Object.freeze([...signedIndexes].sort((left, right) => left - right))
+      : undefined
+  }
+  const plural = /\b(?:these|all|both)\s+(?:attachments|files)\b/iu.test(segment)
+    || /(?:这些|所有|两个|这两个)(?:附件|文件)/u.test(segment)
+  if (plural) return Object.freeze(Array.from({ length: attachmentCount }, (_, index) => index))
+  return attachmentCount === 1 ? Object.freeze([0]) : undefined
+}
+
+function authorityTargetFromSegment(
+  segment: string,
+  attachmentCount: number,
+): { targetFormat: ConversionTargetFormat; selectedAttachmentIndexes: readonly number[] } | undefined {
+  for (const command of authorityCommands(attachmentCount)) {
     const token = command.exec(segment.trim())?.groups?.target
       ?.replace(/^\./u, '')
       .toLocaleLowerCase('und')
     const target = token === undefined ? undefined : TRUSTED_TARGET_ALIASES.get(token)
-    if (target !== undefined) return target
+    const selectedAttachmentIndexes = authoritySelectedAttachmentIndexes(segment, attachmentCount)
+    if (target !== undefined && selectedAttachmentIndexes !== undefined) {
+      return { targetFormat: target, selectedAttachmentIndexes }
+    }
   }
   return undefined
 }
@@ -720,45 +769,63 @@ function authorityTargetFromSegment(segment: string): ConversionTargetFormat | u
 function inheritedChineseTargetFromSegment(
   segment: string,
   prefix: string,
-): ConversionTargetFormat | undefined {
-  if (!/(?:如何|怎么)[^，,；;。.!！？?]{0,96}(?:附件|文件|图片|图像|照片|文档|视频|音频)/u
-    .test(prefix)) return undefined
+  attachmentCount: number,
+  authorityAntecedent: readonly number[] | undefined,
+): { targetFormat: ConversionTargetFormat; selectedAttachmentIndexes: readonly number[] } | undefined {
+  if (authorityAntecedent === undefined
+    && !/(?:如何|怎么)[^，,；;。.!！？?]{0,96}(?:附件|文件|图片|图像|照片|文档|视频|音频)/u
+      .test(prefix)) return undefined
+  const selectedAttachmentIndexes = authorityAntecedent
+    ?? authoritySelectedAttachmentIndexes(prefix, attachmentCount)
+  if (selectedAttachmentIndexes === undefined) return undefined
   const match = new RegExp(
     `^(?:请\\s*)?(?:直接\\s*)?(?:转换成|转换为|转成|转为|另存为|保存为|保存成|导出为|输出为)\\s*(?:一(?:个|份|张)\\s*)?${AUTHORITY_TARGET}${AUTHORITY_CHINESE_TERMINAL}$`,
     'iu',
   ).exec(segment.trim())
   const token = match?.groups?.target?.replace(/^\./u, '').toLocaleLowerCase('und')
-  return token === undefined ? undefined : TRUSTED_TARGET_ALIASES.get(token)
+  const targetFormat = token === undefined ? undefined : TRUSTED_TARGET_ALIASES.get(token)
+  return targetFormat === undefined ? undefined : { targetFormat, selectedAttachmentIndexes }
 }
 
 function inheritedEnglishTargetFromSegment(
   segment: string,
   prefix: string,
-): ConversionTargetFormat | undefined {
-  if (!/文件-\d+/u.test(prefix)) return undefined
+  attachmentCount: number,
+  authorityAntecedent: readonly number[] | undefined,
+): { targetFormat: ConversionTargetFormat; selectedAttachmentIndexes: readonly number[] } | undefined {
+  if (authorityAntecedent === undefined && !prefix.includes(AUTHORITY_SENTINEL_PREFIX)) return undefined
+  const selectedAttachmentIndexes = authorityAntecedent
+    ?? authoritySelectedAttachmentIndexes(prefix, attachmentCount)
+  if (selectedAttachmentIndexes === undefined) return undefined
   const match = new RegExp(
     `^${AUTHORITY_ENGLISH_POLITE}(?:(?:convert|transcode|reformat|encode|render|transform)\\s+(?:it|them)\\s+(?:to|into|as)|(?:save|export)\\s+(?:it|them)\\s+as)\\s+(?:an?\\s+)?${AUTHORITY_TARGET}${AUTHORITY_TERMINAL}$`,
     'iu',
   ).exec(segment.trim())
   const token = match?.groups?.target?.replace(/^\./u, '').toLocaleLowerCase('und')
-  return token === undefined ? undefined : TRUSTED_TARGET_ALIASES.get(token)
+  const targetFormat = token === undefined ? undefined : TRUSTED_TARGET_ALIASES.get(token)
+  return targetFormat === undefined ? undefined : { targetFormat, selectedAttachmentIndexes }
 }
 
 function authoritySegments(text: string): Array<{ prefix: string; segment: string }> {
-  const segments = [{ prefix: '', segment: text }]
-  for (const restart of text.matchAll(AUTHORITY_SEGMENT_RESTART)) {
-    if (restart.index === undefined) continue
-    const end = restart.index + restart[0].length
-    if (end < text.length) segments.push({ prefix: text.slice(0, restart.index), segment: text.slice(end) })
+  const segments: Array<{ prefix: string; segment: string }> = []
+  let start = 0
+  for (const separator of text.matchAll(AUTHORITY_SEGMENT_SEPARATOR)) {
+    if (separator.index === undefined) continue
+    const segment = text.slice(start, separator.index).trim()
+    if (segment !== '') segments.push({ prefix: text.slice(0, start), segment })
+    start = separator.index + separator[0].length
   }
-  return segments.reverse()
+  const segment = text.slice(start).trim()
+  if (segment !== '') segments.push({ prefix: text.slice(0, start), segment })
+  return segments
 }
 
 function replaceAuthorityAttachmentBasenames(
   text: string,
   attachments: readonly LocalAttachmentProjection[],
-): string {
+): string | undefined {
   const normalized = text.normalize('NFKC')
+  if (/[\uE000-\uF8FF]/u.test(normalized)) return undefined
   const fold = (value: string): string => value
     .normalize('NFKD')
     .toLocaleLowerCase('und')
@@ -780,8 +847,8 @@ function replaceAuthorityAttachmentBasenames(
     sourceOffset += scalar.length
   }
   const foldedText = foldedParts.join('')
-  const matches: Array<{ start: number; end: number; replacement: string }> = []
-  for (const attachment of attachments) {
+  const matches: Array<{ start: number; end: number; replacement: string; ordinal: number }> = []
+  for (const [ordinal, attachment] of attachments.entries()) {
     const basename = attachment.name.normalize('NFKC').split(/[\\/]/u).at(-1) ?? ''
     const foldedName = fold(basename)
     if (!foldedName) continue
@@ -793,10 +860,22 @@ function replaceAuthorityAttachmentBasenames(
       if (start !== undefined && end !== undefined
         && !/[\p{L}\p{N}._+-]/u.test(normalized[start - 1] ?? '')
         && !/[\p{L}\p{N}._+-]/u.test(normalized[end] ?? '')) {
-        matches.push({ start, end, replacement: `文件-${attachment.index + 1}` })
+        matches.push({
+          start,
+          end,
+          replacement: `${AUTHORITY_SENTINEL_PREFIX}${ordinal}${AUTHORITY_SENTINEL_SUFFIX}`,
+          ordinal,
+        })
       }
       offset = found + Math.max(1, foldedName.length)
     }
+  }
+  const ambiguousSpans = new Map<string, number>()
+  for (const match of matches) {
+    const key = `${match.start}:${match.end}`
+    const existing = ambiguousSpans.get(key)
+    if (existing !== undefined && existing !== match.ordinal) return undefined
+    ambiguousSpans.set(key, match.ordinal)
   }
   matches.sort((left, right) => left.start - right.start || right.end - left.end)
   const output: string[] = []
@@ -813,27 +892,54 @@ function replaceAuthorityAttachmentBasenames(
 function trustedUniqueTargetFormat(
   text: string,
   attachments: readonly LocalAttachmentProjection[],
-): { targetFormat: ConversionTargetFormat; restarted: boolean } | undefined {
+): {
+  targetFormat: ConversionTargetFormat
+  selectedAttachmentIndexes: readonly number[]
+  restarted: boolean
+} | undefined {
   const normalized = replaceAuthorityAttachmentBasenames(
     text.normalize('NFKC').replace(/[‘’]/gu, "'"),
     attachments,
   )
+  if (normalized === undefined) return undefined
+  const authorities: Array<{
+    targetFormat: ConversionTargetFormat
+    selectedAttachmentIndexes: readonly number[]
+    restarted: boolean
+  }> = []
+  let authorityAntecedent: readonly number[] | undefined
+  let hasUntrustedExecutableSegment = false
   for (const { prefix, segment } of authoritySegments(normalized)) {
-    const target = authorityTargetFromSegment(segment)
-      ?? inheritedChineseTargetFromSegment(segment, prefix)
-      ?? inheritedEnglishTargetFromSegment(segment, prefix)
-    if (target === undefined) continue
-    const prefixHasExecutableTarget = authoritySegments(prefix)
-      .some(({ segment: precedingSegment }) => authorityTargetFromSegment(precedingSegment) !== undefined)
-    if (prefixHasExecutableTarget) {
-      return undefined
+    const directAuthority = authorityTargetFromSegment(segment, attachments.length)
+    const authority = directAuthority
+      ?? inheritedChineseTargetFromSegment(
+        segment,
+        prefix,
+        attachments.length,
+        authorityAntecedent,
+      )
+      ?? inheritedEnglishTargetFromSegment(
+        segment,
+        prefix,
+        attachments.length,
+        authorityAntecedent,
+      )
+    if (authority === undefined) {
+      if (hasConversionRiskSignal(segment)
+        && !AUTHORITY_INFORMATION_SEGMENT.test(segment)
+        && !AUTHORITY_NEGATED_SEGMENT.test(segment)) {
+        hasUntrustedExecutableSegment = true
+      }
+      continue
     }
-    return {
-      targetFormat: target,
+    authorities.push({
+      targetFormat: authority.targetFormat,
+      selectedAttachmentIndexes: authority.selectedAttachmentIndexes,
       restarted: prefix !== '' && baseAttachmentConversionIntent(segment, attachments) === 'local',
-    }
+    })
+    if (directAuthority !== undefined) authorityAntecedent = directAuthority.selectedAttachmentIndexes
   }
-  return undefined
+  return !hasUntrustedExecutableSegment && authorities.length === 1 ? authorities[0] : undefined
 }
 
 export function classifyAttachmentConversionRequest(
@@ -844,7 +950,11 @@ export function classifyAttachmentConversionRequest(
   const decision = baseAttachmentConversionIntent(text, attachments)
   const authority = trustedUniqueTargetFormat(text, attachments)
   if (authority !== undefined && (decision === 'local' || authority.restarted)) {
-    return Object.freeze({ decision: 'local', targetFormat: authority.targetFormat })
+    return Object.freeze({
+      decision: 'local',
+      targetFormat: authority.targetFormat,
+      selectedAttachmentIndexes: Object.freeze([...authority.selectedAttachmentIndexes]),
+    })
   }
   return decision === 'local'
     ? Object.freeze({ decision: 'ambiguous' })

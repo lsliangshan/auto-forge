@@ -25,6 +25,14 @@ const projectionFeatureUrl = new URL(
   '../../cloudbase/user-data/migrations/0002_message_provider_projection.sql',
   import.meta.url,
 )
+const projectionV2AdditiveUrl = new URL(
+  '../../cloudbase/migrations/20260830213000_message_provider_projection_v2.sql',
+  import.meta.url,
+)
+const projectionV2FeatureUrl = new URL(
+  '../../cloudbase/user-data/migrations/0003_message_provider_projection_v2.sql',
+  import.meta.url,
+)
 
 const tableNames = [
   'app_conversations',
@@ -74,6 +82,22 @@ describe('CloudBase user data migration', () => {
     ])
 
     expect(canonical).toBe(featureCopy)
+  })
+
+  it('upgrades projections to version 2 with an ordered selected attachment set', async () => {
+    const [additive, featureCopy] = await Promise.all([
+      readFile(projectionV2AdditiveUrl, 'utf8'),
+      readFile(projectionV2FeatureUrl, 'utf8'),
+    ])
+    expect(additive).toBe(featureCopy)
+    expect(additive).toContain("provider_projection->>'version' IS DISTINCT FROM '2'")
+    expect(additive).toContain(
+      "jsonb_typeof(provider_projection->'selectedAttachmentIndexes') IS DISTINCT FROM 'array'",
+    )
+    expect(additive).toContain("projection->'selectedAttachmentIndexes'")
+    expect(additive).toContain('jsonb_array_elements_text')
+    expect(additive).toContain('selected_text::integer <= previous_text::integer')
+    expect(additive).toContain('SET provider_projection = NULL')
   })
 
   it('stores only constrained canonical projections and returns them from push/list/bootstrap', async () => {

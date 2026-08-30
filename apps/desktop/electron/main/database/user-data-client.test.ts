@@ -564,17 +564,27 @@ describe('UserDataStoreManager', () => {
             assetId: 'projection_remote_asset', kind: 'file' as const, purpose: 'input' as const,
             name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 1,
           },
+          {
+            type: 'media' as const, blockId: 'projection_remote_block_2',
+            assetId: 'projection_remote_asset_2', kind: 'image' as const, purpose: 'input' as const,
+            name: 'photo.png', mimeType: 'image/png', byteSize: 2,
+          },
         ],
         providerProjection: {
+          version: 2 as const,
           kind: 'local_conversion' as const,
           targetFormat: 'pdf' as const,
-          attachmentCount: 1,
+          attachmentCount: 2,
+          selectedAttachmentIndexes: [0],
         },
       },
     }
     local.outbox.recordWithMessage(append)
     expect(local.outbox.find(append.id)?.payload).toMatchObject({
-      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
+      providerProjection: {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 2,
+        selectedAttachmentIndexes: [0],
+      },
     })
 
     const remote = manager.open('projection-remote')
@@ -584,7 +594,16 @@ describe('UserDataStoreManager', () => {
       mutations: [pulledMutation(create, 1), pulledMutation(append, 2)],
     }, 1)
     expect(remote.messages.get(append.payload.id)?.providerProjection).toEqual({
-      kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+      version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 2,
+      selectedAttachmentIndexes: [0],
+    })
+    expect(serializeHistoricalMessage(remote.messages.get(append.payload.id)!)).toEqual({
+      role: 'user',
+      content: expect.stringContaining('附件索引：0'),
+    })
+    expect(serializeHistoricalMessage(remote.messages.get(append.payload.id)!)).toEqual({
+      role: 'user',
+      content: expect.stringContaining('附件数量：1'),
     })
 
     const malformed = pulledMutation({
@@ -595,7 +614,10 @@ describe('UserDataStoreManager', () => {
       payload: {
         ...append.payload,
         id: 'projection_spoof_message',
-        providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 0 },
+        providerProjection: {
+          version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 2,
+          selectedAttachmentIndexes: [1],
+        },
       },
     } as unknown as Extract<SyncMutation, { kind: 'message.append' }>, 3)
     remote.sync.applyRemotePage({
@@ -614,6 +636,7 @@ describe('UserDataStoreManager', () => {
         id: 'projection_unknown_version_message',
         providerProjection: {
           version: 99, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+          selectedAttachmentIndexes: [0],
         },
       },
     } as unknown as Extract<SyncMutation, { kind: 'message.append' }>, 4)
@@ -656,6 +679,14 @@ describe('UserDataStoreManager', () => {
     ['转换这个附件并附带备注：保存为 WEBP', 'webp'],
     ['转换这个附件同时其元数据推荐输出为 WEBP', 'webp'],
     ['转换这个附件，而其文件名注明保存为 PDF', 'pdf'],
+    ['Convert this attachment to PDF, then convert this attachment to WEBP', 'webp'],
+    ['Convert this attachment to PDF, then convert this attachment to PDF', 'pdf'],
+    ['把这个附件转换为PDF，然后把这个附件转换为WEBP', 'webp'],
+    ['把这个附件转换为PDF，然后把这个附件转换为PDF', 'pdf'],
+    ['Convert /tmp/report.pdf to PDF, then convert report.pdf to WEBP', 'webp'],
+    ['Convert 文件-1 to PDF', 'pdf'],
+    ['Convert 文件-999 to PDF', 'pdf'],
+    ['Convert \uE000AF-1\uE001 to PDF', 'pdf'],
   ] as const)('discards a forged remote projection after Main reclassification: %s', (text, targetFormat) => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open(`projection-forged-${targetFormat}-${text.length}`)
@@ -678,7 +709,8 @@ describe('UserDataStoreManager', () => {
           },
         ],
         providerProjection: {
-          kind: 'local_conversion' as const, targetFormat, attachmentCount: 1,
+          version: 2 as const, kind: 'local_conversion' as const, targetFormat, attachmentCount: 1,
+          selectedAttachmentIndexes: [0],
         },
       },
     }

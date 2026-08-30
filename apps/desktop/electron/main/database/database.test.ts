@@ -2346,12 +2346,18 @@ describe('openAppDatabase', () => {
           kind: 'file', purpose: 'input', name: 'private.pdf', mimeType: 'application/pdf', byteSize: 1,
         },
       ],
-      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 }, createdAt: 1,
+      providerProjection: {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        selectedAttachmentIndexes: [0],
+      }, createdAt: 1,
     })
 
     expect(database.messages.get('message_provider_projection')).toMatchObject({
       blocks: expect.arrayContaining([{ type: 'text', text: '/Users/Alice/private.pdf' }]),
-      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
+      providerProjection: {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        selectedAttachmentIndexes: [0],
+      },
     })
 
     database.raw.prepare(`

@@ -343,7 +343,7 @@ describe('WorkflowToolExecutor', () => {
       },
     })
     const test = harness({ detail })
-    const attachments = conversionBindings()
+    const attachments = conversionBindings().slice(0, 1)
     const originalAttachments = structuredClone(attachments)
     const prepared = await test.executor.prepare({
       candidate: test.candidate,
@@ -411,6 +411,45 @@ describe('WorkflowToolExecutor', () => {
     })
     expect(startInput.fileConvertAuthorization.attachments)
       .not.toContainEqual(expect.objectContaining({ index: 1 }))
+  })
+
+  it('passes only the exact nonzero selected attachment index to approval and the Worker', async () => {
+    const detail = workflow({
+      cities: [],
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf'] } }],
+      inputSchema: {
+        type: 'object', additionalProperties: false, required: ['files', 'targetFormat'],
+        properties: {
+          files: { type: 'array', items: { type: 'integer' }, minItems: 1, uniqueItems: true },
+          targetFormat: { const: 'pdf' },
+        },
+      },
+    })
+    const test = harness({ detail })
+    const selected = [conversionBindings()[1]!]
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { input: { files: [1], targetFormat: 'pdf' } },
+      developerMode: true,
+      attachmentBindings: selected,
+    })
+    if (prepared.kind !== 'awaiting_approval') throw new Error('expected approval')
+    expect(prepared.pending.actionSummary).toContain('附件 1：second.png')
+    const approved = await test.executor.approve(prepared.pending, onceDecision(prepared.pending))
+    if (approved.kind !== 'ready') throw new Error('expected ready')
+    await test.executor.start(approved.pending, {
+      userId: 'user_1', conversationId: 'conversation_1', chatRunId: 'run_1',
+    })
+    expect(test.executions.startReserved).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        attachmentBindings: selected,
+        fileConvertAuthorization: expect.objectContaining({
+          attachments: [{ index: 1, sourceFingerprint: 'c'.repeat(64) }],
+        }),
+      }),
+      undefined,
+    )
   })
 
   it('fails file conversion closed when tool arguments reference no current attachment', async () => {

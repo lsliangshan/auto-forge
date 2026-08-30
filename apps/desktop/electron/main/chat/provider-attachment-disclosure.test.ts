@@ -275,7 +275,7 @@ describe('provider attachment disclosure', () => {
     const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
     const plan = authority.createPlan({
       requestId: 'request_canonical_local',
-      text: 'See yes/no and /Users/Alice/Tax Return Records/private.pdf, then convert it to JPG',
+      text: 'See yes/no and /Users/Alice/Tax Return Records/private.pdf and other.pdf, then convert them to JPG',
       context: { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['file', 'file'] },
       attachments: [
         {
@@ -291,6 +291,7 @@ describe('provider attachment disclosure', () => {
 
     expect(plan.access.decision).toBe('local')
     expect(plan.targetFormat).toBe('jpeg')
+    expect(plan.selectedAttachmentIndexes).toEqual([0, 1])
     expect(plan.mainText).toBe([
       '任务：选择并调用具备 file.convert 能力的本地工作流。',
       '附件数量：2',

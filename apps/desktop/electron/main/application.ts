@@ -3262,9 +3262,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             if (localConversionIntent) {
               modelContent = attachmentDisclosure!.mainSafeText.text
               currentMedia = []
-              attachmentBindings = Object.freeze(protectedAssets.map(({
+              const selectedAttachmentIndexes = new Set(privacyPlan.selectedAttachmentIndexes!)
+              attachmentBindings = Object.freeze(protectedAssets.flatMap(({
                 asset, sourceFingerprint,
               }, index) => {
+                if (!selectedAttachmentIndexes.has(index)) return []
                 return Object.freeze({
                   attachmentIndex: index,
                   ownerUserId: session.user.id,
@@ -3321,6 +3323,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 ...(localConversionIntent ? {
                   localConversionOnly: true,
                   localConversionTarget: privacyPlan.targetFormat!,
+                  localConversionAttachmentIndexes: privacyPlan.selectedAttachmentIndexes!,
                 } : {}),
                 ...(attachmentDecision === 'ambiguous'
                   ? { fixedResponse: AMBIGUOUS_CONVERSION_CLARIFICATION }

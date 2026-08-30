@@ -464,6 +464,7 @@ export interface AgentRunInput extends UsageAttribution {
   fixedResponse?: string
   localConversionOnly?: boolean
   localConversionTarget?: ConversionTargetFormat
+  localConversionAttachmentIndexes?: readonly number[]
   allowTools: boolean
   readonly supportsImageInput: boolean
   provider: ModelProviderId
@@ -586,14 +587,22 @@ function immutableClone<T>(value: T, seen = new WeakSet<object>()): T {
 function boundConversionCandidate(
   candidate: WorkflowCandidate,
   targetFormat: ConversionTargetFormat,
+  selectedAttachmentIndexes: readonly number[],
 ): WorkflowCandidate {
   const tool = structuredClone(candidate.tool)
   const parameters = tool.function.parameters as {
-    properties?: { input?: { properties?: { targetFormat?: Record<string, unknown> } } }
+    properties?: { input?: { properties?: {
+      targetFormat?: Record<string, unknown>
+      files?: Record<string, unknown>
+    } } }
   }
   const targetSchema = parameters.properties?.input?.properties?.targetFormat
-  if (targetSchema === undefined) throw appFailure('INVALID_INPUT')
+  const filesSchema = parameters.properties?.input?.properties?.files
+  if (targetSchema === undefined || filesSchema === undefined) throw appFailure('INVALID_INPUT')
   targetSchema.enum = [targetFormat]
+  filesSchema.items = { type: 'integer', enum: [...selectedAttachmentIndexes] }
+  filesSchema.minItems = selectedAttachmentIndexes.length
+  filesSchema.maxItems = selectedAttachmentIndexes.length
   return Object.freeze({ ...candidate, tool: immutableClone(tool) })
 }
 
@@ -897,7 +906,13 @@ export class AgentOrchestrator {
         if (input.localConversionOnly) {
           if (input.summaryProviderSnapshot !== undefined
             || input.localConversionTarget === undefined
-            || input.attachmentDisclosure?.targetFormat !== input.localConversionTarget) {
+            || input.localConversionAttachmentIndexes === undefined
+            || input.attachmentDisclosure?.targetFormat !== input.localConversionTarget
+            || input.attachmentDisclosure.selectedAttachmentIndexes?.length
+              !== input.localConversionAttachmentIndexes.length
+            || input.attachmentDisclosure.selectedAttachmentIndexes.some((index, position) => (
+              index !== input.localConversionAttachmentIndexes![position]
+            ))) {
             throw appFailure('CONFLICT')
           }
         } else {
@@ -926,9 +941,11 @@ export class AgentOrchestrator {
         createdAt: startedAt,
         ...(input.localConversionOnly ? {
           providerProjection: Object.freeze({
+            version: 2 as const,
             kind: 'local_conversion' as const,
             targetFormat: input.localConversionTarget!,
             attachmentCount: input.assetIds.length,
+            selectedAttachmentIndexes: [...input.localConversionAttachmentIndexes!],
           }),
         } : {}),
       })
@@ -1013,7 +1030,11 @@ export class AgentOrchestrator {
         const conversionCandidates = input.localConversionOnly
           ? catalog.filter(({ workflow }) => workflow.permissions.some(({ capability }) => (
               capability === 'file.convert'
-            ))).map((candidate) => boundConversionCandidate(candidate, input.localConversionTarget!))
+            ))).map((candidate) => boundConversionCandidate(
+              candidate,
+              input.localConversionTarget!,
+              input.localConversionAttachmentIndexes!,
+            ))
           : undefined
         const exactCandidate = conversionCandidates === undefined
           ? exactWorkflowCandidate(input.content, catalog)
