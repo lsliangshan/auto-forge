@@ -385,6 +385,10 @@ export function anonymizeAttachmentNames(
     sourceOffset += scalar.length
   }
   const foldedText = foldedParts.join('')
+  const lexicalTokenCounts = new Map<string, number>()
+  for (const token of normalized.match(/[\p{L}\p{N}]+/gu) ?? []) {
+    lexicalTokenCounts.set(token, (lexicalTokenCounts.get(token) ?? 0) + 1)
+  }
   const basenameMatches: Array<{ start: number; end: number; text: string }> = []
   const candidates = [...attachments].map((attachment) => ({
     attachment,
@@ -418,14 +422,38 @@ export function anonymizeAttachmentNames(
 
   const replacements: typeof basenameMatches = []
   const quoteCharacters = new Set(['"', "'", '“', '”', '‘', '’'])
-  const terminalPath = matches.length === 1
-    && /^[\s"'“”‘’\])}]*$/u.test(normalized.slice(matches[0]!.end))
   let quoteStart: number | undefined
-  let fieldStart = 0
-  let tokenStart = 0
-  let inWhitespace = false
+  let segmentTokenStarts: number[] = []
+  let currentTokenStart: number | undefined
   let pathStart: number | undefined
   let matchIndex = 0
+  const finishSegmentToken = () => {
+    if (currentTokenStart !== undefined) segmentTokenStarts.push(currentTokenStart)
+    currentTokenStart = undefined
+  }
+  const relativeSegmentStart = (segmentEnd: number): number | undefined => {
+    finishSegmentToken()
+    if (segmentTokenStarts.length === 0) return undefined
+    const last = segmentTokenStarts.at(-1)!
+    if (segmentTokenStarts.length === 1) return last
+    const previous = segmentTokenStarts.at(-2)!
+    const previousToken = normalized.slice(previous, last).trim().replace(/^["'“‘([{]+|["'”’\])}]+$/gu, '')
+    const lastToken = normalized.slice(last, segmentEnd).trim().replace(/^["'“‘([{]+|["'”’\])}]+$/gu, '')
+    const multiWordPathSegment = (
+      (/^\p{Lu}/u.test(previousToken) && /^\p{Lu}/u.test(lastToken))
+      || (!/^[\p{ASCII}]+$/u.test(previousToken) && !/^[\p{ASCII}]+$/u.test(lastToken))
+    )
+    const repeatedLeadingToken = (lexicalTokenCounts.get(previousToken) ?? 0) > 1
+    return multiWordPathSegment && !repeatedLeadingToken ? previous : last
+  }
+  const shouldRestartRelativePath = (segmentEnd: number): boolean => {
+    if (segmentTokenStarts.length < 3) return false
+    const tokens = segmentTokenStarts.map((start, index) => normalized
+      .slice(start, segmentTokenStarts[index + 1] ?? segmentEnd)
+      .trim()
+      .replace(/^["'“‘([{]+|["'”’\])}]+$/gu, ''))
+    return tokens.every((token) => /^[a-z][a-z0-9:.-]*$/u.test(token))
+  }
   for (let offset = 0; offset < normalized.length;) {
     const match = matches[matchIndex]
     if (match !== undefined && offset === match.start) {
@@ -436,9 +464,8 @@ export function anonymizeAttachmentNames(
         text: match.text,
       })
       offset = match.end
-      fieldStart = offset
-      tokenStart = offset
-      inWhitespace = false
+      segmentTokenStarts = []
+      currentTokenStart = undefined
       pathStart = undefined
       matchIndex += 1
       continue
@@ -450,9 +477,7 @@ export function anonymizeAttachmentNames(
     if (quoteCharacters.has(character) && !wordApostrophe && pathStart === undefined) {
       if (quoteStart === undefined) {
         quoteStart = offset + 1
-        fieldStart = offset
-        tokenStart = offset
-        inWhitespace = false
+        if (currentTokenStart === undefined) currentTokenStart = offset
       } else {
         quoteStart = undefined
       }
@@ -468,22 +493,23 @@ export function anonymizeAttachmentNames(
       const isDrivePath = character === '\\'
         && offset >= 2
         && /[A-Za-z]:/u.test(normalized.slice(offset - 2, offset))
-      if (pathStart === undefined || isAbsoluteUnixPath || isUncPath || isDrivePath) {
+      const relativeStart = relativeSegmentStart(offset)
+      if (pathStart === undefined || isAbsoluteUnixPath || isUncPath || isDrivePath
+        || shouldRestartRelativePath(offset)) {
         if (quotedRootBoundary && quoteStart === undefined) quoteStart = offset
         pathStart = quoteStart ?? (isAbsoluteUnixPath
           ? offset
-          : isDrivePath ? offset - 2 : terminalPath ? fieldStart : tokenStart)
+          : isUncPath ? offset : isDrivePath ? offset - 2 : relativeStart ?? offset)
       }
+      segmentTokenStarts = []
+      currentTokenStart = undefined
     } else if (pathStart === undefined && /[([{]/u.test(character)) {
-      fieldStart = offset + 1
-      tokenStart = offset + 1
-      inWhitespace = false
-    } else if (pathStart === undefined && /\s/u.test(character)) {
-      if (!inWhitespace) tokenStart = offset + 1
-      inWhitespace = true
-    } else if (pathStart === undefined) {
-      if (inWhitespace) tokenStart = offset
-      inWhitespace = false
+      segmentTokenStarts = []
+      currentTokenStart = undefined
+    } else if (/\s/u.test(character)) {
+      finishSegmentToken()
+    } else {
+      if (currentTokenStart === undefined) currentTokenStart = offset
     }
     offset += 1
   }

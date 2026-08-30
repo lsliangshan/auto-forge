@@ -516,6 +516,20 @@ describe('local conversion intent', () => {
     }])).toBe(expected)
   })
 
+  it.each([
+    ['Convert Private Folder/SECRET.PDF to PDF', 'Convert 文件-1 to PDF'],
+    ['Please convert Private\u00a0Folder/SECRET.PDF to PDF', 'Please convert 文件-1 to PDF'],
+    ['Convert 中文 空格/资料/SECRET.PDF to PDF', 'Convert 文件-1 to PDF'],
+    ['Convert “Draft” Folder/SECRET.PDF to PDF', 'Convert 文件-1 to PDF'],
+    ['See yes/no then private/Legal/SECRET.PDF', 'See yes/no then 文件-1'],
+    ['Read https://example.test/a/b then private/Legal/SECRET.PDF', 'Read https://example.test/a/b then 文件-1'],
+    ['Convert /Users/Alice/SECRET.PDF and Private Folder/SECRET.PDF to PDF', 'Convert 文件-1 and 文件-1 to PDF'],
+  ])('finds an independent non-terminal relative path span without consuming prose: %s', (request, expected) => {
+    expect(anonymizeAttachmentNames(request, [{
+      index: 0, name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])).toBe(expected)
+  })
+
   it('keeps ordinary slash-separated prose that does not end in an attachment basename', () => {
     expect(projectLocalConversionPrompt('说明 yes/no 选项', [{
       index: 0, name: 'report.pdf', mimeType: 'application/pdf', byteSize: 12,

@@ -83,13 +83,17 @@ export function providerAttachmentAccess(
     && context.attachmentKinds.some((kind) => kind !== 'image')) {
     return issueAccessDecision('ambiguous')
   }
+  const strictImageReferenceEdit = context.requestedOutput === 'image'
+    && IMAGE_REFERENCE_EDIT.test(text)
+    && !MEDIA_FORMAT_TARGET.test(text)
+  if (strictImageReferenceEdit && context.attachmentKinds.some((kind) => kind !== 'image')) {
+    return issueAccessDecision('ambiguous')
+  }
   if (!context.hasAttachments) return issueAccessDecision('ordinary')
   if (decision === 'local') return issueAccessDecision('local')
   const imageReferenceEdit = decision === 'ordinary'
-    && context.requestedOutput === 'image'
+    && strictImageReferenceEdit
     && context.attachmentKinds.includes('image')
-    && IMAGE_REFERENCE_EDIT.test(text)
-    && !MEDIA_FORMAT_TARGET.test(text)
   if (imageReferenceEdit) return issueAccessDecision('ordinary')
   const explicitMediaOutput = decision === 'ordinary'
     && context.requestedOutput !== 'text'

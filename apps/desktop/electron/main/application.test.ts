@@ -2742,6 +2742,71 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('keeps every image in a multi-reference style edit and preserves projection order', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-multi-reference-edit-'))
+    directories.push(root)
+    const firstSource = join(root, 'first.png')
+    const secondSource = join(root, 'second.png')
+    const firstPng = Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('FIRST_PRIVATE_REFERENCE'),
+    ])
+    const secondPng = Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('SECOND_PRIVATE_REFERENCE'),
+    ])
+    await writeFile(firstSource, firstPng)
+    await writeFile(secondSource, secondPng)
+    const modelInput = vi.fn()
+    const createMediaAssetService = mediaAssetModule.createMediaAssetService
+    vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
+      const service = createMediaAssetService(createOptions)
+      modelInput.mockImplementation(service.modelInput.bind(service))
+      return { ...service, modelInput }
+    })
+    const generateImage = vi.fn(async () => ({ outputs: [] }))
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [firstSource, secondSource],
+      modelProviders: {
+        openrouter: snapshotProvider('openrouter', {
+          listModels: async () => [imageModelInfo('openrouter/multi-reference-edit')],
+          validateCredential: async () => ({ valid: true }),
+          stream: async function* () {
+            yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+          },
+          generateImage,
+        }),
+      },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { image: 'openrouter/multi-reference-edit' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const assets = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+
+    await runtime.services.chat.send({
+      ...chatInput(conversation.id, 'make this image watercolor'),
+      assetIds: assets.map(({ id }) => id),
+      outputType: 'image',
+    })
+    await vi.waitFor(() => expect(generateImage).toHaveBeenCalledTimes(1))
+
+    expect(modelInput).toHaveBeenCalledTimes(1)
+    expect(generateImage).toHaveBeenCalledWith(expect.objectContaining({
+      references: [
+        expect.objectContaining({ mimeType: 'image/png', dataBase64: firstPng.toString('base64') }),
+        expect.objectContaining({ mimeType: 'image/png', dataBase64: secondPng.toString('base64') }),
+      ],
+    }))
+    await runtime.close()
+  })
+
   it('keeps strict format/content understanding requests on the ordinary attachment path', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-ordinary-grammar-'))
     directories.push(root)
@@ -5597,6 +5662,8 @@ describe('createApplicationRuntime', () => {
       ['Users', 'Alice', 'Private Files', 'O’NEIL.PDF']],
     ['secret.pdf', `See yes/no first, then convert /Users/Alice/SECRET.PDF and Private\u00a0Folder/中文 空格/SECRET.PDF to PDF`, 2,
       ['Users', 'Alice', 'Private Folder', '中文 空格', 'SECRET.PDF']],
+    ['secret.pdf', `Please convert Private\u00a0Folder/中文 空格/SECRET.PDF and /Users/Alice/SECRET.PDF to PDF`, 2,
+      ['Private Folder', '中文 空格', 'Users', 'Alice', 'SECRET.PDF']],
   ] as const)('anonymizes exact attachment names in metadata-only main and title egress: %s', async (
     sourceName,
     content,
@@ -6977,6 +7044,81 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.chat.send({
       ...chatInput(conversation.id, content), outputType, assetIds: [asset!.id],
     })).rejects.toMatchObject({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+
+    expect(provider.acquireSnapshot).not.toHaveBeenCalled()
+    expect(listModels).not.toHaveBeenCalled()
+    expect(modelInput).not.toHaveBeenCalled()
+    expect(stream).not.toHaveBeenCalled()
+    expect(generateImage).not.toHaveBeenCalled()
+    expect(submitVideo).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it.each([
+    ['input.mp3'],
+    ['input.mp4'],
+    ['input.pdf'],
+  ] as const)('keeps a mixed reference-style edit containing %s away from Provider acquisition', async (
+    incompatibleFilename,
+  ) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-reference-edit-conflict-'))
+    directories.push(root)
+    const imageSource = join(root, 'reference.png')
+    const incompatibleSource = join(root, incompatibleFilename)
+    await writeFile(imageSource, Buffer.from('89504e470d0a1a0a', 'hex'))
+    await writeFile(incompatibleSource, Buffer.from(
+      incompatibleFilename.endsWith('.pdf') ? '%PDF-1.7 PRIVATE' : 'PRIVATE_MEDIA_BYTES',
+    ))
+    const modelInput = vi.fn()
+    const createMediaAssetService = mediaAssetModule.createMediaAssetService
+    vi.spyOn(mediaAssetModule, 'createMediaAssetService').mockImplementation((createOptions) => {
+      const service = createMediaAssetService(createOptions)
+      modelInput.mockImplementation(service.modelInput.bind(service))
+      return { ...service, modelInput }
+    })
+    const stream = vi.fn(async function* () {
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const generateImage = vi.fn(async () => ({ outputs: [] }))
+    const submitVideo = vi.fn(async () => ({
+      providerJobId: 'provider_reference_conflict', status: 'pending' as const,
+    }))
+    const listModels = vi.fn(async () => [imageModelInfo('openrouter/reference-edit')])
+    const provider = snapshotProvider('openrouter', {
+      listModels,
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream,
+      generateImage,
+      submitVideo,
+    })
+    const chatEvents: ChatEvent[] = []
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [imageSource, incompatibleSource],
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { image: 'openrouter/reference-edit' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const assets = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+
+    const sent = await runtime.services.chat.send({
+      ...chatInput(conversation.id, 'make this image watercolor'),
+      assetIds: assets.map(({ id }) => id),
+      outputType: 'image',
+    })
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'status', requestId: sent.requestId, status: 'completed',
+    })))
 
     expect(provider.acquireSnapshot).not.toHaveBeenCalled()
     expect(listModels).not.toHaveBeenCalled()

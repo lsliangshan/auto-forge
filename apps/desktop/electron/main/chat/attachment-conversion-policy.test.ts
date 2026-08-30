@@ -250,6 +250,24 @@ describe('attachment conversion policy', () => {
   })
 
   it.each([
+    ['audio'], ['video'], ['file'],
+  ] as const)('rejects a mixed image/reference-style request containing a %s attachment', (incompatibleKind) => {
+    expect(providerAttachmentAccess('ordinary', 'make this image watercolor', {
+      hasAttachments: true,
+      requestedOutput: 'image',
+      attachmentKinds: ['image', incompatibleKind],
+    })).toMatchObject({ decision: 'ambiguous', allowProviderBytes: false })
+  })
+
+  it('allows multiple image attachments for a strict reference-style request', () => {
+    expect(providerAttachmentAccess('ordinary', 'make this image watercolor', {
+      hasAttachments: true,
+      requestedOutput: 'image',
+      attachmentKinds: ['image', 'image'],
+    })).toMatchObject({ decision: 'ordinary', allowProviderBytes: true })
+  })
+
+  it.each([
     '生成一张图片，格式为PNG',
     '制作一段视频，格式为任意',
     '生成一张图片并转换这个附件',
