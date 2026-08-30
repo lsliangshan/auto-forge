@@ -12,6 +12,8 @@ import {
 import { projectAttachmentInputs } from './file-attachment-projection.js'
 import {
   anonymizeAttachmentNames,
+  canonicalLocalConversionProviderPrompt,
+  canonicalLocalConversionProviderTitle,
   classifyAttachmentConversionRequest,
   projectLocalConversionPrompt,
   type LocalAttachmentProjection,
@@ -130,38 +132,6 @@ const issuedMediaProjectionReferences = new WeakMap<object, {
   references: readonly { mimeType: string; dataBase64: string; fingerprint: string; kind: 'image' }[]
 }>()
 const protectedSnapshots = new WeakMap<object, ProtectedSnapshotBinding>()
-interface CanonicalLocalConversionIntent {
-  readonly attachmentCount: number
-  readonly attachmentIndexes: readonly number[]
-  readonly targetFormat: ConversionTargetFormat
-}
-
-function canonicalLocalConversionIntent(
-  attachments: readonly AttachmentDisclosurePlanAsset[],
-  targetFormat: ConversionTargetFormat,
-): CanonicalLocalConversionIntent {
-  return Object.freeze({
-    attachmentCount: attachments.length,
-    attachmentIndexes: Object.freeze(attachments.map(({ index }) => index)),
-    targetFormat,
-  })
-}
-
-function canonicalLocalProviderText(intent: CanonicalLocalConversionIntent): {
-  mainText: string
-  titleText: string
-} {
-  const mainText = [
-    '任务：选择并调用具备 file.convert 能力的本地工作流。',
-    `附件数量：${intent.attachmentCount}`,
-    `附件索引：${intent.attachmentIndexes.join(', ')}`,
-    `目标格式：${intent.targetFormat}`,
-    '禁止读取附件内容或调用非 file.convert 工具。',
-  ].join('\n')
-  const titleText = `本地文件转换 · ${intent.attachmentCount} 个附件 · ${intent.targetFormat.toUpperCase()}`
-  return Object.freeze({ mainText, titleText })
-}
-
 function sameValues(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
@@ -245,10 +215,16 @@ export function createProviderAttachmentDisclosureAuthority(input: {
         throw new Error('Local conversion target authority is missing')
       }
       const providerText = access.decision === 'local'
-        ? canonicalLocalProviderText(canonicalLocalConversionIntent(
-            attachments,
-            classification.targetFormat!,
-          ))
+        ? {
+            mainText: canonicalLocalConversionProviderPrompt(
+              attachments.length,
+              classification.targetFormat!,
+            ),
+            titleText: canonicalLocalConversionProviderTitle(
+              attachments.length,
+              classification.targetFormat!,
+            ),
+          }
         : {
             mainText: projectLocalConversionPrompt(normalizedText, projections),
             titleText: `用户：${anonymizeAttachmentNames(normalizedText, projections)}`,

@@ -927,7 +927,8 @@ export class AgentOrchestrator {
         ...(input.localConversionOnly ? {
           providerProjection: Object.freeze({
             kind: 'local_conversion' as const,
-            content: input.attachmentDisclosure!.mainSafeText.text,
+            targetFormat: input.localConversionTarget!,
+            attachmentCount: input.assetIds.length,
           }),
         } : {}),
       })

@@ -41,7 +41,7 @@ describe('conversation context primitives', () => {
     ].join('\n')
     const message: Message = {
       id: 'm_local', conversationId: 'c1', role: 'user', ordinal: 1, createdAt: 1,
-      providerProjection: { kind: 'local_conversion', content: canonical },
+      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
       blocks: [
         { type: 'text', text: `Convert ${rawPath} to PDF` },
         {
@@ -55,6 +55,25 @@ describe('conversation context primitives', () => {
     expect(JSON.stringify(serializeHistoricalMessage(message))).not.toMatch(
       /Alice|Tax Return Records|secret\.pdf|application\/pdf|4242|asset_private_history_1/u,
     )
+  })
+
+  it('fails closed for legacy attachment, suspicious conversion, and encoded historical text without a projection', () => {
+    const legacyAttachment: Message = {
+      id: 'legacy_attachment', conversationId: 'c1', role: 'user', ordinal: 1, createdAt: 1,
+      blocks: [
+        { type: 'text', text: 'Convert /Users/Alice/secret.pdf to PDF' },
+        {
+          type: 'media', blockId: 'legacy_block', assetId: 'legacy_asset_private',
+          kind: 'file', purpose: 'input', name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 99,
+        },
+      ],
+    }
+    const suspiciousText = user(2, 'Convert /Users/Alice/secret.pdf to PDF')
+    const encodedText = user(3, `payload ${Buffer.from('PRIVATE_HISTORY_BYTES'.repeat(8)).toString('base64')}`)
+
+    expect(serializeHistoricalMessage(legacyAttachment)).toBeUndefined()
+    expect(serializeHistoricalMessage(suspiciousText)).toBeUndefined()
+    expect(serializeHistoricalMessage(encodedText)).toBeUndefined()
   })
 
   it('uses 60 percent of a positive context length and the 32000 fallback otherwise', () => {
@@ -397,16 +416,9 @@ function contextHarness(options: {
 describe('conversation context manager', () => {
   it('compresses persisted local turns from canonical projections without raw attachment history', async () => {
     const rawPath = '/Users/Alice/Tax Return Records/secret.pdf'
-    const canonical = [
-      '任务：选择并调用具备 file.convert 能力的本地工作流。',
-      '附件数量：1',
-      '附件索引：0',
-      '目标格式：pdf',
-      '禁止读取附件内容或调用非 file.convert 工具。',
-    ].join('\n')
     const messages = Array.from({ length: 12 }, (_, index): Message => index % 2 === 0 ? {
       id: `local_${index}`, conversationId: 'c1', role: 'user', ordinal: index + 1, createdAt: index + 1,
-      providerProjection: { kind: 'local_conversion', content: canonical },
+      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
       blocks: [{ type: 'text', text: `Convert ${rawPath} to PDF ${'private '.repeat(80)}` }],
     } : assistant(index + 1, `ack ${index}`))
     const { manager, provider } = contextHarness({ messages })
@@ -436,7 +448,7 @@ describe('conversation context manager', () => {
     expect(provider.stream).not.toHaveBeenCalled()
   })
 
-  it('omits historical media and an attachment-bearing summary only in conversion privacy mode', async () => {
+  it('fails closed for attachment-bearing legacy turns and their persisted summary', async () => {
     const summarizedMedia: Message = {
       id: 'message_1', conversationId: 'c1', role: 'user', ordinal: 1, createdAt: 1,
       blocks: [
@@ -477,8 +489,8 @@ describe('conversation context manager', () => {
     const ordinary = await ordinaryHarness.manager.prepare(prepareInput({
       provider: ordinaryHarness.provider, beforeOrdinal: 5, contextLength: 32_000,
     }))
-    expect(JSON.stringify(ordinary)).toContain('SUMMARY_ATTACHMENT_PRIVATE_MARKER')
-    expect(JSON.stringify(ordinary)).toContain('raw-history-secret.txt')
+    expect(JSON.stringify(ordinary)).not.toContain('SUMMARY_ATTACHMENT_PRIVATE_MARKER')
+    expect(JSON.stringify(ordinary)).not.toContain('raw-history-secret.txt')
 
     const privateHarness = contextHarness(fixture)
     const privateHistory = await privateHarness.manager.prepare(prepareInput({
@@ -487,8 +499,8 @@ describe('conversation context manager', () => {
     }))
     const payload = JSON.stringify(privateHistory)
 
-    expect(payload).toContain('保留近期的普通目标')
-    expect(payload).toContain('继续')
+    expect(payload).not.toContain('保留近期的普通目标')
+    expect(payload).not.toContain('继续')
     expect(payload).not.toMatch(
       /SUMMARY_ATTACHMENT_PRIVATE_MARKER|summary-secret|raw-history-secret|application\/x-|777777|888888|summary_media_private|raw_media_private|SUMMARY_PRIVATE_RAW_CONTENT|历史附件/,
     )
@@ -838,6 +850,52 @@ function providerCostQuery() {
 }
 
 describe('conversation context compression billing', () => {
+  it('replaces a persisted raw summary for legacy attachment history across restart', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'autoforge-context-legacy-summary-'))
+    sqliteRoots.push(root)
+    const first = openTestUserDataDatabase(root, 'user_1')
+    first.conversations.insert({ id: 'legacy_summary_conversation', title: 'Legacy' })
+    first.messages.insert({
+      id: 'legacy_summary_user', conversationId: 'legacy_summary_conversation', role: 'user',
+      blocks: [
+        { type: 'text', text: 'Convert /Users/Alice/Tax/secret.pdf to PDF' },
+        {
+          type: 'media', blockId: 'legacy_summary_block', assetId: 'legacy_summary_asset',
+          kind: 'file', purpose: 'input', name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 9123,
+        },
+      ],
+      createdAt: 1,
+    })
+    first.messages.insert({
+      id: 'legacy_summary_assistant', conversationId: 'legacy_summary_conversation', role: 'assistant',
+      blocks: [{ type: 'text', text: 'raw assistant echo /Users/Alice/Tax/secret.pdf PRIVATE_BYTES' }],
+      createdAt: 2,
+    })
+    first.conversationContexts.advance({
+      conversationId: 'legacy_summary_conversation', expectedThroughOrdinal: 0,
+      summaryText: 'RAW_SUMMARY /Users/Alice/Tax/secret.pdf application/pdf 9123 legacy_summary_asset',
+      throughOrdinal: 2, estimatedTokens: 20, updatedAt: 2,
+    })
+    first.close()
+
+    const reopened = openTestUserDataDatabase(root, 'user_1')
+    const provider = { stream: vi.fn<ConversationContextProviderPort['stream']>(async function* () {}) }
+    const manager = createConversationContextManager(reopened)
+    const history = await manager.prepare(prepareInput({
+      conversationId: 'legacy_summary_conversation', beforeOrdinal: 3,
+      provider, contextLength: 32_000,
+    }))
+    const stored = reopened.conversationContexts.get('legacy_summary_conversation')
+    const payload = JSON.stringify({ history, stored })
+
+    expect(payload).toContain('较早的附件相关历史已按隐私策略省略')
+    expect(payload).not.toMatch(
+      /RAW_SUMMARY|Alice|Tax|secret\.pdf|application\/pdf|9123|legacy_summary_asset|PRIVATE_BYTES/u,
+    )
+    expect(provider.stream).not.toHaveBeenCalled()
+    reopened.close()
+  })
+
   it('persists every real SQLite compression round under stable distinct operation keys', async () => {
     const test = sqliteContextHarness((round) => [
       { type: 'generation', id: `summary_generation_${round}` },

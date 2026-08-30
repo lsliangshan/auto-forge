@@ -10,6 +10,7 @@ import {
   authOtpVerificationSchema,
   browserActionAuditEntrySchema,
   chatFileSupport,
+  chatMessageSchema,
   authSessionSchema,
   authUserSchema,
   authorizationSnapshotSchema,
@@ -238,6 +239,40 @@ describe('cross-process contracts', () => {
     expect(syncMutationSchema.parse(messageAppend)).toEqual(messageAppend)
     expect(syncMutationSchema.safeParse({
       ...messageAppend, payload: { ...messageAppend.payload, userId: 'forged' },
+    }).success).toBe(false)
+    const canonicalProjection = {
+      kind: 'local_conversion' as const,
+      targetFormat: 'pdf' as const,
+      attachmentCount: 1,
+    }
+    expect(syncMutationSchema.parse({
+      ...messageAppend,
+      payload: {
+        ...messageAppend.payload,
+        blocks: [...messageAppend.payload.blocks, {
+          type: 'media', blockId: 'projection_block', assetId: 'projection_asset',
+          kind: 'file', purpose: 'input', name: '文件-1', mimeType: 'application/pdf', byteSize: 1,
+        }],
+        providerProjection: canonicalProjection,
+      },
+    })).toMatchObject({ payload: { providerProjection: canonicalProjection } })
+    expect(chatMessageSchema.safeParse({
+      ...messageAppend.payload, providerProjection: canonicalProjection,
+    }).success).toBe(false)
+    for (const providerProjection of [
+      { ...canonicalProjection, targetFormat: 'docx' },
+      { ...canonicalProjection, attachmentCount: 0 },
+      { ...canonicalProjection, content: 'RAW_BASE64_CANARY' },
+      { kind: 'ordinary', targetFormat: 'pdf', attachmentCount: 1 },
+    ]) {
+      expect(syncMutationSchema.safeParse({
+        ...messageAppend,
+        payload: { ...messageAppend.payload, providerProjection },
+      }).success).toBe(false)
+    }
+    expect(syncMutationSchema.safeParse({
+      ...messageAppend,
+      payload: { ...messageAppend.payload, providerProjection: canonicalProjection },
     }).success).toBe(false)
 
     const conversationMutations = [

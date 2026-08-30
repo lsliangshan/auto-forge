@@ -451,7 +451,28 @@ export const messagePageSchema = z.object({
 }).strict()
 export type MessagePage = Omit<z.infer<typeof messagePageSchema>, 'items'> & { items: ChatMessage[] }
 
-export const messageAppendMutationPayloadSchema = chatMessageSchema
+export const messageProviderProjectionSchema = z.object({
+  kind: z.literal('local_conversion'),
+  targetFormat: conversionTargetFormatSchema,
+  attachmentCount: z.number().int().min(1).max(5),
+}).strict()
+export type MessageProviderProjection = z.infer<typeof messageProviderProjectionSchema>
+
+export const messageAppendMutationPayloadSchema = chatMessageSchema.extend({
+  providerProjection: messageProviderProjectionSchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (value.providerProjection === undefined) return
+  const attachmentCount = value.blocks.filter((block) => (
+    block.type === 'media' && block.purpose === 'input'
+  )).length
+  if (value.role !== 'user' || attachmentCount !== value.providerProjection.attachmentCount) {
+    context.addIssue({
+      code: 'custom',
+      path: ['providerProjection'],
+      message: 'Provider projection does not match the user attachment blocks.',
+    })
+  }
+})
 export type MessageAppendMutationPayload = z.infer<typeof messageAppendMutationPayloadSchema>
 export const messageConversionBlockTerminalMutationPayloadSchema = z.object({
   messageId: identifierSchema,

@@ -7,6 +7,7 @@ import {
   appErrorCodeSchema,
   chatBlockSchema,
   chatMessageSchema,
+  messageProviderProjectionSchema,
   conversationGenerationPreferencesSchema,
   conversationSummarySchema,
   conversationTitleStateSchema,
@@ -33,7 +34,6 @@ import {
 import {
   createRepositories,
   type AppRepositories,
-  type MessageProviderProjection,
 } from './repositories.js'
 
 const OUTBOX_LIMIT = 10_000
@@ -82,6 +82,7 @@ const messageRowSchema = z.object({
   blocksJson: z.string(),
   ordinal: z.number().int().positive(),
   executionId: z.string().nullable(),
+  providerProjectionJson: z.string().nullable().optional(),
   createdAt: z.number().int().nonnegative(),
 }).passthrough()
 
@@ -181,7 +182,6 @@ export interface UserDataRepositories {
     recordWithMessage(
       mutation: SyncMutation,
       assetIds?: readonly string[],
-      providerProjection?: MessageProviderProjection,
     ): void
     recordWithConsent(mutation: Extract<SyncMutation, { kind: 'privacy.consent' }>): void
     recordWithPreferences(mutation: Extract<SyncMutation, { kind: 'preferences.update' }>): void
@@ -643,7 +643,6 @@ function optimisticMessageMutation(
   database: SqliteDatabase,
   ownerUserId: string,
   mutation: SyncMutation,
-  providerProjection?: MessageProviderProjection,
 ): void {
   if (mutation.kind !== 'message.append') throw new Error('Message mutation required')
   const payload = mutation.payload
@@ -662,9 +661,9 @@ function optimisticMessageMutation(
     conversationId: payload.conversationId,
     role: payload.role,
     blocksJson: JSON.stringify(payload.blocks),
-    providerProjectionJson: providerProjection === undefined
+    providerProjectionJson: payload.providerProjection === undefined
       ? null
-      : JSON.stringify(providerProjection),
+      : JSON.stringify(payload.providerProjection),
     executionId: payload.executionId ?? null,
     createdAt: timestamp(payload.createdAt),
   })
@@ -996,13 +995,14 @@ function sameConversationCreate(
 function storedMessage(database: SqliteDatabase, id: string) {
   const row = database.prepare(`
     SELECT id, conversation_id AS conversationId, role, blocks_json AS blocksJson,
+           provider_projection_json AS providerProjectionJson,
            ordinal, execution_id AS executionId, created_at AS createdAt
     FROM messages
     WHERE id = @id
   `).get({ id }) as Query | undefined
   if (row === undefined) return undefined
   const parsed = parsePersisted(() => messageRowSchema.parse(row))
-  return parsePersisted(() => chatMessageSchema.parse({
+  const message = parsePersisted(() => chatMessageSchema.parse({
     id: parsed.id,
     conversationId: parsed.conversationId,
     role: parsed.role,
@@ -1010,6 +1010,13 @@ function storedMessage(database: SqliteDatabase, id: string) {
     ...(parsed.executionId === null ? {} : { executionId: parsed.executionId }),
     createdAt: isoTimestamp(parsed.createdAt),
   }))
+  const providerProjection = parsed.providerProjectionJson === null
+    || parsed.providerProjectionJson === undefined
+    ? undefined
+    : parsePersisted(() => messageProviderProjectionSchema.parse(
+      JSON.parse(parsed.providerProjectionJson as string),
+    ))
+  return { ...message, ...(providerProjection === undefined ? {} : { providerProjection }) }
 }
 
 function requireConversionBlockTarget(
@@ -1035,6 +1042,7 @@ function sameMessageAppend(
     && stored.conversationId === mutation.payload.conversationId
     && stored.role === mutation.payload.role
     && stored.executionId === mutation.payload.executionId
+    && isDeepStrictEqual(stored.providerProjection, mutation.payload.providerProjection)
     && timestamp(stored.createdAt) === timestamp(mutation.payload.createdAt)
     && isDeepStrictEqual(
       canonicalMessagePayload({ ...mutation.payload, blocks: stored.blocks }).blocks,
@@ -1221,9 +1229,10 @@ function applyRemoteMutation(
       if (existing === undefined) {
         database.prepare(`
           INSERT INTO messages (
-            id, conversation_id, role, blocks_json, ordinal, execution_id, created_at
+            id, conversation_id, role, blocks_json, provider_projection_json,
+            ordinal, execution_id, created_at
           ) VALUES (
-            @id, @conversationId, @role, @blocksJson,
+            @id, @conversationId, @role, @blocksJson, @providerProjectionJson,
             COALESCE((SELECT MAX(ordinal) + 1 FROM messages WHERE conversation_id = @conversationId), 1),
             @executionId, @createdAt
           )
@@ -1232,6 +1241,9 @@ function applyRemoteMutation(
           conversationId: mutation.payload.conversationId,
           role: mutation.payload.role,
           blocksJson: JSON.stringify(mutation.payload.blocks),
+          providerProjectionJson: mutation.payload.providerProjection === undefined
+            ? null
+            : JSON.stringify(mutation.payload.providerProjection),
           executionId: mutation.payload.executionId ?? null,
           createdAt,
         })
@@ -1793,6 +1805,9 @@ export function createUserDataRepositories(
       conversationId: message.conversationId,
       role: message.role === 'user' ? 'user' : 'assistant',
       blocks: chatBlockSchema.array().parse(message.blocks),
+      ...(message.providerProjection === undefined
+        ? {}
+        : { providerProjection: message.providerProjection }),
       ...(typeof message.executionId === 'string' ? { executionId: message.executionId } : {}),
       createdAt: isoTimestamp(message.createdAt),
     },
@@ -2488,12 +2503,12 @@ export function createUserDataRepositories(
         mutation,
         (validated) => optimisticConversationMutation(database, ownerUserId, validated),
       ),
-      recordWithMessage: (mutation, assetIds = [], providerProjection) => recordMutation(
+      recordWithMessage: (mutation, assetIds = []) => recordMutation(
         mutation,
         (validated) => {
           if (validated.kind !== 'message.append') throw new Error('Message mutation required')
           if (assetIds.length === 0) {
-            optimisticMessageMutation(database, ownerUserId, validated, providerProjection)
+            optimisticMessageMutation(database, ownerUserId, validated)
             return
           }
           const payload = validated.payload
@@ -2502,7 +2517,9 @@ export function createUserDataRepositories(
             conversationId: payload.conversationId,
             role: payload.role,
             blocks: payload.blocks,
-            ...(providerProjection === undefined ? {} : { providerProjection }),
+            ...(payload.providerProjection === undefined
+              ? {}
+              : { providerProjection: payload.providerProjection }),
             ...(payload.executionId === undefined ? {} : { executionId: payload.executionId }),
             createdAt: timestamp(payload.createdAt),
           }, [...assetIds])

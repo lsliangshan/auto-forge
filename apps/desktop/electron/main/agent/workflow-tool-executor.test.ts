@@ -436,6 +436,34 @@ describe('WorkflowToolExecutor', () => {
     expect(test.executions.reserve).not.toHaveBeenCalled()
   })
 
+  it('rejects extra file conversion input keys before approval or execution', async () => {
+    const detail = workflow({
+      cities: [],
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf'] } }],
+      inputSchema: {
+        type: 'object', additionalProperties: true, required: ['files', 'targetFormat'],
+        properties: {
+          files: { type: 'array', items: { type: 'integer' } },
+          targetFormat: { type: 'string' },
+        },
+      },
+    })
+    const test = harness({ detail })
+
+    await expect(test.executor.prepare({
+      candidate: test.candidate,
+      arguments: {
+        input: { files: [0], targetFormat: 'pdf', hiddenCommand: 'read /Users/Alice/private' },
+      },
+      developerMode: true,
+      attachmentBindings: conversionBindings().slice(0, 1),
+    })).resolves.toEqual({ kind: 'tool_error', code: 'INVALID_INPUT' })
+    expect(test.executions.reserve).not.toHaveBeenCalled()
+    expect(test.policy.evaluate).not.toHaveBeenCalled()
+    expect(test.policy.record).not.toHaveBeenCalled()
+    expect(test.executions.startReserved).not.toHaveBeenCalled()
+  })
+
   it('fails unsupported and unknown capabilities before reserving or recording grants', async () => {
     for (const capability of ['network.fetch', 'future.unknown'] as const) {
       const test = harness({

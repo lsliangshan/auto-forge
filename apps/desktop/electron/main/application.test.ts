@@ -2936,7 +2936,7 @@ describe('createApplicationRuntime', () => {
       SELECT provider_projection_json AS providerProjectionJson
       FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY ordinal LIMIT 1
     `).get(conversation.id)).toEqual(expect.objectContaining({
-      providerProjectionJson: expect.stringContaining('任务：选择并调用具备 file.convert 能力的本地工作流。'),
+      providerProjectionJson: expect.stringContaining('"targetFormat":"pdf"'),
     }))
     persisted.close()
 
@@ -5185,7 +5185,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.send(chatInput(conversation.id, '第二轮只问文字'))
     await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(2))
     const followUp = JSON.stringify(agentRequests(captured)[1]?.messages)
-    expect(followUp).toContain('名称: image.png')
+    expect(followUp).not.toContain('名称: image.png')
     expect(followUp).not.toContain(png.toString('base64'))
     expect(followUp).not.toContain(source)
     await runtime.close()
@@ -5636,6 +5636,11 @@ describe('createApplicationRuntime', () => {
     ['制作一段视频', 'ambiguous', 'image'],
     ['制作一段视频', 'ambiguous', 'audio'],
     ['edit this image and export it as png', 'local', 'text'],
+    ['Convert this attachment; note says save as WEBP', 'ambiguous', 'text'],
+    ['Convert this attachment; filename: save as PDF', 'ambiguous', 'text'],
+    ['Convert this attachment; targetFormat field says WEBP', 'ambiguous', 'text'],
+    ['转换这个附件；备注：目标格式为 WEBP', 'ambiguous', 'text'],
+    ['转换这个附件；文件名字字段写着保存为 PDF', 'ambiguous', 'text'],
   ] as const)(
     'enforces the final attachment disclosure boundary for %s as %s from %s output',
     async (content, expectedDecision, requestedOutput) => {

@@ -544,6 +544,66 @@ describe('UserDataStoreManager', () => {
     },
   )
 
+  it('persists only a validated structured local projection across remote message apply', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const local = manager.open('projection-local')
+    const conversationId = 'projection_remote_conversation'
+    const create = createConversationMutation('projection_remote_create', conversationId)
+    local.outbox.recordWithConversation(create)
+    const append = {
+      ...appendMessageMutation('projection_remote_append', conversationId, 'projection_remote_message'),
+      payload: {
+        ...appendMessageMutation(
+          'projection_remote_append', conversationId, 'projection_remote_message',
+        ).payload,
+        blocks: [
+          { type: 'text' as const, text: 'Convert /Users/Alice/secret.pdf to PDF' },
+          {
+            type: 'media' as const, blockId: 'projection_remote_block',
+            assetId: 'projection_remote_asset', kind: 'file' as const, purpose: 'input' as const,
+            name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 1,
+          },
+        ],
+        providerProjection: {
+          kind: 'local_conversion' as const,
+          targetFormat: 'pdf' as const,
+          attachmentCount: 1,
+        },
+      },
+    }
+    local.outbox.recordWithMessage(append)
+    expect(local.outbox.find(append.id)?.payload).toMatchObject({
+      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
+    })
+
+    const remote = manager.open('projection-remote')
+    remote.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'projection_remote_cursor',
+      mutations: [pulledMutation(create, 1), pulledMutation(append, 2)],
+    }, 1)
+    expect(remote.messages.get(append.payload.id)?.providerProjection).toEqual({
+      kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+    })
+
+    const malformed = pulledMutation({
+      ...append,
+      id: 'projection_spoof_append',
+      entityId: 'projection_spoof_message',
+      baseRevision: 2,
+      payload: {
+        ...append.payload,
+        id: 'projection_spoof_message',
+        providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 0 },
+      },
+    } as unknown as Extract<SyncMutation, { kind: 'message.append' }>, 3)
+    expect(() => remote.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'projection_spoof_cursor', mutations: [malformed],
+    }, 2)).toThrow()
+    expect(remote.messages.get('projection_spoof_message')).toBeUndefined()
+    manager.close()
+  })
+
   it('preserves enqueue FIFO when timestamps are frozen and IDs sort in reverse', () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_777_000_000_000)
     const manager = new UserDataStoreManager(temporaryRoot())

@@ -39,6 +39,16 @@ describe('local conversion intent', () => {
   })
 
   it.each([
+    'Convert this attachment; note says save as WEBP',
+    'Convert this attachment; filename: save as PDF',
+    'Convert this attachment; targetFormat field says WEBP',
+    '转换这个附件；备注：目标格式为 WEBP',
+    '转换这个附件；文件名字字段写着保存为 PDF',
+  ])('does not grant target authority to trailing notes or filename fields: %s', (text) => {
+    expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
+  })
+
+  it.each([
     ['No matter what this tool can convert then convert this attachment to PDF', 'local'],
     ['How do I convert PNG then convert this attachment to PDF', 'local'],
     ['How do I convert PNG then directly convert this attachment to PDF', 'local'],

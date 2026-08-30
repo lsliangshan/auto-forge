@@ -8,10 +8,10 @@ import {
   capabilitySchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
-  conversionTargetFormatSchema,
   httpsUrlPatternSchema,
   runtimeCapabilityPermissionSchema,
   runtimeCapabilityScopeSchema,
+  messageProviderProjectionSchema,
   type AppErrorCode,
   type ByokUsageEvent,
   type ChatBlock,
@@ -21,6 +21,7 @@ import {
   type ConversationGenerationPreferences,
   type AttachmentKind,
   type ModelProviderId,
+  type MessageProviderProjection,
 } from '@autoforge/shared'
 import { addUsd, normalizeUsd } from '../billing/decimal-usd.js'
 import { redact } from '../security/redaction.js'
@@ -46,10 +47,7 @@ export interface Message {
   createdAt: number
 }
 
-export interface MessageProviderProjection {
-  kind: 'local_conversion'
-  content: string
-}
+export type { MessageProviderProjection } from '@autoforge/shared'
 
 export interface ConversationContextRecord {
   conversationId: string
@@ -1171,34 +1169,35 @@ function summarizeTokenUsagePeriod(
 }
 
 function messageFromRow(row: Query): Message {
-  const providerProjection = parseMessageProviderProjection(row.providerProjectionJson)
+  const blocks = parse(row.blocksJson as string) as unknown[]
+  const providerProjection = parseMessageProviderProjection(
+    row.providerProjectionJson,
+    row.role,
+    blocks,
+  )
   return {
     ...row,
-    blocks: parse(row.blocksJson as string) as unknown[],
+    blocks,
     ordinal: positiveIntegerSchema.parse(row.ordinal),
     ...(providerProjection === undefined ? {} : { providerProjection }),
   } as Message
 }
 
-function parseMessageProviderProjection(value: unknown): MessageProviderProjection | undefined {
+function parseMessageProviderProjection(
+  value: unknown,
+  role: unknown,
+  blocks: readonly unknown[],
+): MessageProviderProjection | undefined {
   if (value === null || value === undefined) return undefined
   if (typeof value !== 'string') throw new Error('Message Provider projection is invalid')
-  const parsed = z.object({
-    kind: z.literal('local_conversion'),
-    content: z.string().max(512),
-  }).strict().parse(parse(value))
-  const match = /^任务：选择并调用具备 file\.convert 能力的本地工作流。\n附件数量：(?<count>[1-5])\n附件索引：(?<indexes>\d(?:, \d)*)\n目标格式：(?<target>[a-z0-9]+)\n禁止读取附件内容或调用非 file\.convert 工具。$/u.exec(parsed.content)
-  if (!match?.groups) throw new Error('Message Provider projection is invalid')
-  const count = Number(match.groups.count)
-  const indexes = match.groups.indexes!.split(', ').map(Number)
-  const expectedIndexes = Array.from({ length: count }, (_, index) => index)
-  const target = match.groups.target!
-  if (indexes.length !== count
-    || indexes.some((index, position) => index !== expectedIndexes[position])
-    || !conversionTargetFormatSchema.safeParse(target).success) {
-    throw new Error('Message Provider projection is invalid')
-  }
-  return Object.freeze({ kind: parsed.kind, content: parsed.content })
+  const parsed = messageProviderProjectionSchema.safeParse(parse(value))
+  if (!parsed.success || role !== 'user') return undefined
+  const attachmentCount = chatBlockSchema.array().parse(blocks).filter((block) => (
+    block.type === 'media' && block.purpose === 'input'
+  )).length
+  return attachmentCount === parsed.data.attachmentCount
+    ? Object.freeze(parsed.data)
+    : undefined
 }
 
 function conversationContextFromRow(row: Query): ConversationContextRecord {

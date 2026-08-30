@@ -1745,11 +1745,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               id: value.id, conversationId: value.conversationId,
               role: value.role === 'user' ? 'user' : 'assistant',
               blocks: chatBlockSchema.array().parse(value.blocks),
+              ...(value.providerProjection === undefined
+                ? {}
+                : { providerProjection: value.providerProjection }),
               ...(value.executionId === undefined ? {} : { executionId: value.executionId }),
               createdAt: occurredAt,
             },
           }
-          store.outbox.recordWithMessage(mutation, assetIds, value.providerProjection)
+          store.outbox.recordWithMessage(mutation, assetIds)
           queueUserDataFlush()
           const stored = store.messages.get(value.id)
           if (!stored) throw failure('INTERNAL_ERROR')

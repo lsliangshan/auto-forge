@@ -243,9 +243,13 @@ function bindFileConversion(
 ): { attachmentBindings: readonly ExecutionAttachmentBinding[]; request: ExactFileConvertRequest } | ToolError | undefined {
   const permissions = workflow.permissions.filter(({ capability }) => capability === 'file.convert')
   if (permissions.length === 0) return undefined
-  if (permissions.length !== 1 || !isRecord(input) || !Array.isArray(input.files)) {
+  if (permissions.length !== 1 || !isRecord(input)) {
     return toolError('CAPABILITY_SCOPE_DENIED')
   }
+  if (!Object.keys(input).every((key) => key === 'files' || key === 'targetFormat')) {
+    return toolError('INVALID_INPUT')
+  }
+  if (!Array.isArray(input.files)) return toolError('INVALID_INPUT')
   const target = conversionTargetFormatSchema.safeParse(input.targetFormat)
   const scope = permissions[0]!.scope
   if (!target.success || !('formats' in scope) || !scope.formats.includes(target.data)) {

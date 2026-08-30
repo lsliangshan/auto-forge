@@ -13,6 +13,8 @@ import {
   type ProviderUsageRepository,
 } from '../database/repositories.js'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
+import { hasConversionRiskSignal } from './attachment-conversion-policy.js'
+import { canonicalLocalConversionProviderPrompt } from './local-conversion-intent.js'
 import type {
   ModelContentPart,
   ModelMessage,
@@ -133,6 +135,26 @@ function hasHistoricalAttachment(message: Message): boolean {
   ))
 }
 
+const ENCODED_HISTORY_TOKEN = /(?:^|[^A-Za-z0-9+/])(?:[A-Za-z0-9+/]{64,}={0,2})(?:$|[^A-Za-z0-9+/])/u
+const LEGACY_CONVERSION_ATTACHMENT_REFERENCE = /(?:[/\\][^\s]+|[\p{L}\p{N}_+-][\p{L}\p{N}._+-]{0,63}\.[A-Za-z0-9]{1,12}|(?:这个|这张|该|当前)?(?:附件|文件|图片|图像|照片|文档)|\b(?:this|the|that|current|attached)\s+(?:attachment|file|image|photo|document)\b)/iu
+
+function historicalText(message: Message): string {
+  return chatBlockSchema.array().parse(message.blocks)
+    .filter((block): block is Extract<ChatBlock, { type: 'text' }> => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n')
+}
+
+function hasUnsafeLegacyProviderContent(message: Message): boolean {
+  if (message.role === 'user' && message.providerProjection !== undefined) return false
+  if (message.role === 'user' && hasHistoricalAttachment(message)) return true
+  const text = historicalText(message)
+  return ENCODED_HISTORY_TOKEN.test(text)
+    || (message.role === 'user'
+      && hasConversionRiskSignal(text)
+      && LEGACY_CONVERSION_ATTACHMENT_REFERENCE.test(text))
+}
+
 export function serializeHistoricalMessage(
   message: Message,
   omitAttachments = false,
@@ -141,8 +163,15 @@ export function serializeHistoricalMessage(
     throw new Error('Historical message role is invalid')
   }
   if (message.role === 'user' && message.providerProjection !== undefined) {
-    return { role: 'user', content: message.providerProjection.content }
+    return {
+      role: 'user',
+      content: canonicalLocalConversionProviderPrompt(
+        message.providerProjection.attachmentCount,
+        message.providerProjection.targetFormat,
+      ),
+    }
   }
+  if (hasUnsafeLegacyProviderContent(message)) return undefined
   const content = chatBlockSchema.array().parse(message.blocks)
     .filter((block) => !omitAttachments || (block.type !== 'media' && block.type !== 'media_generation'))
     .flatMap(serializeBlock)
@@ -157,6 +186,32 @@ function hasMutableMediaGeneration(message: Message): boolean {
     (block.type === 'media_generation' && block.status !== 'failed')
     || (block.type === 'conversion' && block.state === 'active')
   ))
+}
+
+function safeHistoricalMessages(
+  messages: readonly Message[],
+  afterOrdinal: number,
+  omitAttachments: boolean | undefined,
+): HistoricalModelMessage[] {
+  const safe: HistoricalModelMessage[] = []
+  let omitPairedAssistant = false
+  for (const message of messages) {
+    if (message.ordinal <= afterOrdinal) continue
+    if (message.role === 'assistant' && omitPairedAssistant) {
+      omitPairedAssistant = false
+      continue
+    }
+    const unsafe = hasUnsafeLegacyProviderContent(message)
+    if (message.role === 'user') omitPairedAssistant = unsafe
+    if (unsafe) continue
+    const serialized = serializeHistoricalMessage(message, omitAttachments)
+    if (serialized !== undefined) safe.push({
+      ordinal: message.ordinal,
+      message: serialized,
+      mutable: hasMutableMediaGeneration(message),
+    })
+  }
+  return safe
 }
 
 export function estimateTextTokens(text: string): number {
@@ -392,24 +447,44 @@ export function createConversationContextManager(
       let summary = repositories.conversationContexts.get(input.conversationId)
       const persistedHistory = repositories.messages
         .listBeforeOrdinal(input.conversationId, input.beforeOrdinal)
-      let summaryHasAttachment = input.omitHistoricalAttachments === true
-        && summary !== undefined
+      const summaryHasUnsafeHistory = summary !== undefined
         && persistedHistory.some((message) => (
-          message.ordinal <= summary!.throughOrdinal && hasHistoricalAttachment(message)
+          message.ordinal <= summary!.throughOrdinal && hasUnsafeLegacyProviderContent(message)
         ))
-      const rawHistory = persistedHistory
-        .filter((message) => message.ordinal > (summary?.throughOrdinal ?? 0))
-        .flatMap((message): HistoricalModelMessage[] => {
-          const serialized = serializeHistoricalMessage(message, input.omitHistoricalAttachments)
-          return serialized === undefined ? [] : [{
-            ordinal: message.ordinal,
-            message: serialized,
-            mutable: hasMutableMediaGeneration(message),
-          }]
+      if (summaryHasUnsafeHistory && summary !== undefined) {
+        const expectedThroughOrdinal = summary.throughOrdinal
+        const safeCoveredHistory = safeHistoricalMessages(
+          persistedHistory.filter((message) => message.ordinal <= expectedThroughOrdinal),
+          0,
+          input.omitHistoricalAttachments,
+        )
+        const summaryText = safeCoveredHistory.length === 0
+          ? '较早的附件相关历史已按隐私策略省略。'
+          : await streamSummary(
+              input,
+              undefined,
+              safeCoveredHistory,
+              summaryOutputTokens,
+              `conversation-summary-rebuild:${input.callIdentity.requestId}:${expectedThroughOrdinal}`,
+              repositories.providerUsage,
+            )
+        summary = repositories.conversationContexts.advance({
+          conversationId: input.conversationId,
+          expectedThroughOrdinal,
+          summaryText,
+          throughOrdinal: expectedThroughOrdinal,
+          estimatedTokens: estimateTextTokens(summaryText),
+          updatedAt: Date.now(),
         })
+      }
+      const rawHistory = safeHistoricalMessages(
+        persistedHistory,
+        summary?.throughOrdinal ?? 0,
+        input.omitHistoricalAttachments,
+      )
 
       while (true) {
-        const providerSummary = summaryHasAttachment ? undefined : summary
+        const providerSummary = summary
         const history = [
           ...(providerSummary === undefined ? [] : [summaryMessage(providerSummary.summaryText)]),
           ...rawHistory.map(({ message }) => message),
@@ -458,7 +533,6 @@ export function createConversationContextManager(
             estimatedTokens: estimateTextTokens(summaryText),
             updatedAt: Date.now(),
           })
-          summaryHasAttachment = false
         } catch (error) {
           if (isCancelled(input, error)) throw toSafeAppError({ code: 'CANCELLED' })
           throw toSafeAppError({ code: 'CONFLICT' })

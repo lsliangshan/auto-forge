@@ -68,6 +68,7 @@ function openAppDatabase(path: string) {
   })()
   return {
     ...production,
+    raw: sqlite,
     conversations: repositories.conversations,
     messages: repositories.messages,
     conversationContexts: repositories.conversationContexts,
@@ -2336,23 +2337,29 @@ describe('openAppDatabase', () => {
   it('round-trips the Main-owned canonical Provider projection separately from raw user blocks', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_provider_projection', title: 'Projection' })
-    const canonical = [
-      '任务：选择并调用具备 file.convert 能力的本地工作流。',
-      '附件数量：1',
-      '附件索引：0',
-      '目标格式：pdf',
-      '禁止读取附件内容或调用非 file.convert 工具。',
-    ].join('\n')
     database.messages.insert({
       id: 'message_provider_projection', conversationId: 'conversation_provider_projection',
-      role: 'user', blocks: [{ type: 'text', text: '/Users/Alice/private.pdf' }],
-      providerProjection: { kind: 'local_conversion', content: canonical }, createdAt: 1,
+      role: 'user', blocks: [
+        { type: 'text', text: '/Users/Alice/private.pdf' },
+        {
+          type: 'media', blockId: 'projection_block', assetId: 'projection_asset',
+          kind: 'file', purpose: 'input', name: 'private.pdf', mimeType: 'application/pdf', byteSize: 1,
+        },
+      ],
+      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 }, createdAt: 1,
     })
 
     expect(database.messages.get('message_provider_projection')).toMatchObject({
-      blocks: [{ type: 'text', text: '/Users/Alice/private.pdf' }],
-      providerProjection: { kind: 'local_conversion', content: canonical },
+      blocks: expect.arrayContaining([{ type: 'text', text: '/Users/Alice/private.pdf' }]),
+      providerProjection: { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
     })
+
+    database.raw.prepare(`
+      UPDATE messages SET provider_projection_json = ? WHERE id = ?
+    `).run(JSON.stringify({
+      kind: 'local_conversion', content: 'spoofed raw Provider text', targetFormat: 'docx',
+    }), 'message_provider_projection')
+    expect(database.messages.get('message_provider_projection')?.providerProjection).toBeUndefined()
   })
 
   it('migrates v14 media assets to support generic file attachments without losing media relationships', () => {

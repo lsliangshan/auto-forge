@@ -113,6 +113,7 @@ const TRUSTED_TARGET_CONTEXT = new RegExp([
 ].join('|'), 'giu')
 const GENERIC_TARGET_CONTEXT = /(?:(?:\b(?:to|into|as)\s+(?!(?:well|this|the|that|current)\b)(?:an?\s+)?)|(?:(?:转换成|转换为|转成|转为|另存为|保存为|保存成|导出为|输出为|做成|制作成?|改成|改为|换成|换为|变成|生成为?|格式为|目标格式\s*[:：]?|为)\s*)(?:一(?:个|份|张)\s*)?|(?:\bbut\b|\binstead\b|而是)\s*(?:an?\s+)?)(?<target>\.?[A-Za-z0-9][A-Za-z0-9._+-]{1,15})/giu
 const NEGATED_TARGET_PREFIX = /(?:不要|不用|别|请勿|并非|不是)|\b(?:not|don't|do\s+not|never)\b/iu
+const TARGET_AUTHORITY_BOUNDARY = /[;；]\s*(?:note(?:\s+says)?|file\s*name|filename|target\s*format(?:\s+field)?|备注|文件名(?:字)?字段|目标格式字段)\s*(?::|：|says\b|field\b|写着)?/iu
 
 function conversionActionIsNegated(
   clause: string,
@@ -676,6 +677,27 @@ export interface AttachmentConversionClassification {
   readonly targetFormat?: ConversionTargetFormat
 }
 
+export function canonicalLocalConversionProviderPrompt(
+  attachmentCount: number,
+  targetFormat: ConversionTargetFormat,
+): string {
+  const indexes = Array.from({ length: attachmentCount }, (_, index) => index)
+  return [
+    '任务：选择并调用具备 file.convert 能力的本地工作流。',
+    `附件数量：${attachmentCount}`,
+    `附件索引：${indexes.join(', ')}`,
+    `目标格式：${targetFormat}`,
+    '禁止读取附件内容或调用非 file.convert 工具。',
+  ].join('\n')
+}
+
+export function canonicalLocalConversionProviderTitle(
+  attachmentCount: number,
+  targetFormat: ConversionTargetFormat,
+): string {
+  return `本地文件转换 · ${attachmentCount} 个附件 · ${targetFormat.toUpperCase()}`
+}
+
 function targetMatchIsNegated(text: string, index: number): boolean {
   const prefix = text.slice(Math.max(0, index - 64), index)
   const negations = [...prefix.matchAll(new RegExp(NEGATED_TARGET_PREFIX.source, 'giu'))]
@@ -690,7 +712,11 @@ function targetMatchIsNegated(text: string, index: number): boolean {
 }
 
 function trustedUniqueTargetFormat(text: string): ConversionTargetFormat | undefined {
-  const normalized = text.normalize('NFKC').replace(/[‘’]/gu, "'")
+  const normalizedText = text.normalize('NFKC').replace(/[‘’]/gu, "'")
+  const authorityBoundary = TARGET_AUTHORITY_BOUNDARY.exec(normalizedText)
+  const normalized = authorityBoundary?.index === undefined
+    ? normalizedText
+    : normalizedText.slice(0, authorityBoundary.index)
   const targets = new Set<ConversionTargetFormat>()
   let unknown = false
   for (const match of normalized.matchAll(TRUSTED_TARGET_CONTEXT)) {
