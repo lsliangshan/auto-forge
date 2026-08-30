@@ -3191,7 +3191,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             protectedProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
               purpose: 'main',
             })
-            if (resolved.assets.length > 0) {
+            if (resolved.assets.length > 0 && attachmentDecision === 'ordinary') {
               summaryProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
                 purpose: 'summary',
               })

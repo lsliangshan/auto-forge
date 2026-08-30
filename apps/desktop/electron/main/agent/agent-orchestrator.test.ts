@@ -325,14 +325,19 @@ function protectedAttachmentRunInput(
   return {
     ...input,
     requestId,
-    ...(decision === 'local' ? { modelContent: attachmentDisclosure.mainSafeText.text } : {}),
+    ...(decision === 'local' ? {
+      modelContent: attachmentDisclosure.mainSafeText.text,
+      localConversionOnly: true,
+    } : {}),
     attachmentFingerprints: assetFingerprints,
     providerSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
       purpose: 'main',
     }),
-    summaryProviderSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
-      purpose: 'summary',
-    }),
+    ...(decision === 'ordinary' ? {
+      summaryProviderSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+        purpose: 'summary',
+      }),
+    } : {}),
     attachmentDisclosure,
   }
 }

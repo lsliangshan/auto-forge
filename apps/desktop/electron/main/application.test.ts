@@ -5122,7 +5122,7 @@ describe('createApplicationRuntime', () => {
       stream: vi.fn(async function* (request: ModelStreamRequest) {
         captured.push(request)
         if (!isConversationTitleRequest(request)
-          && JSON.stringify(request.messages).includes('[附件 0: 文件-1')) {
+          && JSON.stringify(request.messages).includes('任务：选择并调用具备 file.convert 能力的本地工作流。')) {
           const toolName = request.tools?.[0]?.function.name
           if (!toolName) throw new Error('expected conversion workflow tool')
           yield {
@@ -5230,7 +5230,9 @@ describe('createApplicationRuntime', () => {
       const conversionRequest = agentRequests(captured).at(-1)!
       const providerPayload = JSON.stringify(conversionRequest)
       expect(conversionRequest.toolChoice).toBeUndefined()
-      expect(providerPayload).toContain('[附件 0: 文件-1, application/octet-stream, 42 bytes]')
+      expect(providerPayload).toContain('附件数量：1')
+      expect(providerPayload).toContain('附件索引：0')
+      expect(providerPayload).toContain('目标格式：pdf')
       expect(providerPayload).not.toContain('current.doc')
       expect(providerPayload).not.toContain('x-autoforge-')
       expect(providerPayload).not.toMatch(/data:|dataBase64|mediaAssetId|sourceFingerprint|absolutePath|relativePath/)
@@ -5455,14 +5457,17 @@ describe('createApplicationRuntime', () => {
     expect(providerPayload).not.toContain(source)
     expect(providerPayload).not.toMatch(/dataBase64|mediaAssetId|sourceId|absolutePath|relativePath|file:\/\//i)
     const agentPayload = JSON.stringify(agentRequests(captured)[0])
-    expect(agentPayload).toContain(`[附件 0: 文件-1, image/png, ${privateBytes.byteLength} bytes]`)
+    expect(agentPayload).toContain('任务：选择并调用具备 file.convert 能力的本地工作流。')
+    expect(agentPayload).toContain('附件数量：1')
+    expect(agentPayload).toContain('附件索引：0')
+    expect(agentPayload).not.toContain(content.normalize('NFKC'))
     expect(agentPayload).not.toContain('附件 9：private-source.png')
     expect(agentPayload).toContain(content === 'No matter what this tool can convert just convert this attachment to PDF'
       ? '当前所选模型或本次请求不允许调用工作流或浏览器工具'
       : '你是由 AutoForge Main 管理的工作流 Agent')
     const titleRequest = captured.find(isConversationTitleRequest)
     expect(titleRequest?.messages).toContainEqual({
-      role: 'user', content: `用户：${content.normalize('NFKC')}`,
+      role: 'user', content: expect.stringMatching(/^本地文件转换 · 1 个附件(?: · [A-Z0-9]+)?$/u),
     })
     const titlePayload = JSON.stringify(titleRequest)
     expect(titlePayload).not.toContain('AI：')
@@ -5629,7 +5634,11 @@ describe('createApplicationRuntime', () => {
         expect(workflowRoute).not.toHaveBeenCalled()
         expect(browserCatalog).not.toHaveBeenCalled()
       } else {
-        expect(JSON.stringify(agentRequests(captured)[0])).toContain('[附件 0: 文件-1, image/png,')
+        const agentPayload = JSON.stringify(agentRequests(captured)[0])
+        expect(agentPayload).toContain('任务：选择并调用具备 file.convert 能力的本地工作流。')
+        expect(agentPayload).toContain('附件数量：1')
+        expect(agentPayload).toContain('附件索引：0')
+        expect(agentPayload).not.toContain(content.normalize('NFKC'))
       }
       const titlePayload = JSON.stringify(captured.find(isConversationTitleRequest))
       if (titlePayload !== undefined) {
@@ -5664,7 +5673,21 @@ describe('createApplicationRuntime', () => {
       ['Users', 'Alice', 'Private Folder', '中文 空格', 'SECRET.PDF']],
     ['secret.pdf', `Please convert Private\u00a0Folder/中文 空格/SECRET.PDF and /Users/Alice/SECRET.PDF to PDF`, 2,
       ['Private Folder', '中文 空格', 'Users', 'Alice', 'SECRET.PDF']],
-  ] as const)('anonymizes exact attachment names in metadata-only main and title egress: %s', async (
+    ['secret.pdf', 'Convert /Users/Alice/Tax Returns/SECRET.PDF to PDF', 2,
+      ['Users', 'Alice', 'Tax Returns', 'SECRET.PDF']],
+    ['secret.pdf', 'Convert Tax Return Records/SECRET.PDF to PDF', 2,
+      ['Tax', 'Return', 'Records', 'SECRET.PDF']],
+    ['secret.pdf', '转换 中文 三词 目录/SECRET.PDF 为 PDF', 2,
+      ['中文', '三词', '目录', 'SECRET.PDF']],
+    ['secret.pdf', 'Convert Private/Private Folder/SECRET.PDF to PDF', 2,
+      ['Private', 'Private Folder', 'SECRET.PDF']],
+    ['secret.pdf', 'See yes/no first, then convert SECRET.PDF to PDF', 2,
+      ['yes', 'no', 'SECRET.PDF']],
+    ['secret.pdf', 'Read https://example.test/ordinary/path then convert SECRET.PDF to PDF', 2,
+      ['example.test', 'ordinary', 'path', 'SECRET.PDF']],
+    ['secret.pdf', 'ordinary/path note. Convert SECRET.PDF to PDF', 2,
+      ['ordinary', 'path', 'note', 'SECRET.PDF']],
+  ] as const)('uses canonical local main and title egress without attachment names or path prose: %s', async (
     sourceName,
     content,
     expectedProviderCalls,
@@ -5722,15 +5745,26 @@ describe('createApplicationRuntime', () => {
 
     expect(captured).toHaveLength(expectedProviderCalls)
     const payload = JSON.stringify(captured)
-    for (const mention of forbiddenMentions) expect(payload).not.toContain(mention)
+    const providerUserPayload = JSON.stringify(captured.flatMap(({ messages }) => (
+      messages.filter(({ role }) => role === 'user').map(({ content: userContent }) => userContent)
+    )))
+    for (const mention of forbiddenMentions) expect(providerUserPayload).not.toContain(mention)
     expect(payload).not.toContain(source)
     expect(payload).not.toContain(asset!.id)
     expect(payload).not.toContain(privateBytes.toString('base64'))
     expect(payload).not.toContain(createHash('sha256').update(privateBytes).digest('hex'))
-    if (content.startsWith('See yes/no first, then')) expect(payload).toContain('See yes/no first, then convert')
     if (expectedProviderCalls > 0) {
-      expect(payload).toContain('文件-1')
-      expect(JSON.stringify(captured.find(isConversationTitleRequest))).toContain('文件-1')
+      const mainRequest = captured.find((request) => !isConversationTitleRequest(request))
+      const titleRequest = captured.find(isConversationTitleRequest)
+      expect(JSON.stringify(mainRequest)).toContain([
+        '任务：选择并调用具备 file.convert 能力的本地工作流。',
+        '附件数量：1',
+        '附件索引：0',
+        '目标格式：pdf',
+        '禁止读取附件内容或调用非 file.convert 工具。',
+      ].join('\\n'))
+      expect(JSON.stringify(titleRequest)).toContain('本地文件转换 · 1 个附件 · PDF')
+      expect(payload).not.toContain(content)
       expect(captured.filter((request) => (
         request.maxOutputTokens !== undefined && !isConversationTitleRequest(request)
       ))).toHaveLength(0)

@@ -271,6 +271,44 @@ describe('provider attachment disclosure', () => {
     expect(() => authority.bindProvider(ambiguous, snapshot)).toThrow('cannot be bound')
   })
 
+  it('derives local main and title text only from structured conversion fields', () => {
+    const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+    const plan = authority.createPlan({
+      requestId: 'request_canonical_local',
+      text: 'See yes/no and /Users/Alice/Tax Return Records/private.pdf, then convert it to JPG',
+      context: { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['file', 'file'] },
+      attachments: [
+        {
+          index: 0, id: 'asset_private_a', name: 'private.pdf', mimeType: 'application/pdf',
+          byteSize: bytesA.length, fingerprint: fingerprintA,
+        },
+        {
+          index: 1, id: 'asset_private_b', name: 'other.pdf', mimeType: 'application/pdf',
+          byteSize: bytesB.length, fingerprint: fingerprintB,
+        },
+      ],
+    })
+
+    expect(plan.access.decision).toBe('local')
+    expect(plan.mainText).toBe([
+      '任务：选择并调用具备 file.convert 能力的本地工作流。',
+      '附件数量：2',
+      '附件索引：0, 1',
+      '目标格式：jpeg',
+      '禁止读取附件内容或调用非 file.convert 工具。',
+    ].join('\n'))
+    expect(plan.titleText).toBe('本地文件转换 · 2 个附件 · JPEG')
+    expect(`${plan.mainText}\n${plan.titleText}`).not.toMatch(
+      /See|yes|no|Users|Alice|Tax|Return|Records|private|other|asset_/iu,
+    )
+  })
+
+  it('does not issue a summary capability for local conversion disclosure', () => {
+    const value = fixture('local')
+    expect(() => protectProviderSnapshot(value.snapshot, value.disclosure, { purpose: 'summary' }))
+      .toThrow('summary')
+  })
+
   it('rejects missing, forged, reordered, or changed-fingerprint byte authority', () => {
     const { disclosure } = fixture('ordinary')
     expect(() => assertAttachmentByteAccess(undefined, binding())).toThrow()

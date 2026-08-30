@@ -864,14 +864,18 @@ export class AgentOrchestrator {
           assetFingerprints: input.attachmentFingerprints ?? [],
           purpose: 'main',
         })
-        if (!input.summaryProviderSnapshot) throw appFailure('CONFLICT')
-        assertProtectedProviderSnapshot(input.summaryProviderSnapshot, input.attachmentDisclosure, {
-          requestId,
-          providerId: input.provider,
-          assetIds: input.assetIds,
-          assetFingerprints: input.attachmentFingerprints ?? [],
-          purpose: 'summary',
-        })
+        if (input.localConversionOnly) {
+          if (input.summaryProviderSnapshot !== undefined) throw appFailure('CONFLICT')
+        } else {
+          if (!input.summaryProviderSnapshot) throw appFailure('CONFLICT')
+          assertProtectedProviderSnapshot(input.summaryProviderSnapshot, input.attachmentDisclosure, {
+            requestId,
+            providerId: input.provider,
+            assetIds: input.assetIds,
+            assetFingerprints: input.attachmentFingerprints ?? [],
+            purpose: 'summary',
+          })
+        }
       }
       const userMessageId = this.id()
       const runId = this.id()
