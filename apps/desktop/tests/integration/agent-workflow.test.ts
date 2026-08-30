@@ -609,8 +609,8 @@ describe('agent workflow integration', () => {
     expect(expectedEntries[1]).not.toHaveProperty('city')
   })
 
-  it('runs two separately approved universal conversions while the Provider sees attachment metadata only', async () => {
-    const prompt = '把图片转成 favicon ico，把文档转成 PDF'
+  it('runs one exact multi-attachment conversion while the Provider sees canonical fields only', async () => {
+    const prompt = '把这两个附件转换为 PDF'
     const providerBodies: Array<{
       messages: unknown[]
       tools: Array<{ function: { name: string } }>
@@ -654,71 +654,35 @@ describe('agent workflow integration', () => {
         turn += 1
         if (turn === 1) {
           return response([
-            { id: 'generation_convert_ico', choices: [{ index: 0, delta: { tool_calls: [{
-              index: 0,
-              id: 'tool_convert_ico',
-              function: {
-                name: body.tools[0]!.function.name,
-                arguments: JSON.stringify({
-                  input: { files: [0], targetFormat: 'ico', preset: 'favicon' },
-                }),
-              },
-            }] }, finish_reason: 'tool_calls' }] },
-            '[DONE]',
-          ])
-        }
-        if (turn === 2) {
-          expect(liveApp.database.executions.list()).toEqual([
-            expect.objectContaining({
-              workflowId: 'file.convert.universal',
-              status: 'completed',
-              input: { files: [0], targetFormat: 'ico', preset: 'favicon' },
-            }),
-          ])
-          expect(body.messages).toEqual(expect.arrayContaining([
-            expect.objectContaining({
-              role: 'tool',
-              tool_call_id: 'tool_convert_ico',
-              content: expect.stringContaining('"targetFormat":"ico"'),
-            }),
-          ]))
-          return response([
             { id: 'generation_convert_pdf', choices: [{ index: 0, delta: { tool_calls: [{
               index: 0,
               id: 'tool_convert_pdf',
               function: {
                 name: body.tools[0]!.function.name,
-                arguments: JSON.stringify({ input: { files: [1], targetFormat: 'pdf' } }),
+                arguments: JSON.stringify({ input: { files: [0, 1], targetFormat: 'pdf' } }),
               },
             }] }, finish_reason: 'tool_calls' }] },
             '[DONE]',
           ])
         }
         const executions = liveApp.database.executions.list()
-        if (executions.length !== 2) {
-          return response([
-            { id: 'generation_conversion_incomplete', choices: [{
-              index: 0, delta: { content: '未完成两个本地转换' }, finish_reason: 'stop',
-            }] },
-            '[DONE]',
-          ])
-        }
-        expect(executions).toHaveLength(2)
-        expect(executions).toEqual(expect.arrayContaining([
+        expect(executions).toEqual([
           expect.objectContaining({
             workflowId: 'file.convert.universal',
             status: 'completed',
-            input: { files: [0], targetFormat: 'ico', preset: 'favicon' },
+            input: { files: [0, 1], targetFormat: 'pdf' },
           }),
+        ])
+        expect(body.messages).toEqual(expect.arrayContaining([
           expect.objectContaining({
-            workflowId: 'file.convert.universal',
-            status: 'completed',
-            input: { files: [1], targetFormat: 'pdf' },
+            role: 'tool',
+            tool_call_id: 'tool_convert_pdf',
+            content: expect.stringContaining('"targetFormat":"pdf"'),
           }),
         ]))
         return response([
           { id: 'generation_conversion_final', choices: [{
-            index: 0, delta: { content: '两个本地转换均已提交' }, finish_reason: 'stop',
+            index: 0, delta: { content: '本地转换已提交' }, finish_reason: 'stop',
           }] },
           '[DONE]',
         ])
@@ -755,9 +719,11 @@ describe('agent workflow integration', () => {
       userId: 'user_1',
       userBlocks: [{ type: 'text', text: prompt }],
       modelContent: [
-        prompt,
-        '[附件 0: favicon-source.png, image/png, 67 bytes]',
-        '[附件 1: contract.docx, application/vnd.openxmlformats-officedocument.wordprocessingml.document, 4096 bytes]',
+        '任务：选择并调用具备 file.convert 能力的本地工作流。',
+        '附件数量：2',
+        '附件索引：0, 1',
+        '目标格式：pdf',
+        '禁止读取附件内容或调用非 file.convert 工具。',
       ].join('\n'),
       assetIds: [],
       currentMedia: [
@@ -778,63 +744,47 @@ describe('agent workflow integration', () => {
     expect(firstApproval).toMatchObject({
       type: 'approval',
       capability: 'file.convert',
-      actionSummary: expect.stringMatching(/附件 0：favicon-source\.png.*目标格式：ico/u),
+      actionSummary: expect.stringMatching(
+        /附件 0：favicon-source\.png.*附件 1：contract\.docx.*目标格式：pdf/u,
+      ),
     })
-    expect(JSON.stringify(firstApproval)).not.toMatch(/contract\.docx|media_private|a{32}|b{32}/)
+    expect(JSON.stringify(firstApproval)).not.toMatch(/media_private|a{32}|b{32}/)
 
-    const secondPending = await app.orchestrator.resumeApproval({
+    const completed = await app.orchestrator.resumeApproval({
       executionId: firstPending.executionId!,
       permissionIndex: 0,
       scopeHash: scopeHash({ formats: ['ico', 'pdf'] }),
       decision: 'once',
     })
 
-    expect(secondPending).toMatchObject({ status: 'awaiting_approval' })
-    const pendingApprovals = app.database.messages.listForConversation('conversation_1')
-      .flatMap((message) => message.blocks)
-      .filter((block) => block.type === 'approval' && block.state === 'pending')
-    expect(pendingApprovals).toHaveLength(1)
-    expect(pendingApprovals[0]).toMatchObject({
-      type: 'approval',
-      capability: 'file.convert',
-      actionSummary: expect.stringMatching(/附件 1：contract\.docx.*目标格式：pdf/u),
-    })
-    expect(JSON.stringify(pendingApprovals[0])).not.toMatch(/favicon-source\.png|media_private|a{32}|b{32}/)
-
-    const completed = await app.orchestrator.resumeApproval({
-      executionId: secondPending.executionId!,
-      permissionIndex: 0,
-      scopeHash: scopeHash({ formats: ['ico', 'pdf'] }),
-      decision: 'once',
-    })
-
     expect(completed, JSON.stringify(completed)).toMatchObject({ status: 'completed' })
-    expect(app.workers.workers).toHaveLength(2)
+    expect(app.workers.workers).toHaveLength(1)
     expect(app.workers.workers.map((worker) => (
       worker.requests.find((request) => request.type === 'start')
     ))).toEqual([
       expect.objectContaining({
         type: 'start', workflowId: 'file.convert.universal',
-        input: { files: [0], targetFormat: 'ico', preset: 'favicon' },
-      }),
-      expect.objectContaining({
-        type: 'start', workflowId: 'file.convert.universal',
-        input: { files: [1], targetFormat: 'pdf' },
+        input: { files: [0, 1], targetFormat: 'pdf' },
       }),
     ])
     expect(starts.mock.calls.map(([, input]) => input.fileConvertAuthorization)).toEqual([
       expect.objectContaining({
-        decision: 'once', attachments: [{ index: 0, sourceFingerprint: 'a'.repeat(64) }], formats: ['ico'],
-      }),
-      expect.objectContaining({
-        decision: 'once', attachments: [{ index: 1, sourceFingerprint: 'b'.repeat(64) }], formats: ['pdf'],
+        decision: 'once',
+        attachments: [
+          { index: 0, sourceFingerprint: 'a'.repeat(64) },
+          { index: 1, sourceFingerprint: 'b'.repeat(64) },
+        ],
+        formats: ['pdf'],
       }),
     ])
-    expect(providerBodies).toHaveLength(3)
+    expect(providerBodies).toHaveLength(2)
     const providerPayload = JSON.stringify(providerBodies)
-    expect(providerPayload).toContain('[附件 0: favicon-source.png, image/png, 67 bytes]')
-    expect(providerPayload).toContain('[附件 1: contract.docx, application/vnd.openxmlformats-officedocument.wordprocessingml.document, 4096 bytes]')
-    expect(providerPayload).not.toMatch(/media_private_png|media_private_docx|sourceFingerprint|attachmentBindings|fileConvertAuthorization/)
+    expect(providerPayload).toContain('附件数量：2')
+    expect(providerPayload).toContain('附件索引：0, 1')
+    expect(providerPayload).toContain('目标格式：pdf')
+    expect(providerPayload).not.toMatch(
+      /favicon-source|contract\.docx|image\/png|application\/vnd\.openxmlformats|media_private|sourceFingerprint|attachmentBindings|fileConvertAuthorization/u,
+    )
     expect(providerPayload).not.toContain(app.directory)
     expect(providerPayload).not.toMatch(/\/Users\/|[A-Za-z]:\\Users\\|iVBORw0|UEsDB|dataBase64|base64/i)
   })
