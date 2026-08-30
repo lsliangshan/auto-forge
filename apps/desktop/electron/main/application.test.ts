@@ -5441,6 +5441,12 @@ describe('createApplicationRuntime', () => {
     ['制作一段视频，格式为任意', 'local', 'video'],
     ['生成一张图片并转换这个附件', 'local', 'image'],
     ['制作一段视频，然后描述附件', 'local', 'video'],
+    ['生成一张图片', 'ambiguous', 'audio'],
+    ['生成一张图片', 'ambiguous', 'video'],
+    ['创建一个音频', 'ambiguous', 'image'],
+    ['创建一个音频', 'ambiguous', 'video'],
+    ['制作一段视频', 'ambiguous', 'image'],
+    ['制作一段视频', 'ambiguous', 'audio'],
     ['edit this image and export it as png', 'local', 'text'],
   ] as const)(
     'enforces the final attachment disclosure boundary for %s as %s from %s output',
@@ -5583,6 +5589,12 @@ describe('createApplicationRuntime', () => {
       ['Users', 'alice', 'Tax Returns', 'Private Files', 'server', 'Private Share', 'STRASSE.PDF', 'Straße.pdf']],
     ['secret.pdf', String.raw`Convert "/Users/Alice/Export Data/SECRET.PDF" and C:\Windows Open Files\SECRET.PDF and \\server\UNC Save As\SECRET.PDF and 资料/中文 转换 资料/SECRET.PDF and "/Users/Alice/Tax, Returns/SECRET.PDF" to PDF`, 2,
       ['Users', 'Alice', 'Export Data', 'Windows Open Files', 'server', 'UNC Save As', '资料/中文', '中文 转换 资料', 'Tax, Returns', 'SECRET.PDF']],
+    ['secret.pdf', String.raw`See yes/no first. Convert ("/Users/O'Neil/Quoted "Draft"/SECRET.PDF") and [C:\O’Neil\Unpaired 'Draft\SECRET.PDF] to PDF`, 2,
+      ['Users', "O'Neil", 'O’Neil', 'Quoted', 'Draft', 'SECRET.PDF']],
+    ["O'Neil.pdf", String.raw`Convert "/Users/Alice/Private Files/O'NEIL.PDF" to PDF`, 2,
+      ['Users', 'Alice', 'Private Files', "O'NEIL.PDF"]],
+    ['O’Neil.pdf', String.raw`Convert [C:\Users\Alice\Private Files\O’NEIL.PDF] to PDF`, 2,
+      ['Users', 'Alice', 'Private Files', 'O’NEIL.PDF']],
   ] as const)('anonymizes exact attachment names in metadata-only main and title egress: %s', async (
     sourceName,
     content,
@@ -6738,7 +6750,7 @@ describe('createApplicationRuntime', () => {
 
     const audioConversation = await runtime.services.chat.createConversation()
     await runtime.services.chat.send({
-      ...chatInput(audioConversation.id, 'speak'),
+      ...chatInput(audioConversation.id, '创建一个音频'),
       outputType: 'audio',
     })
     await vi.waitFor(() => expect(stream).toHaveBeenCalledWith(expect.objectContaining({
@@ -6820,6 +6832,64 @@ describe('createApplicationRuntime', () => {
       outputType: 'image',
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(generateImage).toHaveBeenCalledTimes(2)
+    await runtime.close()
+  })
+
+  it.each([
+    ['生成一张图片', 'audio'],
+    ['生成一张图片', 'video'],
+    ['创建一个音频', 'image'],
+    ['创建一个音频', 'video'],
+    ['制作一段视频', 'image'],
+    ['制作一段视频', 'audio'],
+  ] as const)('fails closed before Provider acquisition when declared media in %s conflicts with %s output without attachments', async (
+    content,
+    outputType,
+  ) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-modality-conflict-'))
+    directories.push(root)
+    const stream = vi.fn(async function* () {
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const generateImage = vi.fn(async () => ({ outputs: [] }))
+    const submitVideo = vi.fn(async () => ({
+      providerJobId: 'provider_modality_conflict', status: 'pending' as const,
+    }))
+    const provider = snapshotProvider('openrouter', {
+      listModels: async () => [
+        imageModelInfo('openrouter/image'),
+        audioModelInfo('openrouter/audio'),
+        videoModelInfo('openrouter/video'),
+      ],
+      validateCredential: async () => ({ valid: true }),
+      stream,
+      generateImage,
+      submitVideo,
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: {
+          image: 'openrouter/image', audio: 'openrouter/audio', video: 'openrouter/video',
+        },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+
+    await runtime.services.chat.send({
+      ...chatInput(conversation.id, content), outputType,
+    })
+
+    expect(provider.acquireSnapshot).not.toHaveBeenCalled()
+    expect(stream).not.toHaveBeenCalled()
+    expect(generateImage).not.toHaveBeenCalled()
+    expect(submitVideo).not.toHaveBeenCalled()
     await runtime.close()
   })
 

@@ -442,6 +442,53 @@ describe('local conversion intent', () => {
     expect(anonymizeAttachmentNames.toString()).not.toMatch(/prefix\.matchAll|replacements\.some/u)
   })
 
+  it.each([
+    ["/Users/O'Neil/SECRET.PDF", "Convert /Users/O'Neil/SECRET.PDF to PDF"],
+    ['/Users/O’Neil/SECRET.PDF', 'Convert /Users/O’Neil/SECRET.PDF to PDF'],
+    ['/Users/Alice/"Draft"/SECRET.PDF', 'Convert /Users/Alice/"Draft"/SECRET.PDF to PDF'],
+    ["C:\\O'Neil\\Draft' Files\\SECRET.PDF", "Convert C:\\O'Neil\\Draft' Files\\SECRET.PDF to PDF"],
+    ['\\\\server\\O’Neil\\“Draft\\SECRET.PDF', 'Convert \\\\server\\O’Neil\\“Draft\\SECRET.PDF to PDF'],
+    ["relative/O'Neil/SECRET.PDF", "Convert relative/O'Neil/SECRET.PDF to PDF"],
+    ["relative\\O’Neil/O'Neil\\SECRET.PDF", "Convert relative\\O’Neil/O'Neil\\SECRET.PDF to PDF"],
+  ])('keeps paired and unpaired apostrophes or quotes inside the complete path span: %s', (mention, request) => {
+    const prompt = projectLocalConversionPrompt(request, [{
+      index: 0, name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])
+
+    expect(prompt).toContain(request.replace(mention, '文件-1'))
+    expect(prompt).not.toMatch(/users|o['’]neil|draft|server|relative|secret\.pdf/iu)
+  })
+
+  it.each([
+    ["O'Neil.pdf", "/Users/Alice/O'NEIL.PDF"],
+    ['O’Neil.pdf', 'C:\\Users\\Alice\\O’NEIL.PDF'],
+    ['Draft".pdf', '\\\\server\\Private\\DRAFT".PDF'],
+  ])('anonymizes a complete path when the attachment filename itself contains a quote: %s', (name, mention) => {
+    expect(projectLocalConversionPrompt(`Convert ${mention} to PDF`, [{
+      index: 0, name, mimeType: 'application/pdf', byteSize: 12,
+    }])).toContain('Convert 文件-1 to PDF')
+  })
+
+  it.each([
+    ['see yes/no first, then convert SECRET.PDF', 'see yes/no first, then convert 文件-1'],
+    ['read https://example.test/a/b first, then convert SECRET.PDF', 'read https://example.test/a/b first, then convert 文件-1'],
+    ['email a/b@example.com before converting SECRET.PDF', 'email a/b@example.com before converting 文件-1'],
+    ['ordinary/path note. Convert SECRET.PDF', 'ordinary/path note. Convert 文件-1'],
+  ])('does not extend an earlier slash across ordinary prose to %s', (request, expected) => {
+    expect(projectLocalConversionPrompt(request, [{
+      index: 0, name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])).toContain(expected)
+  })
+
+  it.each([
+    ['Convert (/Users/Alice/Tax Returns/SECRET.PDF) to PDF', 'Convert (文件-1) to PDF'],
+    [String.raw`Convert [C:\Private Files\SECRET.PDF] to PDF`, 'Convert [文件-1] to PDF'],
+  ])('preserves paired brackets around a fully anonymized path token: %s', (request, expected) => {
+    expect(projectLocalConversionPrompt(request, [{
+      index: 0, name: 'secret.pdf', mimeType: 'application/pdf', byteSize: 12,
+    }])).toContain(expected)
+  })
+
   it('keeps ordinary slash-separated prose that does not end in an attachment basename', () => {
     expect(projectLocalConversionPrompt('说明 yes/no 选项', [{
       index: 0, name: 'report.pdf', mimeType: 'application/pdf', byteSize: 12,

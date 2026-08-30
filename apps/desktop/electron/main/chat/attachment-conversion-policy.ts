@@ -21,7 +21,8 @@ const ENGLISH_ORDINARY_REQUEST = new RegExp(
 )
 const CHINESE_ORDINARY_REQUEST = /^(?:请)?(?:再)?(?:查看|读取|阅读|描述|总结|概括|分析|识别|检查)(?:一下)?(?:这个|这张|该|当前)?(?:文本)?(?:附件|图片|图像|照片|文件|文档|PDF|JPE?G|PNG)(?:的)?(?:内容|页面)?(?:，?请)?(?:简要|仔细|准确)?(?:说明|描述|总结)?[。！？]?$/iu
 const IMAGE_REFERENCE_EDIT = /^(?:please\s+)?(?:(?:make|edit|transform)\s+(?:this|the)\s+image\s+(?:(?:look\s+)?(?:cinematic|watercolou?r|like\s+(?:a\s+)?sunset|like\s+(?:a\s+)?painting|like\s+(?:a\s+)?sketch))|create\s+(?:an?\s+)?new\s+image\s+based\s+on\s+(?:this|the)\s+image)(?:\s+please)?[.!?]?$|^(?:请)?(?:把)?(?:这个|这张|该|当前)?(?:图片|图像|照片)(?:做成|制作成?)(?:水彩画?|油画|素描|电影感|日落风格)[。！？]?$/iu
-const MEDIA_OUTPUT_REQUEST = /^(?:please\s+)?(?:make|create|generate|produce)\s+(?:an?\s+)?(?:[\p{L}\p{N}-]+\s+){0,6}(?:image|photo|audio|video)(?:\s+please)?[.!?]?$|^(?:请)?(?:生成|创建|制作)(?:一个|一张|一段)?(?:图片|图像|音频|视频)[。！？]?$/iu
+const ENGLISH_MEDIA_OUTPUT_REQUEST = /^(?:please\s+)?(?:make|create|generate|produce)\s+(?:an?\s+)?(?:[\p{L}\p{N}-]+\s+){0,6}(image|photo|audio|video)(?:\s+please)?[.!?]?$/iu
+const CHINESE_MEDIA_OUTPUT_REQUEST = /^(?:请)?(?:生成|创建|制作)(?:一个|一张|一段)?(图片|图像|音频|视频)[。！？]?$/iu
 const FILE_FORMAT_TARGET = /(?:\b\.?[a-z][a-z0-9]{1,15}\s+(?:file\s+format|format|version)\b|\.?[a-z0-9]{2,16}\s*(?:格式|版本))/iu
 const MEDIA_FORMAT_TARGET = /\b(?:to|as|into)\s+(?:an?\s+)?\.?[a-z0-9][a-z0-9._+-]{1,15}\b|(?:转成|转为|导出为|保存为|生成为?)\s*\.?[a-z0-9][a-z0-9._+-]{1,15}\b/iu
 function issueAccessDecision(decision: AttachmentConversionIntent): ProviderAttachmentAccessDecision {
@@ -47,9 +48,20 @@ export function hasHighConfidenceOrdinaryAttachmentRequest(text: string): boolea
     || /^(?:请)?(?:查看|读取|阅读)(?:一下)?(?:这个|这张|该|当前)?(?:附件|文件|图片|图像|照片|文档|PDF|JPE?G|PNG)(?:的)?(?:内容)?(?:，)?(?:并|然后)?(?:请)?告诉我(?:它的)?主要内容[。！？]?$/iu.test(normalized)
 }
 
-export function hasHighConfidenceMediaGenerationRequest(text: string): boolean {
+export function hasHighConfidenceMediaGenerationRequest(
+  text: string,
+): 'image' | 'audio' | 'video' | undefined {
   const normalized = text.trim().normalize('NFKC')
-  return MEDIA_OUTPUT_REQUEST.test(normalized) && !MEDIA_FORMAT_TARGET.test(normalized)
+  if (MEDIA_FORMAT_TARGET.test(normalized)) return undefined
+  const declared = (ENGLISH_MEDIA_OUTPUT_REQUEST.exec(normalized)?.[1]
+    ?? CHINESE_MEDIA_OUTPUT_REQUEST.exec(normalized)?.[1]
+  )?.toLocaleLowerCase('und')
+  if (declared === 'image' || declared === 'photo' || declared === '图片' || declared === '图像') {
+    return 'image'
+  }
+  if (declared === 'audio' || declared === '音频') return 'audio'
+  if (declared === 'video' || declared === '视频') return 'video'
+  return undefined
 }
 
 export function providerAttachmentAccess(
@@ -61,6 +73,12 @@ export function providerAttachmentAccess(
     attachmentKinds: ['file'],
   },
 ): ProviderAttachmentAccessDecision {
+  const declaredMedia = hasHighConfidenceMediaGenerationRequest(text)
+  if (declaredMedia !== undefined
+    && context.requestedOutput !== 'auto'
+    && context.requestedOutput !== declaredMedia) {
+    return issueAccessDecision('ambiguous')
+  }
   if (!context.hasAttachments) return issueAccessDecision('ordinary')
   if (decision === 'local') return issueAccessDecision('local')
   const imageReferenceEdit = decision === 'ordinary'
@@ -70,9 +88,9 @@ export function providerAttachmentAccess(
     && !MEDIA_FORMAT_TARGET.test(text)
   if (imageReferenceEdit) return issueAccessDecision('ordinary')
   const explicitMediaOutput = decision === 'ordinary'
-    && context.requestedOutput !== 'auto'
     && context.requestedOutput !== 'text'
-    && hasHighConfidenceMediaGenerationRequest(text)
+    && declaredMedia !== undefined
+    && (context.requestedOutput === 'auto' || declaredMedia === context.requestedOutput)
   if (explicitMediaOutput) return issueAccessDecision('ordinary')
   if (decision === 'ordinary' && hasHighConfidenceOrdinaryAttachmentRequest(text)) {
     return issueAccessDecision('ordinary')

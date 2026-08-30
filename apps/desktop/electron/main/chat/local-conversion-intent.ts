@@ -425,8 +425,9 @@ export function anonymizeAttachmentNames(
   for (let offset = 0; offset < normalized.length;) {
     const match = matches[matchIndex]
     if (match !== undefined && offset === match.start) {
+      const directlyInPath = match.start > 0 && /[\\/]/u.test(normalized[match.start - 1]!)
       replacements.push({
-        start: pathStart ?? match.start,
+        start: directlyInPath ? pathStart ?? match.start : match.start,
         end: match.end,
         text: match.text,
       })
@@ -437,7 +438,7 @@ export function anonymizeAttachmentNames(
       continue
     }
     const character = normalized[offset]!
-    if (quoteCharacters.has(character)) {
+    if (quoteCharacters.has(character) && pathStart === undefined) {
       if (quoteStart === undefined) {
         quoteStart = offset + 1
         tokenStart = quoteStart
@@ -445,11 +446,20 @@ export function anonymizeAttachmentNames(
         quoteStart = undefined
         tokenStart = offset + 1
       }
-      pathStart = undefined
-    } else if (pathStart === undefined && /[\\/]/u.test(character)) {
+    } else if (/[\\/]/u.test(character)) {
+      const previous = normalized[offset - 1]
       const isAbsoluteUnixPath = character === '/'
-        && (offset === 0 || /\s/u.test(normalized[offset - 1]!))
-      pathStart = quoteStart ?? (isAbsoluteUnixPath ? offset : tokenStart)
+        && (offset === 0 || /[\s([{"'“‘]/u.test(previous ?? ''))
+      const isDrivePath = character === '\\'
+        && offset >= 2
+        && /[A-Za-z]:/u.test(normalized.slice(offset - 2, offset))
+      if (pathStart === undefined) {
+        pathStart = quoteStart ?? (isAbsoluteUnixPath
+          ? offset
+          : isDrivePath ? offset - 2 : tokenStart)
+      }
+    } else if (pathStart === undefined && /[([{]/u.test(character)) {
+      tokenStart = offset + 1
     } else if (pathStart === undefined && /\s/u.test(character)) {
       tokenStart = offset + 1
     }

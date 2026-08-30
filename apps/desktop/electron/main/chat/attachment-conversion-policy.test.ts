@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  hasHighConfidenceMediaGenerationRequest,
   hasConversionRiskSignal,
   providerAttachmentAccess,
 } from './attachment-conversion-policy.js'
@@ -175,6 +176,57 @@ describe('attachment conversion policy', () => {
   })
 
   it.each([
+    ['generate an image', 'image'],
+    ['Generate an IMAGE', 'image'],
+    ['make audio', 'audio'],
+    ['produce a short video', 'video'],
+    ['生成一张图片', 'image'],
+    ['创建一个音频', 'audio'],
+    ['制作一段视频', 'video'],
+  ] as const)('returns the declared media modality for %s', (text, expected) => {
+    expect(hasHighConfidenceMediaGenerationRequest(text)).toBe(expected)
+  })
+
+  it.each([
+    ['generate an image', 'image'], ['generate an image', 'audio'], ['generate an image', 'video'],
+    ['make audio', 'image'], ['make audio', 'audio'], ['make audio', 'video'],
+    ['produce a video', 'image'], ['produce a video', 'audio'], ['produce a video', 'video'],
+  ] as const)('requires declared media in %s to match requested %s', (text, requestedOutput) => {
+    const access = providerAttachmentAccess('ordinary', text, {
+      hasAttachments: true,
+      requestedOutput,
+      attachmentKinds: ['image'],
+    })
+    expect(access).toMatchObject(requestedOutput === hasHighConfidenceMediaGenerationRequest(text)
+      ? { decision: 'ordinary', allowProviderBytes: true }
+      : { decision: 'ambiguous', allowProviderBytes: false })
+  })
+
+  it.each(['image', 'audio', 'video'] as const)(
+    'rejects a declared image request when a non-image attachment is routed to %s output',
+    (requestedOutput) => {
+      const access = providerAttachmentAccess('ordinary', 'generate an image', {
+        hasAttachments: true,
+        requestedOutput,
+        attachmentKinds: ['file'],
+      })
+      expect(access.decision === 'ordinary').toBe(requestedOutput === 'image')
+    },
+  )
+
+  it.each([
+    ['generate an image', 'audio'], ['generate an image', 'video'],
+    ['make audio', 'image'], ['make audio', 'video'],
+    ['produce a video', 'image'], ['produce a video', 'audio'],
+  ] as const)('fails closed on a declared/requested mismatch without attachments: %s to %s', (text, requestedOutput) => {
+    expect(providerAttachmentAccess('ordinary', text, {
+      hasAttachments: false,
+      requestedOutput,
+      attachmentKinds: [],
+    })).toMatchObject({ decision: 'ambiguous', allowProviderBytes: false })
+  })
+
+  it.each([
     '生成一张图片，格式为PNG',
     '制作一段视频，格式为任意',
     '生成一张图片并转换这个附件',
@@ -207,6 +259,14 @@ describe('attachment conversion policy', () => {
       requestedOutput: 'text',
       attachmentKinds: ['image'],
     }).decision).toBe('ambiguous')
+  })
+
+  it('does not treat auto output as media evidence when the prompt declares no modality', () => {
+    expect(providerAttachmentAccess('ordinary', 'please help', {
+      hasAttachments: true,
+      requestedOutput: 'auto',
+      attachmentKinds: ['image'],
+    })).toMatchObject({ decision: 'ambiguous', allowProviderBytes: false })
   })
 
   it.each([
