@@ -385,24 +385,26 @@ export function anonymizeAttachmentNames(
   }
   const foldedText = foldedParts.join('')
   const replacements: Array<{ start: number; end: number; text: string }> = []
+  const expandedPathSpan = (start: number, end: number): { start: number; end: number } | undefined => {
+    if (start === 0 || !/[\\/]/u.test(normalized[start - 1]!)) return undefined
+    const prefix = normalized.slice(0, start)
+    let boundary = 0
+    for (const match of prefix.matchAll(/[,，;；。!?！？\n\r"'“”‘’]/gu)) {
+      boundary = Math.max(boundary, (match.index ?? 0) + match[0].length)
+    }
+    for (const match of prefix.matchAll(/(?:\b(?:convert|transcode|save|export|reformat|encode|render|transform|create|generate|make|turn|change|process|use|read|open|describe|summari[sz]e)\b|(?:请把|转换|转成|转为|保存|导出|生成|创建|制作|处理|读取|查看|打开|把))\s+|\s+\b(?:and|or)\b\s+|(?:和|及|以及)\s*/giu)) {
+      boundary = Math.max(boundary, (match.index ?? 0) + match[0].length)
+    }
+    while (/\s/u.test(normalized[boundary] ?? '')) boundary += 1
+    const candidate = normalized.slice(boundary, end)
+    return /[\\/]/u.test(candidate) ? { start: boundary, end } : undefined
+  }
   const candidates = [...attachments].map((attachment) => ({
     attachment,
     basename: attachment.name.normalize('NFKC').split(/[\\/]/u).at(-1) ?? '',
   })).sort((left, right) => (
     fold(right.basename).length - fold(left.basename).length
   ))
-  const pathToken = /(?<![\p{L}\p{N}._+-])(?:(?:[A-Za-z]:)?[\\/]{1,2}|[\p{L}\p{N}._+-]+[\\/])(?:[\p{L}\p{N}._+-]+[\\/])*[\p{L}\p{N}._+-]+/gu
-  for (const match of normalized.matchAll(pathToken)) {
-    if (match.index === undefined) continue
-    const finalSegment = match[0].split(/[\\/]/u).at(-1) ?? ''
-    const candidate = candidates.find(({ basename }) => fold(basename) === fold(finalSegment))
-    if (!candidate) continue
-    replacements.push({
-      start: match.index,
-      end: match.index + match[0].length,
-      text: `文件-${candidate.attachment.index + 1}`,
-    })
-  }
   for (const { attachment, basename } of candidates) {
     const foldedName = fold(basename)
     if (!foldedName) continue
@@ -412,10 +414,13 @@ export function anonymizeAttachmentNames(
       if (found === -1) break
       const start = starts[found]
       const end = ends[found + foldedName.length - 1]
-      if (start !== undefined && end !== undefined && !replacements.some((replacement) => (
-        replacement.start < end && replacement.end > start
+      const span = start === undefined || end === undefined
+        ? undefined
+        : expandedPathSpan(start, end) ?? { start, end }
+      if (span !== undefined && !replacements.some((replacement) => (
+        replacement.start < span.end && replacement.end > span.start
       ))) {
-        replacements.push({ start, end, text: `文件-${attachment.index + 1}` })
+        replacements.push({ ...span, text: `文件-${attachment.index + 1}` })
       }
       searchFrom = found + Math.max(1, foldedName.length)
     }

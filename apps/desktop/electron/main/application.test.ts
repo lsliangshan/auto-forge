@@ -5432,6 +5432,10 @@ describe('createApplicationRuntime', () => {
     ['transform this image into pdf', 'ambiguous', 'image'],
     ['render this image to jpg', 'ambiguous', 'image'],
     ['create this image as ico', 'ambiguous', 'image'],
+    ['create this image in png', 'ambiguous', 'image'],
+    ['create this image with png output', 'ambiguous', 'image'],
+    ['generate an image with this image in foo format', 'ambiguous', 'image'],
+    ['生成这个图片，格式为任意', 'ambiguous', 'image'],
     ['edit this image and export it as png', 'local', 'text'],
   ] as const)(
     'enforces the final attachment disclosure boundary for %s as %s from %s output',
@@ -5570,6 +5574,8 @@ describe('createApplicationRuntime', () => {
     ['İnvoice.pdf', 'Convert invoice.pdf and İNVOICE.PDF to PDF', 2, ['invoice.pdf', 'İNVOICE.PDF']],
     ['Straße.pdf', String.raw`Convert /Users/alice/Tax/STRASSE.PDF and C:\Private\Straße.pdf and \\server\share\STRASSE.PDF to PDF`, 2,
       ['Users', 'alice', 'Tax', 'Private', 'server', 'share', 'STRASSE.PDF', 'Straße.pdf']],
+    ['Straße.pdf', String.raw`Convert "/Users/alice/Tax Returns/STRASSE.PDF" and C:\Private Files\Straße.pdf and \\server\Private Share\STRASSE.PDF to PDF`, 2,
+      ['Users', 'alice', 'Tax Returns', 'Private Files', 'server', 'Private Share', 'STRASSE.PDF', 'Straße.pdf']],
   ] as const)('anonymizes exact attachment names in metadata-only main and title egress: %s', async (
     sourceName,
     content,
@@ -5633,6 +5639,9 @@ describe('createApplicationRuntime', () => {
     if (expectedProviderCalls > 0) {
       expect(payload).toContain('文件-1')
       expect(JSON.stringify(captured.find(isConversationTitleRequest))).toContain('文件-1')
+      expect(captured.filter((request) => (
+        request.maxOutputTokens !== undefined && !isConversationTitleRequest(request)
+      ))).toHaveLength(0)
     } else {
       expect(provider.acquireSnapshot).not.toHaveBeenCalled()
     }

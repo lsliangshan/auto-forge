@@ -379,6 +379,38 @@ describe('local conversion intent', () => {
     expect(prompt).not.toMatch(/users|alice|tax|server|private|folder|strasse|straße/iu)
   })
 
+  it.each([
+    ['Straße.pdf', '/Users/Alice/Tax Returns/STRASSE.PDF'],
+    ['Straße.pdf', String.raw`C:\Users\Alice\Private Files\Straße.pdf`],
+    ['Straße.pdf', String.raw`\\server\Private Share\Folder\STRASSE.PDF`],
+    ['Straße.pdf', 'relative/Private Folder/STRASSE.PDF'],
+    ['Straße.pdf', 'relative\\Private/Folder Name\\Straße.pdf'],
+    ['Straße.pdf', 'relative/Private\u00a0Folder/STRASSE.PDF'],
+    ['Straße.pdf', 'relative/Private\u3000Folder/STRASSE.PDF'],
+  ])('anonymizes an unquoted path token containing directory spaces: %s in %s', (name, mention) => {
+    const prompt = projectLocalConversionPrompt(
+      `转换 ${mention} 和 ${mention}`,
+      [{ index: 0, name, mimeType: 'application/pdf', byteSize: 12 }],
+    )
+
+    expect(prompt).toContain('转换 文件-1 和 文件-1')
+    expect(prompt).not.toMatch(/users|alice|tax|returns|server|private|share|folder|relative|strasse|straße/iu)
+  })
+
+  it.each([
+    ['Straße.pdf', '"/Users/Alice/Tax Returns/STRASSE.PDF"'],
+    ['Straße.pdf', String.raw`'C:\Private Files\Straße.pdf'`],
+    ['Straße.pdf', '“relative/Private Folder/STRASSE.PDF”'],
+  ])('anonymizes the path inside quotes without retaining directory segments: %s in %s', (name, mention) => {
+    const prompt = projectLocalConversionPrompt(
+      `转换 ${mention}`,
+      [{ index: 0, name, mimeType: 'application/pdf', byteSize: 12 }],
+    )
+
+    expect(prompt).toMatch(/转换 ["'“]文件-1["'”]/u)
+    expect(prompt).not.toMatch(/users|alice|tax|returns|private|folder|relative|strasse|straße/iu)
+  })
+
   it('keeps ordinary slash-separated prose that does not end in an attachment basename', () => {
     expect(projectLocalConversionPrompt('说明 yes/no 选项', [{
       index: 0, name: 'report.pdf', mimeType: 'application/pdf', byteSize: 12,

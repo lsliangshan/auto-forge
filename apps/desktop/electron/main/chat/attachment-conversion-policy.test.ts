@@ -141,6 +141,27 @@ describe('attachment conversion policy', () => {
   })
 
   it.each([
+    'create this image in png',
+    'create this image with png output',
+    'generate an image with this image in foo format',
+    '生成这个图片，格式为任意',
+  ])('never upgrades an ambiguous classifier result through a media exception: %s', (text) => {
+    expect(providerAttachmentAccess('ambiguous', text, {
+      hasAttachments: true,
+      requestedOutput: 'image',
+      attachmentKinds: ['image'],
+    })).toMatchObject({ decision: 'ambiguous', allowProviderBytes: false })
+  })
+
+  it('requires an ordinary classifier result even for an approved style sentence', () => {
+    expect(providerAttachmentAccess('ambiguous', 'make this image watercolor', {
+      hasAttachments: true,
+      requestedOutput: 'image',
+      attachmentKinds: ['image'],
+    })).toMatchObject({ decision: 'ambiguous', allowProviderBytes: false })
+  })
+
+  it.each([
     ['make image', 'image'],
     ['make audio', 'audio'],
     ['make video', 'video'],
