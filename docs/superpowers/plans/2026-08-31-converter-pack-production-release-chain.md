@@ -298,7 +298,7 @@
 
 **Files:**
 - Create: `apps/desktop/scripts/converter-packs/create-production-bootstrap.mjs`
-- Create: `apps/desktop/electron-builder.production.yml`
+- Create: `apps/desktop/electron-builder.production.cjs`
 - Create: `apps/desktop/tests/integration/converter-pack-bootstrap.test.ts`
 - Modify: `apps/desktop/electron/main/build-config.test.ts`
 - Modify: `apps/desktop/scripts/verify-converter-packs.mjs`
@@ -308,31 +308,31 @@
 - Consumes: stable HTTPS index URL, Ed25519 public key and an exclusive output directory.
 - Produces: canonical enabled bootstrap metadata used only by production builder configuration.
 
-- [ ] **Step 1: Write failing bootstrap and build-config tests**
+- [x] **Step 1: Write failing bootstrap and build-config tests**
 
   Prove the generator rejects non-HTTPS URLs, private keys, non-Ed25519 keys,
   symlink output and the checked-in resource root. Assert ordinary builder
   config still packages disabled metadata while production config requires an
   explicit generated root.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
   Expected: missing generator and production config assertions.
 
-- [ ] **Step 3: Implement canonical bootstrap generation**
+- [x] **Step 3: Implement canonical bootstrap generation**
 
   Write only `bootstrap.json`, `index.schema.json` and
   `root-public-key.pem` into a new directory. Extend packaged verification with
   an explicit production mode that verifies enabled URL/key metadata and still
   scans the ASAR for private keys, fixtures and engines.
 
-- [ ] **Step 4: Package and verify both modes**
+- [x] **Step 4: Package and verify both modes**
 
   Run ordinary `dist:dir` and confirm fail-closed bootstrap. Generate a test
   release root, package with the production config and confirm the public key
   and enabled canonical bootstrap are present while no private material exists.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   Commit message: `build: enable signed converter metadata for releases`
 

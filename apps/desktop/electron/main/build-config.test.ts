@@ -42,6 +42,7 @@ describe('main process build', () => {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> }
     const builderConfigPath = fileURLToPath(new URL('../../electron-builder.yml', import.meta.url))
     const builderConfig = readFileSync(builderConfigPath, 'utf8')
+    const productionBuilderConfig = readFileSync(fileURLToPath(new URL('../../electron-builder.production.cjs', import.meta.url)), 'utf8')
     const resourceRoot = fileURLToPath(new URL('../../resources/converter-packs/', import.meta.url))
     const bootstrap = JSON.parse(readFileSync(`${resourceRoot}/bootstrap.json`, 'utf8')) as Record<string, unknown>
     const resourceNames = readdirSync(resourceRoot).sort()
@@ -64,6 +65,11 @@ describe('main process build', () => {
     expect(builderConfig).not.toMatch(/private[-_]?key|\.tar|\.exe|ffmpeg|soffice|autoforge-image-converter|autoforge-pdf-raster/iu)
     expect(packageJson.scripts?.['converter-packs:build']).toContain('build-index.mjs')
     expect(packageJson.scripts?.['converter-packs:sign']).toContain('sign-index.mjs')
+    expect(packageJson.scripts?.['converter-packs:create-bootstrap']).toContain('create-production-bootstrap.mjs')
+    expect(packageJson.scripts?.['dist:production']).toContain('electron-builder.production.cjs')
+    expect(packageJson.scripts?.['dist:production']).toContain('--metadata-mode production')
+    expect(productionBuilderConfig).toContain('AUTOFORGE_CONVERTER_METADATA_ROOT')
+    expect(productionBuilderConfig).not.toContain('from: resources/converter-packs')
     expect(packageJson.scripts?.['verify:converter-packs']).toContain('verify-converter-packs.mjs')
     expect(packageJson.scripts?.['dist:dir']).toContain('verify:converter-packs')
   })

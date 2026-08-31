@@ -19,6 +19,7 @@ import { basename, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
+import { createProductionBootstrap } from '../../scripts/converter-packs/create-production-bootstrap.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const buildScript = join(desktopRoot, 'scripts/converter-packs/build-index.mjs')
@@ -248,10 +249,36 @@ describe('converter pack release tooling', () => {
       process.noAsar = previousNoAsar
     }
     expect(rawSize).toBeGreaterThan(100 * 1024 * 1024)
+    const bootstrap = JSON.parse(readFileSync(join(actualDarwinApp, 'Contents', 'Resources', 'converter-packs', 'bootstrap.json'), 'utf8')) as { downloadsEnabled?: unknown }
+    const metadataMode = bootstrap.downloadsEnabled === true ? 'production' : 'disabled'
     const result = run(verifyScript, [
-      '--packaged-app', actualDarwinApp, '--platform', 'darwin', '--arch', 'arm64',
+      '--packaged-app', actualDarwinApp, '--platform', 'darwin', '--arch', 'arm64', '--metadata-mode', metadataMode,
     ])
     expect(result.status, result.stderr).toBe(0)
+  })
+
+  it('accepts enabled Ed25519 metadata only in explicit production metadata mode', async () => {
+    const root = temporaryRoot()
+    const fixture = packagedApp(root, 'darwin')
+    const keys = keyPair(root)
+    const generated = join(root, 'generated-metadata')
+    await createProductionBootstrap({
+      indexUrl: 'https://cdn.example.test/converter-packs/stable/index.json',
+      publicKeyPath: keys.publicKey,
+      output: generated,
+    })
+    rmSync(fixture.converter, { recursive: true, force: true })
+    mkdirSync(fixture.converter)
+    for (const name of ['bootstrap.json', 'index.schema.json', 'root-public-key.pem']) {
+      copyFileSync(join(generated, name), join(fixture.converter, name))
+    }
+
+    const disabled = run(verifyScript, ['--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64'])
+    expect(disabled.status).not.toBe(0)
+    const production = run(verifyScript, [
+      '--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64', '--metadata-mode', 'production',
+    ])
+    expect(production.status, production.stderr).toBe(0)
   })
 
   it('builds canonical archives and indexes byte-identically, signs with an explicit key, and verifies every hash', () => {
