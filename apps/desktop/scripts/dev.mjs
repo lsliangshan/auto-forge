@@ -11,6 +11,10 @@ export function resolvePinnedElectronViteCli() {
   return join(packageDirectory, 'bin', 'electron-vite.js')
 }
 
+export function localDevelopmentConverterReleaseRoot(cwd) {
+  return resolve(cwd, 'node_modules', '.cache', 'autoforge-converter-packs', 'release')
+}
+
 export async function runElectronViteDev({
   cli = resolvePinnedElectronViteCli(),
   executable = process.execPath,
@@ -21,9 +25,13 @@ export async function runElectronViteDev({
   signals = process,
 } = {}) {
   return new Promise((resolveStatus, reject) => {
+    const childEnvironment = {
+      ...environment,
+      AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT: localDevelopmentConverterReleaseRoot(cwd),
+    }
     const child = spawn(executable, [cli, 'dev'], {
       cwd,
-      env: environment,
+      env: childEnvironment,
       stdio: 'inherit',
     })
     let interruptReceived = false

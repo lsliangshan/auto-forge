@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
 
 interface SupervisorModule {
+  localDevelopmentConverterReleaseRoot(cwd: string): string
   resolvePinnedElectronViteCli(): string
   runElectronViteDev(options: Record<string, unknown>): Promise<number>
 }
@@ -35,6 +36,13 @@ function createHarness(platform: NodeJS.Platform = 'darwin') {
 }
 
 describe('development supervisor', () => {
+  it('pins the signed local converter release under the ignored dependency cache', async () => {
+    const supervisor = await loadSupervisor()
+    expect(supervisor.localDevelopmentConverterReleaseRoot('/workspace/apps/desktop')).toBe(
+      '/workspace/apps/desktop/node_modules/.cache/autoforge-converter-packs/release',
+    )
+  })
+
   it('resolves the pinned electron-vite CLI', async () => {
     const supervisor = await loadSupervisor()
     expect(supervisor.resolvePinnedElectronViteCli()).toMatch(
@@ -91,7 +99,10 @@ describe('development supervisor', () => {
       ['/workspace/electron-vite.js', 'dev'],
       {
         cwd: '/workspace/apps/desktop',
-        env: { EXISTING: 'preserved' },
+        env: {
+          AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT: '/workspace/apps/desktop/node_modules/.cache/autoforge-converter-packs/release',
+          EXISTING: 'preserved',
+        },
         stdio: 'inherit',
       },
     )
