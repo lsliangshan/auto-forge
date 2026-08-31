@@ -4,6 +4,8 @@
 node_modules/
 out/
 dist/
+!examples/city-affairs/dist/
+!examples/city-affairs/dist/index.js
 coverage/
 test-results/
 .test-artifacts/

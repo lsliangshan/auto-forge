@@ -8,4 +8,9 @@ export type {
   WorkflowContext,
 } from './context.js'
 export { defineWorkflow } from './define-workflow.js'
-export type { WorkflowDefinition } from './define-workflow.js'
+export type {
+  ConfiguredWorkflowInput,
+  WorkflowConfig,
+  WorkflowConfigItem,
+  WorkflowDefinition,
+} from './define-workflow.js'

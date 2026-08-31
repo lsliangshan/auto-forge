@@ -195,10 +195,14 @@
           id="workflow-city"
           v-model="workflowCity"
           class="workflow-filter-control"
-          placeholder="全部城市"
+          placeholder="不限"
           clearable
           @change="applyWorkflowFilters"
         >
+          <el-option
+            label="不限"
+            value=""
+          />
           <el-option
             v-for="city in workflowCities"
             :key="city"

@@ -80,6 +80,11 @@ export interface WorkflowToolRunBudget {
 export interface PrepareWorkflowToolInput {
   candidate: WorkflowCandidate
   arguments: unknown
+  resolvedInput?: {
+    input: unknown
+    inputSchema: unknown
+    city?: string
+  }
   developerMode: boolean
   attachmentBindings?: readonly ExecutionAttachmentBinding[]
   budget: WorkflowToolRunBudget
@@ -403,7 +408,11 @@ export class WorkflowToolExecutor {
     if (!exactSourceMatchesCandidate(source, input.candidate)) return toolError('WORKFLOW_CHANGED')
 
     let parsed: ParsedArguments | ToolError
-    try { parsed = parseArguments(input.candidate, input.arguments) } catch { return toolError('INVALID_INPUT') }
+    try {
+      parsed = input.resolvedInput === undefined
+        ? parseArguments(input.candidate, input.arguments)
+        : { city: input.resolvedInput.city, input: input.resolvedInput.input }
+    } catch { return toolError('INVALID_INPUT') }
     if ('kind' in parsed) return parsed
 
     const canonicalFileInput = canonicalFileConversionInput(input.candidate.workflow, parsed.input)
@@ -414,7 +423,10 @@ export class WorkflowToolExecutor {
     let inputFingerprint: string
     try {
       validatedInput = structuredClone(rawInput)
-      const validation = validateWorkflowInput(input.candidate.workflow.inputSchema, validatedInput)
+      const validation = validateWorkflowInput(
+        input.resolvedInput?.inputSchema ?? input.candidate.workflow.inputSchema,
+        validatedInput,
+      )
       if (!validation.valid) return toolError('INVALID_INPUT', validation.message.slice(0, 500))
       inputFingerprint = canonicalJson(validatedInput)
     } catch {

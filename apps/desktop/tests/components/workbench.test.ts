@@ -10,6 +10,7 @@ import type {
   DesktopAPI,
   ModelInfo,
   TokenUsageSnapshot,
+  WorkflowDetail,
   WorkflowSummary,
 } from '@autoforge/shared'
 import App from '../../src/App.vue'
@@ -744,6 +745,33 @@ describe('workbench', () => {
     expect(wrapper.text()).not.toContain('百度搜索')
   })
 
+  it('hydrates missing summary cities from a pre-reload desktop process', async () => {
+    const api = createApi()
+    const legacyWorkflow: Omit<WorkflowSummary, 'cities'> = {
+      id: 'legacy.workflow', version: '1.0.0', name: '旧进程工作流', description: '来自热重载前的主进程',
+      author: 'AutoForge', category: '工具', enabled: true,
+      source: 'development', integrity: 'valid', updatedAt: '2026-08-31T00:00:00.000Z',
+    }
+    vi.mocked(api.workflows.list).mockResolvedValue([legacyWorkflow as WorkflowSummary])
+    vi.mocked(api.workflows.get).mockResolvedValue({
+      ...legacyWorkflow,
+      cities: ['北京'],
+      runtimeIdentity: {
+        id: 'legacy.workflow', version: '1.0.0', source: 'development', buildHash: 'a'.repeat(64),
+      },
+      permissions: [], activationExamples: ['办理北京业务'], activationNegativeExamples: [],
+      timeoutMs: 30_000, inputSchema: { type: 'object' }, outputSchema: { type: 'object' },
+    } satisfies WorkflowDetail)
+
+    const { wrapper } = await mountApp('/workflows', api)
+
+    await vi.waitFor(() => expect(wrapper.text()).toContain('旧进程工作流'))
+    expect(wrapper.text()).not.toContain('正在加载工作流')
+    expect(wrapper.get('[data-testid="workflow-city-legacy.workflow"]').text()).toContain('北京')
+    expect(wrapper.findAllComponents({ name: 'ElOption' }).map((option) => option.props('label')))
+      .toContain('北京')
+  })
+
   it('passes a plain workflow query snapshot across the desktop bridge', async () => {
     const api = createApi()
     vi.mocked(api.workflows.list).mockImplementation(async (query) => {
@@ -788,6 +816,36 @@ describe('workbench', () => {
     expect(selectButton.attributes('aria-pressed')).toBe('true')
   })
 
+  it('builds the city filter from every unique workflow city after unrestricted', async () => {
+    const api = createApi()
+    const shanghaiAndBeijing = {
+      id: 'local.city.multi', version: '1.0.0', name: '多城市服务', description: '跨城市服务',
+      author: 'AutoForge', category: '政务', cities: ['上海', '北京'], enabled: true,
+      source: 'installed' as const, integrity: 'valid' as const, updatedAt: '2026-08-31T00:00:00.000Z',
+    }
+    const duplicateShanghai = {
+      ...shanghaiAndBeijing, id: 'local.city.shanghai', name: '上海服务', cities: ['上海'],
+    }
+    vi.mocked(api.workflows.list).mockResolvedValue([shanghaiAndBeijing, duplicateShanghai])
+    const { wrapper } = await mountApp('/workflows', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('多城市服务'))
+
+    const citySelect = wrapper.findAllComponents({ name: 'ElSelect' })
+      .find((component) => component.props('id') === 'workflow-city')!
+    expect(citySelect.findAllComponents({ name: 'ElOption' }).map((option) => ({
+      label: option.props('label'), value: option.props('value'),
+    }))).toEqual([
+      { label: '不限', value: '' },
+      { label: '北京', value: '北京' },
+      { label: '上海', value: '上海' },
+    ])
+
+    vi.mocked(api.workflows.list).mockClear()
+    citySelect.vm.$emit('update:modelValue', '')
+    citySelect.vm.$emit('change', '')
+    await vi.waitFor(() => expect(api.workflows.list).toHaveBeenLastCalledWith({}))
+  })
+
   it('passes the selected city through the workflow query', async () => {
     const { wrapper, api } = await mountApp('/workflows')
     await vi.waitFor(() => expect(api.workflows.list).toHaveBeenCalled())
@@ -799,6 +857,35 @@ describe('workbench', () => {
     citySelect!.vm.$emit('change', '北京')
 
     await vi.waitFor(() => expect(api.workflows.list).toHaveBeenLastCalledWith({ city: '北京' }))
+  })
+
+  it('falls back to local city filtering when a pre-reload desktop process rejects city queries', async () => {
+    const beijing = {
+      id: 'local.city.beijing', version: '1.0.0', name: '北京服务', description: '办理北京服务',
+      author: 'AutoForge', category: '政务', cities: ['北京'], enabled: true,
+      source: 'installed' as const, integrity: 'valid' as const, updatedAt: '2026-08-31T00:00:00.000Z',
+    }
+    const shanghai = { ...beijing, id: 'local.city.shanghai', name: '上海服务', cities: ['上海'] }
+    const unrestricted = { ...beijing, id: 'local.city.unrestricted', name: '通用服务', cities: [] }
+    const api = createApi()
+    vi.mocked(api.workflows.list).mockImplementation(async (query) => {
+      if (query?.city) throw { code: 'INVALID_INPUT' }
+      return [beijing, shanghai, unrestricted]
+    })
+    const { wrapper } = await mountApp('/workflows', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('上海服务'))
+
+    vi.mocked(api.workflows.list).mockClear()
+    const citySelect = wrapper.findAllComponents({ name: 'ElSelect' })
+      .find((component) => component.props('id') === 'workflow-city')!
+    citySelect.vm.$emit('update:modelValue', '北京')
+    citySelect.vm.$emit('change', '北京')
+
+    await vi.waitFor(() => expect(wrapper.text()).not.toContain('上海服务'))
+    expect(wrapper.text()).toContain('北京服务')
+    expect(wrapper.text()).toContain('通用服务')
+    expect(wrapper.text()).not.toContain('工作流加载失败')
+    expect(api.workflows.list.mock.calls).toEqual([[{ city: '北京' }], [{}]])
   })
 
   it('retains city options for filtered results and removes stale options after a full reload', async () => {

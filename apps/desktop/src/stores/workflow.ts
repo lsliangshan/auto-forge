@@ -21,8 +21,30 @@ export const useWorkflowStore = defineStore('workflow', {
       this.loading = true
       this.error = ''
       try {
-        const items = await getDesktopApi().workflows.list(requestQuery)
-        if (version === this._loadVersion) this.items = items
+        const api = getDesktopApi()
+        let legacyCity: string | undefined
+        let items: WorkflowSummary[]
+        try {
+          items = await api.workflows.list(requestQuery)
+        } catch (error) {
+          if (!requestQuery.city || typeof error !== 'object' || error === null
+            || !('code' in error) || error.code !== 'INVALID_INPUT') throw error
+          const { city, ...legacyQuery } = requestQuery
+          legacyCity = city
+          items = await api.workflows.list(legacyQuery)
+        }
+        const needsCityHydration = items.some((item) => !Array.isArray(item.cities))
+        const hydratedItems = needsCityHydration
+          ? await Promise.all(items.map(async (item) => {
+              if (Array.isArray(item.cities)) return item
+              const detail = await api.workflows.get(item.id, item.version)
+              return { ...item, cities: detail.cities }
+            }))
+          : items
+        const visibleItems = legacyCity
+          ? hydratedItems.filter((item) => !item.cities.length || item.cities.includes(legacyCity))
+          : hydratedItems
+        if (version === this._loadVersion) this.items = visibleItems
       } catch (error) { if (version === this._loadVersion) this.error = displayError(error, '工作流加载失败') }
       finally { if (version === this._loadVersion) this.loading = false }
     },

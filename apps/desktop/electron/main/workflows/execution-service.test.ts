@@ -399,7 +399,8 @@ async function runActualWorker(source: string, options: ActualWorkerOptions = {}
             reject(error)
             return
           }
-          if (message.type === 'result' || message.type === 'error') {
+          if (message.type === 'result' || message.type === 'error'
+            || (message as { type: string }).type === 'workflow_config') {
             clearTimeout(timer)
             resolvePromise(messages)
           }
@@ -425,6 +426,94 @@ async function runActualWorker(source: string, options: ActualWorkerOptions = {}
 }
 
 describe('ExecutionService', () => {
+  it('inspects workflow config from the pinned artifact without creating an execution', async () => {
+    const harness = createHarness()
+    const inspection = harness.service.inspectWorkflowConfig({
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      sourceSelector: harness.sourceSelector,
+    })
+    await vi.waitFor(() => expect(harness.workerFactory.specifications).toHaveLength(1))
+
+    const specification = harness.workerFactory.specifications[0]!
+    const worker = harness.workerFactory.workers.get(specification.executionId)!
+    expect(worker.requests).toContainEqual({
+      type: 'inspect_config',
+      inspectionId: specification.executionId,
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      entryPath: join(specification.cwd, 'workflow-entry.mjs'),
+    })
+    worker.respond({
+      type: 'workflow_config',
+      inspectionId: specification.executionId,
+      implemented: true,
+      config: { permit: { description: '办理工作居住证', cities: ['北京'] } },
+    })
+
+    await expect(inspection).resolves.toEqual({
+      implemented: true,
+      config: { permit: { description: '办理工作居住证', cities: ['北京'] } },
+    })
+    expect(harness.repositories.records.size).toBe(0)
+    expect(worker.killed).toBe(true)
+  })
+
+  it('reports a workflow without getConfig and rejects a malformed inspection response', async () => {
+    const absentHarness = createHarness()
+    const absent = absentHarness.service.inspectWorkflowConfig({
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      sourceSelector: absentHarness.sourceSelector,
+    })
+    await vi.waitFor(() => expect(absentHarness.workerFactory.specifications).toHaveLength(1))
+    const absentSpecification = absentHarness.workerFactory.specifications[0]!
+    absentHarness.workerFactory.workers.get(absentSpecification.executionId)!.respond({
+      type: 'workflow_config', inspectionId: absentSpecification.executionId, implemented: false,
+    })
+    await expect(absent).resolves.toEqual({ implemented: false })
+
+    const malformedHarness = createHarness()
+    const malformed = malformedHarness.service.inspectWorkflowConfig({
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      sourceSelector: malformedHarness.sourceSelector,
+    })
+    await vi.waitFor(() => expect(malformedHarness.workerFactory.specifications).toHaveLength(1))
+    const malformedSpecification = malformedHarness.workerFactory.specifications[0]!
+    malformedHarness.workerFactory.workers.get(malformedSpecification.executionId)!.respond({
+      type: 'workflow_config', inspectionId: malformedSpecification.executionId, implemented: true,
+    })
+    await expect(malformed).rejects.toMatchObject({ code: 'WORKER_PROTOCOL_INVALID' })
+  })
+
+  it('does not spawn a config inspection worker after cancellation during source resolution', async () => {
+    let resolveSource!: (value: WorkflowExecutionSourceResolver extends {
+      resolve(...args: never[]): Promise<infer T>
+    } ? T : never) => void
+    const resolvingSource = new Promise<Awaited<ReturnType<WorkflowExecutionSourceResolver['resolve']>>>((resolve) => {
+      resolveSource = resolve
+    })
+    const harness = createHarness({
+      sourceResolver: { resolve: async () => resolvingSource },
+    })
+    const controller = new AbortController()
+    const inspection = harness.service.inspectWorkflowConfig({
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      sourceSelector: harness.sourceSelector,
+      signal: controller.signal,
+    })
+
+    controller.abort()
+    resolveSource({
+      workflow, rootPath: trustedRootPath, entryPath: 'workers/workflow-runner.ts', integrity: 'valid',
+    })
+
+    await expect(inspection).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(harness.workerFactory.specifications).toHaveLength(0)
+  })
+
   it.each(['installed', 'development'] as const)('does not spawn after a selected %s source changes', async (source) => {
     const selected = source === 'installed' ? workflow : {
       ...workflow,
@@ -2505,6 +2594,59 @@ describe('NodeWorkerFactory', () => {
         globalProcessType: 'undefined',
       },
     })
+  })
+
+  it('reads getConfig in isolation without invoking run', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({
+        getConfig() {
+          return {
+            permit: { description: '办理工作居住证', cities: ['北京'] },
+          }
+        },
+        async run() { throw new Error('run must not be called while reading config') },
+      })
+    `, {
+      writeInput: (worker) => {
+        worker.stdin!.write(`${JSON.stringify({
+          type: 'inspect_config',
+          inspectionId: 'inspection_runner',
+          workflowId: 'runner.test',
+          workflowVersion: '1.0.0',
+          entryPath: 'workflow.mjs',
+        })}\n`)
+      },
+    })
+
+    expect(messages).toEqual([{
+      type: 'workflow_config',
+      inspectionId: 'inspection_runner',
+      implemented: true,
+      config: {
+        permit: { description: '办理工作居住证', cities: ['北京'] },
+      },
+    }])
+  })
+
+  it('reports an absent getConfig without invoking run', async () => {
+    const messages = await runActualWorker(`
+      export default { async run() { throw new Error('run must not be called while reading config') } }
+    `, {
+      writeInput: (worker) => {
+        worker.stdin!.write(`${JSON.stringify({
+          type: 'inspect_config',
+          inspectionId: 'inspection_runner',
+          workflowId: 'runner.test',
+          workflowVersion: '1.0.0',
+          entryPath: 'workflow.mjs',
+        })}\n`)
+      },
+    })
+
+    expect(messages).toEqual([{
+      type: 'workflow_config', inspectionId: 'inspection_runner', implemented: false,
+    }])
   })
 
   it('exposes a log-only logger capability to workflows', async () => {

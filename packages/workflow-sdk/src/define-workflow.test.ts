@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type {
+  ConfiguredWorkflowInput,
   ConversionErrorCode,
   ConverterCapability,
   ConverterSubmitInput,
@@ -8,6 +9,13 @@ import type {
 import { defineWorkflow } from './define-workflow.js'
 
 describe('defineWorkflow', () => {
+  it('exposes a generic configured workflow input envelope', () => {
+    expectTypeOf<ConfiguredWorkflowInput<'permit', { applicant: string }>>().toEqualTypeOf<{
+      key: 'permit'
+      input: { applicant: string }
+    }>()
+  })
+
   it('returns a frozen workflow definition', () => {
     const definition = defineWorkflow({
       async run(_context, input: { value: string }) {
@@ -58,5 +66,40 @@ describe('defineWorkflow', () => {
         return null
       },
     })
+  })
+
+  it('preserves an optional typed workflow config reader', () => {
+    const definition = defineWorkflow({
+      async run() {
+        return { opened: true }
+      },
+      getConfig() {
+        return {
+          'government-service': {
+            description: '政务服务',
+            cities: ['北京'] as const,
+            url: 'https://service.example.gov.cn',
+          },
+        } as const
+      },
+    })
+
+    expect(definition.getConfig?.()).toEqual({
+      'government-service': {
+        description: '政务服务',
+        cities: ['北京'],
+        url: 'https://service.example.gov.cn',
+      },
+    })
+    expectTypeOf(definition.getConfig).toEqualTypeOf<
+      | (() => {
+        readonly 'government-service': {
+          readonly description: '政务服务'
+          readonly cities: readonly ['北京']
+          readonly url: 'https://service.example.gov.cn'
+        }
+      })
+      | undefined
+    >()
   })
 })

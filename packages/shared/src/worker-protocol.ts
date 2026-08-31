@@ -124,6 +124,13 @@ export type WorkerCapabilityRequest = z.infer<typeof workerCapabilityRequestSche
 
 export const workerRequestSchema = z.discriminatedUnion('type', [
   z.object({
+    type: z.literal('inspect_config'),
+    inspectionId: identifierSchema,
+    workflowId: identifierSchema,
+    workflowVersion: identifierSchema,
+    entryPath: z.string().trim().min(1),
+  }).strict(),
+  z.object({
     type: z.literal('start'),
     executionId: identifierSchema,
     workflowId: identifierSchema,
@@ -147,6 +154,12 @@ export const workerRequestSchema = z.discriminatedUnion('type', [
 export type WorkerRequest = z.infer<typeof workerRequestSchema>
 
 export const workerResponseSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('workflow_config'),
+    inspectionId: identifierSchema,
+    implemented: z.boolean(),
+    config: z.unknown().optional(),
+  }).strict(),
   z.object({ type: z.literal('ready'), executionId: identifierSchema }).strict(),
   z.object({
     type: z.literal('log'),

@@ -175,6 +175,17 @@ export interface ExecutionStartInput {
   fileConvertAuthorization?: FileConvertAuthorization
 }
 
+export interface WorkflowConfigInspectionInput {
+  workflowId: string
+  workflowVersion: string
+  sourceSelector: WorkflowExecutionSourceSelector
+  signal?: AbortSignal
+}
+
+export type WorkflowConfigInspection =
+  | { implemented: false }
+  | { implemented: true; config: unknown }
+
 export interface ExecutionAttachmentBinding extends ArtifactAttachmentBinding {
   conversationId?: string
   sourceFingerprint: string
@@ -636,6 +647,123 @@ export class ExecutionService {
     return true
   }
 
+  async inspectWorkflowConfig(input: WorkflowConfigInspectionInput): Promise<WorkflowConfigInspection> {
+    if (this.stopped) throw failure('CONFLICT')
+    const checkCancelled = () => {
+      if (input.signal?.aborted) throw failure('CANCELLED')
+    }
+    checkCancelled()
+    const inspectionId = randomUUID()
+    let directory: string | undefined
+    let worker: WorkflowWorker | undefined
+    try {
+      const source = await this.dependencies.sourceResolver.resolve(
+        input.workflowId,
+        input.workflowVersion,
+        input.sourceSelector,
+      )
+      checkCancelled()
+      if (!source) throw failure('NOT_FOUND')
+      const artifactPath = await this.resolveEntryPath(input, source)
+      checkCancelled()
+      const artifact = await this.readVerifiedArtifact(source, artifactPath)
+      checkCancelled()
+      directory = await this.temporaryDirectories.create()
+      checkCancelled()
+      const entryPath = await this.stageVerifiedArtifact(source, directory, artifact)
+      checkCancelled()
+      const nonce = randomUUID()
+      worker = await this.dependencies.workers.spawn({
+        executionId: inspectionId,
+        nonce,
+        cwd: directory,
+        env: workerEnvironment(nonce),
+      })
+      checkCancelled()
+      const inspectedWorker = worker
+      inspectedWorker.stderr.resume()
+
+      return await new Promise<WorkflowConfigInspection>((resolvePromise, rejectPromise) => {
+        let settled = false
+        let buffer = Buffer.alloc(0)
+        const finish = (result: WorkflowConfigInspection | AppError, failed = false) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          input.signal?.removeEventListener('abort', onAbort)
+          if (failed) rejectPromise(result)
+          else resolvePromise(result as WorkflowConfigInspection)
+        }
+        const fail = (error: unknown) => finish(toSafeAppError(error), true)
+        const onAbort = () => fail(failure('CANCELLED'))
+        const timer = setTimeout(() => fail(failure('WORKER_TIMEOUT')), Math.min(source.workflow.timeoutMs, 5_000))
+        timer.unref?.()
+        input.signal?.addEventListener('abort', onAbort, { once: true })
+        if (input.signal?.aborted) return onAbort()
+        inspectedWorker.on('error', fail)
+        inspectedWorker.on('exit', () => {
+          if (!settled) fail(failure('INTERNAL_ERROR'))
+        })
+        inspectedWorker.stdin.on('error', fail)
+        inspectedWorker.stdout.on('error', fail)
+        inspectedWorker.stdout.on('data', (value: Buffer | string) => {
+          if (settled) return
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
+          let offset = 0
+          while (offset < chunk.length && !settled) {
+            const newline = chunk.indexOf(10, offset)
+            const end = newline === -1 ? chunk.length : newline
+            const segment = chunk.subarray(offset, end)
+            if (buffer.length + segment.length > MAX_LINE_BYTES) return fail(failure('WORKER_PROTOCOL_INVALID'))
+            if (newline === -1) {
+              buffer = buffer.length === 0 ? Buffer.from(segment) : Buffer.concat([buffer, segment])
+              return
+            }
+            let line = buffer.length === 0 ? Buffer.from(segment) : Buffer.concat([buffer, segment])
+            buffer = Buffer.alloc(0)
+            if (line.at(-1) === 13) line = line.subarray(0, -1)
+            let parsed: ReturnType<typeof workerResponseSchema.safeParse>
+            try { parsed = workerResponseSchema.safeParse(JSON.parse(line.toString('utf8'))) } catch {
+              return fail(failure('WORKER_PROTOCOL_INVALID'))
+            }
+            if (!parsed.success) return fail(failure('WORKER_PROTOCOL_INVALID'))
+            const message = parsed.data
+            if (message.type === 'error') return fail(message.error)
+            if (message.type !== 'workflow_config'
+              || message.inspectionId !== inspectionId
+              || message.implemented !== Object.prototype.hasOwnProperty.call(message, 'config')) {
+              return fail(failure('WORKER_PROTOCOL_INVALID'))
+            }
+            finish(message.implemented
+              ? { implemented: true, config: message.config }
+              : { implemented: false })
+            offset = newline + 1
+          }
+        })
+
+        try {
+          const request = workerRequestSchema.parse({
+            type: 'inspect_config',
+            inspectionId,
+            workflowId: input.workflowId,
+            workflowVersion: input.workflowVersion,
+            entryPath,
+          })
+          const line = `${JSON.stringify(request)}\n`
+          if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw failure('WORKER_PROTOCOL_INVALID')
+          inspectedWorker.stdin.write(line)
+        } catch (error) {
+          fail(error)
+        }
+      })
+    } finally {
+      if (worker) {
+        try { worker.kill('SIGTERM') } catch { /* Inspection worker cleanup is best effort. */ }
+      }
+      if (directory) await this.removeTemporaryDirectory(directory)
+    }
+  }
+
   async start(input: ExecutionStartInput, signal?: AbortSignal): Promise<StartedExecution> {
     return this.startReserved(this.reserve(), input, signal)
   }
@@ -893,7 +1021,7 @@ export class ExecutionService {
   }
 
   private async resolveEntryPath(
-    input: ExecutionStartInput,
+    input: Pick<ExecutionStartInput, 'workflowId' | 'workflowVersion'>,
     source: WorkflowExecutionSource,
     checkCancelled: () => void = () => undefined,
   ): Promise<ResolvedArtifactPath> {

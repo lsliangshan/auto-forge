@@ -2874,6 +2874,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     resolveCurrentWorkflow: async (selector, id, version) => (
       (await sourceResolver.resolve(id, version, selector))?.workflow
     ),
+    inspectWorkflowConfig: (input) => executions.inspectWorkflowConfig(input),
     checkRemainingBudgets: ({ toolExecutions }) => (
       toolExecutions >= 5 ? 'TOOL_CALL_LIMIT' : undefined
     ),

@@ -184,6 +184,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     resolveCurrentWorkflow: async (_selector, id, version) => (
       (await workflows.list()).find((candidate) => candidate.id === id && candidate.version === version)
     ),
+    inspectWorkflowConfig: async () => ({ implemented: false }),
     checkRemainingBudgets: () => undefined,
     persistence: {
       persistUser(value) { records.users.push(value); return { ordinal: records.users.length } },
@@ -797,6 +798,148 @@ function attachCombinedBrowserContinuation(
 }
 
 describe('AgentOrchestrator', () => {
+  it('matches getConfig dynamically and executes the workflow with a generic key/input envelope', async () => {
+    const dependencies = harness([
+      toolTurn,
+      [
+        {
+          type: 'text_delta', choiceIndex: 0,
+          text: JSON.stringify({
+            decision: 'match', key: 'retirement-age-calculator',
+            input: { birthDate: '1990-01-02' },
+          }),
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+      [
+        { type: 'text_delta', choiceIndex: 0, text: '退休年龄计算页面已打开' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    const configuredWorkflow = { ...workflow, permissions: [] }
+    dependencies.workflows.list = async () => [configuredWorkflow]
+    const inspectWorkflowConfig = vi.fn(async () => ({
+      implemented: true as const,
+      config: {
+        'beijing-work-residence-permit': {
+          description: '查询、办理北京工作居住证', cities: ['北京'],
+        },
+        'retirement-age-calculator': {
+          description: '根据出生日期计算退休年龄', cities: [],
+          inputSchema: {
+            type: 'object', additionalProperties: false, required: ['birthDate'],
+            properties: { birthDate: { type: 'string', format: 'date' } },
+          },
+        },
+      },
+    }))
+    Object.assign(dependencies, { inspectWorkflowConfig })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'configured_workflow',
+      content: '帮我算一下 1990 年 1 月 2 日出生的退休年龄',
+      provider: 'openrouter', model: 'openrouter/model', requestId: 'configured_workflow_request',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(inspectWorkflowConfig).toHaveBeenCalledWith(expect.objectContaining({
+      workflowId: configuredWorkflow.id,
+      workflowVersion: configuredWorkflow.version,
+      signal: expect.any(AbortSignal),
+    }))
+    expect(dependencies.records.starts).toContainEqual(expect.objectContaining({
+      input: {
+        key: 'retirement-age-calculator',
+        input: { birthDate: '1990-01-02' },
+      },
+    }))
+    const providerRequests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls
+      .map(([request]) => request)
+    expect(providerRequests).toHaveLength(3)
+    expect(JSON.stringify(providerRequests[1]?.messages)).toContain('retirement-age-calculator')
+  })
+
+  it('does not reserve or execute a configured workflow when no config item matches', async () => {
+    const dependencies = harness([
+      toolTurn,
+      [
+        { type: 'text_delta', choiceIndex: 0, text: JSON.stringify({ decision: 'no_match' }) },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+      [
+        { type: 'text_delta', choiceIndex: 0, text: '这个工作流暂不支持上海，请补充其他需求。' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    dependencies.workflows.list = async () => [{ ...workflow, permissions: [] }]
+    Object.assign(dependencies, {
+      inspectWorkflowConfig: async () => ({
+        implemented: true as const,
+        config: { permit: { description: '办理工作居住证', cities: ['北京'] } },
+      }),
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'configured_no_match', content: '办理上海工作居住证',
+      provider: 'openrouter', model: 'openrouter/model', requestId: 'configured_no_match_request',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.records.reservations).toHaveLength(0)
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('暂不支持上海')
+  })
+
+  it('uses a unique usage operation for repeated config selection of the same workflow', async () => {
+    const secondToolTurn: ProviderStreamEvent[] = [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_2', name: 'workflow_1',
+        arguments: { input: {} },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]
+    const dependencies = harness([
+      toolTurn,
+      [
+        { type: 'text_delta', choiceIndex: 0, text: JSON.stringify({ decision: 'no_match' }) },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+      secondToolTurn,
+      [
+        {
+          type: 'text_delta', choiceIndex: 0,
+          text: JSON.stringify({ decision: 'match', key: 'permit', resolvedCity: '北京', input: {} }),
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+      [
+        { type: 'text_delta', choiceIndex: 0, text: '已打开办理页面' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    dependencies.workflows.list = async () => [{ ...workflow, permissions: [] }]
+    Object.assign(dependencies, {
+      inspectWorkflowConfig: async () => ({
+        implemented: true as const,
+        config: { permit: { description: '办理工作居住证', cities: ['北京'] } },
+      }),
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'configured_retry', content: '办理北京工作居住证',
+      provider: 'openrouter', model: 'openrouter/model', requestId: 'configured_retry_request',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.records.starts).toHaveLength(1)
+    const operationKeys = dependencies.records.usage
+      .filter(({ method }) => method === 'start')
+      .map(({ args }) => (args[0] as { operationKey: string }).operationKey)
+      .filter((key) => key.includes('workflow-config-selection'))
+    expect(operationKeys).toHaveLength(2)
+    expect(new Set(operationKeys).size).toBe(2)
+  })
+
   it('sends the AutoForge assistant identity as the leading system prompt', async () => {
     const dependencies = harness([[
       { type: 'finish', choiceIndex: 0, reason: 'stop' },

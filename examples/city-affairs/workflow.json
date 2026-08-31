@@ -1,0 +1,81 @@
+{
+  "id": "government.personal.city-affairs",
+  "version": "1.0.0",
+  "name": "城事通",
+  "description": "根据个人政务业务打开对应的官方查询或办理页面。",
+  "author": "AutoForge",
+  "category": "政务",
+  "cities": [],
+  "entryPath": "dist/index.js",
+  "codeSha256": "60eb913d5ad449e3efefaa1fb15c8aeba6becc709f24c841c5adb01c71955fd4",
+  "permissions": [
+    {
+      "capability": "browser.open",
+      "scope": {
+        "origins": [
+          "https://fw.bjrcgz.gov.cn",
+          "https://fuwu.rsj.beijing.gov.cn"
+        ]
+      }
+    }
+  ],
+  "activationExamples": [
+    "查询北京工作居住证",
+    "办理北京工作居住证",
+    "续签北京工作居住证",
+    "申请北京工作居住证",
+    "变更北京工作居住证",
+    "计算法定退休年龄"
+  ],
+  "activationNegativeExamples": [
+    "解释什么是工作居住证",
+    "计算两个日期相差多少天",
+    "查询企业工商信息"
+  ],
+  "timeoutMs": 30000,
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "key",
+      "input"
+    ],
+    "properties": {
+      "key": {
+        "type": "string",
+        "enum": [
+          "beijing-work-residence-permit",
+          "retirement-age-calculator"
+        ]
+      },
+      "input": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "success",
+      "business",
+      "url"
+    ],
+    "properties": {
+      "success": {
+        "const": true
+      },
+      "business": {
+        "type": "string",
+        "enum": [
+          "beijing-work-residence-permit",
+          "retirement-age-calculator"
+        ]
+      },
+      "url": {
+        "type": "string"
+      }
+    }
+  }
+}

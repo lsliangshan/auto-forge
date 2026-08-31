@@ -17,6 +17,7 @@ const SDK_SPECIFIER = '@autoforge/workflow-sdk'
 
 interface WorkflowDefinition {
   invoke(inputJson: string): Promise<string> | string
+  inspectConfig(): Promise<string> | string
 }
 
 interface PendingRequest {
@@ -276,6 +277,20 @@ async function loadWorkflow(
         return JSON.stringify({ ok: true, value: output === undefined ? null : output })
       } catch (error) { return serializeError(error) }
     }
+    export async function inspectConfig() {
+      try {
+        if (!definition || typeof definition !== 'object' || typeof definition.run !== 'function') {
+          const error = new Error('The worker protocol message is invalid.')
+          error.code = 'WORKER_PROTOCOL_INVALID'
+          throw error
+        }
+        if (typeof definition.getConfig !== 'function') {
+          return JSON.stringify({ ok: true, value: { implemented: false } })
+        }
+        const config = await definition.getConfig()
+        return JSON.stringify({ ok: true, value: { implemented: true, config } })
+      } catch (error) { return serializeError(error) }
+    }
   `, { context, identifier: 'autoforge:workflow-invoker' })
   await wrapper.link(async (specifier) => {
     if (specifier === 'autoforge:workflow-entry') return entry
@@ -284,8 +299,12 @@ async function loadWorkflow(
   })
   await wrapper.evaluate()
   const invoke = Reflect.get(wrapper.namespace, 'invoke') as unknown
-  if (typeof invoke !== 'function') throw protocolError()
-  return { invoke: invoke as WorkflowDefinition['invoke'] }
+  const inspectConfig = Reflect.get(wrapper.namespace, 'inspectConfig') as unknown
+  if (typeof invoke !== 'function' || typeof inspectConfig !== 'function') throw protocolError()
+  return {
+    invoke: invoke as WorkflowDefinition['invoke'],
+    inspectConfig: inspectConfig as WorkflowDefinition['inspectConfig'],
+  }
 }
 
 function requestCapability(state: RunnerState, request: WorkerCapabilityRequest): Promise<unknown> {
@@ -344,12 +363,51 @@ async function runWorkflow(state: RunnerState, message: Extract<WorkerRequest, {
   }
 }
 
+async function inspectWorkflowConfig(
+  state: RunnerState,
+  message: Extract<WorkerRequest, { type: 'inspect_config' }>,
+): Promise<void> {
+  try {
+    const loaded = await loadWorkflow(message.entryPath, () => Promise.reject(protocolError()))
+    if (state.terminal) return
+    const outputJson = await loaded.inspectConfig()
+    if (typeof outputJson !== 'string') throw protocolError()
+    const envelope = JSON.parse(outputJson) as unknown
+    if (!envelope || typeof envelope !== 'object' || typeof Reflect.get(envelope, 'ok') !== 'boolean') {
+      throw protocolError()
+    }
+    if (!Reflect.get(envelope, 'ok')) throw Reflect.get(envelope, 'error')
+    const value = Reflect.get(envelope, 'value')
+    if (!value || typeof value !== 'object' || typeof Reflect.get(value, 'implemented') !== 'boolean') {
+      throw protocolError()
+    }
+    state.terminal = true
+    const implemented = Reflect.get(value, 'implemented') as boolean
+    write(implemented
+      ? {
+          type: 'workflow_config', inspectionId: message.inspectionId, implemented: true,
+          config: Reflect.get(value, 'config'),
+        }
+      : { type: 'workflow_config', inspectionId: message.inspectionId, implemented: false })
+    process.stdin.pause()
+  } catch (error) {
+    terminate(state, toSafeAppError(error))
+  }
+}
+
 async function handle(state: RunnerState, message: WorkerRequest): Promise<void> {
   if (message.type === 'start') {
     if (state.started) return terminate(state, protocolError())
     state.started = true
     state.executionId = message.executionId
     void runWorkflow(state, message)
+    return
+  }
+  if (message.type === 'inspect_config') {
+    if (state.started) return terminate(state, protocolError())
+    state.started = true
+    state.executionId = message.inspectionId
+    void inspectWorkflowConfig(state, message)
     return
   }
   if (!state.started || state.terminal) return terminate(state, protocolError())

@@ -17,7 +17,11 @@ import {
 } from '@autoforge/shared'
 import { z } from 'zod'
 import type { PolicyEngine } from '../permissions/policy-engine.js'
-import type { ExecutionAttachmentBinding } from '../workflows/execution-service.js'
+import type {
+  ExecutionAttachmentBinding,
+  WorkflowConfigInspection,
+  WorkflowConfigInspectionInput,
+} from '../workflows/execution-service.js'
 import type { ExactWorkflowSource, WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import { addUsd } from '../billing/decimal-usd.js'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
@@ -72,6 +76,7 @@ import {
 } from './browser-page-evidence-resolver.js'
 import { resolveBrowserVisualEvidence } from './browser-visual-evidence-resolver.js'
 import { WorkflowRouter, type WorkflowRoutingRequest } from './workflow-router.js'
+import { selectWorkflowConfig } from './workflow-config-selector.js'
 import {
   APPROVAL_EXPIRY_MS,
   MAX_WORKFLOW_EXECUTIONS,
@@ -79,6 +84,7 @@ import {
 } from './workflow-tool-loop.js'
 import {
   WorkflowToolExecutor,
+  type PrepareWorkflowToolInput,
   type PendingWorkflowTool,
   type ToolError,
   type WorkflowToolExecutionPort,
@@ -471,6 +477,7 @@ export interface AgentOrchestratorDependencies {
     id: string,
     version: string,
   ): Promise<WorkflowDetail | undefined>
+  inspectWorkflowConfig(input: WorkflowConfigInspectionInput): Promise<WorkflowConfigInspection>
   checkRemainingBudgets(input: WorkflowToolRunBudget & { phase: 'prepare' | 'start' }): AppError['code'] | undefined
   history: ConversationHistoryPort
   providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
@@ -634,6 +641,7 @@ interface ActiveAgentRun {
     outputTokens: number
     costUsd?: string
   }
+  workflowConfigSelections: number
   knowledgeSelection: Readonly<KnowledgeSelection>
   knowledgeSearchScope?: KnowledgeSearchScope
   knowledgeSearchScopeReleased: boolean
@@ -1109,6 +1117,7 @@ export class AgentOrchestrator {
         messages: [],
         tools: [],
         workflowCatalogTools: [],
+        workflowConfigSelections: 0,
         workflows: new Map(),
         browserCatalog: EMPTY_BROWSER_CATALOG,
         browserToolsAllowed: false,
@@ -1732,11 +1741,13 @@ export class AgentOrchestrator {
   private async selectWorkflowRouting(
     active: ActiveAgentRun,
     request: WorkflowRoutingRequest,
+    operation = 'workflow-routing',
   ): Promise<string> {
     let text = ''
     let finishReason: string | undefined
+    const previousUsage = active.workflowRoutingUsage
     for await (const event of trackProviderStream({
-      operationKey: `agent:${active.requestId}:workflow-routing`,
+      operationKey: `agent:${active.requestId}:${operation}`,
       purpose: 'workflow_routing',
       attribution: {
         userId: active.userId,
@@ -1757,10 +1768,12 @@ export class AgentOrchestrator {
       now: this.now,
     })) {
       if (event.type === 'usage') {
+        const costs = [previousUsage?.costUsd, event.costUsd]
+          .filter((value): value is string => value !== undefined)
         active.workflowRoutingUsage = {
-          inputTokens: event.inputTokens,
-          outputTokens: event.outputTokens,
-          ...(event.costUsd === undefined ? {} : { costUsd: event.costUsd }),
+          inputTokens: (previousUsage?.inputTokens ?? 0) + event.inputTokens,
+          outputTokens: (previousUsage?.outputTokens ?? 0) + event.outputTokens,
+          ...(costs.length === 0 ? {} : { costUsd: addUsd(costs) }),
         }
       }
       if (active.cancelled || request.signal.aborted) continue
@@ -1808,19 +1821,70 @@ export class AgentOrchestrator {
       return this.drive(active)
     }
     if (!active.loop.canOfferTools()) return this.terminalize(active, 'failed', appFailure('TOOL_CALL_LIMIT'))
+    const inspection = await this.dependencies.inspectWorkflowConfig({
+      workflowId: candidate.workflow.id,
+      workflowVersion: candidate.workflow.version,
+      sourceSelector: candidate.selector,
+      signal: active.controller.signal,
+    })
+    let toolArguments = call.arguments
+    let resolvedInput: PrepareWorkflowToolInput['resolvedInput']
+    if (inspection.implemented) {
+      const selection = await selectWorkflowConfig({
+        query: active.currentUser.text,
+        config: inspection.config,
+        ...(active.contextLength === undefined ? {} : { contextLength: active.contextLength }),
+        select: (request) => this.selectWorkflowRouting(
+          active,
+          request,
+          `workflow-config-selection:${++active.workflowConfigSelections}`,
+        ),
+        signal: active.controller.signal,
+      })
+      if (selection.kind === 'no_match') {
+        this.appendToolExchange(active, {
+          callId: call.id,
+          assistantContent,
+          toolName: candidate.toolName,
+          arguments: call.arguments,
+        }, {
+          kind: 'tool_error', code: 'INVALID_INPUT',
+          message: 'No workflow configuration item matches the user request.',
+        })
+        this.enableKnowledgeAfterWorkflow(active)
+        return this.drive(active)
+      }
+      const runInput = { key: selection.key, input: selection.input }
+      const runInputSchema = {
+        type: 'object',
+        additionalProperties: false,
+        required: ['key', 'input'],
+        properties: {
+          key: { const: selection.key },
+          input: selection.inputSchema,
+        },
+      }
+      toolArguments = { input: runInput }
+      resolvedInput = {
+        input: runInput,
+        inputSchema: runInputSchema,
+        ...(selection.resolvedCity === undefined ? {} : { city: selection.resolvedCity }),
+      }
+    }
     if (active.localConversionTarget !== undefined
-      && requestedConversionTarget(call.arguments) !== active.localConversionTarget) {
+      && requestedConversionTarget(toolArguments) !== active.localConversionTarget) {
       this.appendToolExchange(active, {
         callId: call.id,
         assistantContent,
         toolName: candidate.toolName,
-        arguments: call.arguments,
+        arguments: toolArguments,
       }, { kind: 'tool_error', code: 'INVALID_INPUT' })
       return this.drive(active)
     }
     const prepared = await this.workflowTools.prepare({
       candidate,
-      arguments: call.arguments,
+      arguments: toolArguments,
+      ...(resolvedInput === undefined ? {} : { resolvedInput }),
       developerMode: this.dependencies.developerMode?.() ?? false,
       attachmentBindings: active.attachmentBindings,
       budget: this.toolBudget(active),
@@ -1830,7 +1894,7 @@ export class AgentOrchestrator {
         callId: call.id,
         assistantContent,
         toolName: candidate.toolName,
-        arguments: call.arguments,
+        arguments: toolArguments,
       }, prepared)
       this.enableKnowledgeAfterWorkflow(active)
       return this.drive(active)
@@ -1850,7 +1914,7 @@ export class AgentOrchestrator {
         callId: call.id,
         assistantContent,
         toolName: candidate.toolName,
-        arguments: call.arguments,
+        arguments: toolArguments,
       }, { kind: 'tool_error', code: eligibility.code })
       this.enableKnowledgeAfterWorkflow(active)
       return this.drive(active)
