@@ -51,7 +51,7 @@ import {
   KnowledgeEntitlementVerifier,
 } from './knowledge/entitlement-verifier.js'
 import type { SafeStoragePort } from './security/secret-store.js'
-import { createLocalDevelopmentConversionRuntimeFactory } from './conversion/local-development-conversion-runtime.js'
+import { selectConversionRuntimeFactory } from './conversion/local-development-conversion-runtime.js'
 import { createProductionConversionRuntimeFactory } from './conversion/production-conversion-runtime.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
@@ -187,9 +187,10 @@ async function initialize(): Promise<ApplicationRuntime> {
   const converterPackResources = app.isPackaged
     ? join(process.resourcesPath, 'converter-packs')
     : join(app.getAppPath(), 'resources', 'converter-packs')
-  const developmentConverterRelease = app.isPackaged
-    ? undefined
-    : process.env.AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT
+  const productionConversionRuntimeFactory = createProductionConversionRuntimeFactory({
+    resourcesRoot: converterPackResources,
+    network: networkProxy,
+  })
   return createApplicationRuntime({
     paths: {
       database: join(userData, 'autoforge.sqlite'),
@@ -202,12 +203,11 @@ async function initialize(): Promise<ApplicationRuntime> {
     },
     safeStorage: safeStoragePort,
     networkProxy,
-    conversionRuntimeFactory: developmentConverterRelease
-      ? createLocalDevelopmentConversionRuntimeFactory({ releaseRoot: developmentConverterRelease })
-      : createProductionConversionRuntimeFactory({
-          resourcesRoot: converterPackResources,
-          network: networkProxy,
-        }),
+    conversionRuntimeFactory: selectConversionRuntimeFactory({
+      packaged: app.isPackaged,
+      developmentReleaseRoot: process.env.AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT,
+      productionFactory: productionConversionRuntimeFactory,
+    }),
     browserWorkspace,
     knowledgeService,
     applyTheme: (theme) => {

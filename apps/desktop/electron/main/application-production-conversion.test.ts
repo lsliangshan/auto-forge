@@ -160,6 +160,7 @@ describe.skipIf(!enabled)(`Application production conversion composition (${enab
       network: networkProxy,
       platform: process.platform,
       arch: process.arch,
+      allowUnsafeTestRootKey: true,
     })
     const conversionRuntimeFactory = vi.fn(createFactory)
     const session: AuthSession = {

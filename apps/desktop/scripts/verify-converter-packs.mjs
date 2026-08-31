@@ -30,6 +30,7 @@ import {
   validateIndex,
   verifyRestrictedUstar,
 } from './converter-packs/pack-tooling-lib.mjs'
+import { isDisallowedProductionConverterRootKey } from './converter-packs/root-key-policy.mjs'
 
 const desktopRoot = fileURLToPath(new URL('..', import.meta.url))
 // Electron's Node runtime otherwise treats every `.asar` path as a virtual
@@ -249,6 +250,7 @@ function validateBootstrap(root, metadataMode) {
   let publicKey
   try { publicKey = createPublicKey(publicKeyBytes) } catch { fail('Production converter root public key is invalid.') }
   if (publicKey.asymmetricKeyType !== 'ed25519') fail('Production converter root public key must use Ed25519.')
+  if (isDisallowedProductionConverterRootKey(publicKey)) fail('Production converter root public key must not use a development or test key.')
 }
 
 function packagedResources(app, platform) {

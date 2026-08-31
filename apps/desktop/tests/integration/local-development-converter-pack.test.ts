@@ -8,6 +8,7 @@ import { ConverterPackManager } from '../../electron/main/conversion/converter-p
 import {
   createLocalDevelopmentConversionRuntimeFactory,
   loadLocalDevelopmentConverterRelease,
+  selectConversionRuntimeFactory,
 } from '../../electron/main/conversion/local-development-conversion-runtime.js'
 import { createLocalDevelopmentImageRelease } from '../../scripts/converter-packs/create-local-development-image-release.mjs'
 
@@ -18,6 +19,38 @@ afterEach(async () => {
 })
 
 describe.skipIf(process.platform !== 'darwin')('local development image converter pack', () => {
+  it('never selects a local release for a packaged application', () => {
+    const production = async () => { throw new Error('production sentinel') }
+    const development = async () => { throw new Error('development sentinel') }
+    let developmentFactoryCalls = 0
+    const selected = selectConversionRuntimeFactory({
+      packaged: true,
+      developmentReleaseRoot: '/tmp/untrusted-development-release',
+      productionFactory: production,
+      createDevelopmentFactory: () => {
+        developmentFactoryCalls += 1
+        return development
+      },
+    })
+
+    expect(selected).toBe(production)
+    expect(developmentFactoryCalls).toBe(0)
+  })
+
+  it('refuses to replace an existing output directory', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-image-existing-')))
+    roots.push(root)
+    const sentinel = join(root, 'sentinel.txt')
+    await writeFile(sentinel, 'preserve me')
+
+    await expect(createLocalDevelopmentImageRelease({
+      output: root,
+      platform: 'darwin',
+      arch: process.arch,
+    })).rejects.toThrow(/exist|output/iu)
+    await expect(readFile(sentinel, 'utf8')).resolves.toBe('preserve me')
+  })
+
   it('is signed, installed, and converts JPEG input to PNG through the pack executable', async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-image-pack-')))
     roots.push(root)
@@ -132,6 +165,10 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     lease.release()
     await expect(binding.runtime.acquirePack(
       { ...job, id: 'unsupported-job', targetFormat: 'webp' },
+      controller.signal,
+    )).rejects.toMatchObject({ code: 'CONVERSION_FORMAT_UNSUPPORTED' })
+    await expect(binding.runtime.acquirePack(
+      { ...job, id: 'unsupported-direction-job', targetFormat: 'jpeg' },
       controller.signal,
     )).rejects.toMatchObject({ code: 'CONVERSION_FORMAT_UNSUPPORTED' })
   })

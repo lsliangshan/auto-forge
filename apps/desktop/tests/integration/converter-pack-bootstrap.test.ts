@@ -63,6 +63,11 @@ describe('production converter bootstrap', () => {
     await expect(createProductionBootstrap({ indexUrl: validUrl.replace('https:', 'http:'), publicKeyPath, output: join(root, 'http') })).rejects.toThrow(/https/iu)
     await expect(createProductionBootstrap({ indexUrl: validUrl, publicKeyPath: privateKeyPath, output: join(root, 'private') })).rejects.toThrow(/public|private/iu)
     await expect(createProductionBootstrap({ indexUrl: validUrl, publicKeyPath: rsaPath, output: join(root, 'rsa') })).rejects.toThrow(/ed25519/iu)
+    await expect(createProductionBootstrap({
+      indexUrl: validUrl,
+      publicKeyPath: join(desktopRoot, 'electron/main/conversion/fixtures/test-converter-root-public-key.pem'),
+      output: join(root, 'development-key'),
+    })).rejects.toThrow(/development|test|production/iu)
     await expect(createProductionBootstrap({ indexUrl: validUrl, publicKeyPath, output: pinnedRoot })).rejects.toThrow(/checked-in|resource/iu)
 
     const target = join(root, 'target')

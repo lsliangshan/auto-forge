@@ -12,6 +12,7 @@ import {
   readStableRegularFile,
   requireAbsolutePath,
 } from './pack-tooling-lib.mjs'
+import { isDisallowedProductionConverterRootKey } from './root-key-policy.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const checkedInRoot = join(desktopRoot, 'resources', 'converter-packs')
@@ -45,6 +46,7 @@ export async function createProductionBootstrap({ indexUrl, publicKeyPath, outpu
   let publicKey
   try { publicKey = createPublicKey(keyBytes) } catch { fail('Root public key is invalid.') }
   if (publicKey.asymmetricKeyType !== 'ed25519') fail('Root public key must use Ed25519.')
+  if (isDisallowedProductionConverterRootKey(publicKey)) fail('Development or test root keys are forbidden in production metadata.')
   const canonicalPublicKey = Buffer.from(publicKey.export({ type: 'spki', format: 'pem' }), 'utf8')
   const schemaBytes = await readStableRegularFile(join(protectedRoot, 'index.schema.json'), 'Pinned index schema')
   let schema

@@ -279,6 +279,16 @@ describe('converter pack release tooling', () => {
       '--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64', '--metadata-mode', 'production',
     ])
     expect(production.status, production.stderr).toBe(0)
+
+    copyFileSync(
+      join(desktopRoot, 'electron/main/conversion/fixtures/test-converter-root-public-key.pem'),
+      join(fixture.converter, 'root-public-key.pem'),
+    )
+    const developmentKey = run(verifyScript, [
+      '--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64', '--metadata-mode', 'production',
+    ])
+    expect(developmentKey.status).not.toBe(0)
+    expect(developmentKey.stderr).toMatch(/development|test/iu)
   })
 
   it('builds canonical archives and indexes byte-identically, signs with an explicit key, and verifies every hash', () => {

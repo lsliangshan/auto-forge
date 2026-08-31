@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { createPrivateKey, createPublicKey, sign } from 'node:crypto'
-import { chmod, mkdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL, URL } from 'node:url'
@@ -81,9 +81,10 @@ export async function createLocalDevelopmentImageRelease({ output, platform, arc
   }
   if (typeof output !== 'string' || !output.startsWith('/')) throw new Error('Local development release output must be absolute.')
   const parent = await realpath(dirname(output))
-  const temporary = join(parent, `.local-converter-release-${process.pid}`)
-  await rm(temporary, { recursive: true, force: true })
-  await mkdir(temporary, { mode: 0o700 })
+  if (await lstat(output).catch(() => undefined) !== undefined) {
+    throw new Error('Local development release output already exists.')
+  }
+  const temporary = await realpath(await mkdtemp(join(parent, '.local-converter-release-')))
   try {
     const entries = localEntries()
     const archive = createRestrictedUstar(entries)
@@ -120,7 +121,6 @@ export async function createLocalDevelopmentImageRelease({ output, platform, arc
       writeFile(join(temporary, 'index.sig'), `${signature}\n`, { flag: 'wx', mode: 0o600 }),
       writeFile(join(temporary, 'root-public-key.pem'), publicKey, { flag: 'wx', mode: 0o600 }),
     ])
-    await rm(output, { recursive: true, force: true })
     await rename(temporary, output)
   } catch (error) {
     await rm(temporary, { recursive: true, force: true })
@@ -130,9 +130,13 @@ export async function createLocalDevelopmentImageRelease({ output, platform, arc
 
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(resolve(entry)).href) {
-  await mkdir(join(desktopRoot, 'node_modules', '.cache', 'autoforge-converter-packs'), { recursive: true, mode: 0o700 })
+  const cacheRoot = join(desktopRoot, 'node_modules', '.cache', 'autoforge-converter-packs')
+  await mkdir(cacheRoot, { recursive: true, mode: 0o700 })
+  const canonicalCacheRoot = await realpath(cacheRoot)
+  const output = join(canonicalCacheRoot, 'release')
+  await rm(output, { recursive: true, force: true })
   await createLocalDevelopmentImageRelease({
-    output: join(desktopRoot, 'node_modules', '.cache', 'autoforge-converter-packs', 'release'),
+    output,
     platform: process.platform,
     arch: process.arch,
   })

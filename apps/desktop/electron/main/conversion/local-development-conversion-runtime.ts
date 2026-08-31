@@ -24,8 +24,8 @@ export interface LocalDevelopmentConverterRelease {
 const localDevelopmentImageAdapter: ConverterAdapter = {
   ...imageIconAdapter,
   supports(input, target) {
-    return (input.format === 'jpeg' || input.format === 'png')
-      && (target === 'jpeg' || target === 'png')
+    return input.format === 'jpeg'
+      && target === 'png'
       && imageIconAdapter.supports(input, target)
   },
 }
@@ -39,12 +39,36 @@ async function readStableFile(path: string, maximumBytes: number): Promise<Buffe
   try {
     handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
     const opened = await handle.stat()
-    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+    const named = await lstat(path)
+    if (
+      !opened.isFile()
+      || opened.nlink !== 1
+      || named.isSymbolicLink()
+      || named.nlink !== 1
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || opened.size !== before.size
+      || named.dev !== opened.dev
+      || named.ino !== opened.ino
+      || named.size !== opened.size
+    ) {
       throw new Error('Local development converter release changed while opening.')
     }
     const bytes = await handle.readFile()
     const after = await handle.stat()
-    if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || bytes.byteLength !== opened.size) {
+    const namedAfter = await lstat(path)
+    if (
+      after.nlink !== 1
+      || namedAfter.isSymbolicLink()
+      || namedAfter.nlink !== 1
+      || after.dev !== opened.dev
+      || after.ino !== opened.ino
+      || after.size !== opened.size
+      || namedAfter.dev !== after.dev
+      || namedAfter.ino !== after.ino
+      || namedAfter.size !== after.size
+      || bytes.byteLength !== opened.size
+    ) {
       throw new Error('Local development converter release changed while reading.')
     }
     return bytes
@@ -120,4 +144,16 @@ export function createLocalDevelopmentConversionRuntimeFactory(options: {
       }),
     }
   }
+}
+
+export function selectConversionRuntimeFactory(options: {
+  packaged: boolean
+  developmentReleaseRoot?: string
+  productionFactory: ProductionConversionRuntimeFactory
+  createDevelopmentFactory?: (releaseRoot: string) => ProductionConversionRuntimeFactory
+}): ProductionConversionRuntimeFactory {
+  if (options.packaged || !options.developmentReleaseRoot) return options.productionFactory
+  const createDevelopment = options.createDevelopmentFactory
+    ?? ((releaseRoot: string) => createLocalDevelopmentConversionRuntimeFactory({ releaseRoot }))
+  return createDevelopment(options.developmentReleaseRoot)
 }
