@@ -2069,7 +2069,10 @@ export function createLocalKnowledgeService(
     bind,
     setCloudSyncConsent: (ownerId, accepted) => {
       const active = binding
-      if (!active || active.ownerId !== ownerId || active.epoch !== epoch) fail('AUTH_REQUIRED')
+      if (!active || active.ownerId !== ownerId || active.epoch !== epoch) {
+        if (unavailable?.ownerId === ownerId && unavailable.epoch === epoch) return
+        fail('AUTH_REQUIRED')
+      }
       applyCloudSyncConsent(active, accepted)
     },
     configureCloudRemote: (remote) => {
@@ -2080,7 +2083,10 @@ export function createLocalKnowledgeService(
     refreshEntitlement: async (ownerId, snapshot, authorizationConfirmed = true) => {
       if (!dependencies.refreshEntitlement && !dependencies.verifyEntitlement) return
       const active = binding
-      if (!active || active.ownerId !== ownerId || active.epoch !== epoch) fail('AUTH_REQUIRED')
+      if (!active || active.ownerId !== ownerId || active.epoch !== epoch) {
+        if (unavailable?.ownerId === ownerId && unavailable.epoch === epoch) return
+        fail('AUTH_REQUIRED')
+      }
       const refreshEpoch = epoch
       if (!authorizationConfirmed) {
         entitlement(active)

@@ -1029,9 +1029,12 @@ export const chatSendInputSchema = z.object({
 
 export type ChatSendInput = z.infer<typeof chatSendInputSchema>
 
+const citySchema = nonEmptyStringSchema
+
 export const workflowQuerySchema = z.object({
   search: z.string().trim().optional(),
   category: z.string().trim().min(1).optional(),
+  city: nonEmptyStringSchema.optional(),
   enabled: z.boolean().optional(),
   source: z.enum(['installed', 'development']).optional(),
 }).strict()
@@ -1072,6 +1075,7 @@ export const workflowSummarySchema = z.object({
   description: z.string(),
   author: nonEmptyStringSchema,
   category: nonEmptyStringSchema,
+  cities: z.array(citySchema).default([]),
   enabled: z.boolean(),
   source: z.enum(['installed', 'development']),
   integrity: z.enum(['valid', 'failed', 'unchecked']),
@@ -1096,8 +1100,6 @@ export const workflowRuntimeIdentitySchema = z.discriminatedUnion('source', [
 
 export type WorkflowRuntimeIdentity = z.infer<typeof workflowRuntimeIdentitySchema>
 
-const citySchema = nonEmptyStringSchema
-
 export const browserContinuationManifestSchema = z.object({
   auth: z.object({
     loginUrls: nonEmptyUniqueArraySchema(httpsUrlPatternSchema).optional(),
@@ -1113,7 +1115,6 @@ export const browserContinuationManifestSchema = z.object({
 
 export const workflowDetailSchema = workflowSummarySchema.extend({
   codeSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
-  cities: z.array(citySchema).default([]),
   runtimeIdentity: workflowRuntimeIdentitySchema,
   permissions: z.array(workflowPermissionSchema),
   activationExamples: z.array(nonEmptyStringSchema),

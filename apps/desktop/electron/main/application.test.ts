@@ -9173,6 +9173,33 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('filters workflows by city while retaining workflows available in all cities', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-city-filter-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+    const install = async (id: string, name: string, cities: string[]) => {
+      const project = await runtime.services.developer.createProject(name)
+      const manifest = JSON.parse(
+        await runtime.services.developer.readFile(project.id, 'workflow.json'),
+      ) as Record<string, unknown>
+      Object.assign(manifest, { id, name, cities })
+      await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+      await runtime.services.developer.build(project.id)
+      await runtime.services.workflows.installProject(project.id)
+    }
+
+    await install('local.city.beijing', '北京服务', ['北京'])
+    await install('local.city.shanghai', '上海服务', ['上海'])
+    await install('local.city.unrestricted', '通用服务', [])
+
+    const results = await runtime.services.workflows.list({ city: '北京' })
+
+    expect(results.map(({ name }) => name)).toEqual(expect.arrayContaining(['北京服务', '通用服务']))
+    expect(results.map(({ name }) => name)).not.toContain('上海服务')
+    expect(results.find(({ name }) => name === '北京服务')).toMatchObject({ cities: ['北京'] })
+    await runtime.close()
+  })
+
   it('marks edited workflow sources unavailable to chat until an explicit successful build', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-chat-availability-'))
     directories.push(root)

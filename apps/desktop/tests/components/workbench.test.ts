@@ -10,6 +10,7 @@ import type {
   DesktopAPI,
   ModelInfo,
   TokenUsageSnapshot,
+  WorkflowSummary,
 } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
@@ -756,6 +757,81 @@ describe('workbench', () => {
 
     expect(api.workflows.list).toHaveBeenCalledWith({ search: '万象转换', source: 'development' })
     expect(store.error).toBe('')
+  })
+
+  it('shows workflow city availability in the list', async () => {
+    const api = createApi()
+    const items = [
+      {
+        id: 'local.city.beijing', version: '1.0.0', name: '北京服务', description: '办理北京服务',
+        author: 'AutoForge', category: '政务', cities: ['北京'], enabled: true,
+        source: 'installed', integrity: 'valid', updatedAt: '2026-08-31T00:00:00.000Z',
+      },
+      {
+        id: 'local.city.unrestricted', version: '1.0.0', name: '通用服务', description: '适用于全部城市',
+        author: 'AutoForge', category: '工具', cities: [], enabled: true,
+        source: 'installed', integrity: 'valid', updatedAt: '2026-08-31T00:00:00.000Z',
+      },
+    ] satisfies WorkflowSummary[]
+    vi.mocked(api.workflows.list).mockResolvedValue(items)
+
+    const { wrapper } = await mountApp('/workflows', api)
+    await vi.waitFor(() => expect(api.workflows.list).toHaveBeenCalled())
+
+    const city = wrapper.get('[data-testid="workflow-city-local.city.beijing"]')
+    expect(city.text()).toContain('北京')
+    expect(city.attributes('aria-label')).toBe('适用城市：北京')
+    expect(wrapper.get('[data-testid="workflow-city-local.city.unrestricted"]').text()).toContain('不限城市')
+    const selectButton = wrapper.get('button[aria-label="查看北京服务详情"]')
+    expect(selectButton.attributes('aria-pressed')).toBe('false')
+    await selectButton.trigger('click')
+    expect(selectButton.attributes('aria-pressed')).toBe('true')
+  })
+
+  it('passes the selected city through the workflow query', async () => {
+    const { wrapper, api } = await mountApp('/workflows')
+    await vi.waitFor(() => expect(api.workflows.list).toHaveBeenCalled())
+
+    const citySelect = wrapper.findAllComponents({ name: 'ElSelect' })
+      .find((component) => component.props('id') === 'workflow-city')
+    expect(citySelect).toBeDefined()
+    citySelect!.vm.$emit('update:modelValue', '北京')
+    citySelect!.vm.$emit('change', '北京')
+
+    await vi.waitFor(() => expect(api.workflows.list).toHaveBeenLastCalledWith({ city: '北京' }))
+  })
+
+  it('retains city options for filtered results and removes stale options after a full reload', async () => {
+    const beijing = {
+      id: 'local.city.beijing', version: '1.0.0', name: '北京服务', description: '办理北京服务',
+      author: 'AutoForge', category: '政务', cities: ['北京'], enabled: true,
+      source: 'installed' as const, integrity: 'valid' as const, updatedAt: '2026-08-31T00:00:00.000Z',
+    }
+    const shanghai = { ...beijing, id: 'local.city.shanghai', name: '上海服务', cities: ['上海'] }
+    const unrestricted = { ...beijing, id: 'local.city.unrestricted', name: '通用服务', cities: [] }
+    const api = createApi()
+    vi.mocked(api.workflows.list).mockImplementation(async (query) => query?.city
+      ? [beijing, unrestricted]
+      : [beijing, shanghai, unrestricted])
+    const { wrapper, pinia } = await mountApp('/workflows', api)
+    await vi.waitFor(() => expect(api.workflows.list).toHaveBeenCalled())
+    const optionLabels = () => wrapper.findAllComponents({ name: 'ElOption' })
+      .map((component) => component.props('label'))
+    expect(optionLabels()).toContain('上海')
+
+    const citySelect = wrapper.findAllComponents({ name: 'ElSelect' })
+      .find((component) => component.props('id') === 'workflow-city')!
+    citySelect.vm.$emit('update:modelValue', '北京')
+    citySelect.vm.$emit('change', '北京')
+    await vi.waitFor(() => expect(api.workflows.list).toHaveBeenLastCalledWith({ city: '北京' }))
+    expect(optionLabels()).toContain('上海')
+
+    const store = useWorkflowStore(pinia)
+    store.query = {}
+    store.items = [beijing, unrestricted]
+    await flushPromises()
+
+    expect(optionLabels()).not.toContain('上海')
   })
 
   it('renders the real developer empty state without inventing a project', async () => {

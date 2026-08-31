@@ -2183,8 +2183,12 @@ describe('local knowledge service', () => {
       createParser: () => { throw new Error('must not run') },
       saveExport: async () => undefined,
       isMember: () => false,
+      verifyEntitlement: () => { throw new Error('signed path unused') },
     })
     await expect(encryptionUnavailable.bind('alice')).resolves.toBeUndefined()
+    await expect(encryptionUnavailable.refreshEntitlement!('alice', undefined, false))
+      .resolves.toBeUndefined()
+    expect(() => encryptionUnavailable.setCloudSyncConsent!('alice', true)).not.toThrow()
     await expect(encryptionUnavailable.getAvailability({ userId: 'alice' })).resolves.toMatchObject({
       encryption: { available: false, reason: 'encryption_unavailable' },
       parser: { available: false, reason: 'parser_unavailable' },

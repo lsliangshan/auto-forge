@@ -44,6 +44,13 @@ function png(width: number, height: number, fill = 0): Buffer {
   ])
 }
 
+function progressiveJpeg(): Buffer {
+  return Buffer.from(
+    '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/wgALCAACAAIBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAB//aAAgBAQAAAAE//8QAFhAAAwAAAAAAAAAAAAAAAAAAAAQV/9oACAEBAAEFAqLp/8QAGBAAAgMAAAAAAAAAAAAAAAAAAAEENJP/2gAIAQEABj8CuSdWf//EABYQAAMAAAAAAAAAAAAAAAAAAADB8P/aAAgBAQABPyG5Z//aAAgBAQAAABB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxBj/9k=',
+    'base64',
+  )
+}
+
 function gif(width: number, height: number, frames: number): Buffer {
   return Buffer.concat([
     Buffer.from('GIF89a', 'ascii'),
@@ -431,6 +438,12 @@ const probe = (
 ) => probeConversionInput({ bytes, displayName, mimeType, byteSize })
 
 describe('conversion catalog input probing', () => {
+  it('accepts progressive JPEGs with multiple scans', () => {
+    expect(probe(progressiveJpeg(), 'progressive.jpg', 'image/jpeg')).toMatchObject({
+      format: 'jpeg', width: 2, height: 2, frameCount: 1,
+    })
+  })
+
   it('rejects a forged extension and MIME when PNG magic wins', () => {
     expect(() => probe(png(2, 3), 'portrait.jpg', 'image/jpeg')).toThrowError(
       expect.objectContaining({ code: 'CONVERSION_INPUT_INVALID' }),

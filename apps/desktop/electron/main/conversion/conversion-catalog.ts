@@ -272,9 +272,13 @@ function jpegProbe(bytes: Uint8Array): StructuralProbe | undefined {
       sawScan = true
       offset += length
       while (offset + 1 < bytes.length) {
-        if (bytes[offset] === 0xff && bytes[offset + 1] === 0xd9) break
-        if (bytes[offset] === 0xff && bytes[offset + 1] !== 0x00 && (bytes[offset + 1]! < 0xd0 || bytes[offset + 1]! > 0xd7)) return undefined
-        offset += bytes[offset] === 0xff ? 2 : 1
+        if (bytes[offset] !== 0xff) {
+          offset += 1
+          continue
+        }
+        const next = bytes[offset + 1]!
+        if (next !== 0x00 && (next < 0xd0 || next > 0xd7)) break
+        offset += 2
       }
       continue
     }

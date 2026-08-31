@@ -78,6 +78,8 @@ import {
   userProfileUpdateSchema,
   workflowDetailSchema,
   workflowPermissionSchema,
+  workflowQuerySchema,
+  workflowSummarySchema,
   workerMessageSchema,
 } from './index'
 
@@ -1381,6 +1383,19 @@ describe('cross-process contracts', () => {
       ...validWorkflowDetail,
       runtimeIdentity: { ...validWorkflowDetail.runtimeIdentity, id: 'workflow.other' },
     })).toThrow()
+  })
+
+  it('preserves normalized cities in workflow list contracts', () => {
+    const summary = {
+      id: 'workflow.example', version: '1.0.0', name: '示例工作流', description: '示例',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'installed' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z',
+    }
+
+    expect(workflowSummarySchema.parse({ ...summary, cities: [' 北京 ', '上海'] }).cities)
+      .toEqual(['北京', '上海'])
+    expect(workflowSummarySchema.parse(summary).cities).toEqual([])
+    expect(workflowQuerySchema.parse({ city: ' 北京 ' })).toEqual({ city: '北京' })
   })
 
   it('preserves optional browser continuation metadata without synthesizing it for legacy workflows', () => {

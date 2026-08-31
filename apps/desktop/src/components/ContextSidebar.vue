@@ -147,71 +147,118 @@
     </template>
 
     <template v-else-if="route.name === 'workflows'">
-      <div class="sidebar-toolbar">
-        <span class="af-panel-heading">筛选工作流</span>
+      <div class="workflow-filter-panel">
+        <div class="workflow-filter-heading">
+          <span class="workflow-filter-icon"><el-icon><Filter /></el-icon></span>
+          <div>
+            <span class="af-panel-heading">筛选工作流</span>
+            <small>按能力与适用范围快速定位</small>
+          </div>
+          <span
+            v-if="workflowActiveFilterCount"
+            class="workflow-filter-count"
+          >{{ workflowActiveFilterCount }}</span>
+        </div>
+        <el-input
+          v-model="workflowSearch"
+          class="workflow-filter-search"
+          clearable
+          :prefix-icon="Search"
+          placeholder="搜索名称或说明"
+          aria-label="搜索工作流"
+          @keyup.enter="applyWorkflowFilters"
+        />
+        <label
+          class="field-label"
+          for="workflow-category"
+        >类别</label>
+        <el-select
+          id="workflow-category"
+          v-model="workflowCategory"
+          class="workflow-filter-control"
+          placeholder="全部类别"
+          clearable
+          @change="applyWorkflowFilters"
+        >
+          <el-option
+            v-for="category in workflowCategories"
+            :key="category"
+            :label="category"
+            :value="category"
+          />
+        </el-select>
+        <label
+          class="field-label"
+          for="workflow-city"
+        >城市</label>
+        <el-select
+          id="workflow-city"
+          v-model="workflowCity"
+          class="workflow-filter-control"
+          placeholder="全部城市"
+          clearable
+          @change="applyWorkflowFilters"
+        >
+          <el-option
+            v-for="city in workflowCities"
+            :key="city"
+            :label="city"
+            :value="city"
+          />
+        </el-select>
+        <label
+          class="field-label"
+          for="workflow-source"
+        >来源</label>
+        <el-select
+          id="workflow-source"
+          v-model="workflowSource"
+          class="workflow-filter-control"
+          placeholder="全部来源"
+          clearable
+          @change="applyWorkflowFilters"
+        >
+          <el-option
+            label="已安装"
+            value="installed"
+          /><el-option
+            label="开发中"
+            value="development"
+          />
+        </el-select>
+        <label
+          class="field-label"
+          for="workflow-state"
+        >状态</label>
+        <el-select
+          id="workflow-state"
+          v-model="workflowEnabled"
+          class="workflow-filter-control"
+          placeholder="全部状态"
+          clearable
+          @change="applyWorkflowFilters"
+        >
+          <el-option
+            label="已启用"
+            value="true"
+          /><el-option
+            label="已停用"
+            value="false"
+          />
+        </el-select>
+        <div class="workflow-filter-actions">
+          <el-button @click="resetWorkflowFilters">
+            重置
+          </el-button>
+          <el-button
+            type="primary"
+            :icon="Search"
+            @click="applyWorkflowFilters"
+          >
+            应用筛选
+          </el-button>
+        </div>
       </div>
-      <el-input
-        v-model="workflowSearch"
-        clearable
-        placeholder="搜索名称或说明"
-        aria-label="搜索工作流"
-        @keyup.enter="applyWorkflowFilters"
-      />
-      <label
-        class="field-label"
-        for="workflow-category"
-      >类别</label>
-      <el-select
-        id="workflow-category"
-        v-model="workflowCategory"
-        placeholder="全部类别"
-        clearable
-        @change="applyWorkflowFilters"
-      ><el-option v-for="category in workflowCategories" :key="category" :label="category" :value="category" /></el-select>
-      <label
-        class="field-label"
-        for="workflow-source"
-      >来源</label>
-      <el-select
-        id="workflow-source"
-        v-model="workflowSource"
-        placeholder="全部来源"
-        clearable
-        @change="applyWorkflowFilters"
-      >
-        <el-option
-          label="已安装"
-          value="installed"
-        /><el-option
-          label="开发中"
-          value="development"
-        />
-      </el-select>
-      <label
-        class="field-label"
-        for="workflow-state"
-      >状态</label>
-      <el-select
-        id="workflow-state"
-        v-model="workflowEnabled"
-        placeholder="全部状态"
-        clearable
-        @change="applyWorkflowFilters"
-      >
-        <el-option
-          label="已启用"
-          value="true"
-        /><el-option
-          label="已停用"
-          value="false"
-        />
-      </el-select>
-      <el-button
-        :icon="Search"
-        @click="applyWorkflowFilters"
-      >
-        应用筛选
-      </el-button>
     </template>
 
     <template v-else-if="route.name === 'developer'">
@@ -285,7 +332,7 @@
 </template>
 
 <script setup lang="ts">
-import { ChatDotRound, Delete, Edit, Plus, Refresh, Search } from '@element-plus/icons-vue'
+import { ChatDotRound, Delete, Edit, Filter, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import type { ExecutionStatus, SyncState } from '@autoforge/shared'
 import { ElMessageBox } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -318,7 +365,11 @@ const workflowSearch = ref('')
 const workflowSource = ref<'installed' | 'development' | ''>('')
 const workflowEnabled = ref<'true' | 'false' | ''>('')
 const workflowCategory = ref('')
+const workflowCity = ref('')
 const workflowCategories = computed(() => [...new Set(workflow.items.map(({ category }) => category))].sort())
+const workflowCities = ref<string[]>([])
+const workflowActiveFilterCount = computed(() => Object.values(workflow.query)
+  .filter((value) => value !== undefined && value !== '').length)
 const executionSearch = ref('')
 const executionWorkflowId = ref('')
 const executionFrom = ref('')
@@ -389,8 +440,17 @@ function applyWorkflowFilters() {
     ...(workflowSearch.value.trim() ? { search: workflowSearch.value.trim() } : {}),
     ...(workflowSource.value ? { source: workflowSource.value } : {}),
     ...(workflowCategory.value ? { category: workflowCategory.value } : {}),
+    ...(workflowCity.value ? { city: workflowCity.value } : {}),
     ...(workflowEnabled.value ? { enabled: workflowEnabled.value === 'true' } : {}),
   })
+}
+function resetWorkflowFilters() {
+  workflowSearch.value = ''
+  workflowSource.value = ''
+  workflowCategory.value = ''
+  workflowCity.value = ''
+  workflowEnabled.value = ''
+  void workflow.load({})
 }
 function applyExecutionFilters() {
   void execution.load({
@@ -428,6 +488,14 @@ onMounted(() => {
   if (route.name === 'chat' && !chat.conversations.length && !chat.loading) void chat.loadConversations()
   setupSettingsScrollSync()
 })
+watch(() => workflow.items, (items) => {
+  const hasActiveQuery = Object.keys(workflow.query).length > 0
+  const cities = new Set(hasActiveQuery ? workflowCities.value : [])
+  for (const item of items) {
+    for (const city of item.cities) cities.add(city)
+  }
+  workflowCities.value = [...cities].sort((left, right) => left.localeCompare(right, 'zh-CN'))
+}, { immediate: true })
 watch(() => route.name, setupSettingsScrollSync)
 onBeforeUnmount(detachSettingsScrollSync)
 </script>
@@ -464,6 +532,16 @@ onBeforeUnmount(detachSettingsScrollSync)
 .sidebar-state small { color: var(--af-text-muted); }.sidebar-error { color: var(--af-danger); font-size: 0.75rem; }
 .sync-retry-error { padding: 0 8px; }
 .field-label { margin-top: 4px; color: var(--af-text-muted); font-size: 0.6875rem; font-weight: 650; }
+.workflow-filter-panel { display: flex; flex-direction: column; gap: 8px; border: 1px solid color-mix(in srgb, var(--af-border) 86%, transparent); border-radius: 14px; padding: 12px; background: color-mix(in srgb, var(--af-surface) 82%, transparent); box-shadow: 0 8px 24px rgb(32 36 43 / 4%); }
+.workflow-filter-heading { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 9px; margin-bottom: 3px; }
+.workflow-filter-heading > div { display: grid; gap: 2px; }.workflow-filter-heading small { color: var(--af-text-muted); font-size: 0.5625rem; line-height: 1.35; }
+.workflow-filter-icon { display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid color-mix(in srgb, var(--af-cobalt) 18%, var(--af-border)); border-radius: 10px; color: var(--af-cobalt); background: var(--af-cobalt-soft); }
+.workflow-filter-count { display: grid; min-width: 22px; height: 22px; place-items: center; border-radius: 999px; color: var(--af-cobalt); background: var(--af-cobalt-soft); font-size: 0.625rem; font-weight: 750; }
+.workflow-filter-search :deep(.el-input__wrapper), .workflow-filter-control :deep(.el-select__wrapper) { min-height: 38px; border-radius: 9px; background: var(--af-surface); box-shadow: 0 0 0 1px var(--af-border) inset; transition: box-shadow .16s ease, background-color .16s ease; }
+.workflow-filter-search :deep(.el-input__wrapper:hover), .workflow-filter-control :deep(.el-select__wrapper:hover) { box-shadow: 0 0 0 1px var(--af-border-strong) inset; }
+.workflow-filter-search :deep(.el-input__wrapper.is-focus), .workflow-filter-control :deep(.el-select__wrapper.is-focused) { box-shadow: 0 0 0 1px var(--af-cobalt) inset, var(--af-focus); }
+.workflow-filter-panel .field-label { margin-top: 3px; padding-left: 2px; color: var(--af-text); font-size: 0.625rem; letter-spacing: .02em; }
+.workflow-filter-actions { display: grid; grid-template-columns: .75fr 1.25fr; gap: 8px; margin-top: 7px; padding-top: 11px; border-top: 1px solid var(--af-border); }.workflow-filter-actions .el-button { width: 100%; min-height: 36px; margin: 0; border-radius: 9px; font-weight: 650; }.workflow-filter-actions .el-button--primary { box-shadow: 0 5px 14px color-mix(in srgb, var(--af-cobalt) 18%, transparent); }
 .native-filter { width: 100%; border: 1px solid var(--af-border-strong); border-radius: 4px; padding: 7px 8px; color: var(--af-text); background: var(--af-surface); font-size: 0.6875rem; }
 .settings-section-link { width: 100%; min-height: 38px; border: 0; border-radius: 9px; padding: 9px 11px; color: var(--af-text); background: transparent; font: inherit; font-size: 0.8125rem; line-height: 1.4; cursor: pointer; text-align: left; transition: color .16s ease, background-color .16s ease, box-shadow .16s ease; }
 .settings-section-link:hover, .settings-section-link.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }

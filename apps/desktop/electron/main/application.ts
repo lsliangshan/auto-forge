@@ -661,6 +661,7 @@ function summary(workflow: WorkflowDetail): WorkflowSummary {
     description: workflow.description,
     author: workflow.author,
     category: workflow.category,
+    cities: workflow.cities,
     enabled: workflow.enabled,
     source: workflow.source,
     integrity: workflow.integrity,
@@ -3789,6 +3790,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           workflows = workflows.filter((workflow) => `${workflow.name}\n${workflow.description}\n${workflow.id}`.toLocaleLowerCase().includes(search))
         }
         if (query?.category) workflows = workflows.filter((workflow) => workflow.category === query.category)
+        if (query?.city) {
+          const city = query.city
+          workflows = workflows.filter((workflow) => !workflow.cities.length || workflow.cities.includes(city))
+        }
         if (query?.enabled !== undefined) workflows = workflows.filter((workflow) => workflow.enabled === query.enabled)
         if (query?.source) workflows = workflows.filter((workflow) => workflow.source === query.source)
         return workflows.map(summary)
