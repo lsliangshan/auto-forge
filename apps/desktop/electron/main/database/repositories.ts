@@ -11,12 +11,17 @@ import {
   httpsUrlPatternSchema,
   runtimeCapabilityPermissionSchema,
   runtimeCapabilityScopeSchema,
+  messageProviderProjectionSchema,
   type AppErrorCode,
   type ByokUsageEvent,
   type ChatBlock,
+  type ConversionJobStatus,
+  type ConversionPreset,
+  type ConversionTargetFormat,
   type ConversationGenerationPreferences,
   type AttachmentKind,
   type ModelProviderId,
+  type MessageProviderProjection,
 } from '@autoforge/shared'
 import { addUsd, normalizeUsd } from '../billing/decimal-usd.js'
 import { redact } from '../security/redaction.js'
@@ -36,10 +41,13 @@ export interface Message {
   conversationId: string
   role: string
   blocks: unknown[]
+  providerProjection?: MessageProviderProjection
   ordinal: number
   executionId?: string
   createdAt: number
 }
+
+export type { MessageProviderProjection } from '@autoforge/shared'
 
 export interface ConversationContextRecord {
   conversationId: string
@@ -293,6 +301,121 @@ export interface Execution {
   createdAt: number
   startedAt?: number
   endedAt?: number
+}
+
+export interface ConversionJob {
+  id: string
+  ownerUserId: string
+  executionId: string
+  sourceKind: 'media' | 'artifact'
+  sourceId: string
+  targetFormat: ConversionTargetFormat
+  preset?: ConversionPreset
+  status: ConversionJobStatus
+  epoch: number
+  progress: number
+  errorCode?: AppErrorCode
+  createdAt: number
+  updatedAt: number
+  startedAt?: number
+  endedAt?: number
+}
+
+export type NewConversionJob = Pick<
+  ConversionJob,
+  'id' | 'ownerUserId' | 'executionId' | 'sourceKind' | 'sourceId' | 'targetFormat'
+> & Partial<Pick<ConversionJob, 'preset' | 'status' | 'epoch' | 'progress' | 'errorCode' | 'createdAt' | 'updatedAt' | 'startedAt' | 'endedAt'>>
+
+export type ConversionJobTransition = Partial<Pick<
+  ConversionJob,
+  'status' | 'progress' | 'errorCode' | 'startedAt' | 'endedAt'
+>>
+
+const conversionIconRepresentationSizeSchema = z.union([
+  z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64),
+  z.literal(128), z.literal(256), z.literal(512), z.literal(1024),
+])
+const conversionIcnsSlotDimensions = {
+  icp4: [16, 1, 16], ic11: [16, 2, 32], icp5: [32, 1, 32], ic12: [32, 2, 64],
+  icp6: [64, 1, 64], ic07: [128, 1, 128], ic13: [128, 2, 256],
+  ic08: [256, 1, 256], ic14: [256, 2, 512], ic09: [512, 1, 512], ic10: [512, 2, 1024],
+} as const
+const conversionIcnsRepresentationSchema = z.object({
+  sourceType: z.enum(['icp4', 'ic11', 'icp5', 'ic12', 'icp6', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10']),
+  logicalWidth: conversionIconRepresentationSizeSchema,
+  logicalHeight: conversionIconRepresentationSizeSchema,
+  pixelWidth: conversionIconRepresentationSizeSchema,
+  pixelHeight: conversionIconRepresentationSizeSchema,
+  scale: z.union([z.literal(1), z.literal(2)]),
+}).strict().superRefine((value, context) => {
+  const [logicalSize, scale, pixelSize] = conversionIcnsSlotDimensions[value.sourceType]
+  if (
+    value.logicalWidth !== logicalSize || value.logicalHeight !== logicalSize
+    || value.pixelWidth !== pixelSize || value.pixelHeight !== pixelSize || value.scale !== scale
+  ) context.addIssue({ code: 'custom', message: 'ICNS representation metadata must match its source slot' })
+})
+const conversionIcoDimensionSchema = z.number().int().min(1).max(256)
+const conversionIcoRepresentationSchema = z.object({
+  sourceType: z.literal('ico'),
+  sourceIndex: z.number().int().min(1).max(256),
+  logicalWidth: conversionIcoDimensionSchema,
+  logicalHeight: conversionIcoDimensionSchema,
+  pixelWidth: conversionIcoDimensionSchema,
+  pixelHeight: conversionIcoDimensionSchema,
+  scale: z.literal(1),
+}).strict().superRefine((value, context) => {
+  if (value.logicalWidth !== value.pixelWidth || value.logicalHeight !== value.pixelHeight) {
+    context.addIssue({ code: 'custom', message: 'ICO representation metadata must preserve its pixel dimensions' })
+  }
+})
+const conversionIconRepresentationSchema = z.union([
+  conversionIcnsRepresentationSchema,
+  conversionIcoRepresentationSchema,
+])
+
+export const conversionArtifactMetadataSchema = z.object({
+  iconRepresentations: z.array(conversionIconRepresentationSizeSchema).min(1).max(9)
+    .refine((sizes) => new Set(sizes).size === sizes.length, 'Icon representations must be unique')
+    .optional(),
+  iconRepresentation: conversionIconRepresentationSchema.optional(),
+  pdfPage: z.number().int().min(1).max(100).optional(),
+  frameSelection: z.literal('first').optional(),
+  transparentPadding: z.literal(true).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, 'Conversion metadata must describe an output')
+
+export type ConversionArtifactMetadata = z.infer<typeof conversionArtifactMetadataSchema>
+
+export interface ConversionArtifact {
+  id: string
+  ownerUserId: string
+  executionId: string
+  conversionJobId?: string
+  role: 'input' | 'output'
+  displayName: string
+  detectedFormat: string
+  mimeType: string
+  byteSize: number
+  sha256: string
+  relativePath: string
+  metadata?: ConversionArtifactMetadata
+  status: 'ready' | 'deleted'
+  createdAt: number
+  updatedAt: number
+  deletedAt?: number
+}
+
+export type NewConversionArtifact = Pick<
+  ConversionArtifact,
+  'id' | 'ownerUserId' | 'executionId' | 'role' | 'displayName' | 'detectedFormat' | 'mimeType' | 'byteSize' | 'sha256' | 'relativePath'
+> & Partial<Pick<ConversionArtifact, 'conversionJobId' | 'metadata' | 'status' | 'createdAt' | 'updatedAt' | 'deletedAt'>>
+
+export interface CompleteConversionJobWithArtifactsInput {
+  jobId: string
+  ownerUserId: string
+  executionId: string
+  expectedEpoch: number
+  endedAt: number
+  artifacts: readonly NewConversionArtifact[]
 }
 
 export interface ExecutionStep {
@@ -772,6 +895,44 @@ export interface AppRepositories {
     updateForUser(id: string, ownerUserId: string, value: Partial<Omit<Execution, 'id' | 'ownerUserId' | 'workflowId' | 'workflowVersion' | 'createdAt'>>): Execution | undefined
     markInterrupted(): number
   }
+  conversionJobs: {
+    create(input: NewConversionJob): ConversionJob
+    getOwned(jobId: string, ownerUserId: string): ConversionJob | null
+    listForExecution(executionId: string, ownerUserId: string): ConversionJob[]
+    claimNext(ownerUserId: string): ConversionJob | null
+    transition(input: {
+      jobId: string
+      ownerUserId: string
+      expectedEpoch: number
+      expectedStatuses: ConversionJobStatus[]
+      patch: ConversionJobTransition
+    }): boolean
+    retry(input: {
+      jobId: string
+      ownerUserId: string
+      expectedEpoch: number
+      expectedStatuses: ConversionJobStatus[]
+    }): boolean
+    interruptCompletedForArtifactRecovery(input: {
+      jobId: string
+      ownerUserId: string
+      expectedEpoch: number
+    }): boolean
+    completeWithArtifacts(input: CompleteConversionJobWithArtifactsInput): ConversionArtifact[] | null
+    interruptInFlight(ownerUserId: string): number
+  }
+  conversionArtifacts: {
+    create(input: NewConversionArtifact): ConversionArtifact
+    createBatch(inputs: readonly NewConversionArtifact[]): ConversionArtifact[]
+    getOwned(artifactId: string, ownerUserId: string): ConversionArtifact | null
+    listForExecution(executionId: string, ownerUserId: string): ConversionArtifact[]
+    listForJob(jobId: string, ownerUserId: string): ConversionArtifact[]
+    markDeleted(
+      artifactId: string,
+      ownerUserId: string,
+      expected: ConversionArtifact,
+    ): boolean
+  }
   executionSteps: { insert(value: ExecutionStep): ExecutionStep; list(executionId: string): ExecutionStep[]; listForUser(executionId: string, ownerUserId: string): ExecutionStep[] }
   executionLogs: { insert(value: ExecutionLogInput): ExecutionLog; list(executionId: string): ExecutionLog[]; listForUser(executionId: string, ownerUserId: string): ExecutionLog[] }
   permissionGrants: { upsert(value: PermissionGrant): PermissionGrant; get(workflowId: string, workflowVersion: string, capability: string, scopeHash: string): PermissionGrant | undefined; list(): PermissionGrant[]; delete(id: string): void }
@@ -794,7 +955,7 @@ export interface AppRepositories {
 }
 
 const conversationColumns = 'id, title, title_state AS titleState, user_id AS userId, generation_preferences_json AS generationPreferencesJson, created_at AS createdAt, updated_at AS updatedAt'
-const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, ordinal, execution_id AS executionId, created_at AS createdAt'
+const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, provider_projection_json AS providerProjectionJson, ordinal, execution_id AS executionId, created_at AS createdAt'
 const conversationContextColumns = 'conversation_id AS conversationId, summary_text AS summaryText, through_ordinal AS throughOrdinal, estimated_tokens AS estimatedTokens, updated_at AS updatedAt'
 const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
 const mediaGenerationJobColumns = 'id, conversation_id AS conversationId, assistant_message_id AS assistantMessageId, provider, model, kind, provider_job_id AS providerJobId, status, parameters_json AS parametersJson, next_poll_at AS nextPollAt, poll_attempts AS pollAttempts, error_code AS errorCode, asset_id AS assetId, created_at AS createdAt, updated_at AS updatedAt, ended_at AS endedAt'
@@ -803,6 +964,8 @@ const providerUsageColumns = 'id, operation_key AS operationKey, user_id AS user
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
 const executionColumns = 'id, owner_user_id AS ownerUserId, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
+const conversionJobColumns = 'id, owner_user_id AS ownerUserId, execution_id AS executionId, source_kind AS sourceKind, source_id AS sourceId, target_format AS targetFormat, preset, status, epoch, progress, error_code AS errorCode, created_at AS createdAt, updated_at AS updatedAt, started_at AS startedAt, ended_at AS endedAt'
+const conversionArtifactColumns = 'id, owner_user_id AS ownerUserId, execution_id AS executionId, conversion_job_id AS conversionJobId, role, display_name AS displayName, detected_format AS detectedFormat, mime_type AS mimeType, byte_size AS byteSize, sha256, relative_path AS relativePath, metadata_json AS metadataJson, status, created_at AS createdAt, updated_at AS updatedAt, deleted_at AS deletedAt'
 const browserTabBindingColumns = 'id, tab_id AS tabId, user_id AS userId, conversation_id AS conversationId, chat_run_id AS chatRunId, execution_id AS executionId, workflow_id AS workflowId, workflow_version AS workflowVersion, source, build_hash AS buildHash, security_fingerprint AS securityFingerprint, permission_matrix_json AS permissionMatrixJson, status, terminal_reason AS terminalReason, created_at AS createdAt, ended_at AS endedAt'
 const browserActionAuditColumns = 'id, binding_id AS bindingId, chat_run_id AS chatRunId, sequence, origin, action, target_summary AS targetSummary, risk, outcome, error_code AS errorCode, created_at AS createdAt'
 
@@ -1006,11 +1169,35 @@ function summarizeTokenUsagePeriod(
 }
 
 function messageFromRow(row: Query): Message {
+  const blocks = parse(row.blocksJson as string) as unknown[]
+  const providerProjection = parseMessageProviderProjection(
+    row.providerProjectionJson,
+    row.role,
+    blocks,
+  )
   return {
     ...row,
-    blocks: parse(row.blocksJson as string) as unknown[],
+    blocks,
     ordinal: positiveIntegerSchema.parse(row.ordinal),
+    ...(providerProjection === undefined ? {} : { providerProjection }),
   } as Message
+}
+
+function parseMessageProviderProjection(
+  value: unknown,
+  role: unknown,
+  blocks: readonly unknown[],
+): MessageProviderProjection | undefined {
+  if (value === null || value === undefined) return undefined
+  if (typeof value !== 'string') throw new Error('Message Provider projection is invalid')
+  const parsed = messageProviderProjectionSchema.safeParse(parse(value))
+  if (!parsed.success || role !== 'user') return undefined
+  const attachmentCount = chatBlockSchema.array().parse(blocks).filter((block) => (
+    block.type === 'media' && block.purpose === 'input'
+  )).length
+  return attachmentCount === parsed.data.attachmentCount
+    ? Object.freeze(parsed.data)
+    : undefined
 }
 
 function conversationContextFromRow(row: Query): ConversationContextRecord {
@@ -1251,9 +1438,12 @@ function insertMessage(
   blocks: unknown[] = value.blocks,
 ): Message {
   const ordinal = nextMessageOrdinal(database, value.conversationId)
-  database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @ordinal, @executionId, @createdAt)').run({
+  database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, provider_projection_json, ordinal, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @providerProjectionJson, @ordinal, @executionId, @createdAt)').run({
     ...value,
     blocksJson: JSON.stringify(blocks),
+    providerProjectionJson: value.providerProjection === undefined
+      ? null
+      : JSON.stringify(value.providerProjection),
     ordinal,
     executionId: value.executionId ?? null,
   })
@@ -1512,6 +1702,109 @@ function executionFromRow(row: Query): Execution {
     input: parse(row.inputJson as string),
     result: parse(row.resultJson as string | null),
   } as Execution
+}
+
+function conversionJobFromRow(row: Query): ConversionJob {
+  return {
+    id: row.id as string,
+    ownerUserId: row.ownerUserId as string,
+    executionId: row.executionId as string,
+    sourceKind: row.sourceKind as ConversionJob['sourceKind'],
+    sourceId: row.sourceId as string,
+    targetFormat: row.targetFormat as ConversionTargetFormat,
+    preset: optional<ConversionPreset>(row.preset),
+    status: row.status as ConversionJobStatus,
+    epoch: row.epoch as number,
+    progress: row.progress as number,
+    errorCode: optional<AppErrorCode>(row.errorCode),
+    createdAt: row.createdAt as number,
+    updatedAt: row.updatedAt as number,
+    startedAt: optional<number>(row.startedAt),
+    endedAt: optional<number>(row.endedAt),
+  }
+}
+
+function conversionArtifactFromRow(row: Query): ConversionArtifact {
+  return {
+    id: row.id as string,
+    ownerUserId: row.ownerUserId as string,
+    executionId: row.executionId as string,
+    conversionJobId: optional<string>(row.conversionJobId),
+    role: row.role as ConversionArtifact['role'],
+    displayName: row.displayName as string,
+    detectedFormat: row.detectedFormat as string,
+    mimeType: row.mimeType as string,
+    byteSize: row.byteSize as number,
+    sha256: row.sha256 as string,
+    relativePath: row.relativePath as string,
+    metadata: row.metadataJson === null ? undefined : conversionArtifactMetadataSchema.parse(parse(row.metadataJson as string)),
+    status: row.status as ConversionArtifact['status'],
+    createdAt: row.createdAt as number,
+    updatedAt: row.updatedAt as number,
+    deletedAt: optional<number>(row.deletedAt),
+  }
+}
+
+function conversionArtifactMetadata(value: unknown): ConversionArtifactMetadata | undefined {
+  if (value === undefined) return undefined
+  const parsed = conversionArtifactMetadataSchema.safeParse(value)
+  if (!parsed.success) throw new Error('Invalid conversion artifact metadata')
+  return parsed.data
+}
+
+function relativeConversionArtifactPath(value: unknown): string {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.startsWith('/')
+    || value.startsWith('\\')
+    || /^[A-Za-z]:/.test(value)
+    || value.includes('\0')
+  ) throw new Error('Invalid conversion artifact path')
+  return value
+}
+
+function insertConversionArtifact(
+  database: SqliteDatabase,
+  input: NewConversionArtifact,
+): ConversionArtifact {
+  const createdAt = input.createdAt ?? now()
+  const updatedAt = input.updatedAt ?? createdAt
+  const status = input.status ?? 'ready'
+  const metadata = conversionArtifactMetadata(input.metadata)
+  const relativePath = relativeConversionArtifactPath(input.relativePath)
+  const inserted = database.prepare(`
+    INSERT INTO conversion_artifacts (
+      id, owner_user_id, execution_id, conversion_job_id, role, display_name,
+      detected_format, mime_type, byte_size, sha256, relative_path, metadata_json,
+      status, created_at, updated_at, deleted_at
+    )
+    SELECT
+      @id, @ownerUserId, @executionId, @conversionJobId, @role, @displayName,
+      @detectedFormat, @mimeType, @byteSize, @sha256, @relativePath, @metadataJson,
+      @status, @createdAt, @updatedAt, @deletedAt
+    WHERE EXISTS (
+      SELECT 1 FROM executions WHERE id = @executionId AND owner_user_id = @ownerUserId
+    ) AND (
+      @conversionJobId IS NULL OR EXISTS (
+        SELECT 1 FROM conversion_jobs
+        WHERE id = @conversionJobId AND owner_user_id = @ownerUserId AND execution_id = @executionId
+      )
+    )
+  `).run({
+    ...input,
+    conversionJobId: input.conversionJobId ?? null,
+    metadataJson: metadata === undefined ? null : JSON.stringify(metadata),
+    relativePath,
+    status,
+    createdAt,
+    updatedAt,
+    deletedAt: input.deletedAt ?? (status === 'deleted' ? updatedAt : null),
+  }).changes
+  if (inserted !== 1) throw new Error('Conversion artifact ownership mismatch')
+  const row = one<Query>(database, `SELECT ${conversionArtifactColumns} FROM conversion_artifacts WHERE id = @id`, { id: input.id })
+  if (!row) throw new Error('Conversion artifact was not created')
+  return conversionArtifactFromRow(row)
 }
 
 function permissionFromRow(row: Query): PermissionGrant {
@@ -2669,6 +2962,281 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return row && executionFromRow(row)
       },
       markInterrupted: () => transaction(database, () => database.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = @endedAt WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run({ endedAt: now() }).changes),
+    },
+    conversionJobs: {
+      create(input) {
+        const createdAt = input.createdAt ?? now()
+        const updatedAt = input.updatedAt ?? createdAt
+        const status = input.status ?? 'queued'
+        const epoch = input.epoch ?? 0
+        const progress = input.progress ?? 0
+        const inserted = transaction(database, () => database.prepare(`
+          INSERT INTO conversion_jobs (
+            id, owner_user_id, execution_id, source_kind, source_id, target_format, preset,
+            status, epoch, progress, error_code, created_at, updated_at, started_at, ended_at
+          )
+          SELECT
+            @id, @ownerUserId, @executionId, @sourceKind, @sourceId, @targetFormat, @preset,
+            @status, @epoch, @progress, @errorCode, @createdAt, @updatedAt, @startedAt, @endedAt
+          WHERE EXISTS (
+            SELECT 1 FROM executions WHERE id = @executionId AND owner_user_id = @ownerUserId
+          )
+        `).run({
+          ...input,
+          preset: input.preset ?? null,
+          status,
+          epoch,
+          progress,
+          errorCode: input.errorCode ?? null,
+          createdAt,
+          updatedAt,
+          startedAt: input.startedAt ?? null,
+          endedAt: input.endedAt ?? null,
+        }).changes)
+        if (inserted !== 1) throw new Error('Conversion execution ownership mismatch')
+        const row = one<Query>(database, `SELECT ${conversionJobColumns} FROM conversion_jobs WHERE id = @id`, { id: input.id })
+        if (!row) throw new Error('Conversion job was not created')
+        return conversionJobFromRow(row)
+      },
+      getOwned(jobId, ownerUserId) {
+        const row = one<Query>(database, `
+          SELECT ${conversionJobColumns} FROM conversion_jobs
+          WHERE id = @jobId AND owner_user_id = @ownerUserId
+        `, { jobId, ownerUserId })
+        return row ? conversionJobFromRow(row) : null
+      },
+      listForExecution(executionId, ownerUserId) {
+        return many<Query>(database, `
+          SELECT ${conversionJobColumns} FROM conversion_jobs
+          WHERE execution_id = @executionId AND owner_user_id = @ownerUserId
+          ORDER BY created_at, id
+        `, { executionId, ownerUserId }).map(conversionJobFromRow)
+      },
+      claimNext(ownerUserId) {
+        return transaction(database, () => {
+          const row = one<Query>(database, `
+            SELECT ${conversionJobColumns} FROM conversion_jobs
+            WHERE owner_user_id = @ownerUserId AND status = 'queued'
+            ORDER BY created_at, id
+            LIMIT 1
+          `, { ownerUserId })
+          if (!row) return null
+          const claimedAt = now()
+          const claimed = database.prepare(`
+            UPDATE conversion_jobs
+            SET status = 'downloading_component',
+                updated_at = @claimedAt,
+                started_at = COALESCE(started_at, @claimedAt)
+            WHERE id = @id AND owner_user_id = @ownerUserId AND status = 'queued'
+          `).run({ id: row.id, ownerUserId, claimedAt }).changes
+          if (claimed !== 1) return null
+          const updated = one<Query>(database, `
+            SELECT ${conversionJobColumns} FROM conversion_jobs WHERE id = @id AND owner_user_id = @ownerUserId
+          `, { id: row.id, ownerUserId })
+          return updated ? conversionJobFromRow(updated) : null
+        })
+      },
+      transition(input) {
+        if (input.expectedStatuses.length === 0) return false
+        const expectedParameters = Object.fromEntries(input.expectedStatuses.map((status, index) => [`status${index}`, status]))
+        const statuses = input.expectedStatuses.map((_, index) => `@status${index}`).join(', ')
+        const updatedAt = now()
+        return transaction(database, () => database.prepare(`
+          UPDATE conversion_jobs
+          SET status = COALESCE(@status, status),
+              progress = COALESCE(@progress, progress),
+              error_code = COALESCE(@errorCode, error_code),
+              started_at = COALESCE(@startedAt, started_at),
+              ended_at = COALESCE(@endedAt, ended_at),
+              updated_at = @updatedAt
+          WHERE id = @jobId
+            AND owner_user_id = @ownerUserId
+            AND epoch = @expectedEpoch
+            AND status IN (${statuses})
+            AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+        `).run({
+          jobId: input.jobId,
+          ownerUserId: input.ownerUserId,
+          expectedEpoch: input.expectedEpoch,
+          status: input.patch.status ?? null,
+          progress: input.patch.progress ?? null,
+          errorCode: input.patch.errorCode ?? null,
+          startedAt: input.patch.startedAt ?? null,
+          endedAt: input.patch.endedAt ?? null,
+          updatedAt,
+          ...expectedParameters,
+        }).changes === 1)
+      },
+      retry(input) {
+        if (input.expectedStatuses.length === 0) return false
+        const expectedParameters = Object.fromEntries(input.expectedStatuses.map((status, index) => [`status${index}`, status]))
+        const statuses = input.expectedStatuses.map((_, index) => `@status${index}`).join(', ')
+        return transaction(database, () => database.prepare(`
+          UPDATE conversion_jobs
+          SET epoch = epoch + 1,
+              status = 'queued',
+              progress = 0,
+              error_code = NULL,
+              started_at = NULL,
+              ended_at = NULL,
+              updated_at = @updatedAt
+          WHERE id = @jobId
+            AND owner_user_id = @ownerUserId
+            AND epoch = @expectedEpoch
+            AND status IN (${statuses})
+            AND status IN ('failed', 'cancelled', 'interrupted')
+        `).run({
+          jobId: input.jobId,
+          ownerUserId: input.ownerUserId,
+          expectedEpoch: input.expectedEpoch,
+          updatedAt: now(),
+          ...expectedParameters,
+        }).changes === 1)
+      },
+      interruptCompletedForArtifactRecovery(input) {
+        const interruptedAt = now()
+        return transaction(database, () => database.prepare(`
+          UPDATE conversion_jobs
+          SET status = 'interrupted',
+              error_code = 'CONVERSION_INTERRUPTED',
+              updated_at = @interruptedAt,
+              ended_at = @interruptedAt
+          WHERE id = @jobId
+            AND owner_user_id = @ownerUserId
+            AND epoch = @expectedEpoch
+            AND status = 'completed'
+        `).run({
+          jobId: input.jobId,
+          ownerUserId: input.ownerUserId,
+          expectedEpoch: input.expectedEpoch,
+          interruptedAt,
+        }).changes === 1)
+      },
+      completeWithArtifacts(input) {
+        if (input.artifacts.length === 0 || input.artifacts.length > 256) {
+          throw new Error('Invalid conversion artifact batch')
+        }
+        return transaction(database, () => {
+          const completed = database.prepare(`
+            UPDATE conversion_jobs
+            SET status = 'completed',
+                progress = 100,
+                error_code = NULL,
+                updated_at = @endedAt,
+                ended_at = @endedAt
+            WHERE id = @jobId
+              AND owner_user_id = @ownerUserId
+              AND execution_id = @executionId
+              AND epoch = @expectedEpoch
+              AND status = 'verifying'
+          `).run({
+            jobId: input.jobId,
+            ownerUserId: input.ownerUserId,
+            executionId: input.executionId,
+            expectedEpoch: input.expectedEpoch,
+            endedAt: input.endedAt,
+          }).changes
+          if (completed !== 1) return null
+          return input.artifacts.map((artifact) => {
+            if (
+              artifact.ownerUserId !== input.ownerUserId
+              || artifact.executionId !== input.executionId
+              || artifact.conversionJobId !== input.jobId
+              || artifact.role !== 'output'
+              || artifact.status === 'deleted'
+            ) throw new Error('Conversion artifact batch identity mismatch')
+            return insertConversionArtifact(database, artifact)
+          })
+        })
+      },
+      interruptInFlight(ownerUserId) {
+        return transaction(database, () => {
+          const interruptedAt = now()
+          return database.prepare(`
+            UPDATE conversion_jobs
+            SET status = 'interrupted',
+                error_code = 'CONVERSION_INTERRUPTED',
+                updated_at = @interruptedAt,
+                ended_at = @interruptedAt
+            WHERE owner_user_id = @ownerUserId
+              AND status IN ('downloading_component', 'converting', 'verifying')
+          `).run({ ownerUserId, interruptedAt }).changes
+        })
+      },
+    },
+    conversionArtifacts: {
+      create(input) {
+        return transaction(database, () => insertConversionArtifact(database, input))
+      },
+      createBatch(inputs) {
+        if (inputs.length === 0 || inputs.length > 256) throw new Error('Invalid conversion artifact batch')
+        return transaction(database, () => inputs.map((input) => insertConversionArtifact(database, input)))
+      },
+      getOwned(artifactId, ownerUserId) {
+        const row = one<Query>(database, `
+          SELECT ${conversionArtifactColumns} FROM conversion_artifacts
+          WHERE id = @artifactId AND owner_user_id = @ownerUserId
+        `, { artifactId, ownerUserId })
+        return row ? conversionArtifactFromRow(row) : null
+      },
+      listForExecution(executionId, ownerUserId) {
+        return many<Query>(database, `
+          SELECT ${conversionArtifactColumns} FROM conversion_artifacts
+          WHERE execution_id = @executionId AND owner_user_id = @ownerUserId
+          ORDER BY created_at, id
+        `, { executionId, ownerUserId }).map(conversionArtifactFromRow)
+      },
+      listForJob(jobId, ownerUserId) {
+        return many<Query>(database, `
+          SELECT ${conversionArtifactColumns} FROM conversion_artifacts
+          WHERE conversion_job_id = @jobId AND owner_user_id = @ownerUserId
+          ORDER BY created_at, id
+        `, { jobId, ownerUserId }).map(conversionArtifactFromRow)
+      },
+      markDeleted(artifactId, ownerUserId, expected) {
+        return transaction(database, () => {
+          const deletedAt = now()
+          return database.prepare(`
+            UPDATE conversion_artifacts
+            SET status = 'deleted', updated_at = @deletedAt, deleted_at = @deletedAt
+            WHERE id = @artifactId
+              AND owner_user_id = @ownerUserId
+              AND execution_id = @expectedExecutionId
+              AND conversion_job_id IS @expectedConversionJobId
+              AND role = @expectedRole
+              AND display_name = @expectedDisplayName
+              AND detected_format = @expectedDetectedFormat
+              AND mime_type IS @expectedMimeType
+              AND byte_size = @expectedByteSize
+              AND sha256 = @expectedSha256
+              AND relative_path = @expectedRelativePath
+              AND metadata_json IS @expectedMetadataJson
+              AND status = 'ready'
+              AND created_at = @expectedCreatedAt
+              AND updated_at = @expectedUpdatedAt
+              AND deleted_at IS @expectedDeletedAt
+          `).run({
+            artifactId,
+            ownerUserId,
+            deletedAt,
+            expectedExecutionId: expected.executionId,
+            expectedConversionJobId: expected.conversionJobId ?? null,
+            expectedRole: expected.role,
+            expectedDisplayName: expected.displayName,
+            expectedDetectedFormat: expected.detectedFormat,
+            expectedMimeType: expected.mimeType ?? null,
+            expectedByteSize: expected.byteSize,
+            expectedSha256: expected.sha256,
+            expectedRelativePath: expected.relativePath,
+            expectedMetadataJson: expected.metadata === undefined
+              ? null
+              : JSON.stringify(expected.metadata),
+            expectedCreatedAt: expected.createdAt,
+            expectedUpdatedAt: expected.updatedAt,
+            expectedDeletedAt: expected.deletedAt ?? null,
+          }).changes === 1
+        })
+      },
     },
     executionSteps: {
       insert(value) { transaction(database, () => database.prepare('INSERT INTO execution_steps (id, execution_id, sequence, name, status, percent, started_at, ended_at) VALUES (@id, @executionId, @sequence, @name, @status, @percent, @startedAt, @endedAt)').run(value)); return value },

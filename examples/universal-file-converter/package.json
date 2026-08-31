@@ -1,0 +1,21 @@
+{
+  "name": "@autoforge/example-universal-file-converter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --external:@autoforge/workflow-sdk --outfile=dist/index.js && node --input-type=module -e \"import { createHash } from 'node:crypto'; import { readFile, writeFile } from 'node:fs/promises'; const workflow = JSON.parse(await readFile('workflow.json', 'utf8')); const code = await readFile(workflow.entryPath); const manifest = { ...workflow, codeSha256: createHash('sha256').update(code).digest('hex') }; const canonical = JSON.stringify(manifest, null, 2) + '\\n'; await Promise.all([writeFile('workflow.json', canonical), writeFile('manifest.json', canonical)]);\"",
+    "test": "pnpm --dir ../.. exec vitest run examples/universal-file-converter/src/index.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@autoforge/shared": "workspace:*",
+    "@autoforge/workflow-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "esbuild": "0.28.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10"
+  }
+}

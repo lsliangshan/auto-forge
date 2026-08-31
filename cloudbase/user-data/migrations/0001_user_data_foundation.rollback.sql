@@ -10,7 +10,10 @@ REVOKE ALL ON FUNCTION autoforge_get_usage_snapshot(varchar, timestamptz, timest
 REVOKE ALL ON FUNCTION autoforge_get_user_data_preferences(varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION autoforge_update_user_data_preferences(varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION autoforge_purge_expired_conversation_tombstones() FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION autoforge_apply_message_provider_projection() FROM PUBLIC, anon, authenticated, service_role;
 
+DROP TRIGGER IF EXISTS app_sync_message_provider_projection ON app_sync_mutations;
+DROP FUNCTION IF EXISTS autoforge_apply_message_provider_projection();
 DROP FUNCTION IF EXISTS autoforge_sync_push(varchar, integer, varchar, jsonb);
 DROP FUNCTION IF EXISTS autoforge_sync_pull(varchar, integer, varchar, varchar, integer);
 DROP FUNCTION IF EXISTS autoforge_list_conversations(varchar, integer, varchar, boolean);

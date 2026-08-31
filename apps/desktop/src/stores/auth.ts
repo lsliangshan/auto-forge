@@ -2,9 +2,11 @@ import { defineStore } from 'pinia'
 import { hasBusinessCapability, type AuthCredentials, type AuthOtpChallenge, type AuthOtpRequest, type AuthSession } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
+import { useDeveloperStore } from './developer'
 import { useExecutionStore } from './execution'
 import { useKnowledgeStore } from './knowledge'
 import { useSettingsStore, type AccountOperationAttemptToken } from './settings'
+import { useConversionStore } from './conversion'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
@@ -90,7 +92,9 @@ function replaceSession(
   if (previousUserId !== nextUserId) {
     if (previousUserId !== undefined) {
       useChatStore().resetLocalData()
+      useDeveloperStore().resetDebug()
       useExecutionStore().resetLocalData()
+      useConversionStore().resetLocalData()
       useKnowledgeStore().resetLocalData()
     }
   }

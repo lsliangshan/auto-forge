@@ -6,6 +6,7 @@ describe('classifyCapability', () => {
     ['browser.open', 'safe_navigation'], ['browser.url', 'safe_navigation'],
     ['browser.close', 'safe_navigation'], ['browser.fill', 'external_action'],
     ['browser.click', 'external_action'], ['clipboard.read', 'sensitive_read'],
+    ['file.convert', 'sensitive_read_managed_write'],
     ['filesystem.write', 'external_action'], ['network.fetch', 'unsupported'],
     ['filesystem.read', 'unsupported'], ['clipboard.write', 'unsupported'],
     ['notification.send', 'unsupported'], ['artifact.create', 'unsupported'],

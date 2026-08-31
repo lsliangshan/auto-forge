@@ -6,6 +6,7 @@ out/
 dist/
 coverage/
 test-results/
+.test-artifacts/
 playwright-report/
 blob-report/
 playwright/.cache/

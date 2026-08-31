@@ -19,7 +19,8 @@ import type {
   LegacyImportBatchResult,
 } from './legacy-user-data-import.js'
 
-const PROTOCOL_VERSION = 1 as const
+const SYNC_PROTOCOL_VERSION = 3 as const
+const LEGACY_IMPORT_PROTOCOL_VERSION = 1 as const
 const BATCH_LIMIT = 100
 const MAX_EVENT_BYTES = 1_048_576
 const MAX_RETRY_DELAY = 5 * 60 * 1_000
@@ -62,7 +63,7 @@ function legacyImportCall(
 ): LegacyImportCall {
   return {
     action: 'importLegacyBatch',
-    protocolVersion: PROTOCOL_VERSION,
+    protocolVersion: LEGACY_IMPORT_PROTOCOL_VERSION,
     deviceId: binding.deviceId,
     ...input,
   }
@@ -90,6 +91,7 @@ function affectedConversationIds(
     payload?: unknown
     conversationId?: string
   }[],
+  store?: UserDataStore,
 ): string[] {
   const ids = new Set<string>()
   for (const mutation of mutations) {
@@ -102,6 +104,11 @@ function affectedConversationIds(
       && 'conversationId' in mutation.payload
       && typeof mutation.payload.conversationId === 'string') {
       ids.add(mutation.payload.conversationId)
+    }
+    if (mutation.kind === 'message.conversion_block_terminal') {
+      const conversationId = mutation.conversationId
+        ?? store?.messages.get(mutation.entityId)?.conversationId
+      if (conversationId) ids.add(conversationId)
     }
   }
   return [...ids]
@@ -166,6 +173,21 @@ export class UserDataSyncEngine {
       this.#status = { state: 'idle' }
       this.#refreshWarning(this.#binding)
     })
+  }
+
+  /** Runs one authenticated bootstrap cycle: all ready pushes followed by exactly one pull. */
+  async bootstrapSync(): Promise<void> {
+    const binding = this.#binding
+    if (!binding || this.#status.state === 'paused' || this.#status.state === 'quarantined') {
+      return
+    }
+    this.#refreshWarning(binding)
+    if (binding.store.outbox.listReady(this.#dependencies.now(), 1).length > 0) {
+      this.#flushRequested = true
+    } else {
+      this.#pullRequested = true
+    }
+    await this.#ensureDrain(binding)
   }
 
   flush(): Promise<void> {
@@ -350,6 +372,7 @@ export class UserDataSyncEngine {
     let authoritativePullCompleted = false
 
     while (this.#isCurrent(binding)) {
+      this.#flushRequested = false
       const ready = binding.store.outbox.listReady(this.#dependencies.now(), BATCH_LIMIT)
       if (ready.length === 0) break
       const candidates = ready.map((item): SyncMutation => ({
@@ -368,7 +391,7 @@ export class UserDataSyncEngine {
       }
       if (batchLength === 0) {
         binding.store.outbox.markFailed(ready[0]!.id, 'OUTBOX_LIMIT_EXCEEDED')
-        this.#notify(binding, affectedConversationIds([ready[0]!]))
+        this.#notify(binding, affectedConversationIds([ready[0]!], binding.store))
         quarantineCode ??= 'OUTBOX_LIMIT_EXCEEDED'
         continue
       }
@@ -377,14 +400,14 @@ export class UserDataSyncEngine {
       const ids = batch.map(({ id }) => id)
       binding.store.outbox.markSyncing(ids)
       this.#trackSyncing(binding, ids)
-      const conversationIds = affectedConversationIds(batch)
+      const conversationIds = affectedConversationIds(batch, binding.store)
       this.#notify(binding, conversationIds)
 
       let response: UserDataFunctionResponse
       try {
         response = await this.port.call({
           action: 'syncPush',
-          protocolVersion: PROTOCOL_VERSION,
+          protocolVersion: SYNC_PROTOCOL_VERSION,
           deviceId: binding.deviceId,
           mutations,
         })
@@ -435,11 +458,42 @@ export class UserDataSyncEngine {
         return
       }
 
+      const consentConflicts: Array<Extract<
+        SyncMutation,
+        { kind: 'privacy.consent' | 'privacy.consent.revoke' }
+      >> = []
       try {
-        binding.store.outbox.acknowledgePushResults(mutations, data.results)
+        const acknowledgement = binding.store.outbox.acknowledgePushResults(mutations, data.results)
+        const supersededIds = new Set(acknowledgement.supersededIds)
         this.#pruneSyncing(binding)
         this.#notifyConsent(binding, mutations)
         this.#notify(binding, conversationIds)
+        let terminalResultCode: AppErrorCode | undefined
+        for (const result of data.results) {
+          if (supersededIds.has(result.id)) continue
+          if (result.status === 'conflict') {
+            const code = result.errorCode === 'SYNC_CONFLICT' ? result.errorCode : 'SYNC_CONFLICT'
+            binding.store.outbox.markFailed(result.id, code)
+            this.#untrackSyncing(binding, [result.id])
+            const mutation = mutations.find(({ id }) => id === result.id)
+            if (mutation?.kind === 'privacy.consent'
+              || mutation?.kind === 'privacy.consent.revoke') {
+              consentConflicts.push(mutation)
+            } else {
+              terminalResultCode ??= code
+            }
+          } else if (result.status === 'rejected') {
+            const code = result.errorCode ?? 'INVALID_INPUT'
+            binding.store.outbox.markFailed(result.id, code)
+            this.#untrackSyncing(binding, [result.id])
+            terminalResultCode ??= code
+          }
+        }
+        if (terminalResultCode) {
+          this.#notify(binding, conversationIds)
+          this.#quarantine(terminalResultCode)
+          return
+        }
       } catch {
         for (const id of ids) {
           if (binding.store.outbox.find(id)?.state === 'syncing') {
@@ -450,31 +504,6 @@ export class UserDataSyncEngine {
         this.#notify(binding, conversationIds)
         this.#quarantine('SYNC_FAILED')
         return
-      }
-
-      let terminalResultCode: AppErrorCode | undefined
-      const consentConflicts: Array<Extract<
-        SyncMutation,
-        { kind: 'privacy.consent' | 'privacy.consent.revoke' }
-      >> = []
-      for (const result of data.results) {
-        if (result.status === 'conflict') {
-          const code = result.errorCode === 'SYNC_CONFLICT' ? result.errorCode : 'SYNC_CONFLICT'
-          binding.store.outbox.markFailed(result.id, code)
-          this.#untrackSyncing(binding, [result.id])
-          const mutation = mutations.find(({ id }) => id === result.id)
-          if (mutation?.kind === 'privacy.consent'
-            || mutation?.kind === 'privacy.consent.revoke') {
-            consentConflicts.push(mutation)
-          } else {
-            terminalResultCode ??= code
-          }
-        } else if (result.status === 'rejected') {
-          const code = result.errorCode ?? 'INVALID_INPUT'
-          binding.store.outbox.markFailed(result.id, code)
-          this.#untrackSyncing(binding, [result.id])
-          terminalResultCode ??= code
-        }
       }
       if (consentConflicts.length > 0) {
         const pullOutcome = await this.#pull(binding)
@@ -490,11 +519,6 @@ export class UserDataSyncEngine {
         for (const mutation of consentConflicts) binding.store.outbox.delete(mutation.id)
         this.#notifyConsent(binding, consentConflicts)
         authoritativePullCompleted = true
-      }
-      if (terminalResultCode) {
-        this.#notify(binding, conversationIds)
-        this.#quarantine(terminalResultCode)
-        return
       }
     }
 
@@ -513,7 +537,7 @@ export class UserDataSyncEngine {
   #pushEventBytes(deviceId: string, mutations: readonly SyncMutation[]): number {
     return Buffer.byteLength(JSON.stringify({
       action: 'syncPush',
-      protocolVersion: PROTOCOL_VERSION,
+      protocolVersion: SYNC_PROTOCOL_VERSION,
       deviceId,
       mutations,
     }), 'utf8')
@@ -539,7 +563,7 @@ export class UserDataSyncEngine {
       try {
         response = await this.port.call({
           action: 'syncPull',
-          protocolVersion: PROTOCOL_VERSION,
+          protocolVersion: SYNC_PROTOCOL_VERSION,
           deviceId: binding.deviceId,
           ...(previousCursor === undefined ? {} : { cursor: previousCursor }),
           limit: BATCH_LIMIT,
@@ -561,13 +585,13 @@ export class UserDataSyncEngine {
       }
       try {
         binding.store.sync.applyRemotePage({
-          protocolVersion: PROTOCOL_VERSION,
+          protocolVersion: SYNC_PROTOCOL_VERSION,
           mutations: data.mutations,
           cursor: data.cursor,
         }, this.#dependencies.now())
         this.#pruneSyncing(binding)
         this.#notifyConsent(binding, data.mutations)
-        this.#notify(binding, affectedConversationIds(data.mutations))
+        this.#notify(binding, affectedConversationIds(data.mutations, binding.store))
       } catch {
         this.#quarantine('INTERNAL_ERROR')
         return 'stopped'
@@ -599,7 +623,7 @@ export class UserDataSyncEngine {
     const nextRetryAt = this.#dependencies.now() + delay
     for (const { id } of batch) binding.store.outbox.markPending(id, nextRetryAt)
     this.#untrackSyncing(binding, batch.map(({ id }) => id))
-    this.#notify(binding, affectedConversationIds(batch))
+    this.#notify(binding, affectedConversationIds(batch, binding.store))
     this.#scheduleRetry(binding, attempt, delay)
   }
 

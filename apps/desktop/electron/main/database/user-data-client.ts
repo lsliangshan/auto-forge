@@ -12,6 +12,9 @@ import legacyImportIdentityMigration from '../../../resources/user-cache-migrati
 import legacyImportIdentityHistoryMigration from '../../../resources/user-cache-migrations/0006_legacy_import_identity_history.sql?raw'
 import attachmentKindMigration from '../../../resources/user-cache-migrations/0007_attachment_kind.sql?raw'
 import privacyConsentRevocationMigration from '../../../resources/user-cache-migrations/0008_privacy_consent_revocation.sql?raw'
+import conversionBlockBindingJournalMigration from '../../../resources/user-cache-migrations/0009_conversion_block_binding_journal.sql?raw'
+import messageProviderProjectionMigration from '../../../resources/user-cache-migrations/0010_message_provider_projection.sql?raw'
+import stripQueuedProviderProjectionMigration from '../../../resources/user-cache-migrations/0011_strip_queued_provider_projection.sql?raw'
 import {
   createUserDataRepositories,
   type UserDataRepositories,
@@ -28,6 +31,9 @@ const USER_CACHE_MIGRATIONS = [
   { version: 6, source: legacyImportIdentityHistoryMigration },
   { version: 7, source: attachmentKindMigration },
   { version: 8, source: privacyConsentRevocationMigration },
+  { version: 9, source: conversionBlockBindingJournalMigration },
+  { version: 10, source: messageProviderProjectionMigration },
+  { version: 11, source: stripQueuedProviderProjectionMigration },
 ] as const
 
 export type UserDataStore = UserDataRepositories

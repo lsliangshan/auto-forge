@@ -9,6 +9,7 @@ import {
   type ChatBlock,
   type ChatEvent,
   type KnowledgeEvidence,
+  type ConversionTargetFormat,
   type ModelProviderId,
   type KnowledgeSearchResult,
   type KnowledgeSelection,
@@ -16,12 +17,14 @@ import {
 } from '@autoforge/shared'
 import { z } from 'zod'
 import type { PolicyEngine } from '../permissions/policy-engine.js'
+import type { ExecutionAttachmentBinding } from '../workflows/execution-service.js'
 import type { ExactWorkflowSource, WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import { addUsd } from '../billing/decimal-usd.js'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
+  type MessageProviderProjection,
   type ProviderUsageRepository,
 } from '../database/repositories.js'
 import type {
@@ -32,6 +35,10 @@ import type {
   ModelStreamRequest,
   ModelTool,
 } from '../chat/model-provider.js'
+import {
+  assertProtectedProviderSnapshot,
+  type ProviderAttachmentDisclosure,
+} from '../chat/provider-attachment-disclosure.js'
 import type { ConversationHistoryPort, CurrentMediaMetadata } from '../chat/conversation-context.js'
 import { createWorkflowCatalog, type WorkflowCandidate } from './workflow-catalog.js'
 import { classifyCapability } from './capability-risk.js'
@@ -285,6 +292,7 @@ export interface PersistUserInput {
   blocks: ChatBlock[]
   assetIds: string[]
   createdAt: number
+  providerProjection?: MessageProviderProjection
 }
 
 export interface PersistedUserPosition {
@@ -341,7 +349,27 @@ export interface AgentPersistencePort {
 
 export function createAgentPersistence(
   repositories: Pick<AppRepositories, 'messages' | 'chatRuns'>,
+  onAssistantBlocks?: (messageId: string, blocks: ChatBlock[]) => void,
+  onAssistantFinalized?: (messageId: string, blocks: ChatBlock[]) => void,
 ): AgentPersistencePort {
+  const mergePersistedConversions = (messageId: string, blocks: ChatBlock[]): ChatBlock[] => {
+    const get = repositories.messages.get as unknown
+    const stored = typeof get === 'function'
+      ? (get as (id: string) => { blocks: unknown[] } | undefined)(messageId)
+      : undefined
+    if (!stored) return blocks
+    const terminal = new Set(stored.blocks.filter((block): block is Extract<ChatBlock, { type: 'conversion' }> => (
+      typeof block === 'object'
+      && block !== null
+      && (block as { type?: unknown }).type === 'conversion'
+      && (block as { state?: unknown }).state === 'terminal'
+    )).map((block) => `${block.blockId}\0${block.executionId}`))
+    return blocks.map((block) => (
+      block.type === 'conversion' && terminal.has(`${block.blockId}\0${block.executionId}`)
+        ? { ...block, state: 'terminal' as const }
+        : block
+    ))
+  }
   return {
     persistUser(input) {
       const message = repositories.messages.insertWithAssets({
@@ -350,6 +378,9 @@ export function createAgentPersistence(
         role: 'user',
         blocks: input.blocks,
         createdAt: input.createdAt,
+        ...(input.providerProjection === undefined
+          ? {}
+          : { providerProjection: input.providerProjection }),
       }, input.assetIds)
       return { ordinal: message.ordinal }
     },
@@ -404,14 +435,17 @@ export function createAgentPersistence(
       })
     },
     updateAssistant(messageId, blocks) {
-      return repositories.messages.update(messageId, { blocks })
+      const updated = repositories.messages.update(messageId, { blocks })
+      onAssistantBlocks?.(messageId, blocks)
+      return updated
     },
     replaceAssistantBlock(messageId, blockId, block) {
       return repositories.messages.replaceBlock(messageId, blockId, block)
     },
     finalize(input) {
+      const blocks = mergePersistedConversions(input.messageId, input.blocks)
       repositories.chatRuns.finalizeWithMessage(input.runId, input.messageId, input.requestId, {
-        blocks: input.blocks,
+        blocks,
         status: input.status,
         endedAt: input.endedAt,
         ...(input.generationId === undefined ? {} : { generationId: input.generationId }),
@@ -420,6 +454,7 @@ export function createAgentPersistence(
         ...(input.costUsd === undefined ? {} : { costUsd: input.costUsd }),
         ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
       })
+      onAssistantFinalized?.(input.messageId, blocks)
     },
   }
 }
@@ -483,14 +518,24 @@ export interface AgentRunInput extends UsageAttribution {
   userBlocks: ChatBlock[]
   modelContent: string | ModelContentPart[]
   assetIds: string[]
+  attachmentFingerprints?: readonly string[]
   contextLength?: number
   currentMedia: CurrentMediaMetadata[]
+  omitHistoricalAttachments?: boolean
+  omitConversationHistory?: boolean
+  attachmentBindings?: readonly ExecutionAttachmentBinding[]
+  attachmentDisclosure?: ProviderAttachmentDisclosure
+  fixedResponse?: string
+  localConversionOnly?: boolean
+  localConversionTarget?: ConversionTargetFormat
+  localConversionAttachmentIndexes?: readonly number[]
   allowTools: boolean
   readonly supportsImageInput: boolean
   provider: ModelProviderId
   model: string
   requestId?: string
-  providerSnapshot: ModelProviderSnapshot
+  providerSnapshot?: ModelProviderSnapshot
+  summaryProviderSnapshot?: ModelProviderSnapshot
   knowledgeSelection?: KnowledgeSelection
   /** Main-captured immutable document/version/generation scope; never Renderer supplied. */
   knowledgeSearchScope?: KnowledgeSearchScope
@@ -534,6 +579,8 @@ interface ActiveAgentRun {
   model: string
   contextLength?: number
   readonly supportsImageInput: boolean
+  readonly attachmentBindings: readonly ExecutionAttachmentBinding[]
+  readonly localConversionTarget?: ConversionTargetFormat
   blocks: ChatBlock[]
   messages: ModelMessage[]
   tools: ModelTool[]
@@ -608,6 +655,48 @@ interface ActiveAgentRun {
 
 function appFailure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
+}
+
+function immutableClone<T>(value: T, seen = new WeakSet<object>()): T {
+  const clone = structuredClone(value)
+  const freeze = (current: unknown): void => {
+    if (!current || typeof current !== 'object' || seen.has(current)) return
+    seen.add(current)
+    for (const child of Object.values(current)) freeze(child)
+    Object.freeze(current)
+  }
+  freeze(clone)
+  return clone
+}
+
+function boundConversionCandidate(
+  candidate: WorkflowCandidate,
+  targetFormat: ConversionTargetFormat,
+  selectedAttachmentIndexes: readonly number[],
+): WorkflowCandidate {
+  const tool = structuredClone(candidate.tool)
+  const parameters = tool.function.parameters as {
+    properties?: { input?: { properties?: {
+      targetFormat?: Record<string, unknown>
+      files?: Record<string, unknown>
+    } } }
+  }
+  const targetSchema = parameters.properties?.input?.properties?.targetFormat
+  const filesSchema = parameters.properties?.input?.properties?.files
+  if (targetSchema === undefined || filesSchema === undefined) throw appFailure('INVALID_INPUT')
+  targetSchema.enum = [targetFormat]
+  filesSchema.items = { type: 'integer', enum: [...selectedAttachmentIndexes] }
+  filesSchema.minItems = selectedAttachmentIndexes.length
+  filesSchema.maxItems = selectedAttachmentIndexes.length
+  return Object.freeze({ ...candidate, tool: immutableClone(tool) })
+}
+
+function requestedConversionTarget(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const input = (value as { input?: unknown }).input
+  return input && typeof input === 'object' && !Array.isArray(input)
+    ? (input as { targetFormat?: unknown }).targetFormat
+    : undefined
 }
 
 function asAppError(error: unknown): AppError {
@@ -905,10 +994,6 @@ export class AgentOrchestrator {
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const requestId = input.requestId ?? this.id()
-    if (input.providerSnapshot.providerId !== input.provider) {
-      this.releaseKnowledgeSearchScope(input.knowledgeSearchScope)
-      throw appFailure('CONFLICT')
-    }
     if (this.activeByRequest.has(requestId) || this.activeByConversation.has(input.conversationId)) {
       this.releaseKnowledgeSearchScope(input.knowledgeSearchScope)
       const error = appFailure('CONFLICT')
@@ -924,6 +1009,43 @@ export class AgentOrchestrator {
     this.activeByConversation.set(input.conversationId, requestId)
     let active: ActiveAgentRun | undefined
     try {
+      if (input.fixedResponse !== undefined) return this.runFixedResponse(input, requestId)
+      if (!input.providerSnapshot || input.providerSnapshot.providerId !== input.provider) {
+        this.releaseKnowledgeSearchScope(input.knowledgeSearchScope)
+        throw appFailure('CONFLICT')
+      }
+      if (input.assetIds.length > 0) {
+        assertProtectedProviderSnapshot(input.providerSnapshot, input.attachmentDisclosure, {
+          requestId,
+          providerId: input.provider,
+          assetIds: input.assetIds,
+          assetFingerprints: input.attachmentFingerprints ?? [],
+          purpose: 'main',
+        })
+        if (input.localConversionOnly) {
+          if (input.summaryProviderSnapshot !== undefined
+            || input.localConversionTarget === undefined
+            || input.localConversionAttachmentIndexes === undefined
+            || input.attachmentDisclosure?.targetFormat !== input.localConversionTarget
+            || input.attachmentDisclosure.selectedAttachmentIndexes?.length
+              !== input.localConversionAttachmentIndexes.length
+            || input.attachmentDisclosure.selectedAttachmentIndexes.some((index, position) => (
+              index !== input.localConversionAttachmentIndexes![position]
+            ))) {
+            throw appFailure('CONFLICT')
+          }
+        } else {
+          if (input.localConversionTarget !== undefined) throw appFailure('CONFLICT')
+          if (!input.summaryProviderSnapshot) throw appFailure('CONFLICT')
+          assertProtectedProviderSnapshot(input.summaryProviderSnapshot, input.attachmentDisclosure, {
+            requestId,
+            providerId: input.provider,
+            assetIds: input.assetIds,
+            assetFingerprints: input.attachmentFingerprints ?? [],
+            purpose: 'summary',
+          })
+        }
+      }
       const userMessageId = this.id()
       const runId = this.id()
       const messageId = this.id()
@@ -936,6 +1058,15 @@ export class AgentOrchestrator {
         blocks: input.userBlocks,
         assetIds: input.assetIds,
         createdAt: startedAt,
+        ...(input.localConversionOnly ? {
+          providerProjection: Object.freeze({
+            version: 2 as const,
+            kind: 'local_conversion' as const,
+            targetFormat: input.localConversionTarget!,
+            attachmentCount: input.assetIds.length,
+            selectedAttachmentIndexes: [...input.localConversionAttachmentIndexes!],
+          }),
+        } : {}),
       })
       this.dependencies.persistence.createRun({
         runId,
@@ -970,6 +1101,10 @@ export class AgentOrchestrator {
         model: input.model,
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
         supportsImageInput: input.supportsImageInput,
+        attachmentBindings: immutableClone(input.attachmentBindings ?? []),
+        ...(input.localConversionTarget === undefined
+          ? {}
+          : { localConversionTarget: input.localConversionTarget }),
         blocks: [],
         messages: [],
         tools: [],
@@ -1029,6 +1164,7 @@ export class AgentOrchestrator {
       const browserToolsAllowed = input.allowTools
         && !directConversationOnly
         && !contextualConfirmationOnly
+        && !input.localConversionOnly
         && !EXPLICIT_BROWSER_OPTOUT.test(input.content)
       active.browserToolsAllowed = browserToolsAllowed
       if (browserToolsAllowed && this.dependencies.browserContinuation) {
@@ -1044,8 +1180,19 @@ export class AgentOrchestrator {
           workflows: this.dependencies.workflows,
           selectorFor: this.dependencies.createSourceSelector,
         }).create({ developerMode: this.dependencies.developerMode?.() ?? false })
-        const exactCandidate = exactWorkflowCandidate(input.content, catalog)
-        const candidates = exactCandidate === undefined
+        const conversionCandidates = input.localConversionOnly
+          ? catalog.filter(({ workflow }) => workflow.permissions.some(({ capability }) => (
+              capability === 'file.convert'
+            ))).map((candidate) => boundConversionCandidate(
+              candidate,
+              input.localConversionTarget!,
+              input.localConversionAttachmentIndexes!,
+            ))
+          : undefined
+        const exactCandidate = conversionCandidates === undefined
+          ? exactWorkflowCandidate(input.content, catalog)
+          : undefined
+        const candidates = conversionCandidates ?? (exactCandidate === undefined
           ? await new WorkflowRouter().route({
               query: input.content,
               candidates: catalog,
@@ -1053,7 +1200,7 @@ export class AgentOrchestrator {
               select: (request) => this.selectWorkflowRouting(active!, request),
               signal: active.controller.signal,
             })
-          : [exactCandidate]
+          : [exactCandidate])
         active.workflowCatalogTools = candidates.map(({ tool }) => tool)
         const forcedWorkflow = exactCandidate
           ?? (workflowExecutionRequested(input.content, candidates) ? candidates[0] : undefined)
@@ -1101,7 +1248,7 @@ export class AgentOrchestrator {
       const historyMessages = await this.dependencies.history.prepare({
         conversationId: input.conversationId,
         beforeOrdinal: userPosition.ordinal,
-        providerSnapshot,
+        providerSnapshot: input.summaryProviderSnapshot ?? providerSnapshot,
         callIdentity: { requestId, chatRunId: runId, userId: input.userId },
         model: input.model,
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
@@ -1109,6 +1256,8 @@ export class AgentOrchestrator {
         currentMessage: { role: 'user', content: input.modelContent },
         tools: active.tools,
         currentMedia: input.currentMedia,
+        ...(input.omitHistoricalAttachments ? { omitHistoricalAttachments: true } : {}),
+        ...(input.omitConversationHistory ? { omitConversationHistory: true } : {}),
         signal: active.controller.signal,
       })
       active.messages = [
@@ -1275,6 +1424,26 @@ export class AgentOrchestrator {
 
   recognizesExecution(executionId: string): boolean {
     return this.recognizedExecutionIds.has(executionId)
+  }
+
+  onConversionJobSubmitted(executionId: string): boolean {
+    const active = this.activeByExecution.get(executionId)
+    const pending = active?.pending
+    if (!active || active.terminal || !pending || pending.tool.executionId !== executionId) return false
+    if (!pending.tool.candidate.workflow.permissions.some(({ capability }) => (
+      capability === 'file.convert'
+    ))) return false
+    const existing = active.blocks.filter((block): block is Extract<ChatBlock, { type: 'conversion' }> => (
+      block.type === 'conversion' && block.executionId === executionId
+    ))
+    if (existing.length > 1 || (existing.length === 1 && existing[0]?.state !== 'active')) {
+      throw appFailure('CONFLICT')
+    }
+    if (existing.length === 1) return false
+    this.appendBlock(active, {
+      type: 'conversion', blockId: this.id(), executionId, state: 'active',
+    })
+    return true
   }
 
   hasActiveRuns(): boolean {
@@ -1639,10 +1808,21 @@ export class AgentOrchestrator {
       return this.drive(active)
     }
     if (!active.loop.canOfferTools()) return this.terminalize(active, 'failed', appFailure('TOOL_CALL_LIMIT'))
+    if (active.localConversionTarget !== undefined
+      && requestedConversionTarget(call.arguments) !== active.localConversionTarget) {
+      this.appendToolExchange(active, {
+        callId: call.id,
+        assistantContent,
+        toolName: candidate.toolName,
+        arguments: call.arguments,
+      }, { kind: 'tool_error', code: 'INVALID_INPUT' })
+      return this.drive(active)
+    }
     const prepared = await this.workflowTools.prepare({
       candidate,
       arguments: call.arguments,
       developerMode: this.dependencies.developerMode?.() ?? false,
+      attachmentBindings: active.attachmentBindings,
       budget: this.toolBudget(active),
     })
     if (prepared.kind === 'tool_error') {
@@ -1662,6 +1842,7 @@ export class AgentOrchestrator {
         ...(prepared.pending.city === undefined ? {} : { resolvedCity: prepared.pending.city }),
         input: prepared.pending.input,
       },
+      this.isDistinctFileConversionCandidate(candidate),
     )
     if (eligibility.kind === 'failed') {
       await this.workflowTools.cancel(prepared.pending)
@@ -2154,6 +2335,7 @@ export class AgentOrchestrator {
             ...(tool.city === undefined ? {} : { resolvedCity: tool.city }),
             input: tool.input,
           },
+          this.isDistinctFileConversionCandidate(tool.candidate),
         )
         if (boundary.kind === 'failed') return { kind: 'tool_error' as const, code: boundary.code }
         loopStart = boundary
@@ -2882,6 +3064,11 @@ export class AgentOrchestrator {
     ))
   }
 
+  private isDistinctFileConversionCandidate(candidate: WorkflowCandidate): boolean {
+    return candidate.workflow.permissions.length > 0
+      && candidate.workflow.permissions.every(({ capability }) => capability === 'file.convert')
+  }
+
   private updateWorkflowStatus(
     active: ActiveAgentRun,
     pending: PendingTool,
@@ -3240,6 +3427,59 @@ export class AgentOrchestrator {
     this.appendText(active, '需要你先授权向当前模型供应商发送最小知识库依据，然后重新发送问题。')
     this.appendWorkflowProvenance(active)
     return this.terminalize(active, 'completed')
+  }
+
+  private runFixedResponse(input: AgentRunInput, requestId: string): AgentRunResult {
+    const userMessageId = this.id()
+    const runId = this.id()
+    const messageId = this.id()
+    const startedAt = this.now()
+    const blocks: ChatBlock[] = input.fixedResponse
+      ? [{ type: 'text', text: input.fixedResponse }]
+      : []
+    this.dependencies.persistence.persistUser({
+      messageId: userMessageId,
+      conversationId: input.conversationId,
+      blocks: input.userBlocks,
+      assetIds: input.assetIds,
+      createdAt: startedAt,
+    })
+    this.dependencies.persistence.createRun({
+      runId,
+      conversationId: input.conversationId,
+      requestId,
+      userId: input.userId,
+      provider: input.provider,
+      model: input.model,
+      startedAt,
+    })
+    this.dependencies.persistence.createAssistant({
+      messageId,
+      conversationId: input.conversationId,
+      initialBlocks: [],
+      createdAt: startedAt,
+    })
+    this.dependencies.persistence.updateAssistant(messageId, structuredClone(blocks))
+    if (blocks[0]) {
+      this.safeEmit({
+        type: 'block', conversationId: input.conversationId, messageId, block: blocks[0],
+      })
+    }
+    this.dependencies.persistence.finalize({
+      runId,
+      requestId,
+      messageId,
+      blocks,
+      status: 'completed',
+      endedAt: this.now(),
+    })
+    if (this.activeByConversation.get(input.conversationId) === requestId) {
+      this.activeByConversation.delete(input.conversationId)
+    }
+    this.safeEmit({
+      type: 'status', conversationId: input.conversationId, requestId, status: 'completed',
+    })
+    return { requestId, status: 'completed' }
   }
 
   private safeEmit(event: ChatEvent): void {

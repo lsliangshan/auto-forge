@@ -19,7 +19,8 @@ import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import type { CloudBaseFunctionPort } from '../auth/cloudbase-auth-port.js'
 
-const protocolVersionSchema = z.literal(1)
+const syncProtocolVersionSchema = z.union([z.literal(1), z.literal(2), z.literal(3)])
+const legacyProtocolVersionSchema = z.literal(1)
 const identifierSchema = z.string().min(1).max(128).refine((value) => value.trim() === value)
 export const maximumUserDataCallBytes = 1_048_576
 const userDataErrorCodeSchema = z.enum([
@@ -47,14 +48,14 @@ export interface UserDataCallDiagnostic {
 
 const syncPushCallSchema = z.object({
   action: z.literal('syncPush'),
-  protocolVersion: protocolVersionSchema,
+  protocolVersion: syncProtocolVersionSchema,
   deviceId: identifierSchema,
   mutations: z.array(syncMutationSchema).max(100),
 }).strict()
 
 const syncPullCallSchema = z.object({
   action: z.literal('syncPull'),
-  protocolVersion: protocolVersionSchema,
+  protocolVersion: syncProtocolVersionSchema,
   deviceId: identifierSchema,
   cursor: opaqueCursorSchema.optional(),
   limit: z.number().int().positive().max(100).optional(),
@@ -80,7 +81,7 @@ const legacyMessageSchema = z.object({
 }).strict()
 const importLegacyBatchCallSchema = legacyImportConfirmRequestSchema.extend({
   action: z.literal('importLegacyBatch'),
-  protocolVersion: protocolVersionSchema,
+  protocolVersion: legacyProtocolVersionSchema,
   deviceId: identifierSchema,
   conversations: z.array(legacyConversationSchema),
   messages: z.array(legacyMessageSchema),
@@ -242,7 +243,9 @@ export class CloudBaseUserDataPort {
       if (!hasStrictShape(input, ['action', 'protocolVersion', 'deviceId', 'mutations'])) {
         throw toSafeAppError({ code: 'INVALID_INPUT' })
       }
-      if (input.protocolVersion !== 1) throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
+      if (input.protocolVersion !== 1 && input.protocolVersion !== 2 && input.protocolVersion !== 3) {
+        throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
+      }
       if (typeof input.deviceId !== 'string'
         || input.deviceId.length === 0
         || input.deviceId.length > 128
@@ -259,7 +262,9 @@ export class CloudBaseUserDataPort {
         ['action', 'protocolVersion', 'deviceId'],
         ['cursor', 'limit'],
       )) throw toSafeAppError({ code: 'INVALID_INPUT' })
-      if (input.protocolVersion !== 1) throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
+      if (input.protocolVersion !== 1 && input.protocolVersion !== 2 && input.protocolVersion !== 3) {
+        throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
+      }
     } else if (input.action === 'importLegacyBatch') {
       if (!hasStrictShape(input, [
         'action', 'protocolVersion', 'deviceId', 'batchId', 'includeUnowned',
@@ -330,7 +335,7 @@ export class CloudBaseUserDataPort {
     remoteStage?: UserDataCallDiagnostic['remoteStage'],
   ): void {
     const parsedCode = userDataErrorCodeSchema.safeParse(code)
-    const diagnosticCode = parsedCode.success ? parsedCode.data : 'INTERNAL_ERROR'
+    const diagnosticCode: UserDataErrorCode = parsedCode.success ? parsedCode.data : 'INTERNAL_ERROR'
     if (!isRecord(input)) {
       this.onDiagnostic?.({ action: undefined, stage, code: diagnosticCode })
       return

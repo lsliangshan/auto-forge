@@ -12,6 +12,7 @@ describe('developer store hot updates', () => {
     const listeners = new Set<(event: ExecutionEvent) => void>()
     const api = {
       auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments: vi.fn().mockResolvedValue(undefined) },
       executions: {
         onEvent(listener: (event: ExecutionEvent) => void) {
           listeners.add(listener)
@@ -27,6 +28,8 @@ describe('developer store hot updates', () => {
     const firstModule = await import('../../src/stores/developer')
     const store = firstModule.useDeveloperStore(pinia)
     store.debugExecutionId = 'exec_1'
+    store.debugExecutionConversionCapable = true
+    store.debugStatus = 'running'
     store.ensureExecutionSubscription()
 
     vi.resetModules()
@@ -41,6 +44,154 @@ describe('developer store hot updates', () => {
     for (const listener of listeners) listener(event)
 
     expect(store.debugEvents).toEqual([event])
+    expect(store.debugExecutionId).toBe('exec_1')
+    expect(store.debugExecutionConversionCapable).toBe(true)
+    expect(store.debugStatus).toBe('running')
+    store.selectedProjectId = 'project_1'
+    ;(store as unknown as { developerAttachments: unknown[] }).developerAttachments = [{
+      id: 'draft_hmr', name: 'source.png', mimeType: 'image/png', byteSize: 10,
+    }]
     store.$dispose()
+    expect(api.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' })
+    expect(store.debugExecutionId).toBe('')
+    expect(store.debugExecutionConversionCapable).toBe(false)
+    expect(store.debugStatus).toBe('idle')
+  })
+
+  it('clears Main-owned drafts when HMR removes the picker annotation', async () => {
+    const clearAttachments = vi.fn().mockResolvedValue(undefined)
+    const api = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments },
+      executions: { onEvent: () => () => undefined },
+    }
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    vi.resetModules()
+    const { useDeveloperStore } = await import('../../src/stores/developer')
+    const store = useDeveloperStore()
+    store.selectedProjectId = 'project_1'
+    store.configureDeveloperAttachmentField('files')
+    store.ensureExecutionSubscription()
+    store.developerAttachments = [{ id: 'draft_1', name: 'source.png', mimeType: 'image/png', byteSize: 1 }]
+
+    store.configureDeveloperAttachmentField('')
+
+    await vi.waitFor(() => expect(clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' }))
+    store.$dispose()
+  })
+
+  it('does not publish a picker result that completes during a project switch', async () => {
+    let resolvePick!: (value: Array<{ id: string; name: string; mimeType: string; byteSize: number }>) => void
+    const pickFiles = vi.fn(() => new Promise((resolve) => { resolvePick = resolve }))
+    const clearAttachments = vi.fn().mockResolvedValue(undefined)
+    const api = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments, pickFiles, removeAttachment: vi.fn().mockResolvedValue(undefined) },
+      executions: { onEvent: () => () => undefined },
+    }
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    vi.resetModules()
+    const { useDeveloperStore } = await import('../../src/stores/developer')
+    const store = useDeveloperStore()
+    store.projects = [{ id: 'project_1', name: 'one', files: [] }, { id: 'project_2', name: 'two', files: [] }]
+    store.selectedProjectId = 'project_1'
+    store.configureDeveloperAttachmentField('files')
+    const pending = store.pickDeveloperAttachments()
+    const switching = store.selectProject('project_2')
+    await vi.waitFor(() => expect(pickFiles).toHaveBeenCalled())
+    resolvePick([{ id: 'late', name: 'late.png', mimeType: 'image/png', byteSize: 1 }])
+    await Promise.all([pending, switching])
+
+    expect(store.developerAttachments).toEqual([])
+    expect(store.debugInput).toEqual({})
+    expect(api.developer.removeAttachment).toHaveBeenCalledWith({ projectId: 'project_1', attachmentId: 'late' })
+    store.$dispose()
+  })
+
+  it('retains failed stale-picker cleanup for a later lifecycle retry without exposing IDs', async () => {
+    let resolvePick!: (value: Array<{ id: string; name: string; mimeType: string; byteSize: number }>) => void
+    const pickFiles = vi.fn(() => new Promise((resolve) => { resolvePick = resolve }))
+    const removeAttachment = vi.fn().mockRejectedValue(new Error('remove failed'))
+    const clearAttachments = vi.fn().mockRejectedValue(new Error('clear failed'))
+    const api = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments, pickFiles, removeAttachment },
+      executions: { onEvent: () => () => undefined },
+    }
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    vi.resetModules()
+    const { useDeveloperStore } = await import('../../src/stores/developer')
+    const store = useDeveloperStore()
+    store.projects = [{ id: 'project_1', name: 'one', files: [] }, { id: 'project_2', name: 'two', files: [] }]
+    store.selectedProjectId = 'project_1'
+    store.configureDeveloperAttachmentField('files')
+    const pending = store.pickDeveloperAttachments()
+    await vi.waitFor(() => expect(pickFiles).toHaveBeenCalled())
+    store.selectedProjectId = 'project_2'
+    resolvePick([{ id: 'hidden', name: 'hidden.png', mimeType: 'image/png', byteSize: 1 }])
+    await pending
+    expect(store.developerAttachments).toEqual([])
+
+    clearAttachments.mockResolvedValue(undefined)
+    pickFiles.mockResolvedValue([])
+    await store.pickDeveloperAttachments()
+    expect(clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' })
+    store.$dispose()
+  })
+
+  it('invalidates a pending picker before dispose', async () => {
+    let resolvePick!: (value: Array<{ id: string; name: string; mimeType: string; byteSize: number }>) => void
+    const pickFiles = vi.fn(() => new Promise((resolve) => { resolvePick = resolve }))
+    const clearAttachments = vi.fn().mockResolvedValue(undefined)
+    const removeAttachment = vi.fn().mockResolvedValue(undefined)
+    const api = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments, pickFiles, removeAttachment },
+      executions: { onEvent: () => () => undefined },
+    }
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    vi.resetModules()
+    const { useDeveloperStore } = await import('../../src/stores/developer')
+    const store = useDeveloperStore()
+    store.selectedProjectId = 'project_1'
+    store.configureDeveloperAttachmentField('files')
+    store.ensureExecutionSubscription()
+    const pending = store.pickDeveloperAttachments()
+    await vi.waitFor(() => expect(pickFiles).toHaveBeenCalled())
+    store.$dispose()
+    resolvePick([{ id: 'disposed', name: 'disposed.png', mimeType: 'image/png', byteSize: 1 }])
+    await pending
+
+    expect(store.developerAttachments).toEqual([])
+    expect(removeAttachment).toHaveBeenCalledWith({ projectId: 'project_1', attachmentId: 'disposed' })
+  })
+
+  it('reconciles cleanup left by a disposed store in a later store instance', async () => {
+    const clearAttachments = vi.fn().mockRejectedValueOnce(new Error('main unavailable'))
+    const api = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, settings: {},
+      developer: { clearAttachments, pickFiles: vi.fn().mockResolvedValue([]), removeAttachment: vi.fn().mockRejectedValue(new Error('remove unavailable')) },
+      executions: { onEvent: () => () => undefined },
+    }
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    vi.resetModules()
+    const { useDeveloperStore } = await import('../../src/stores/developer')
+    const first = useDeveloperStore()
+    first.selectedProjectId = 'project_1'
+    first.developerAttachments = [{ id: 'pending', name: 'pending.png', mimeType: 'image/png', byteSize: 1 }]
+    first.ensureExecutionSubscription()
+    first.$dispose()
+    await vi.waitFor(() => expect(clearAttachments).toHaveBeenCalledTimes(1))
+
+    clearAttachments.mockResolvedValue(undefined)
+    const { createPinia, setActivePinia } = await import('pinia')
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const second = useDeveloperStore(pinia)
+    await second.pickDeveloperAttachments()
+
+    expect(clearAttachments).toHaveBeenCalledTimes(2)
+    expect(second.developerAttachments).toEqual([])
+    second.$dispose()
   })
 })

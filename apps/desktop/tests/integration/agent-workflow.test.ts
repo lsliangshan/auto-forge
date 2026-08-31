@@ -609,6 +609,186 @@ describe('agent workflow integration', () => {
     expect(expectedEntries[1]).not.toHaveProperty('city')
   })
 
+  it('runs one exact multi-attachment conversion while the Provider sees canonical fields only', async () => {
+    const prompt = '把这两个附件转换为 PDF'
+    const providerBodies: Array<{
+      messages: unknown[]
+      tools: Array<{ function: { name: string } }>
+    }> = []
+    const appRef: { current?: Awaited<ReturnType<typeof runtime>> } = {}
+    let turn = 0
+    const app = await runtime({
+      workerBehavior: 'complete',
+      workflowOverrides: {
+        id: 'file.convert.universal',
+        name: '万象转换',
+        description: '把当前附件转换为明确的目标格式',
+        category: 'files',
+        cities: [],
+        permissions: [{ capability: 'file.convert', scope: { formats: ['ico', 'pdf'] } }],
+        activationExamples: [prompt],
+        activationNegativeExamples: [],
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['files', 'targetFormat'],
+          properties: {
+            files: {
+              type: 'array', items: { type: 'integer', minimum: 0 },
+              minItems: 1, maxItems: 5, uniqueItems: true,
+            },
+            targetFormat: { type: 'string', enum: ['ico', 'pdf'] },
+            preset: { type: 'string', enum: ['default', 'favicon', 'app-icon'] },
+          },
+        },
+      },
+      workerOutput: (request) => ({
+        accepted: true,
+        files: (request.input as { files: number[] }).files,
+        targetFormat: (request.input as { targetFormat: string }).targetFormat,
+      }),
+      fetch: async (_input, init) => {
+        const liveApp = appRef.current!
+        const body = JSON.parse(String(init?.body)) as typeof providerBodies[number]
+        providerBodies.push(body)
+        turn += 1
+        if (turn === 1) {
+          return response([
+            { id: 'generation_convert_pdf', choices: [{ index: 0, delta: { tool_calls: [{
+              index: 0,
+              id: 'tool_convert_pdf',
+              function: {
+                name: body.tools[0]!.function.name,
+                arguments: JSON.stringify({ input: { files: [0, 1], targetFormat: 'pdf' } }),
+              },
+            }] }, finish_reason: 'tool_calls' }] },
+            '[DONE]',
+          ])
+        }
+        const executions = liveApp.database.executions.list()
+        expect(executions).toEqual([
+          expect.objectContaining({
+            workflowId: 'file.convert.universal',
+            status: 'completed',
+            input: { files: [0, 1], targetFormat: 'pdf' },
+          }),
+        ])
+        expect(body.messages).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            role: 'tool',
+            tool_call_id: 'tool_convert_pdf',
+            content: expect.stringContaining('"targetFormat":"pdf"'),
+          }),
+        ]))
+        return response([
+          { id: 'generation_conversion_final', choices: [{
+            index: 0, delta: { content: '本地转换已提交' }, finish_reason: 'stop',
+          }] },
+          '[DONE]',
+        ])
+      },
+    })
+    appRef.current = app
+    const starts = vi.spyOn(app.executionService, 'startReserved')
+    const attachmentBindings = [
+      {
+        attachmentIndex: 0,
+        ownerUserId: 'user_1',
+        conversationId: 'conversation_1',
+        displayName: 'favicon-source.png',
+        mimeType: 'image/png',
+        byteSize: 67,
+        source: { kind: 'media' as const, mediaAssetId: 'media_private_png' },
+        sourceFingerprint: 'a'.repeat(64),
+      },
+      {
+        attachmentIndex: 1,
+        ownerUserId: 'user_1',
+        conversationId: 'conversation_1',
+        displayName: 'contract.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        byteSize: 4_096,
+        source: { kind: 'media' as const, mediaAssetId: 'media_private_docx' },
+        sourceFingerprint: 'b'.repeat(64),
+      },
+    ]
+    const firstPending = await app.orchestrator.run({
+      conversationId: 'conversation_1',
+      content: prompt,
+      provider: 'openrouter',
+      userId: 'user_1',
+      userBlocks: [{ type: 'text', text: prompt }],
+      modelContent: [
+        '任务：选择并调用具备 file.convert 能力的本地工作流。',
+        '附件数量：2',
+        '附件索引：0, 1',
+        '目标格式：pdf',
+        '禁止读取附件内容或调用非 file.convert 工具。',
+      ].join('\n'),
+      assetIds: [],
+      currentMedia: [
+        { kind: 'image', byteSize: 67 },
+        { kind: 'file', byteSize: 4_096 },
+      ],
+      attachmentBindings,
+      allowTools: true,
+      model: 'local-test-model',
+      requestId: 'request_universal_conversion',
+      providerSnapshot: app.providerSnapshot,
+    })
+
+    expect(firstPending).toMatchObject({ status: 'awaiting_approval' })
+    const firstApproval = app.database.messages.listForConversation('conversation_1')
+      .flatMap((message) => message.blocks)
+      .find((block) => block.type === 'approval' && block.state === 'pending')
+    expect(firstApproval).toMatchObject({
+      type: 'approval',
+      capability: 'file.convert',
+      actionSummary: expect.stringMatching(
+        /附件 0：favicon-source\.png.*附件 1：contract\.docx.*目标格式：pdf/u,
+      ),
+    })
+    expect(JSON.stringify(firstApproval)).not.toMatch(/media_private|a{32}|b{32}/)
+
+    const completed = await app.orchestrator.resumeApproval({
+      executionId: firstPending.executionId!,
+      permissionIndex: 0,
+      scopeHash: scopeHash({ formats: ['ico', 'pdf'] }),
+      decision: 'once',
+    })
+
+    expect(completed, JSON.stringify(completed)).toMatchObject({ status: 'completed' })
+    expect(app.workers.workers).toHaveLength(1)
+    expect(app.workers.workers.map((worker) => (
+      worker.requests.find((request) => request.type === 'start')
+    ))).toEqual([
+      expect.objectContaining({
+        type: 'start', workflowId: 'file.convert.universal',
+        input: { files: [0, 1], targetFormat: 'pdf' },
+      }),
+    ])
+    expect(starts.mock.calls.map(([, input]) => input.fileConvertAuthorization)).toEqual([
+      expect.objectContaining({
+        decision: 'once',
+        attachments: [
+          { index: 0, sourceFingerprint: 'a'.repeat(64) },
+          { index: 1, sourceFingerprint: 'b'.repeat(64) },
+        ],
+        formats: ['pdf'],
+      }),
+    ])
+    expect(providerBodies).toHaveLength(2)
+    const providerPayload = JSON.stringify(providerBodies)
+    expect(providerPayload).toContain('附件数量：2')
+    expect(providerPayload).toContain('附件索引：0, 1')
+    expect(providerPayload).toContain('目标格式：pdf')
+    expect(providerPayload).not.toMatch(
+      /favicon-source|contract\.docx|image\/png|application\/vnd\.openxmlformats|media_private|sourceFingerprint|attachmentBindings|fileConvertAuthorization/u,
+    )
+    expect(providerPayload).not.toContain(app.directory)
+    expect(providerPayload).not.toMatch(/\/Users\/|[A-Za-z]:\\Users\\|iVBORw0|UEsDB|dataBase64|base64/i)
+  })
+
   it.each([
     ['unknown city', '工作居住证怎么办', '请问要办理哪个城市？'],
     ['unrelated question', '什么是二进制？', '二进制是使用 0 和 1 表示数值的进位制。'],

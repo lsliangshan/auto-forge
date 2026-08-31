@@ -54,4 +54,17 @@ describe('workflowSecurityFingerprint', () => {
       'browser.click': ['https://click.example.gov.cn'],
     })
   })
+
+  it('fingerprints declared conversion formats without adding them to the browser matrix', () => {
+    const png = workflow()
+    png.permissions.push({ capability: 'file.convert', scope: { formats: ['png'] } })
+    const jpeg = workflow()
+    jpeg.permissions.push({ capability: 'file.convert', scope: { formats: ['jpeg'] } })
+
+    expect(workflowSecurityFingerprint(png)).not.toBe(workflowSecurityFingerprint(jpeg))
+    expect(browserPermissionMatrix(png)).toEqual({
+      'browser.open': ['https://open.example.gov.cn', 'https://second.example.gov.cn'],
+      'browser.click': ['https://click.example.gov.cn'],
+    })
+  })
 })

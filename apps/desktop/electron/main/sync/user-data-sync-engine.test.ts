@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import type { PrivacyConsentState, SyncMutation } from '@autoforge/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { UserDataStoreManager, type UserDataStore } from '../database/user-data-client.js'
+import { openAppDatabase } from '../database/client.js'
 import type {
   CloudBaseUserDataCall,
   RemoteSyncMutation,
@@ -27,6 +28,7 @@ type CreateMutation = Extract<SyncMutation, { kind: 'conversation.create' }>
 type PulledCreateMutation = Extract<RemoteSyncMutation, { kind: 'conversation.create' }>
 type RenameMutation = Extract<SyncMutation, { kind: 'conversation.rename' }>
 type MessageMutation = Extract<SyncMutation, { kind: 'message.append' }>
+type ConversionTerminalMutation = Extract<SyncMutation, { kind: 'message.conversion_block_terminal' }>
 
 function createMutation(index: number, prefix = 'alice'): CreateMutation {
   const suffix = String(index).padStart(3, '0')
@@ -50,7 +52,7 @@ function createMutation(index: number, prefix = 'alice'): CreateMutation {
 function mutationAtEventSize(mutation: CreateMutation, targetBytes: number): CreateMutation {
   const emptyTitle = { ...mutation, payload: { ...mutation.payload, title: '' } }
   const fixedBytes = Buffer.byteLength(JSON.stringify({
-    action: 'syncPush', protocolVersion: 1, deviceId: 'device-a', mutations: [emptyTitle],
+    action: 'syncPush', protocolVersion: 2, deviceId: 'device-a', mutations: [emptyTitle],
   }), 'utf8')
   return {
     ...mutation,
@@ -104,6 +106,76 @@ function messageMutation(id: string, conversationId: string, baseRevision: numbe
       createdAt: '2026-08-25T00:03:00.000Z',
     },
     occurredAt: '2026-08-25T00:03:00.000Z',
+  }
+}
+
+function conversionMessageMutation(id: string, conversationId: string, baseRevision: number): MessageMutation {
+  return {
+    ...messageMutation(id, conversationId, baseRevision),
+    payload: {
+      id: `${id}_message`, conversationId, role: 'assistant', createdAt: '2026-08-25T00:03:00.000Z',
+      blocks: [{ type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal' }],
+    },
+  }
+}
+
+function conversionTerminalMutation(
+  id: string,
+  messageId: string,
+  baseRevision: number,
+): ConversionTerminalMutation {
+  return {
+    id,
+    kind: 'message.conversion_block_terminal',
+    entityId: messageId,
+    baseRevision,
+    payload: {
+      messageId,
+      blockId: 'conversion_block_1',
+      executionId: 'execution_1',
+      state: 'terminal',
+    },
+    occurredAt: '2026-08-25T00:04:00.000Z',
+  }
+}
+
+function createLocalTerminalOutbox(
+  store: UserDataStore,
+  index: number,
+): { conversationId: string; mutation: ConversionTerminalMutation } {
+  const create = createMutation(index)
+  const append = conversionMessageMutation(`terminal_ack_${index}`, create.entityId, 1)
+  append.payload = {
+    ...append.payload,
+    blocks: [{
+      type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'active',
+    }],
+  }
+  store.sync.applyRemotePage({
+    protocolVersion: 1, cursor: `terminal_ack_create_${index}`, mutations: [remoteReceipt(create, 1)],
+  }, 1)
+  store.sync.applyRemotePage({
+    protocolVersion: 1, cursor: `terminal_ack_append_${index}`, mutations: [remoteReceipt(append, 2)],
+  }, 2)
+  store.messages.replaceBlock(append.entityId, 'conversion_block_1', {
+    type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal',
+  })
+  const mutation = store.outbox.list(10).find((candidate) => (
+    candidate.kind === 'message.conversion_block_terminal'
+  ))
+  if (!mutation || mutation.kind !== 'message.conversion_block_terminal') {
+    throw new Error('Missing conversion terminal mutation')
+  }
+  return {
+    conversationId: create.entityId,
+    mutation: {
+      id: mutation.id,
+      kind: mutation.kind,
+      entityId: mutation.entityId,
+      baseRevision: mutation.baseRevision,
+      payload: mutation.payload,
+      occurredAt: mutation.occurredAt,
+    },
   }
 }
 
@@ -307,6 +379,408 @@ describe('UserDataSyncEngine', () => {
       ...serverRevokedR4.payload, state: 'revoked', revision: 4,
     })
     manager.close()
+  })
+
+  it('runs one consolidated bootstrap push cycle with exactly one trailing pull', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const pending = createMutation(200)
+    store.outbox.recordWithConversation(pending)
+    const calls: CloudBaseUserDataCall[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      calls.push(input)
+      if (input.action === 'syncPush') {
+        return success({
+          results: input.mutations.map(({ id }) => ({ id, status: 'applied', revision: 1 })),
+          cursor: 'cursor_bind_drain_push',
+        })
+      }
+      return success({
+        mutations: [],
+        cursor: 'cursor_bind_drain_pull',
+      })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.bootstrapSync()
+
+    expect(calls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
+    expect(calls.filter((call) => call.action === 'syncPush' || call.action === 'syncPull')
+      .every(({ protocolVersion }) => protocolVersion === 3)).toBe(true)
+    expect(store.outbox.find(pending.id)).toBeUndefined()
+    expect(engine.status()).toEqual({ state: 'idle' })
+    expect(store.sync.getCheckpoint()).toMatchObject({
+      protocolVersion: 3,
+      remoteCursor: 'cursor_bind_drain_pull',
+    })
+  })
+
+  it('runs exactly one bootstrap pull when no ready outbox work exists', async () => {
+    const manager = createManager()
+    const calls: CloudBaseUserDataCall[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      calls.push(input)
+      if (input.action !== 'syncPull') throw new Error(`Unexpected ${input.action}`)
+      return success({ mutations: [], cursor: 'cursor_bind_pull_only' })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.bootstrapSync()
+
+    expect(calls.map(({ action }) => action)).toEqual(['syncPull'])
+    expect(engine.status()).toEqual({ state: 'idle' })
+  })
+
+  it('absorbs a live flush during bootstrap push without scheduling a duplicate pull', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const recovered = createMutation(202)
+    const live = createMutation(203)
+    store.outbox.recordWithConversation(recovered)
+    const actions: CloudBaseUserDataCall['action'][] = []
+    let firstPushStarted!: () => void
+    const started = new Promise<void>((resolve) => { firstPushStarted = resolve })
+    let releaseFirstPush!: () => void
+    const held = new Promise<void>((resolve) => { releaseFirstPush = resolve })
+    let pushCount = 0
+    const { engine } = createEngine(manager, async (input) => {
+      actions.push(input.action)
+      if (input.action === 'syncPush') {
+        pushCount += 1
+        if (pushCount === 1) {
+          firstPushStarted()
+          await held
+        }
+        return success({
+          results: input.mutations.map(({ id }) => ({ id, status: 'applied', revision: 1 })),
+          cursor: `cursor_bootstrap_push_${pushCount}`,
+        })
+      }
+      return success({ mutations: [], cursor: 'cursor_bootstrap_pull' })
+    })
+
+    await engine.start('alice', 'device-a')
+    const bootstrap = engine.bootstrapSync()
+    await started
+    store.outbox.recordWithConversation(live)
+    const runtimeFlush = engine.flush()
+    releaseFirstPush()
+    await Promise.all([bootstrap, runtimeFlush])
+
+    expect(actions).toEqual(['syncPush', 'syncPush', 'syncPull'])
+    expect(store.outbox.list(100)).toEqual([])
+    expect(engine.status()).toEqual({ state: 'idle' })
+  })
+
+  it('continues a duplicate-at-base conversion chain through rebased push and pull', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const seeded = createLocalTerminalOutbox(store, 201)
+    const later = renameMutation(
+      'duplicate_base_later',
+      seeded.conversationId,
+      seeded.mutation.baseRevision + 1,
+      'Rebased after duplicate',
+    )
+    store.outbox.recordWithConversation(later)
+    const pushes: SyncMutation[][] = []
+    let rebased: SyncMutation | undefined
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        pushes.push([...input.mutations])
+        if (pushes.length === 1) {
+          return success({
+            results: input.mutations.map((mutation) => mutation.kind === 'message.conversion_block_terminal'
+              ? { id: mutation.id, status: 'duplicate' as const, revision: mutation.baseRevision }
+              : { id: mutation.id, status: 'conflict' as const, errorCode: 'SYNC_CONFLICT' as const }),
+            cursor: 'duplicate_base_first_push',
+          })
+        }
+        rebased = input.mutations[0]
+        return success({
+          results: input.mutations.map(({ id }) => ({ id, status: 'applied' as const, revision: 3 })),
+          cursor: 'duplicate_base_second_push',
+        })
+      }
+      if (!rebased) throw new Error('Rebased mutation was not pushed')
+      return success({
+        mutations: [{
+          id: seeded.mutation.id,
+          kind: 'message.conversion_block_terminal',
+          entityId: seeded.mutation.entityId,
+          conversationId: seeded.conversationId,
+          baseRevision: seeded.mutation.baseRevision,
+          resultRevision: seeded.mutation.baseRevision,
+          compacted: true,
+          receivedAt: seeded.mutation.occurredAt,
+        }, remoteReceipt(rebased, 3)],
+        cursor: 'duplicate_base_pull',
+      })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.bootstrapSync()
+
+    expect(pushes).toHaveLength(2)
+    expect(pushes[0]?.map(({ id }) => id)).toEqual([seeded.mutation.id, later.id])
+    expect(pushes[1]).toEqual([
+      expect.objectContaining({
+        id: expect.not.stringMatching(later.id),
+        kind: 'conversation.rename',
+        baseRevision: seeded.mutation.baseRevision,
+      }),
+    ])
+    expect(store.outbox.countPending()).toBe(0)
+    expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+      title: 'Rebased after duplicate',
+      revision: 3,
+      syncState: 'synced',
+    })
+    expect(store.sync.getCheckpoint()).toMatchObject({
+      protocolVersion: 3,
+      remoteCursor: 'duplicate_base_pull',
+    })
+    expect(engine.status()).toEqual({ state: 'idle' })
+  })
+
+  it('notifies the affected conversation for a compacted terminal receipt with no local message', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const create = createMutation(202)
+    store.sync.applyRemotePage({
+      protocolVersion: 2,
+      cursor: 'compacted_terminal_seed',
+      mutations: [remoteReceipt(create, 1)],
+    }, 1)
+    const changed: string[][] = []
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action !== 'syncPull') throw new Error('Unexpected push')
+      return success({
+        mutations: [{
+          id: 'compacted_terminal_receipt',
+          kind: 'message.conversion_block_terminal',
+          entityId: 'purged_terminal_message',
+          conversationId: create.entityId,
+          baseRevision: 1,
+          resultRevision: 2,
+          compacted: true,
+          receivedAt: '2026-08-25T00:04:00.000Z',
+        }],
+        cursor: 'compacted_terminal_cursor',
+      })
+    }, new FakeClock(), (conversationIds) => changed.push([...conversationIds]))
+
+    await engine.start('alice', 'device-a')
+    await engine.pull()
+
+    expect(store.messages.get('purged_terminal_message')).toBeUndefined()
+    expect(store.conversations.getSummary(create.entityId)?.revision).toBe(2)
+    expect(changed).toContainEqual([create.entityId])
+  })
+
+  it('syncs only the payload-free conversion block JSON', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const create = createMutation(0)
+    const conversion = conversionMessageMutation('conversion_payload_free', create.entityId, 1)
+    const pushed: SyncMutation[] = []
+    store.outbox.recordWithConversation(create)
+    store.outbox.recordWithMessage(conversion)
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        pushed.push(...input.mutations)
+        return success({
+          results: input.mutations.map((mutation, index) => ({
+            id: mutation.id, status: 'applied' as const, revision: index + 1,
+          })),
+          cursor: 'conversion_payload_free_push',
+        })
+      }
+      return success({ mutations: [], cursor: 'conversion_payload_free_pull' })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    const payload = JSON.stringify(pushed.find((mutation) => mutation.id === conversion.id)?.payload)
+    expect(payload).toContain('"type":"conversion"')
+    expect(payload).not.toMatch(/bytes|path|sha256|artifactId|jobId|metadata|managedPath/i)
+  })
+
+  it('does not turn local conversion rows into sync outbox mutations', async () => {
+    const manager = createManager()
+    const database = openAppDatabase(join(roots.at(-1)!, 'app.sqlite'))
+    try {
+      database.executions.insert({
+        id: 'conversion_execution', ownerUserId: 'alice', workflowId: 'file.convert.universal',
+        workflowVersion: '1.0.0', status: 'running', createdAt: 1,
+      })
+      database.conversionJobs.create({
+        id: 'conversion_job', ownerUserId: 'alice', executionId: 'conversion_execution',
+        sourceKind: 'media', sourceId: 'source_media', targetFormat: 'png', status: 'queued', createdAt: 1,
+      })
+      const call = vi.fn(async () => success({ mutations: [], cursor: null }))
+      const { engine } = createEngine(manager, call)
+
+      await engine.start('alice', 'device-a')
+      await engine.flush()
+
+      expect(manager.open('alice').outbox.countPending()).toBe(0)
+      expect(call).not.toHaveBeenCalledWith(expect.objectContaining({ action: 'syncPush' }))
+    } finally {
+      database.close()
+      manager.close()
+    }
+  })
+
+  it('pushes the terminal conversion transition as a normal receipt and notifies its owning conversation', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const create = createMutation(41)
+    const append = conversionMessageMutation('terminal_sync', create.entityId, 1)
+    append.payload = {
+      ...append.payload,
+      blocks: [{ type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'active' }],
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_sync_create', mutations: [remoteReceipt(create, 1)],
+    }, 1)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'terminal_sync_append', mutations: [remoteReceipt(append, 2)],
+    }, 2)
+    store.messages.replaceBlock(append.entityId, 'conversion_block_1', {
+      type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal',
+    })
+    const changes: string[][] = []
+    const pushed: SyncMutation[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        pushed.push(...input.mutations)
+        return success({
+          results: input.mutations.map((mutation) => ({
+            id: mutation.id, status: 'applied' as const, revision: mutation.baseRevision + 1,
+          })),
+          cursor: 'terminal_sync_push',
+        })
+      }
+      return success({ mutations: [], cursor: 'terminal_sync_pull' })
+    }, new FakeClock(), (ids) => changes.push([...ids]))
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(pushed).toHaveLength(1)
+    expect(pushed[0]).toMatchObject({
+      kind: 'message.conversion_block_terminal', entityId: append.entityId,
+      payload: { messageId: append.entityId, blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal' },
+    })
+    expect(JSON.stringify(pushed[0]?.payload)).not.toMatch(/jobId|artifactId|path|bytes|sha256/i)
+    expect(engine.status()).toEqual({ state: 'idle' })
+    expect(store.outbox.find(pushed[0]!.id)).toBeUndefined()
+    expect(store.conversations.getSummary(create.entityId)).toMatchObject({ revision: 3, syncState: 'synced' })
+    expect(changes.flat()).toContain(create.entityId)
+  })
+
+  it.each([
+    { label: 'applied base plus one', status: 'applied' as const, revisionDelta: 1, accepted: true },
+    { label: 'duplicate base', status: 'duplicate' as const, revisionDelta: 0, accepted: true },
+    { label: 'applied base', status: 'applied' as const, revisionDelta: 0, accepted: false },
+    { label: 'duplicate base plus one', status: 'duplicate' as const, revisionDelta: 1, accepted: false },
+  ])('handles terminal push acknowledgement and notification: $label', async ({
+    label, status, revisionDelta, accepted,
+  }) => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const index = 50 + ['applied base plus one', 'duplicate base', 'applied base', 'duplicate base plus one']
+      .indexOf(label)
+    const seeded = createLocalTerminalOutbox(store, index)
+    const changes: string[][] = []
+    const { engine } = createEngine(manager, async (input) => input.action === 'syncPush'
+      ? success({
+          results: [{
+            id: seeded.mutation.id,
+            status,
+            revision: seeded.mutation.baseRevision + revisionDelta,
+          }],
+          cursor: `terminal_ack_push_${index}`,
+        })
+      : success({ mutations: [], cursor: `terminal_ack_pull_${index}` }),
+    new FakeClock(), (ids) => changes.push([...ids]))
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    if (accepted) {
+      expect(engine.status()).toEqual({ state: 'idle' })
+      expect(store.outbox.find(seeded.mutation.id)).toBeUndefined()
+      expect(store.conversations.getSummary(seeded.conversationId)).toMatchObject({
+        revision: status === 'duplicate'
+          ? seeded.mutation.baseRevision
+          : seeded.mutation.baseRevision + 1,
+        syncState: 'synced',
+      })
+    } else {
+      expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'SYNC_FAILED' })
+      expect(store.outbox.find(seeded.mutation.id)).toMatchObject({
+        state: 'failed', lastErrorCode: 'SYNC_FAILED',
+      })
+      expect(store.conversations.getSummary(seeded.conversationId)?.syncState).toBe('failed')
+    }
+    expect(changes.flat()).toContain(seeded.conversationId)
+  })
+
+  it.each([
+    { label: 'terminal local content advances the next revision', localState: 'terminal' as const, resultRevision: 3, accepted: true },
+    { label: 'active local content rejects a duplicate revision', localState: 'active' as const, resultRevision: 2, accepted: false },
+  ])('handles terminal pull OCC, quarantine, and notification: $label', async ({
+    localState, resultRevision, accepted,
+  }) => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const index = localState === 'terminal' ? 60 : 61
+    const create = createMutation(index)
+    const append = conversionMessageMutation(`terminal_pull_${index}`, create.entityId, 1)
+    append.payload = {
+      ...append.payload,
+      blocks: [{
+        type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1', state: localState,
+      }],
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: `terminal_pull_create_${index}`, mutations: [remoteReceipt(create, 1)],
+    }, 1)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: `terminal_pull_append_${index}`, mutations: [remoteReceipt(append, 2)],
+    }, 2)
+    const checkpointBeforePull = store.sync.getCheckpoint()
+    const terminal = conversionTerminalMutation(`terminal_pull_mutation_${index}`, append.entityId, 2)
+    const changes: string[][] = []
+    const { engine } = createEngine(manager, async (input) => input.action === 'syncPull'
+      ? success({
+          mutations: [remoteReceipt(terminal, resultRevision)],
+          cursor: `terminal_pull_cursor_${index}`,
+        })
+      : success({ results: [] }),
+    new FakeClock(), (ids) => changes.push([...ids]))
+
+    await engine.start('alice', 'device-a')
+    await engine.pull()
+
+    if (accepted) {
+      expect(engine.status()).toEqual({ state: 'idle' })
+      expect(store.sync.getCheckpoint()?.remoteCursor).toBe(`terminal_pull_cursor_${index}`)
+      expect(store.conversations.getSummary(create.entityId)?.revision).toBe(3)
+      expect(changes.flat()).toContain(create.entityId)
+    } else {
+      expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'INTERNAL_ERROR' })
+      expect(store.sync.getCheckpoint()).toEqual(checkpointBeforePull)
+      expect(store.conversations.getSummary(create.entityId)?.revision).toBe(2)
+      expect(changes).toEqual([])
+    }
+    expect(store.messages.get(append.entityId)?.blocks).toEqual([{
+      type: 'conversion', blockId: 'conversion_block_1', executionId: 'execution_1',
+      state: accepted ? 'terminal' : localState,
+    }])
   })
 
   it('reports a 24-hour warning from durable outbox age and clears after recovery', async () => {
@@ -563,7 +1037,7 @@ describe('UserDataSyncEngine', () => {
     expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
       expect.objectContaining({ id: mutation.entityId, revision: 1, syncState: 'synced' }),
     )
-    expect(store.sync.getCheckpoint()).toMatchObject({ protocolVersion: 1, remoteCursor: 'cursor_pull_0001' })
+    expect(store.sync.getCheckpoint()).toMatchObject({ protocolVersion: 3, remoteCursor: 'cursor_pull_0001' })
     expect(calls.map(({ action }) => action)).toEqual(['syncPush', 'syncPull'])
     expect(engine.status()).toEqual({ state: 'idle' })
   })

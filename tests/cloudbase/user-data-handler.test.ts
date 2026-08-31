@@ -74,6 +74,88 @@ function approvalMutation(origin: string) {
   }])
 }
 
+function fileConvertApprovalMutation(
+  formats: string[],
+  extraScope: Record<string, unknown> = {},
+) {
+  return messageMutation([{
+    type: 'approval',
+    blockId: 'conversion_approval_1',
+    state: 'pending',
+    executionId: 'execution_1',
+    workflowId: 'file.convert.universal',
+    workflowName: '万象转换',
+    workflowVersion: '1.0.0',
+    source: 'installed',
+    actionSummary: '读取附件 1 并创建 PDF 结果',
+    permissionIndex: 0,
+    capability: 'file.convert',
+    scope: { formats, ...extraScope },
+    scopeHash: 'b'.repeat(64),
+  }])
+}
+
+function conversionBlockMutation(extraBlock: Record<string, unknown> = {}) {
+  return messageMutation([{
+    type: 'conversion',
+    blockId: 'conversion_block_1',
+    executionId: 'execution_1',
+    state: 'active',
+    ...extraBlock,
+  }])
+}
+
+function conversionTerminalMutation(extraPayload: Record<string, unknown> = {}) {
+  return {
+    id: 'conversion_terminal_mutation_1',
+    entityId: 'message_1',
+    baseRevision: 1,
+    occurredAt,
+    kind: 'message.conversion_block_terminal',
+    payload: {
+      messageId: 'message_1',
+      blockId: 'conversion_block_1',
+      executionId: 'execution_1',
+      state: 'terminal',
+      ...extraPayload,
+    },
+  }
+}
+
+function fileInputMutation(extraBlock: Record<string, unknown> = {}) {
+  return messageMutation([{
+    type: 'media',
+    blockId: 'file_block_1',
+    assetId: 'file_asset_1',
+    kind: 'file',
+    purpose: 'input',
+    name: 'notes.txt',
+    mimeType: 'text/plain',
+    byteSize: 12,
+    ...extraBlock,
+  }])
+}
+
+function projectedConversionMessageMutation(
+  providerProjection: unknown = {
+    version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+    selectedAttachmentIndexes: [0],
+  },
+) {
+  const mutation = fileInputMutation()
+  return {
+    ...mutation,
+    payload: {
+      ...mutation.payload,
+      blocks: [
+        { type: 'text', text: 'Convert this attachment to PDF' },
+        ...mutation.payload.blocks,
+      ],
+      providerProjection,
+    },
+  }
+}
+
 function mockRpcResponse(
   value: unknown,
   options: {
@@ -293,7 +375,7 @@ describe('CloudBase user data function', () => {
         },
       },
       {
-        event: { action: 'listMessages', conversationId: 'conv_1', limit: 100 },
+        event: { action: 'listMessages', protocolVersion: 2, conversationId: 'conv_1', limit: 100 },
         rpcName: 'autoforge_list_messages',
         output: { items: [] },
         parameters: {
@@ -476,6 +558,138 @@ describe('CloudBase user data function', () => {
     expect(rpc).not.toHaveBeenCalled()
   })
 
+  it('accepts only canonical unique file-convert scopes and payload-free conversion blocks', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      results: [{ id: 'message_mutation_1', status: 'applied', revision: 1 }],
+    })
+    const handler = createUserDataHandler({ rpc })
+
+    for (const mutation of [
+      fileConvertApprovalMutation(['pdf', 'png']),
+      fileInputMutation(),
+      conversionBlockMutation(),
+      conversionTerminalMutation(),
+    ]) {
+      await expect(handler({
+        action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [mutation],
+      }, authenticatedContext)).resolves.toMatchObject({ ok: true })
+    }
+    expect(rpc).toHaveBeenCalledTimes(4)
+
+    const invalidMutations = [
+      fileConvertApprovalMutation([]),
+      fileConvertApprovalMutation(['pdf', 'pdf']),
+      fileConvertApprovalMutation(['docx']),
+      fileConvertApprovalMutation(['pdf'], { paths: ['/private/input.pdf'] }),
+      fileInputMutation({ purpose: 'output' }),
+      conversionBlockMutation({ state: 'terminal' }),
+      ...['bytes', 'path', 'sha256', 'artifactId', 'jobId'].map((key) => (
+        conversionBlockMutation({ [key]: 'private-local-value' })
+      )),
+      conversionTerminalMutation({ jobId: 'job_1' }),
+    ]
+
+    for (const mutation of invalidMutations) {
+      await expect(handler({
+        action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [mutation],
+      }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    }
+    expect(rpc).toHaveBeenCalledTimes(4)
+  })
+
+  it('passes only an exact structured message projection to sync RPC', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      results: [{ id: 'message_mutation_1', status: 'applied', revision: 1 }],
+    })
+    const handler = createUserDataHandler({ rpc })
+    const valid = projectedConversionMessageMutation()
+
+    await expect(handler({
+      action: 'syncPush', protocolVersion: 3, deviceId: 'dev_1', mutations: [valid],
+    }, authenticatedContext)).resolves.toMatchObject({ ok: true })
+    expect(rpc).toHaveBeenCalledWith('autoforge_sync_push', expect.objectContaining({
+      p_mutations: [expect.objectContaining({
+        payload: expect.objectContaining({
+          providerProjection: {
+            version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+            selectedAttachmentIndexes: [0],
+          },
+        }),
+      })],
+    }))
+
+    await expect(handler({
+      action: 'syncPush', protocolVersion: 2, deviceId: 'dev_1', mutations: [valid],
+    }, authenticatedContext)).resolves.toEqual({
+      ok: false, error: { code: 'INVALID_INPUT' },
+    })
+
+    for (const providerProjection of [
+      { kind: 'local_conversion', targetFormat: 'docx', attachmentCount: 1 },
+      { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 0 },
+      { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1, content: 'raw' },
+      { kind: 'ordinary', targetFormat: 'pdf', attachmentCount: 1 },
+      { version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
+      {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        selectedAttachmentIndexes: [1],
+      },
+      {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 2,
+        selectedAttachmentIndexes: [1, 0],
+      },
+    ]) {
+      await expect(handler({
+        action: 'syncPush', protocolVersion: 3, deviceId: 'dev_1',
+        mutations: [projectedConversionMessageMutation(providerProjection)],
+      }, authenticatedContext)).resolves.toEqual({
+        ok: false, error: { code: 'INVALID_INPUT' },
+      })
+    }
+    expect(rpc).toHaveBeenCalledTimes(1)
+  })
+
+  it('negotiates projection fields only for protocol v3 list and pull responses', async () => {
+    const projectedMessage = projectedConversionMessageMutation().payload
+    const pulled = {
+      id: 'message_mutation_1', kind: 'message.append', entityId: 'message_1',
+      baseRevision: 0, resultRevision: 1, payload: projectedMessage, receivedAt: occurredAt,
+    }
+    const rpc = vi.fn(async (name: string) => name === 'autoforge_list_messages'
+      ? { items: [projectedMessage] }
+      : { mutations: [pulled], cursor: null })
+    const handler = createUserDataHandler({ rpc })
+
+    const legacyList = await handler({
+      action: 'listMessages', conversationId: 'conv_1', limit: 100,
+    }, authenticatedContext)
+    expect(legacyList).toHaveProperty('ok', true)
+    expect(legacyList).not.toHaveProperty('data.items.0.providerProjection')
+    expect(Object.keys((legacyList as { data: { items: object[] } }).data.items[0]!).sort())
+      .toEqual(['blocks', 'conversationId', 'createdAt', 'id', 'role'])
+
+    for (const protocolVersion of [1, 2] as const) {
+      await expect(handler({
+        action: 'listMessages', protocolVersion, conversationId: 'conv_1', limit: 100,
+      }, authenticatedContext)).resolves.not.toHaveProperty('data.items.0.providerProjection')
+      await expect(handler({
+        action: 'syncPull', protocolVersion, deviceId: 'dev_1', limit: 100,
+      }, authenticatedContext)).resolves.not.toHaveProperty(
+        'data.mutations.0.payload.providerProjection',
+      )
+    }
+    await expect(handler({
+      action: 'listMessages', protocolVersion: 3, conversationId: 'conv_1', limit: 100,
+    }, authenticatedContext)).resolves.toHaveProperty(
+      'data.items.0.providerProjection.targetFormat', 'pdf',
+    )
+    await expect(handler({
+      action: 'syncPull', protocolVersion: 3, deviceId: 'dev_1', limit: 100,
+    }, authenticatedContext)).resolves.toHaveProperty(
+      'data.mutations.0.payload.providerProjection.targetFormat', 'pdf',
+    )
+  })
+
   it('rejects extra action and nested union keys before calling RPC', async () => {
     const rpc = vi.fn()
     const handler = createUserDataHandler({ rpc })
@@ -514,7 +728,7 @@ describe('CloudBase user data function', () => {
       { action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [consentMutation] },
       { action: 'syncPull', protocolVersion: 1, deviceId: 'dev_1' },
       { action: 'listConversations', limit: 50 },
-      { action: 'listMessages', conversationId: 'conv_1', limit: 100 },
+      { action: 'listMessages', protocolVersion: 2, conversationId: 'conv_1', limit: 100 },
       { action: 'previewLegacyImport', ownedCount: 1, unownedCount: 0 },
       {
         action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'dev_1', batchId: 'batch_1',
@@ -713,12 +927,18 @@ describe('CloudBase user data function', () => {
     expect(rpc).toHaveBeenCalledTimes(2)
   })
 
-  it('enforces protocol, identifier, batch, and request-size limits before RPC', async () => {
+  it('accepts v1/v2/v3, rejects later protocols, and enforces identifiers, batches, and request size', async () => {
     const rpc = vi.fn()
     const handler = createUserDataHandler({ rpc })
 
     await expect(handler({
       action: 'syncPull', protocolVersion: 2, deviceId: 'dev_1',
+    }, authenticatedContext)).resolves.toEqual({ ok: true, data: undefined })
+    expect(rpc).toHaveBeenLastCalledWith('autoforge_sync_pull', expect.objectContaining({
+      p_protocol_version: 2,
+    }))
+    await expect(handler({
+      action: 'syncPull', protocolVersion: 4, deviceId: 'dev_1',
     }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'UPGRADE_REQUIRED' } })
     await expect(handler({
       action: 'syncPull', protocolVersion: 1, deviceId: ' dev_1',
@@ -754,7 +974,7 @@ describe('CloudBase user data function', () => {
         },
       }],
     }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
-    expect(rpc).not.toHaveBeenCalled()
+    expect(rpc).toHaveBeenCalledOnce()
   })
 
   it('rejects non-datetime date strings before RPC', async () => {
@@ -910,6 +1130,49 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
         },
       )
       expect(fetchImpl.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    }
+  })
+
+  it('strictly parses structured projections from message list and sync pull responses', async () => {
+    const projectedPayload = projectedConversionMessageMutation().payload
+    const projectedMessage = {
+      ...projectedPayload,
+      providerProjection: {
+        version: 2, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1,
+        selectedAttachmentIndexes: [0],
+      },
+    }
+    for (const [name, output] of [
+      ['autoforge_list_messages', { items: [projectedMessage] }],
+      ['autoforge_sync_pull', {
+        mutations: [{
+          id: 'message_mutation_1', kind: 'message.append', entityId: 'message_1',
+          baseRevision: 0, resultRevision: 1, payload: projectedMessage, receivedAt: occurredAt,
+        }],
+        cursor: null,
+      }],
+    ] as const) {
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-secret',
+        fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse(output)),
+      })
+      await expect(rpc(name, {})).resolves.toEqual(output)
+    }
+
+    for (const providerProjection of [
+      { kind: 'local_conversion', targetFormat: 'docx', attachmentCount: 1 },
+      { kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1, raw: 'text' },
+      { version: 99, kind: 'local_conversion', targetFormat: 'pdf', attachmentCount: 1 },
+    ]) {
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-secret',
+        fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({
+          items: [{ ...projectedMessage, providerProjection }],
+        })),
+      })
+      await expect(rpc('autoforge_list_messages', {})).rejects.toEqual({
+        code: 'SERVICE_UNAVAILABLE',
+      })
     }
   })
 
@@ -1074,6 +1337,42 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
     })
     await expect(forged('autoforge_sync_pull', {}))
       .rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+  })
+
+  it('accepts only strict remote-only compacted conversion terminal receipts', async () => {
+    const receipt = {
+      id: 'conversion_terminal_mutation_1',
+      kind: 'message.conversion_block_terminal',
+      entityId: 'message_1',
+      conversationId: 'conversation_1',
+      baseRevision: 1,
+      resultRevision: 2,
+      compacted: true,
+      receivedAt: occurredAt,
+    }
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({ mutations: [receipt], cursor: opaqueCursor })),
+    })
+    await expect(rpc('autoforge_sync_pull', {})).resolves.toEqual({
+      mutations: [receipt], cursor: opaqueCursor,
+    })
+
+    for (const forgedReceipt of [
+      { ...receipt, conversationId: undefined },
+      { ...receipt, payload: { state: 'terminal' } },
+    ]) {
+      const forged = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest',
+        serviceKey: 'server-secret',
+        fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({
+          mutations: [forgedReceipt], cursor: opaqueCursor,
+        })),
+      })
+      await expect(forged('autoforge_sync_pull', {}))
+        .rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+    }
   })
 
   it('rejects pulled mutations whose entity identity disagrees with the strict payload', async () => {

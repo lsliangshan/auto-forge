@@ -119,6 +119,8 @@ function createApi() {
     chat: {}, workflows: {}, permissions: {}, settings: {}, system: {},
     developer: {
       listProjects: vi.fn().mockResolvedValue([project]), createProject: vi.fn(), registerProject: vi.fn(),
+      pickFiles: vi.fn().mockResolvedValue([]), removeAttachment: vi.fn().mockResolvedValue(undefined),
+      clearAttachments: vi.fn().mockResolvedValue(undefined),
       readFile: vi.fn(async (_projectId: string, path: string) => path === 'workflow.json'
         ? JSON.stringify({
             id: 'browser.search.baidu', version: '1.0.0', name: 'Baidu', description: '', author: 'AutoForge', category: 'browser',
@@ -137,7 +139,7 @@ function createApi() {
       createEntry: vi.fn().mockResolvedValue(project), renameEntry: vi.fn().mockResolvedValue(project), deleteEntry: vi.fn().mockResolvedValue(project),
       build: vi.fn().mockResolvedValue({ ...project, status: 'ready' }),
       validate: vi.fn().mockResolvedValue({ valid: true, diagnostics: [] } satisfies ValidationResult),
-      run: vi.fn().mockResolvedValue({ executionId: 'exec_1' }),
+      run: vi.fn().mockResolvedValue({ executionId: 'exec_1', conversionCapable: false }),
     },
     executions: {
       onEvent: vi.fn((listener: (event: ExecutionEvent) => void) => { executionListener = listener; return vi.fn() }),
@@ -145,6 +147,12 @@ function createApi() {
         id: 'exec_1', workflowId: 'browser.search.baidu', workflowVersion: '1.0.0', status: 'completed',
         createdAt: '2026-07-19T00:00:00.000Z', input: {}, output: { success: true }, steps: [], logs: [],
       }),
+    },
+    conversion: {
+      listForExecution: vi.fn().mockResolvedValue({ availability: 'local', jobs: [] }),
+      cancel: vi.fn().mockResolvedValue(undefined), retry: vi.fn().mockResolvedValue(undefined),
+      saveCopy: vi.fn().mockResolvedValue({ saved: true }), reveal: vi.fn().mockResolvedValue(undefined),
+      deleteArtifact: vi.fn().mockResolvedValue(undefined), onEvent: vi.fn(() => vi.fn()),
     },
   }
   return { api: api as unknown as DesktopAPI, raw: api, emit: (event: ExecutionEvent) => executionListener?.(event) }
@@ -650,6 +658,135 @@ describe('developer workbench', () => {
     expect(wrapper.text()).not.toContain('filesystem.read')
   })
 
+  it('renders a native picker only for an annotated array and keeps ordinary arrays as JSON', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', required: ['files'], properties: {
+        files: {
+          type: 'array', title: '附件', items: { type: 'integer' }, minItems: 1, maxItems: 5,
+          'x-autoforge-control': 'file-picker',
+        },
+        tags: { type: 'array', title: '标签', items: { type: 'string' } },
+      },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    expect(wrapper.get('[data-testid="debug-file-picker-files"]')).toBeTruthy()
+    expect(wrapper.find('[data-testid="debug-field-files-json"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="debug-field-tags-json"]').text()).toContain('JSON')
+  })
+
+  it('keeps same-name drafts distinct and submits contiguous indexes without paths after removal', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', required: ['files', 'targetFormat'], properties: {
+        files: {
+          type: 'array', title: '附件', items: { type: 'integer' }, minItems: 1, maxItems: 5,
+          'x-autoforge-control': 'file-picker',
+        },
+        targetFormat: { type: 'string', enum: ['png'] },
+      },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    raw.developer.pickFiles.mockResolvedValueOnce([
+      { id: 'draft_first', name: 'same.png', mimeType: 'image/png', byteSize: 101 },
+      { id: 'draft_second', name: 'middle.png', mimeType: 'image/png', byteSize: 102 },
+      { id: 'draft_third', name: 'same.png', mimeType: 'image/png', byteSize: 103 },
+    ])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="debug-pick-files-files"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.findAll('[data-testid^="debug-file-files-"]')).toHaveLength(3))
+    expect(wrapper.text().match(/same\.png/g)).toHaveLength(2)
+    await wrapper.get('[data-testid="debug-remove-file-draft_second"]').trigger('click')
+    await vi.waitFor(() => expect(raw.developer.removeAttachment).toHaveBeenCalledWith({
+      projectId: 'project_1', attachmentId: 'draft_second',
+    }))
+    await wrapper.get('[data-testid="debug-field-targetFormat"]').setValue('0')
+    await store.runDebug()
+
+    expect(raw.developer.run).toHaveBeenCalledWith({
+      projectId: 'project_1',
+      input: { files: [0, 1], targetFormat: 'png' },
+      attachmentIds: ['draft_first', 'draft_third'],
+    })
+    const serialized = JSON.stringify(raw.developer.run.mock.calls)
+    expect(serialized).not.toMatch(/private|Users|path|relativePath/)
+  })
+
+  it('enforces five selected drafts and clears them on project switch and dispose', async () => {
+    const { api, raw } = createApi()
+    const second = { ...project, id: 'project_2', name: 'Second', rootPath: '/private/second' }
+    raw.developer.listProjects.mockResolvedValue([project, second])
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', properties: {
+        files: { type: 'array', items: { type: 'integer' }, 'x-autoforge-control': 'file-picker' },
+      },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    raw.developer.pickFiles.mockResolvedValueOnce(Array.from({ length: 5 }, (_, index) => ({
+      id: `draft_${index}`, name: `${index}.png`, mimeType: 'image/png', byteSize: index + 1,
+    })))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="debug-pick-files-files"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.findAll('[data-testid^="debug-file-files-"]')).toHaveLength(5))
+    expect(wrapper.get('[data-testid="debug-pick-files-files"]').attributes('disabled')).toBeDefined()
+    await store.selectProject('project_2')
+    expect(raw.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' })
+    wrapper.unmount()
+    store.$dispose()
+    expect(raw.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_2' })
+  })
+
+  it('drops selected drafts when debug preflight fails before Main can consume them', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', properties: {
+        files: { type: 'array', items: { type: 'integer' }, 'x-autoforge-control': 'file-picker' },
+      },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    raw.developer.pickFiles.mockResolvedValueOnce([
+      { id: 'draft_failed', name: 'failed.png', mimeType: 'image/png', byteSize: 10 },
+    ])
+    raw.developer.build.mockRejectedValueOnce(Object.assign(new Error('redacted'), { code: 'INTERNAL_ERROR' }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+    await wrapper.get('[data-testid="debug-pick-files-files"]').trigger('click')
+    await vi.waitFor(() => expect(store.developerAttachments).toHaveLength(1))
+
+    await store.runDebug()
+
+    expect(raw.developer.run).not.toHaveBeenCalled()
+    expect(raw.developer.clearAttachments).toHaveBeenCalledWith({ projectId: 'project_1' })
+    expect(store.developerAttachments).toEqual([])
+  })
+
   it('keeps invalid complex JSON as a visible draft and blocks execution', async () => {
     const { api, raw } = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -759,8 +896,8 @@ describe('developer workbench', () => {
   it('submits an unchanged schema-driven input on consecutive debug runs', async () => {
     const { api, raw, emit } = createApi()
     raw.developer.run
-      .mockResolvedValueOnce({ executionId: 'exec_1' })
-      .mockResolvedValueOnce({ executionId: 'exec_2' })
+      .mockResolvedValueOnce({ executionId: 'exec_1', conversionCapable: false })
+      .mockResolvedValueOnce({ executionId: 'exec_2', conversionCapable: false })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useDeveloperStore()
     await store.loadProjects()
@@ -813,6 +950,167 @@ describe('developer workbench', () => {
     await vi.waitFor(() => expect(store.debugDetail?.logs).toHaveLength(1))
     await wrapper.vm.$nextTick()
     expect(wrapper.text().split('正在使用百度搜索：今日天气')).toHaveLength(2)
+  })
+
+  it('keeps a running conversion block bound to its execution snapshot while the manifest and editor change', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.id = 'file.convert.universal'
+    manifest.permissions = [{ capability: 'file.convert', scope: { formats: ['pdf', 'webm'] } }]
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    raw.developer.run.mockResolvedValueOnce({ executionId: 'exec_1', conversionCapable: true })
+    let resolveValidation!: (value: ValidationResult) => void
+    raw.developer.validate.mockReturnValueOnce(new Promise((resolve) => { resolveValidation = resolve }))
+    raw.conversion.listForExecution.mockResolvedValue({
+      availability: 'local',
+      jobs: [
+        {
+          jobId: 'job_video', executionId: 'exec_1', targetFormat: 'webm', status: 'converting',
+          epoch: 0, progress: 48, artifacts: [],
+        },
+        {
+          jobId: 'job_restart', executionId: 'exec_1', targetFormat: 'pdf', status: 'interrupted',
+          epoch: 0, progress: 35, artifacts: [],
+        },
+      ],
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+    const running = store.runDebug()
+    await vi.waitFor(() => expect(raw.developer.validate).toHaveBeenCalledWith('project_1'))
+
+    store.manifests.project_1 = { ...manifest, permissions: [] } as never
+    await wrapper.vm.$nextTick()
+    store.editCurrent('{')
+    await wrapper.vm.$nextTick()
+    expect(store.currentManifest).toBeUndefined()
+    resolveValidation({ valid: true, diagnostics: [] })
+    await running
+    await vi.waitFor(() => {
+      expect(raw.conversion.listForExecution).toHaveBeenCalledWith({ executionId: 'exec_1' })
+      expect(wrapper.get('[aria-label="文件转换结果"]').text()).toContain('正在转换')
+    })
+    expect(store.debugExecutionConversionCapable).toBe(true)
+
+    await store.selectFile('src/index.ts')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).toContain('排队中')
+    const block = wrapper.get('[aria-label="文件转换结果"]')
+    expect(block.text()).toContain('正在转换')
+    expect(block.text()).toContain('转换已中断')
+    await block.get('[data-testid="conversion-cancel"]').trigger('click')
+    await block.get('[data-testid="conversion-retry"]').trigger('click')
+
+    expect(raw.conversion.cancel).toHaveBeenCalledWith({ jobId: 'job_video' })
+    expect(raw.conversion.retry).toHaveBeenCalledWith({ jobId: 'job_restart' })
+    expect(raw.executions.cancel).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { rendererBuildConversionCapable: true, mainRunConversionCapable: false },
+    { rendererBuildConversionCapable: false, mainRunConversionCapable: true },
+  ])(
+    'uses Main conversionCapable=$mainRunConversionCapable when workflow.json saves after the first build',
+    async ({ rendererBuildConversionCapable, mainRunConversionCapable }) => {
+      const { api, raw } = createApi()
+      const baseManifest = JSON.parse(
+        await raw.developer.readFile('project_1', 'workflow.json'),
+      ) as Record<string, unknown>
+      const permissions = (conversionCapable: boolean) => conversionCapable
+        ? [{ capability: 'file.convert', scope: { formats: ['webm'] } }]
+        : []
+      let savedManifest = {
+        ...baseManifest,
+        permissions: permissions(rendererBuildConversionCapable),
+      }
+      raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+        ? `${JSON.stringify(savedManifest, null, 2)}\n`
+        : 'export default 1')
+      raw.developer.writeFile.mockImplementation(async (_projectId: string, path: string, content: string) => {
+        if (path === 'workflow.json') savedManifest = JSON.parse(content) as Record<string, unknown>
+      })
+      let resolveFirstValidation!: (value: ValidationResult) => void
+      raw.developer.validate
+        .mockReturnValueOnce(new Promise((resolve) => { resolveFirstValidation = resolve }))
+        .mockResolvedValue({ valid: true, diagnostics: [] })
+      raw.developer.run.mockImplementationOnce(async () => ({
+        executionId: 'exec_authoritative',
+        conversionCapable: (savedManifest.permissions as Array<{ capability: string }>).some(
+          ({ capability }) => capability === 'file.convert',
+        ),
+      }))
+      Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+      const store = useDeveloperStore()
+      await store.loadProjects()
+      await store.selectFile('workflow.json')
+      const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+      const running = store.runDebug()
+      await vi.waitFor(() => expect(raw.developer.validate).toHaveBeenCalledTimes(1))
+      const savedDuringValidation = {
+        ...baseManifest,
+        permissions: permissions(mainRunConversionCapable),
+      }
+      store.editCurrent(`${JSON.stringify(savedDuringValidation, null, 2)}\n`)
+      await store.saveCurrent()
+      expect(raw.developer.writeFile).toHaveBeenCalledWith(
+        'project_1', 'workflow.json', `${JSON.stringify(savedDuringValidation, null, 2)}\n`,
+      )
+
+      resolveFirstValidation({ valid: true, diagnostics: [] })
+      await running
+      await wrapper.vm.$nextTick()
+
+      expect(raw.developer.build).toHaveBeenCalledTimes(1)
+      expect(raw.developer.run).toHaveBeenCalledTimes(1)
+      expect(store.debugExecutionId).toBe('exec_authoritative')
+      expect(store.debugExecutionConversionCapable).toBe(mainRunConversionCapable)
+      expect(wrapper.find('[aria-label="文件转换结果"]').exists()).toBe(mainRunConversionCapable)
+    },
+  )
+
+  it('resets the conversion snapshot and hides the block when a newer non-conversion run starts', async () => {
+    const { api, raw } = createApi()
+    const browserManifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    const conversionManifest = {
+      ...browserManifest,
+      id: 'file.convert.universal',
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf', 'webm'] } }],
+    }
+    let builtManifest = conversionManifest
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(builtManifest) : 'export default 1')
+    let resolveBrowserRun!: (value: { executionId: string; conversionCapable: boolean }) => void
+    raw.developer.run
+      .mockResolvedValueOnce({ executionId: 'exec_conversion', conversionCapable: true })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveBrowserRun = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    await store.runDebug()
+    store.debugStatus = 'completed'
+
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+    await vi.waitFor(() => expect(wrapper.find('[aria-label="文件转换结果"]').exists()).toBe(true))
+
+    builtManifest = browserManifest
+    const browserRun = store.runDebug()
+    await vi.waitFor(() => expect(raw.developer.run).toHaveBeenCalledTimes(2))
+    await wrapper.vm.$nextTick()
+    expect(store.debugExecutionId).toBe('')
+    expect(store.debugExecutionConversionCapable).toBe(false)
+    expect(wrapper.find('[aria-label="文件转换结果"]').exists()).toBe(false)
+
+    resolveBrowserRun({ executionId: 'exec_browser', conversionCapable: false })
+    await browserRun
+    expect(store.debugExecutionId).toBe('exec_browser')
+    expect(store.debugExecutionConversionCapable).toBe(false)
+    expect(wrapper.find('[aria-label="文件转换结果"]').exists()).toBe(false)
   })
 
   it('isolates execution events, handles approvals, and cancels only the active debug run', async () => {
@@ -940,7 +1238,7 @@ describe('developer workbench', () => {
     const { api, raw } = createApi()
     const second = { ...project, id: 'project_2', name: 'Second project', rootPath: '/private/second' }
     raw.developer.listProjects.mockResolvedValue([project, second])
-    let resolveRun!: (value: { executionId: string }) => void
+    let resolveRun!: (value: { executionId: string; conversionCapable: boolean }) => void
     raw.developer.run.mockReturnValueOnce(new Promise((resolve) => { resolveRun = resolve }))
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useDeveloperStore()
@@ -950,13 +1248,49 @@ describe('developer workbench', () => {
     await vi.waitFor(() => expect(raw.developer.run).toHaveBeenCalled())
     ;(store.debugInput as { nested: { value: string } }).nested.value = 'mutated'
     await store.selectProject(second.id)
-    resolveRun({ executionId: 'exec_late' })
+    resolveRun({ executionId: 'exec_late', conversionCapable: false })
     await run
 
     expect(raw.developer.run).toHaveBeenCalledWith({ projectId: project.id, input: { keyword: 'captured', nested: { value: 'captured' } } })
     expect(raw.executions.cancel).toHaveBeenCalledWith('exec_late')
     expect(store.debugExecutionId).toBe('')
     expect(store.debugStatus).toBe('idle')
+  })
+
+  it('does not attach a stale conversion snapshot to a newer non-conversion execution', async () => {
+    const { api, raw } = createApi()
+    const second = { ...project, id: 'project_2', name: 'Second project', rootPath: '/private/second' }
+    const browserManifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    const conversionManifest = {
+      ...browserManifest,
+      id: 'file.convert.universal',
+      permissions: [{ capability: 'file.convert', scope: { formats: ['webm'] } }],
+    }
+    raw.developer.listProjects.mockResolvedValue([project, second])
+    raw.developer.readFile.mockImplementation(async (projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(projectId === project.id ? conversionManifest : browserManifest)
+      : 'export default 1')
+    let resolveStaleRun!: (value: { executionId: string; conversionCapable: boolean }) => void
+    raw.developer.run
+      .mockReturnValueOnce(new Promise((resolve) => { resolveStaleRun = resolve }))
+      .mockResolvedValueOnce({ executionId: 'exec_new', conversionCapable: false })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+
+    const staleRun = store.runDebug()
+    await vi.waitFor(() => expect(raw.developer.run).toHaveBeenCalledTimes(1))
+    await store.selectProject(second.id)
+    expect(store.debugExecutionId).toBe('')
+    expect(store.debugExecutionConversionCapable).toBe(false)
+
+    await store.runDebug()
+    resolveStaleRun({ executionId: 'exec_stale', conversionCapable: true })
+    await staleRun
+
+    expect(store.debugExecutionId).toBe('exec_new')
+    expect(store.debugExecutionConversionCapable).toBe(false)
+    expect(raw.executions.cancel).toHaveBeenCalledWith('exec_stale')
   })
 
   it('ignores a validation error returned after its debug run becomes stale', async () => {

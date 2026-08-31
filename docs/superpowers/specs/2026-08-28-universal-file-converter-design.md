@@ -49,10 +49,14 @@ file is never overwritten.
 The first release supports:
 
 - macOS on Apple Silicon;
-- macOS on Intel;
-- Windows on x64.
+- macOS on Intel.
 
-Linux support and Linux packaging are outside this design.
+Windows and Linux conversion support and packaging are outside the first
+release. The production factory rejects Windows before reading release
+metadata or accessing the signed index/network. Cross-platform validation of
+signed Windows inventory, portable paths, reserved names, and active-content
+roles remains in place as security hardening; it does not advertise Windows
+release support.
 
 ## Scope
 
@@ -66,7 +70,7 @@ This design covers:
 - chat and developer-page presentation;
 - cancellation, timeout, restart recovery, and cleanup;
 - local privacy and security controls;
-- macOS and Windows packaging and release gates.
+- macOS arm64/x64 packaging and release gates.
 
 This design does not add:
 
@@ -320,7 +324,8 @@ The existing media limits remain authoritative:
 - video input: 200 MiB per file;
 - other file input: 100 MiB per file;
 - total input per request: 250 MiB;
-- output: 500 MiB per artifact.
+- output: 500 MiB in aggregate per conversion job; each artifact is necessarily
+  bounded by the same aggregate cap.
 
 Additional limits are:
 
@@ -623,6 +628,24 @@ state on startup. It validates every application-relative path and never
 follows symlinks. Clearing local data includes conversion jobs, artifacts,
 staging, and downloaded packs according to the existing clear-data contract.
 
+Startup recovery recognizes strict direct-child `results/batch-<UUID>`
+directories and paired `.trash/rollback-<UUID>` plus
+`.rollback-<UUID>.reserve` evidence. It retains a result batch only when its
+complete leaf set maps to ready output artifacts whose owner, execution, and
+completed job all agree. A batch with no durable ownership is atomically moved
+out of `results` after directory identity checks. Quarantine first creates the
+private `rollback-<UUID>` container exclusively, then moves the source batch to
+its fixed `batch` child; an empty or non-empty competing container therefore
+cannot be overwritten by directory rename. Recovery accepts both this nested
+layout and the earlier direct-leaf layout. It opens and validates every
+rollback leaf no-follow before changing any content, then truncates and fsyncs
+only those retained handles. It leaves zero-byte tombstones and their identity
+reservation until explicit local-data clear because deleting a revalidated
+path would reintroduce a replacement race. Symlinks, swaps, destination
+conflicts, forged rows, anonymous extra leaves, or identity mismatches create
+durable owner-local conflict evidence; later bindings fail before touching
+either node.
+
 ## Testing Strategy
 
 Implementation follows test-driven development. Each behavior begins with a
@@ -669,8 +692,8 @@ converters to prove:
 
 ### Real Engine Tests
 
-On macOS arm64, macOS x64, and Windows x64, use licensed fixture files to cover
-at least one real route for every target family:
+On macOS arm64 and macOS x64, use licensed fixture files to cover at least one
+real route for every target family:
 
 - static image conversion;
 - animated GIF/WebP conversion;
@@ -708,12 +731,11 @@ Automated packaging must inspect the produced app and prove that:
 - platform and architecture selection is exact;
 - macOS components satisfy signing, hardened-runtime, quarantine, and
   notarization requirements;
-- Windows components and archives satisfy code-signing requirements;
 - all third-party license notices and source-offer obligations are met.
 
 The real hosted pack artifacts, production signature, macOS notarization,
-Windows signing, and CDN behavior are external release gates. Local fixtures or
-unsigned development packs must never be reported as release acceptance.
+and CDN behavior are external release gates. Local fixtures or unsigned
+development packs must never be reported as release acceptance.
 
 ## Implementation Boundaries
 
@@ -732,6 +754,103 @@ The implementation should remain layered:
 No layer may expose paths or generic process execution to the layer above it.
 The implementation plan must break these into independently verifiable tasks
 and keep production pack publication as an explicit external gate.
+
+## Task 14 Implementation Evidence (2026-08-30)
+
+The Task 14 Electron suite exercises the production Renderer, Preload, IPC,
+Main, restricted Worker, signed-pack process runner, SQLite repositories, and
+visible conversion card. With an explicit Task 13 test-pack root, it proves:
+
+- a combined two-command request such as `把图片转成 favicon ico，把文档转成 PDF`
+  fails closed without presenting an approval; two subsequent single-command
+  requests bind the PNG and DOCX by exact attachment index, present separately
+  approved sanitized scopes, expose only canonical attachment count/index and
+  target format to the Provider, keep names, MIME types, paths, bytes, base64,
+  and internal identifiers out of Provider input, and produce durable ICO and
+  PDF results whose native saved copies pass signature/content checks;
+- `file.convert.universal` / `万象转换` is discovered through the Renderer
+  workflow page, Debug Panel native selection sends only indexes plus opaque
+  attachment IDs, and a real MP4-to-WebM process result arriving after cancel
+  cannot replace the durable cancelled state;
+- the typed Main `developer.run` success response binds `executionId` to a
+  `conversionCapable` boolean derived from the exact `built.manifest` used by
+  that same run. The Renderer commits the pair atomically under its run token
+  and never infers this execution property from its earlier build or the
+  mutable editor manifest. A deterministic two-direction race holds the first
+  validation while a valid `workflow.json` save flips `file.convert` before
+  Main rebuilds; the card follows Main's returned snapshot in both directions.
+  Once started, the live card, status, cancel, and retry controls survive
+  permission removal, invalid `workflow.json`, editor switching, and
+  state-preserving HMR; a new run, project/session invalidation, or store
+  disposal clears the execution ID and capability together, and a stale run
+  result cannot attach its capability to a newer execution;
+- quitting with a conversion in flight and reopening the same local profile
+  recovers the job as interrupted, while explicit retry advances its epoch and
+  produces a verified durable artifact;
+- an invalid signed-pack root fails visibly without consulting a PATH sentinel,
+  and an absent explicit root skips with an external-gate message rather than
+  falling back to host tools;
+- real repository rows and app-owned fixture files cover narrow and wide chat,
+  long unbroken names, page and icon-representation metadata, download,
+  action-pending, error, deleted, remote-only, keyboard-focus, dark, and 200%
+  zoom states. Main's persisted dark setting/native-theme state is asserted;
+  Playwright emulates the corresponding Renderer media query for deterministic
+  screenshot capture. Final computer-use visual inspection remains pending.
+
+The page/representation screenshots remain visual fixture evidence. A later
+Task 14 production-runtime closure separately proves real multi-output process
+acceptance: three PDF pages and three ICNS/ICO representations cross the job
+runner, per-output content and metadata verification, one atomic SQLite job and
+artifact transaction, and durable artifact reads. The existing card lists all
+artifacts; collapsible grouping remains presentation behavior rather than a
+storage/runtime gap.
+
+The ordinary Electron entrypoint now installs an owner-bound production
+runtime factory. It reads only packaged `converter-packs/bootstrap.json` and a
+packaged root key through no-follow stable handles, accepts only an HTTPS index
+and sibling signature fetched under one controlled network lease with streamed
+byte caps, and never consults `PATH`. The checked-in bootstrap keeps downloads
+disabled and carries no key, so an unreleased build remains deterministically
+unavailable. Windows is outside the first-release matrix and remains
+unconditionally unavailable even if a Job Object-shaped process-tree port is
+injected; rejection happens before release metadata or network/index access.
+
+Before adapter planning, the runtime copies the already-owned no-follow input
+handle into an exclusive private work directory, verifies size, hash, inode and
+timestamps, and passes only that private path to the fixed adapter. Every plan
+must declare a complete, unique output mapping directly inside that work root.
+The artifact service validates every output and its page/representation
+metadata before moving all leaves into one exclusive per-batch result directory
+and committing job completion plus every ready artifact in one transaction.
+Failure, cancellation, stale epoch, or CAS loss produces no ready subset; the
+whole exact batch directory is atomically retained under the owner-local
+`.trash` quarantine, including when staging cleanup fails. ICO probes retain
+ordered source indexes, dimensions and payload hashes, deduplicate only equal
+dimension-plus-hash entries, and persist truthful representation metadata.
+
+The startup recovery closure was also developed against discriminatory tests.
+Before wiring, the orphan-batch, rollback/CAS residue, symlink, replacement,
+and destination-conflict group reported **5 failed / 1 passed**; rollback
+directory identity evidence separately reported **1 failed / 27 skipped**.
+The directory-rename no-clobber review then added two focused REDs: an empty
+destination created after Application's pre-check reported **1 failed / 276
+skipped**, and the same empty-container race in normal artifact rollback
+reported **1 failed / 28 skipped**. Both paths now use the same exclusive
+container plus nested payload layout.
+The completed implementation covers a crash after durable batch moves but
+before the SQLite CAS, normal completed multi-output ownership, forged
+in-flight ownership, anonymous extra leaves, same-owner double binding,
+symlink escape, source replacement, empty and non-empty quarantine conflicts,
+and rollback-leaf replacement. Normal reconciliation is idempotent; a detected
+conflict remains durably fail-closed until the user clears local data.
+
+This local Darwin arm64 fixture evidence is not release acceptance. Production
+signing keys and index, hosted packs and CDN behavior, all eight production
+platform/architecture pack coordinates, third-party license review, real
+Darwin x64 execution, code signing, hardened runtime,
+notarization, quarantine behavior, production privacy review, and update or
+rollback drills remain external Task 13 gates. Real CloudBase/PostgreSQL sync,
+RLS, storage, and cross-device evidence remains an external Task 12 gate.
 
 ## Technical References
 

@@ -168,6 +168,7 @@
 
 <script setup lang="ts">
 import { Close } from '@element-plus/icons-vue'
+import type { WorkflowDetail } from '@autoforge/shared'
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { useChatStore } from '../stores/chat'
@@ -184,7 +185,12 @@ const workflow = useWorkflowStore()
 const inspectorTitle = computed(() => route.name === 'executions' ? '执行详情' : route.name === 'workflows' ? '工作流信息' : route.name === 'developer' ? '开发输出' : '任务详情')
 const isCancellable = computed(() => execution.selectedDetail && ['queued', 'awaiting_approval', 'running'].includes(execution.selectedDetail.status))
 const statusLabel = (status: string) => ({ queued: '排队中', awaiting_approval: '等待授权', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' })[status] ?? status
-const formatScope = (scope: { origins?: string[]; paths?: string[] }) => scope.origins?.join('、') ?? scope.paths?.join('、') ?? '无附加范围'
+const formatScope = (scope: WorkflowDetail['permissions'][number]['scope']) => {
+  if ('origins' in scope) return scope.origins.join('、')
+  if ('paths' in scope) return scope.paths.join('、')
+  if ('formats' in scope) return scope.formats.join('、')
+  return '无附加范围'
+}
 const formatData = (value: unknown) => {
   if (value === undefined) return '—'
   try { return JSON.stringify(value, null, 2) }

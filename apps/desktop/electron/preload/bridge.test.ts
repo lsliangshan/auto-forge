@@ -20,6 +20,12 @@ function harness(ports: Partial<DesktopBridgePorts> = {}) {
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
 describe('preload desktop bridge', () => {
   it('maps the fixed CloudBase authentication methods', async () => {
     const app = harness()
@@ -235,6 +241,40 @@ describe('preload desktop bridge', () => {
     })
   })
 
+  it('maps developer draft operations and run attachments to fixed path-free channels', async () => {
+    const app = harness()
+
+    vi.mocked(app.ipcRenderer.invoke).mockResolvedValueOnce([])
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ executionId: 'execution_1', conversionCapable: true })
+
+    expect(app.api.developer.pickFiles).toBeTypeOf('function')
+    expect(app.api.developer.removeAttachment).toBeTypeOf('function')
+    expect(app.api.developer.clearAttachments).toBeTypeOf('function')
+    await app.api.developer.pickFiles({ projectId: 'project_1', existingAttachmentIds: ['draft_1'] })
+    await app.api.developer.removeAttachment({ projectId: 'project_1', attachmentId: 'draft_1' })
+    await app.api.developer.clearAttachments({ projectId: 'project_1' })
+    const runResult = await app.api.developer.run({
+      projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'],
+    })
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.developerPickFiles, {
+      projectId: 'project_1', existingAttachmentIds: ['draft_1'],
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.developerRemoveAttachment, {
+      projectId: 'project_1', attachmentId: 'draft_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.developerClearAttachments, {
+      projectId: 'project_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.developerRun, {
+      projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'],
+    })
+    expect(runResult).toEqual({ executionId: 'execution_1', conversionCapable: true })
+    expect(JSON.stringify(vi.mocked(app.ipcRenderer.invoke).mock.calls)).not.toContain('/private/')
+  })
+
   it('resolves dropped-file paths only in preload, filters blanks, and uses a fixed channel', async () => {
     const getPathForFile = vi.fn()
       .mockReturnValueOnce('/private/photo.png')
@@ -366,6 +406,282 @@ describe('preload desktop bridge', () => {
 
     expect(listener).toHaveBeenCalledOnce()
     expect(listener).toHaveBeenCalledWith(event)
+  })
+
+  it('maps only opaque conversion identifiers and validates subscribed events', async () => {
+    const app = harness()
+
+    await app.api.conversion.listForExecution({ executionId: 'execution_1' })
+    await app.api.conversion.cancel({ jobId: 'job_1' })
+    await app.api.conversion.retry({ jobId: 'job_2' })
+    await app.api.conversion.saveCopy({ artifactId: 'artifact_1' })
+    await app.api.conversion.reveal({ artifactId: 'artifact_2' })
+    await app.api.conversion.deleteArtifact({ artifactId: 'artifact_3' })
+
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-6)).toEqual([
+      [ipcChannels.conversionListForExecution, { executionId: 'execution_1' }],
+      [ipcChannels.conversionCancel, { jobId: 'job_1' }],
+      [ipcChannels.conversionRetry, { jobId: 'job_2' }],
+      [ipcChannels.conversionSaveCopy, { artifactId: 'artifact_1' }],
+      [ipcChannels.conversionReveal, { artifactId: 'artifact_2' }],
+      [ipcChannels.conversionDeleteArtifact, { artifactId: 'artifact_3' }],
+    ])
+    expect(app.api.conversion).not.toHaveProperty('path')
+    expect(app.api.conversion).not.toHaveProperty('invoke')
+
+    const listener = vi.fn()
+    const unsubscribe = app.api.conversion.onEvent(listener)
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith('conversion:subscribe', undefined)
+    const subscribeIndex = vi.mocked(app.ipcRenderer.invoke).mock.calls.findIndex(
+      ([channel]) => channel === 'conversion:subscribe',
+    )
+    expect(vi.mocked(app.ipcRenderer.on).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(app.ipcRenderer.invoke).mock.invocationCallOrder[subscribeIndex]!)
+    const wrapped = [...app.listeners.get(ipcChannels.conversionEvent)!][0]!
+    const event = {
+      type: 'job_updated',
+      job: {
+        jobId: 'job_1', executionId: 'execution_1', targetFormat: 'png',
+        status: 'completed', epoch: 0, progress: 100,
+        artifacts: [{
+          artifactId: 'artifact_1', status: 'ready', displayName: 'result.png',
+          detectedFormat: 'png', mimeType: 'image/png', byteSize: 8,
+        }],
+      },
+    }
+    wrapped({}, event)
+    wrapped({}, { ...event, managedPath: '/private/conversion/result.png' })
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(event)
+
+    unsubscribe()
+    unsubscribe()
+    expect(app.ipcRenderer.removeListener).toHaveBeenCalledWith(ipcChannels.conversionEvent, wrapped)
+    await vi.waitFor(() => expect(app.ipcRenderer.invoke)
+      .toHaveBeenCalledWith('conversion:unsubscribe', undefined))
+  })
+
+  it('installs the local conversion listener before Main can replay a terminal transition', () => {
+    const app = harness()
+    const terminal = {
+      type: 'job_updated',
+      job: {
+        jobId: 'job_terminal', executionId: 'execution_terminal', targetFormat: 'png',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    }
+    vi.mocked(app.ipcRenderer.invoke).mockImplementation(async (channel) => {
+      if (channel === 'conversion:subscribe') {
+        for (const listener of app.listeners.get(ipcChannels.conversionEvent) ?? []) {
+          listener({}, terminal)
+        }
+      }
+      return undefined
+    })
+    const listener = vi.fn()
+
+    const unsubscribe = app.api.conversion.onEvent(listener)
+
+    expect(listener).toHaveBeenCalledWith(terminal)
+    unsubscribe()
+  })
+
+  it('shares one serialized Main conversion subscription across local listeners', async () => {
+    const app = harness()
+    const first = vi.fn()
+    const second = vi.fn()
+
+    const unsubscribeFirst = app.api.conversion.onEvent(first)
+    const unsubscribeSecond = app.api.conversion.onEvent(second)
+
+    await vi.waitFor(() => expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionSubscribe,
+    )).toHaveLength(1))
+    expect(app.listeners.get(ipcChannels.conversionEvent)).toHaveLength(1)
+
+    unsubscribeFirst()
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionUnsubscribe,
+    )).toHaveLength(0)
+
+    const wrapped = [...app.listeners.get(ipcChannels.conversionEvent)!][0]!
+    wrapped({}, {
+      type: 'job_updated',
+      job: {
+        jobId: 'job_shared', executionId: 'execution_shared', targetFormat: 'png',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    })
+    expect(first).not.toHaveBeenCalled()
+    expect(second).toHaveBeenCalledOnce()
+
+    unsubscribeSecond()
+    await vi.waitFor(() => expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionUnsubscribe,
+    )).toHaveLength(1))
+    expect(app.listeners.get(ipcChannels.conversionEvent)).toHaveLength(0)
+  })
+
+  it('serializes immediate cleanup behind an in-flight conversion subscribe', async () => {
+    const app = harness()
+    const subscribe = deferred<void>()
+    let mainSubscribed = false
+    vi.mocked(app.ipcRenderer.invoke).mockImplementation(async (channel) => {
+      if (channel === ipcChannels.conversionSubscribe) {
+        await subscribe.promise
+        mainSubscribed = true
+      } else if (channel === ipcChannels.conversionUnsubscribe) {
+        mainSubscribed = false
+      }
+      return undefined
+    })
+
+    const unsubscribe = app.api.conversion.onEvent(vi.fn())
+    await vi.waitFor(() => expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionSubscribe,
+    )).toHaveLength(1))
+    unsubscribe()
+    subscribe.resolve()
+
+    await vi.waitFor(() => expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.filter(
+      ([channel]) => channel === ipcChannels.conversionUnsubscribe,
+    )).toHaveLength(1))
+    expect(mainSubscribed).toBe(false)
+    expect(app.listeners.get(ipcChannels.conversionEvent)).toHaveLength(0)
+  })
+
+  it('cleans a failed subscribe and boundedly retries for the existing listener', async () => {
+    const app = harness()
+    let subscribeAttempts = 0
+    vi.mocked(app.ipcRenderer.invoke).mockImplementation(async (channel) => {
+      if (channel === ipcChannels.conversionSubscribe) {
+        subscribeAttempts += 1
+        if (subscribeAttempts === 1) throw new Error('failed before Main attached')
+      }
+      return undefined
+    })
+    const listener = vi.fn()
+
+    const unsubscribe = app.api.conversion.onEvent(listener)
+
+    await vi.waitFor(() => expect(subscribeAttempts).toBe(2))
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.map(([channel]) => channel).slice(0, 3))
+      .toEqual([
+        ipcChannels.conversionSubscribe,
+        ipcChannels.conversionUnsubscribe,
+        ipcChannels.conversionSubscribe,
+      ])
+    const wrapped = [...app.listeners.get(ipcChannels.conversionEvent)!][0]!
+    wrapped({}, {
+      type: 'job_updated',
+      job: {
+        jobId: 'job_retry_success', executionId: 'execution_retry_success', targetFormat: 'png',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    })
+    expect(listener).toHaveBeenCalledOnce()
+    unsubscribe()
+  })
+
+  it('cleans an ambiguous attached-then-rejected subscribe before retrying', async () => {
+    const app = harness()
+    const operations: string[] = []
+    let mainSubscribed = false
+    let subscribeAttempts = 0
+    vi.mocked(app.ipcRenderer.invoke).mockImplementation(async (channel) => {
+      if (channel === ipcChannels.conversionSubscribe) {
+        operations.push('subscribe')
+        subscribeAttempts += 1
+        mainSubscribed = true
+        if (subscribeAttempts === 1) throw new Error('response rejected after Main attached')
+      } else if (channel === ipcChannels.conversionUnsubscribe) {
+        operations.push('unsubscribe')
+        mainSubscribed = false
+      }
+      return undefined
+    })
+
+    const unsubscribe = app.api.conversion.onEvent(vi.fn())
+
+    await vi.waitFor(() => expect(subscribeAttempts).toBe(2))
+    expect(operations).toEqual(['subscribe', 'unsubscribe', 'subscribe'])
+    expect(mainSubscribed).toBe(true)
+    unsubscribe()
+    await vi.waitFor(() => expect(mainSubscribed).toBe(false))
+  })
+
+  it('cleans an ambiguous failed subscribe without retry after all listeners are removed', async () => {
+    const app = harness()
+    const rejectSubscribe = deferred<void>()
+    const operations: string[] = []
+    let mainSubscribed = false
+    vi.mocked(app.ipcRenderer.invoke).mockImplementation(async (channel) => {
+      if (channel === ipcChannels.conversionSubscribe) {
+        operations.push('subscribe')
+        mainSubscribed = true
+        await rejectSubscribe.promise
+        throw new Error('response rejected after Main attached')
+      } else if (channel === ipcChannels.conversionUnsubscribe) {
+        operations.push('unsubscribe')
+        mainSubscribed = false
+      }
+      return undefined
+    })
+
+    const unsubscribe = app.api.conversion.onEvent(vi.fn())
+    await vi.waitFor(() => expect(mainSubscribed).toBe(true))
+    unsubscribe()
+    rejectSubscribe.resolve()
+
+    await vi.waitFor(() => expect(operations).toEqual(['subscribe', 'unsubscribe']))
+    expect(mainSubscribed).toBe(false)
+    expect(app.listeners.get(ipcChannels.conversionEvent)).toHaveLength(0)
+  })
+
+  it('lets a second listener reconcile after bounded persistent subscribe failure', async () => {
+    const app = harness()
+    let allowSubscribe = false
+    let subscribeAttempts = 0
+    let unsubscribeAttempts = 0
+    vi.mocked(app.ipcRenderer.invoke).mockImplementation(async (channel) => {
+      if (channel === ipcChannels.conversionSubscribe) {
+        subscribeAttempts += 1
+        if (!allowSubscribe) throw new Error('persistent subscribe failure')
+      } else if (channel === ipcChannels.conversionUnsubscribe) {
+        unsubscribeAttempts += 1
+      }
+      return undefined
+    })
+    const first = vi.fn()
+    const second = vi.fn()
+    const unsubscribeFirst = app.api.conversion.onEvent(first)
+
+    await vi.waitFor(() => {
+      expect(subscribeAttempts).toBe(2)
+      expect(unsubscribeAttempts).toBe(2)
+    })
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    expect(subscribeAttempts).toBe(2)
+
+    allowSubscribe = true
+    const unsubscribeSecond = app.api.conversion.onEvent(second)
+
+    await vi.waitFor(() => expect(subscribeAttempts).toBe(3))
+    const wrapped = [...app.listeners.get(ipcChannels.conversionEvent)!][0]!
+    wrapped({}, {
+      type: 'job_updated',
+      job: {
+        jobId: 'job_second_reconcile', executionId: 'execution_second_reconcile', targetFormat: 'pdf',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    })
+    expect(first).toHaveBeenCalledOnce()
+    expect(second).toHaveBeenCalledOnce()
+
+    unsubscribeFirst()
+    expect(unsubscribeAttempts).toBe(2)
+    unsubscribeSecond()
+    await vi.waitFor(() => expect(unsubscribeAttempts).toBe(3))
   })
 
   it('normalizes IPC errors without exposing resolved paths', async () => {

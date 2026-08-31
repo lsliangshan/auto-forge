@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import type { AppErrorCode, ModelProviderId, WorkflowDetail } from '@autoforge/shared'
 import {
@@ -12,10 +13,17 @@ import { scopeHash } from '../permissions/policy-engine.js'
 import type { ConversationHistoryPort } from '../chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from '../chat/model-provider.js'
 import {
+  createProviderAttachmentDisclosureAuthority,
+  createProviderAttachmentProjection,
+  protectProviderSnapshot,
+} from '../chat/provider-attachment-disclosure.js'
+import {
   ProviderUsageConsistencyError,
+  type Execution,
   type ProviderUsageRepository,
 } from '../database/repositories.js'
 import { createWorkflowSourceSelectorVault } from '../workflows/workflow-source-selector.js'
+import type { ExecutionAttachmentBinding } from '../workflows/execution-service.js'
 import { APPROVAL_EXPIRY_MS, MAX_AGENT_ACTIVE_MS } from './workflow-tool-loop.js'
 import { BrowserContinuationCatalog } from './browser-continuation-catalog.js'
 import type {
@@ -227,6 +235,25 @@ const developmentApprovalWorkflow: WorkflowDetail = {
     buildHash: 'e'.repeat(64),
   },
 }
+const conversionWorkflow: WorkflowDetail = {
+  ...workflow,
+  id: 'file.convert.universal',
+  name: '万象转换',
+  category: 'file',
+  permissions: [{ capability: 'file.convert', scope: { formats: ['pdf', 'png'] } }],
+  activationExamples: ['将附件转换成 PDF'],
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['files', 'targetFormat'],
+    properties: {
+      files: {
+        type: 'array', items: { type: 'integer', minimum: 0 },
+        minItems: 1, maxItems: 5, uniqueItems: true,
+      },
+      targetFormat: { type: 'string', enum: ['pdf', 'png'] },
+    },
+  },
+  runtimeIdentity: { id: 'file.convert.universal', version: '1.0.0', source: 'installed' },
+}
 const externalApprovalIdentity = {
   permissionIndex: 0,
   scopeHash: scopeHash(approvalWorkflow.permissions[0]!.scope),
@@ -251,9 +278,89 @@ function textRunInput(
     modelContent: input.content,
     assetIds: [],
     currentMedia: [],
+    attachmentBindings: [],
     allowTools: true,
     supportsImageInput: false,
   }
+}
+
+function protectedAttachmentRunInput(
+  input: AgentRunInput,
+  decision: 'local' | 'ordinary' = 'local',
+): AgentRunInput {
+  const requestId = input.requestId ?? 'request_attachment'
+  const provider = input.providerSnapshot!.provider
+  const providerSnapshot = {
+    ...input.providerSnapshot,
+    providerId: input.provider,
+    provider: {
+      ...provider,
+      listModels: provider.listModels ?? (async () => []),
+      validateCredential: provider.validateCredential ?? (async () => ({ valid: true })),
+    },
+  }
+  const structuredParts = Array.isArray(input.modelContent)
+    ? input.modelContent.filter((part) => part.type === 'media' || part.type === 'file')
+    : []
+  const assetFingerprints = input.assetIds.map((_, index) => {
+    const part = structuredParts[index]
+    return part === undefined
+      ? 'b'.repeat(64)
+      : createHash('sha256').update(Buffer.from(part.dataBase64, 'base64')).digest('hex')
+  })
+  const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+  const plan = authority.createPlan({
+    requestId,
+    text: decision === 'ordinary' ? input.content : 'convert this attachment to PDF',
+    context: { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['image'] },
+    attachments: input.assetIds.map((id, index) => ({
+      index, id, name: `private-${index}.png`, mimeType: 'image/png', byteSize: 12,
+      fingerprint: assetFingerprints[index]!,
+    })),
+  })
+  const attachmentDisclosure = authority.bindProvider(plan, providerSnapshot)
+  if (decision === 'ordinary') {
+    createProviderAttachmentProjection(attachmentDisclosure, input.provider, structuredParts.map((part, index) => ({
+      assetId: input.assetIds[index]!,
+      kind: part.type === 'file' ? 'file' : part.kind,
+      mimeType: part.mimeType,
+      name: `private-${index}.png`,
+      dataBase64: part.dataBase64,
+    })))
+  }
+  return {
+    ...input,
+    requestId,
+    ...(decision === 'local' ? {
+      modelContent: attachmentDisclosure.mainSafeText.text,
+      localConversionOnly: true,
+      localConversionTarget: plan.targetFormat,
+      localConversionAttachmentIndexes: plan.selectedAttachmentIndexes,
+    } : {}),
+    attachmentFingerprints: assetFingerprints,
+    providerSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+      purpose: 'main',
+    }),
+    ...(decision === 'ordinary' ? {
+      summaryProviderSnapshot: protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+        purpose: 'summary',
+      }),
+    } : {}),
+    attachmentDisclosure,
+  }
+}
+
+function currentConversionAttachments(): ExecutionAttachmentBinding[] {
+  return [{
+    attachmentIndex: 0,
+    ownerUserId: 'user_1',
+    conversationId: 'conversion_conversation',
+    displayName: '../../private/report.pdf',
+    mimeType: 'application/pdf',
+    byteSize: 12,
+    source: { kind: 'media', mediaAssetId: 'media_private_0' },
+    sourceFingerprint: 'b'.repeat(64),
+  }]
 }
 
 function continuationBinding(
@@ -1402,7 +1509,7 @@ describe('AgentOrchestrator', () => {
     ]
     const orchestrator = new AgentOrchestrator(dependencies)
 
-    const result = await orchestrator.run({
+    const result = await orchestrator.run(protectedAttachmentRunInput({
       userId: 'user_1',
       providerSnapshot: {
         providerId: 'openrouter', provider: dependencies.providerInstances.openrouter as ModelProvider,
@@ -1418,7 +1525,7 @@ describe('AgentOrchestrator', () => {
       supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
-    })
+    }, 'ordinary'))
 
     expect(result.status).toBe('completed')
     expect(dependencies.records.users).toEqual([
@@ -1510,14 +1617,21 @@ describe('AgentOrchestrator', () => {
 
     const finalizeWithMessage = vi.fn()
     const terminalPersistence = createAgentPersistence({
-      messages: { insert, insertWithAssets, replaceBlock },
+      messages: {
+        insert, insertWithAssets, replaceBlock,
+        get: vi.fn(() => ({ blocks: [{
+          type: 'conversion', blockId: 'conversion_1', executionId: 'execution_1', state: 'terminal',
+        }] })),
+      },
       chatRuns: { finalizeWithMessage },
     } as never)
     terminalPersistence.finalize({
       runId: 'run_1',
       requestId: 'request_1',
       messageId: 'assistant_1',
-      blocks: [pending],
+      blocks: [pending, {
+        type: 'conversion', blockId: 'conversion_1', executionId: 'execution_1', state: 'active',
+      }],
       status: 'failed',
       endedAt: 12,
       errorCode: 'MEDIA_GENERATION_FAILED',
@@ -1526,8 +1640,51 @@ describe('AgentOrchestrator', () => {
       'run_1',
       'assistant_1',
       'request_1',
-      expect.objectContaining({ status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' }),
+      expect.objectContaining({
+        status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED',
+        blocks: expect.arrayContaining([expect.objectContaining({
+          type: 'conversion', blockId: 'conversion_1', state: 'terminal',
+        })]),
+      }),
     )
+  })
+
+  it('marks assistant finalization only after the message append transaction commits', () => {
+    const committed: string[] = []
+    const finalized = vi.fn(() => { committed.push('binding-finalized') })
+    const persistence = createAgentPersistence({
+      messages: { get: vi.fn(() => ({ blocks: [] })) },
+      chatRuns: {
+        finalizeWithMessage: vi.fn(() => { committed.push('message-append-committed') }),
+      },
+    } as never, undefined, finalized)
+
+    persistence.finalize({
+      runId: 'run_finalize_boundary',
+      requestId: 'request_finalize_boundary',
+      messageId: 'message_finalize_boundary',
+      blocks: [],
+      status: 'completed',
+      endedAt: 12,
+    })
+
+    expect(committed).toEqual(['message-append-committed', 'binding-finalized'])
+    expect(finalized).toHaveBeenCalledWith('message_finalize_boundary', [])
+
+    const rejected = vi.fn()
+    const failedPersistence = createAgentPersistence({
+      messages: { get: vi.fn(() => ({ blocks: [] })) },
+      chatRuns: { finalizeWithMessage: vi.fn(() => { throw new Error('append failed') }) },
+    } as never, undefined, rejected)
+    expect(() => failedPersistence.finalize({
+      runId: 'run_finalize_failure',
+      requestId: 'request_finalize_failure',
+      messageId: 'message_finalize_failure',
+      blocks: [],
+      status: 'failed',
+      endedAt: 13,
+    })).toThrow('append failed')
+    expect(rejected).not.toHaveBeenCalled()
   })
 
   it('skips workflow listing when tools are disabled', async () => {
@@ -2743,6 +2900,194 @@ describe('AgentOrchestrator', () => {
     ))
     expect(approvalBlocks).toHaveLength(1)
   })
+
+  it('keeps exact conversion bindings in Main and forwards them only after one approval', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_convert', name: 'workflow_1',
+        arguments: { input: { files: [0], targetFormat: 'pdf' } },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已提交本地转换' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [conversionWorkflow]
+    let finishExecution!: (execution: Execution) => void
+    dependencies.executions.startReserved = async (reservation, input) => {
+      dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
+      return {
+        id: reservation.executionId,
+        finished: new Promise<Execution>((resolve) => { finishExecution = resolve }),
+      }
+    }
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const runInput = protectedAttachmentRunInput({
+      ...textRunInput({
+        conversationId: 'conversion_conversation', content: '将附件转换成 PDF',
+        provider: 'openrouter', model: 'model',
+      }),
+      modelContent: '将附件转换成 PDF\n[附件 0: report.pdf, application/pdf, 12 bytes]',
+      assetIds: ['media_private_0'],
+      attachmentBindings: currentConversionAttachments(),
+    })
+
+    const pending = await orchestrator.run(runInput)
+
+    expect(pending).toMatchObject({ status: 'awaiting_approval', executionId: 'reserved_1' })
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0])
+      .toMatchObject({ tools: [{ function: { parameters: {
+        properties: { input: { properties: { targetFormat: { enum: ['pdf'] } } } },
+      } } }] })
+    const approvalEvent = dependencies.records.events.find((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'approval'
+    )) as { block: { actionSummary: string } } | undefined
+    expect(approvalEvent?.block.actionSummary).toContain('附件 0：report.pdf')
+    expect(approvalEvent?.block.actionSummary).toContain('目标格式：pdf')
+
+    await expect(orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      permissionIndex: 0,
+      scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
+      decision: 'always',
+      workflowId: conversionWorkflow.id,
+      workflowVersion: conversionWorkflow.version,
+      capability: 'file.convert',
+      scope: conversionWorkflow.permissions[0]!.scope,
+    })).resolves.toMatchObject({ status: 'failed', error: { code: 'INVALID_INPUT' } })
+    expect(dependencies.records.starts).toHaveLength(0)
+
+    const resultPromise = orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      permissionIndex: 0,
+      scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
+      decision: 'once',
+    })
+
+    await vi.waitFor(() => expect(dependencies.records.starts).toHaveLength(1))
+    expect(dependencies.records.events.filter((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'conversion'
+    ))).toHaveLength(0)
+    expect(orchestrator.onConversionJobSubmitted('reserved_1')).toBe(true)
+    expect(orchestrator.onConversionJobSubmitted('reserved_1')).toBe(false)
+    finishExecution({
+      id: 'reserved_1',
+      workflowId: conversionWorkflow.id,
+      workflowVersion: conversionWorkflow.version,
+      status: 'completed',
+      input: { files: [0], targetFormat: 'pdf' },
+      result: { title: 'converted' },
+      createdAt: 1,
+    })
+    const result = await resultPromise
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(dependencies.records.starts).toContainEqual(expect.objectContaining({
+      executionId: 'reserved_1',
+      attachmentBindings: currentConversionAttachments(),
+      fileConvertAuthorization: {
+        executionId: 'reserved_1', capability: 'file.convert', decision: 'once',
+        attachments: [{ index: 0, sourceFingerprint: 'b'.repeat(64) }],
+        formats: ['pdf'],
+      },
+    }))
+    const conversion = dependencies.records.events.find((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'conversion'
+    )) as { block: unknown } | undefined
+    expect(conversion?.block).toEqual({
+      type: 'conversion', blockId: expect.any(String), executionId: 'reserved_1', state: 'active',
+    })
+    expect(JSON.stringify(conversion)).not.toMatch(/bytes|path|sha256|artifactId|jobId|metadata/i)
+    const providerPayload = JSON.stringify(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls)
+    expect(providerPayload).not.toMatch(/media_private_0|b{32}|sourceFingerprint|attachmentBindings/)
+  })
+
+  it('rejects a Provider tool call that changes the Main-bound conversion target before approval', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_wrong_target', name: 'workflow_1',
+        arguments: { input: { files: [0], targetFormat: 'png' } },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '未执行不一致的转换请求' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [conversionWorkflow]
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    const result = await orchestrator.run(protectedAttachmentRunInput({
+      ...textRunInput({
+        conversationId: 'conversion_target_authority', content: '将附件转换成 PDF',
+        provider: 'openrouter', model: 'model',
+      }),
+      modelContent: 'canonical local conversion request',
+      assetIds: ['media_private_0'],
+      attachmentBindings: currentConversionAttachments(),
+      localConversionTarget: 'pdf',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(dependencies.records.events.filter((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'approval'
+    ))).toHaveLength(0)
+    expect(dependencies.records.starts).toHaveLength(0)
+  })
+
+  it.each(['failed', 'cancelled'] as const)(
+    'does not create a conversion block when a %s execution submits zero jobs',
+    async (status) => {
+      const dependencies = harness([[
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: `call_zero_job_${status}`,
+          name: 'workflow_1', arguments: { input: { files: [0], targetFormat: 'pdf' } },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ], [
+        { type: 'text_delta', choiceIndex: 0, text: '转换未提交' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ]])
+      dependencies.workflows.list = async () => [conversionWorkflow]
+      dependencies.executions.startReserved = async (reservation, input) => {
+        dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
+        return {
+          id: reservation.executionId,
+          finished: Promise.resolve({
+            id: reservation.executionId,
+            status,
+            ...(status === 'failed' ? { errorCode: 'INTERNAL_ERROR' as const } : {}),
+          }),
+        }
+      }
+      const orchestrator = new AgentOrchestrator(dependencies)
+      const pending = await orchestrator.run(protectedAttachmentRunInput({
+        ...textRunInput({
+          conversationId: 'conversion_conversation', content: '将附件转换成 PDF',
+          provider: 'openrouter', model: 'model',
+        }),
+        modelContent: '将附件转换成 PDF\n[附件 0: report.pdf, application/pdf, 12 bytes]',
+        assetIds: ['media_private_0'],
+        attachmentBindings: currentConversionAttachments(),
+      }))
+
+      await orchestrator.resumeApproval({
+        executionId: pending.executionId!,
+        permissionIndex: 0,
+        scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
+        decision: 'once',
+      })
+
+      expect(dependencies.records.events.filter((event) => (
+        typeof event === 'object' && event !== null && 'block' in event
+        && (event as { block?: { type?: string } }).block?.type === 'conversion'
+      ))).toHaveLength(0)
+      expect(JSON.stringify(dependencies.records.terminal)).not.toContain('"type":"conversion"')
+    },
+  )
 
   it('expires an approval at thirty minutes and pauses active time for a timely approval', async () => {
     let milliseconds = 0

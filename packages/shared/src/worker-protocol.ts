@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { conversionFormatScopeSchema, fileConvertRequestSchema } from './conversion.js'
 import { appErrorSchema } from './errors.js'
 import { isHttpsUrlPattern } from './https-url-pattern.js'
 
@@ -41,6 +42,7 @@ export const capabilitySchema = z.enum([
   'clipboard.write',
   'notification.send',
   'artifact.create',
+  'file.convert',
 ])
 
 export type Capability = z.infer<typeof capabilitySchema>
@@ -55,6 +57,7 @@ const emptyScopeSchema = z.object({}).strict()
 export const capabilityScopeSchema = z.union([
   browserScopeSchema,
   filesystemScopeSchema,
+  conversionFormatScopeSchema,
   emptyScopeSchema,
 ])
 
@@ -63,6 +66,7 @@ export type CapabilityScope = z.infer<typeof capabilityScopeSchema>
 export const runtimeCapabilityScopeSchema = z.union([
   runtimeBrowserScopeSchema,
   filesystemScopeSchema,
+  conversionFormatScopeSchema,
   emptyScopeSchema,
 ])
 
@@ -72,13 +76,17 @@ export const runtimeCapabilityPermissionSchema = z.object({
 }).strict().superRefine(({ capability, scope }, context) => {
   const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
   const needsPaths = capability.startsWith('filesystem.')
+  const needsFormats = capability === 'file.convert'
   if (needsOrigins && !('origins' in scope)) {
     context.addIssue({ code: 'custom', message: 'This capability requires exact origin scope' })
   }
   if (needsPaths && !('paths' in scope)) {
     context.addIssue({ code: 'custom', message: 'This capability requires path scope' })
   }
-  if (!needsOrigins && !needsPaths && Object.keys(scope).length !== 0) {
+  if (needsFormats && !('formats' in scope)) {
+    context.addIssue({ code: 'custom', message: 'This capability requires conversion format scope' })
+  }
+  if (!needsOrigins && !needsPaths && !needsFormats && Object.keys(scope).length !== 0) {
     context.addIssue({ code: 'custom', message: 'This capability requires an empty scope' })
   }
 })
@@ -109,6 +117,7 @@ export const workerCapabilityRequestSchema = z.discriminatedUnion('capability', 
     scope: runtimeBrowserScopeSchema,
     arguments: z.object({}).strict(),
   }).strict(),
+  fileConvertRequestSchema,
 ])
 
 export type WorkerCapabilityRequest = z.infer<typeof workerCapabilityRequestSchema>

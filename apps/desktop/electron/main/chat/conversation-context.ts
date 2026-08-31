@@ -13,6 +13,8 @@ import {
   type ProviderUsageRepository,
 } from '../database/repositories.js'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
+import { hasConversionRiskSignal } from './attachment-conversion-policy.js'
+import { canonicalLocalConversionProviderPrompt } from './local-conversion-intent.js'
 import type {
   ModelContentPart,
   ModelMessage,
@@ -59,6 +61,8 @@ export interface PrepareConversationContextInput {
   currentMessage: { role: 'user'; content: string | ModelContentPart[] }
   tools: ModelTool[]
   currentMedia: CurrentMediaMetadata[]
+  omitHistoricalAttachments?: boolean
+  omitConversationHistory?: boolean
   signal: AbortSignal
 }
 
@@ -140,15 +144,57 @@ function serializeBlock(block: ChatBlock): string[] {
       return [`[请求失败: ${block.code}; ${block.message}]`]
     case 'media_generation':
       return [`[${block.kind} 生成状态: ${block.status}${block.errorCode ? `; ${block.errorCode}` : ''}]`]
+    case 'conversion':
+      return [`[本地文件转换: ${block.state === 'active' ? '进行中' : '已结束'}]`]
   }
   return unexpectedBlock(block)
 }
 
-export function serializeHistoricalMessage(message: Message): ModelMessage | undefined {
+function hasHistoricalAttachment(message: Message): boolean {
+  return chatBlockSchema.array().parse(message.blocks).some((block) => (
+    block.type === 'media' || block.type === 'media_generation'
+  ))
+}
+
+const ENCODED_HISTORY_TOKEN = /(?:^|[^A-Za-z0-9+/])(?:[A-Za-z0-9+/]{64,}={0,2})(?:$|[^A-Za-z0-9+/])/u
+const LEGACY_CONVERSION_ATTACHMENT_REFERENCE = /(?:[/\\][^\s]+|[\p{L}\p{N}_+-][\p{L}\p{N}._+-]{0,63}\.[A-Za-z0-9]{1,12}|(?:这个|这张|该|当前)?(?:附件|文件|图片|图像|照片|文档)|\b(?:this|the|that|current|attached)\s+(?:attachment|file|image|photo|document)\b)/iu
+
+function historicalText(message: Message): string {
+  return chatBlockSchema.array().parse(message.blocks)
+    .filter((block): block is Extract<ChatBlock, { type: 'text' }> => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n')
+}
+
+function hasUnsafeLegacyProviderContent(message: Message): boolean {
+  if (message.role === 'user' && message.providerProjection !== undefined) return false
+  if (message.role === 'user' && hasHistoricalAttachment(message)) return true
+  const text = historicalText(message)
+  return ENCODED_HISTORY_TOKEN.test(text)
+    || (message.role === 'user'
+      && hasConversionRiskSignal(text)
+      && LEGACY_CONVERSION_ATTACHMENT_REFERENCE.test(text))
+}
+
+export function serializeHistoricalMessage(
+  message: Message,
+  omitAttachments = false,
+): ModelMessage | undefined {
   if (message.role !== 'user' && message.role !== 'assistant') {
     throw new Error('Historical message role is invalid')
   }
+  if (message.role === 'user' && message.providerProjection !== undefined) {
+    return {
+      role: 'user',
+      content: canonicalLocalConversionProviderPrompt(
+        message.providerProjection.selectedAttachmentIndexes,
+        message.providerProjection.targetFormat,
+      ),
+    }
+  }
+  if (hasUnsafeLegacyProviderContent(message)) return undefined
   const content = chatBlockSchema.array().parse(message.blocks)
+    .filter((block) => !omitAttachments || (block.type !== 'media' && block.type !== 'media_generation'))
     .flatMap(serializeBlock)
     .filter((part) => part.length > 0)
     .join('\n')
@@ -158,8 +204,35 @@ export function serializeHistoricalMessage(message: Message): ModelMessage | und
 
 function hasMutableMediaGeneration(message: Message): boolean {
   return chatBlockSchema.array().parse(message.blocks).some((block) => (
-    block.type === 'media_generation' && block.status !== 'failed'
+    (block.type === 'media_generation' && block.status !== 'failed')
+    || (block.type === 'conversion' && block.state === 'active')
   ))
+}
+
+function safeHistoricalMessages(
+  messages: readonly Message[],
+  afterOrdinal: number,
+  omitAttachments: boolean | undefined,
+): HistoricalModelMessage[] {
+  const safe: HistoricalModelMessage[] = []
+  let omitPairedAssistant = false
+  for (const message of messages) {
+    if (message.ordinal <= afterOrdinal) continue
+    if (message.role === 'assistant' && omitPairedAssistant) {
+      omitPairedAssistant = false
+      continue
+    }
+    const unsafe = hasUnsafeLegacyProviderContent(message)
+    if (message.role === 'user') omitPairedAssistant = unsafe
+    if (unsafe) continue
+    const serialized = serializeHistoricalMessage(message, omitAttachments)
+    if (serialized !== undefined) safe.push({
+      ordinal: message.ordinal,
+      message: serialized,
+      mutable: hasMutableMediaGeneration(message),
+    })
+  }
+  return safe
 }
 
 export function estimateTextTokens(text: string): number {
@@ -390,23 +463,51 @@ export function createConversationContextManager(
       if (requestTokens([], input) > chatBudget) {
         throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
       }
+      if (input.omitConversationHistory) return []
 
       let summary = repositories.conversationContexts.get(input.conversationId)
-      const rawHistory = repositories.messages
+      const persistedHistory = repositories.messages
         .listBeforeOrdinal(input.conversationId, input.beforeOrdinal)
-        .filter((message) => message.ordinal > (summary?.throughOrdinal ?? 0))
-        .flatMap((message): HistoricalModelMessage[] => {
-          const serialized = serializeHistoricalMessage(message)
-          return serialized === undefined ? [] : [{
-            ordinal: message.ordinal,
-            message: serialized,
-            mutable: hasMutableMediaGeneration(message),
-          }]
+      const summaryHasUnsafeHistory = summary !== undefined
+        && persistedHistory.some((message) => (
+          message.ordinal <= summary!.throughOrdinal && hasUnsafeLegacyProviderContent(message)
+        ))
+      if (summaryHasUnsafeHistory && summary !== undefined) {
+        const expectedThroughOrdinal = summary.throughOrdinal
+        const safeCoveredHistory = safeHistoricalMessages(
+          persistedHistory.filter((message) => message.ordinal <= expectedThroughOrdinal),
+          0,
+          input.omitHistoricalAttachments,
+        )
+        const summaryText = safeCoveredHistory.length === 0
+          ? '较早的附件相关历史已按隐私策略省略。'
+          : await streamSummary(
+              input,
+              undefined,
+              safeCoveredHistory,
+              summaryOutputTokens,
+              `conversation-summary-rebuild:${input.callIdentity.requestId}:${expectedThroughOrdinal}`,
+              repositories.providerUsage,
+            )
+        summary = repositories.conversationContexts.advance({
+          conversationId: input.conversationId,
+          expectedThroughOrdinal,
+          summaryText,
+          throughOrdinal: expectedThroughOrdinal,
+          estimatedTokens: estimateTextTokens(summaryText),
+          updatedAt: Date.now(),
         })
+      }
+      const rawHistory = safeHistoricalMessages(
+        persistedHistory,
+        summary?.throughOrdinal ?? 0,
+        input.omitHistoricalAttachments,
+      )
 
       while (true) {
+        const providerSummary = summary
         const history = [
-          ...(summary === undefined ? [] : [summaryMessage(summary.summaryText)]),
+          ...(providerSummary === undefined ? [] : [summaryMessage(providerSummary.summaryText)]),
           ...rawHistory.map(({ message }) => message),
         ]
         if (requestTokens(history, input) <= chatBudget) return history
@@ -427,7 +528,7 @@ export function createConversationContextManager(
           ? 0
           : rawHistory.length - mutableBarrier
         const chunk = selectCompressionChunk(
-          summary,
+          providerSummary,
           rawHistory,
           Math.max(protectedRawMessageCount(rawHistory), protectedByBarrier),
           summaryInputBudget,
@@ -438,7 +539,7 @@ export function createConversationContextManager(
         const throughOrdinal = chunk.at(-1)!.ordinal
         const summaryText = await streamSummary(
           input,
-          summary,
+          providerSummary,
           chunk,
           summaryOutputTokens,
           `conversation-summary:${input.callIdentity.requestId}:${expectedThroughOrdinal}:${throughOrdinal}`,

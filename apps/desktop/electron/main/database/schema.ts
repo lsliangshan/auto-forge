@@ -26,6 +26,7 @@ export const messages = sqliteTable('messages', {
   conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
   role: text('role').notNull(),
   blocksJson: text('blocks_json').notNull(),
+  providerProjectionJson: text('provider_projection_json'),
   executionId: text('execution_id'),
   createdAt: integer('created_at').notNull(),
 }, (table) => [index('messages_conversation_created_at_idx').on(table.conversationId, table.createdAt, table.id)])
@@ -163,6 +164,47 @@ export const executions = sqliteTable('executions', {
   index('executions_status_created_at_idx').on(table.status, table.createdAt),
   index('executions_created_at_idx').on(table.createdAt),
   index('executions_owner_created_at_idx').on(table.ownerUserId, table.createdAt, table.id),
+])
+
+export const conversionJobs = sqliteTable('conversion_jobs', {
+  id: text('id').primaryKey(),
+  ownerUserId: text('owner_user_id').notNull(),
+  executionId: text('execution_id').notNull().references(() => executions.id, { onDelete: 'cascade' }),
+  sourceKind: text('source_kind').notNull(),
+  sourceId: text('source_id').notNull(),
+  targetFormat: text('target_format').notNull(),
+  preset: text('preset'),
+  status: text('status').notNull(),
+  epoch: integer('epoch').notNull(),
+  progress: integer('progress').notNull(),
+  errorCode: text('error_code'),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+  startedAt: integer('started_at'),
+  endedAt: integer('ended_at'),
+}, (table) => [
+  index('conversion_jobs_owner_status_created_at_idx').on(table.ownerUserId, table.status, table.createdAt),
+])
+
+export const conversionArtifacts = sqliteTable('conversion_artifacts', {
+  id: text('id').primaryKey(),
+  ownerUserId: text('owner_user_id').notNull(),
+  executionId: text('execution_id').notNull().references(() => executions.id, { onDelete: 'cascade' }),
+  conversionJobId: text('conversion_job_id').references(() => conversionJobs.id, { onDelete: 'set null' }),
+  role: text('role').notNull(),
+  displayName: text('display_name').notNull(),
+  detectedFormat: text('detected_format').notNull(),
+  mimeType: text('mime_type').notNull(),
+  byteSize: integer('byte_size').notNull(),
+  sha256: text('sha256').notNull(),
+  relativePath: text('relative_path').notNull(),
+  metadataJson: text('metadata_json'),
+  status: text('status').notNull(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+  deletedAt: integer('deleted_at'),
+}, (table) => [
+  index('conversion_artifacts_owner_job_idx').on(table.ownerUserId, table.conversionJobId),
 ])
 
 export const executionSteps = sqliteTable('execution_steps', {

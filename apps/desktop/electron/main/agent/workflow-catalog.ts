@@ -76,6 +76,14 @@ function inputSchemaWithBoundary(inputSchema: unknown, toolName: string): unknow
   return { $id: `urn:autoforge:workflow-tool:${toolName}:input`, ...inputSchema }
 }
 
+function stripModelAnnotations(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripModelAnnotations)
+  if (!isRecord(value)) return value
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !key.startsWith('x-autoforge-'))
+    .map(([key, child]) => [key, stripModelAnnotations(child)]))
+}
+
 function toolParameters(workflow: WorkflowDetail, toolName: string): Record<string, unknown> {
   const restricted = workflow.cities.length > 0
   return {
@@ -83,7 +91,7 @@ function toolParameters(workflow: WorkflowDetail, toolName: string): Record<stri
     required: restricted ? ['resolvedCity', 'input'] : ['input'],
     properties: {
       ...(restricted ? { resolvedCity: { type: 'string', enum: workflow.cities } } : {}),
-      input: inputSchemaWithBoundary(workflow.inputSchema, toolName),
+      input: inputSchemaWithBoundary(stripModelAnnotations(workflow.inputSchema), toolName),
     },
   }
 }

@@ -107,9 +107,19 @@ function services(): DesktopIpcServices {
     developer: {
       listProjects: vi.fn(), createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
       createEntry: vi.fn(), renameEntry: vi.fn(), deleteEntry: vi.fn(),
-      build: vi.fn(), validate: vi.fn(), run: vi.fn(),
+      build: vi.fn(), validate: vi.fn(), run: vi.fn(), pickFiles: vi.fn().mockResolvedValue([]),
+      removeAttachment: vi.fn().mockResolvedValue(undefined), clearAttachments: vi.fn().mockResolvedValue(undefined),
     },
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn() },
+    conversion: {
+      listForExecution: vi.fn().mockResolvedValue({ availability: 'local', jobs: [] }),
+      cancel: vi.fn().mockResolvedValue(undefined),
+      retry: vi.fn().mockResolvedValue(undefined),
+      saveCopy: vi.fn().mockResolvedValue({ saved: true }),
+      reveal: vi.fn().mockResolvedValue(undefined),
+      deleteArtifact: vi.fn().mockResolvedValue(undefined),
+      onEvent: vi.fn(() => () => undefined),
+    },
     permissions: { listGrants: vi.fn(), revoke: vi.fn() },
     settings: {
       get: vi.fn().mockResolvedValue(appSettings), update: vi.fn(),
@@ -189,6 +199,7 @@ function services(): DesktopIpcServices {
 function harness(
   senderUrl = 'http://127.0.0.1:5173/chat',
   rendererTarget: import('./register-ipc.js').RendererTarget = { kind: 'development', origin: 'http://127.0.0.1:5173' },
+  configure: (dependencies: DesktopIpcServices) => void = () => undefined,
 ) {
   const handlers = new Map<string, (event: IpcInvokeEvent, input?: unknown) => Promise<unknown>>()
   const removed: string[] = []
@@ -197,9 +208,26 @@ function harness(
     removeHandler(channel) { handlers.delete(channel); removed.push(channel) },
   }
   const mainFrame = { url: senderUrl }
-  const webContents = { id: 1, isDestroyed: () => false, mainFrame }
+  const webContentsListeners = new Map<string, Set<() => void>>()
+  let webContentsDestroyed = false
+  const sent: Array<{ channel: string; payload: unknown }> = []
+  const webContents = {
+    id: 1,
+    isDestroyed: () => webContentsDestroyed,
+    mainFrame,
+    send: (channel: string, payload: unknown) => { sent.push({ channel, payload }) },
+    on: (event: string, listener: () => void) => {
+      const listeners = webContentsListeners.get(event) ?? new Set()
+      listeners.add(listener)
+      webContentsListeners.set(event, listeners)
+    },
+    removeListener: (event: string, listener: () => void) => {
+      webContentsListeners.get(event)?.delete(listener)
+    },
+  }
   const mainWindow = { isDestroyed: () => false, webContents }
   const dependencies = services()
+  configure(dependencies)
   const dispose = registerDesktopIpc({
     ipcMain,
     services: dependencies,
@@ -208,7 +236,11 @@ function harness(
   })
   const event = { sender: webContents, senderFrame: mainFrame }
   return {
-    dependencies, handlers, removed, dispose,
+    dependencies, handlers, removed, dispose, sent,
+    destroyWindow: () => {
+      webContentsDestroyed = true
+      for (const listener of webContentsListeners.get('destroyed') ?? []) listener()
+    },
     setSenderUrl: (url: string) => { mainFrame.url = url },
     invoke: (channel: string, input?: unknown) => handlers.get(channel)!(event, input),
     invokeFrom: (url: string, channel: string, input?: unknown) => {
@@ -272,6 +304,221 @@ describe('registerDesktopIpc', () => {
       SELECT deletion_job_id AS deletionJobId
       FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = ?
     `).get(base.id)).toEqual({ deletionJobId: 'delete_ipc_1' })
+  })
+
+  it('returns the Main-owned developer execution capability snapshot through the strict IPC contract', async () => {
+    const app = harness('http://127.0.0.1:5173/developer', undefined, (dependencies) => {
+      vi.mocked(dependencies.developer.run).mockResolvedValue({
+        executionId: 'execution_1', conversionCapable: true,
+      } as never)
+    })
+
+    await expect(app.invoke(ipcChannels.developerRun, {
+      projectId: 'project_1', input: {},
+    })).resolves.toEqual({ executionId: 'execution_1', conversionCapable: true })
+  })
+
+  it('authenticates strict developer draft commands without accepting a path', async () => {
+    const app = harness()
+
+    expect(app.handlers.has(ipcChannels.developerPickFiles)).toBe(true)
+    expect(app.handlers.has(ipcChannels.developerRemoveAttachment)).toBe(true)
+    expect(app.handlers.has(ipcChannels.developerClearAttachments)).toBe(true)
+    await expect(app.invoke(ipcChannels.developerPickFiles, {
+      projectId: 'project_1', existingAttachmentIds: [],
+    })).resolves.toEqual([])
+    await expect(app.invoke(ipcChannels.developerRemoveAttachment, {
+      projectId: 'project_1', attachmentId: 'draft_1',
+    })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.developerClearAttachments, {
+      projectId: 'project_1',
+    })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.developerPickFiles, {
+      projectId: 'project_1', existingAttachmentIds: [], path: '/private/source.png',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(app.dependencies.developer.pickFiles).toHaveBeenCalledWith({
+      projectId: 'project_1', existingAttachmentIds: [],
+    })
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalledTimes(3)
+  })
+
+  it('accepts only fixed opaque conversion IDs and requires an authenticated trusted sender', async () => {
+    const app = harness()
+
+    await expect(app.invoke(ipcChannels.conversionListForExecution, { executionId: 'execution_1' }))
+      .resolves.toEqual({ availability: 'local', jobs: [] })
+    await expect(app.invoke(ipcChannels.conversionCancel, { jobId: 'job_1' })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.conversionRetry, { jobId: 'job_2' })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.conversionSaveCopy, { artifactId: 'artifact_1' }))
+      .resolves.toEqual({ saved: true })
+    await expect(app.invoke(ipcChannels.conversionReveal, { artifactId: 'artifact_2' })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.conversionDeleteArtifact, { artifactId: 'artifact_3' }))
+      .resolves.toBeUndefined()
+
+    expect(app.dependencies.conversion.listForExecution).toHaveBeenCalledWith({ executionId: 'execution_1' })
+    expect(app.dependencies.conversion.saveCopy).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
+    for (const [channel, input] of [
+      [ipcChannels.conversionListForExecution, { executionId: 'execution_1', path: '/private/source.png' }],
+      [ipcChannels.conversionCancel, { jobId: '../job_1' }],
+      [ipcChannels.conversionSaveCopy, { artifactId: 'artifact_1', destination: '/tmp/result.png' }],
+      [ipcChannels.conversionReveal, { artifactId: '/private/result.png' }],
+      [ipcChannels.conversionDeleteArtifact, { artifactId: 'artifact_3', ownerUserId: 'forged' }],
+    ] as const) {
+      await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+
+    vi.mocked(app.dependencies.auth.requireSession).mockRejectedValueOnce(toSafeAppError({ code: 'AUTH_REQUIRED' }))
+    await expect(app.invoke(ipcChannels.conversionCancel, { jobId: 'job_1' }))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(app.dependencies.conversion.cancel).toHaveBeenCalledTimes(1)
+  })
+
+  it('forwards only strict conversion events and unsubscribes on logout or window destruction', async () => {
+    let listener: ((event: never) => void) | undefined
+    const unsubscribe = vi.fn()
+    const app = harness(
+      'http://127.0.0.1:5173/chat',
+      { kind: 'development', origin: 'http://127.0.0.1:5173' },
+      (dependencies) => {
+        vi.mocked(dependencies.conversion.onEvent).mockImplementation((next) => {
+          listener = next as (event: never) => void
+          return unsubscribe
+        })
+      },
+    )
+    expect(listener).toBeUndefined()
+    await app.invoke('conversion:subscribe')
+    expect(listener).toBeTypeOf('function')
+    const event = {
+      type: 'job_updated', job: {
+        jobId: 'job_1', executionId: 'execution_1', targetFormat: 'png',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    }
+    listener!(event as never)
+    listener!({ ...event, managedPath: '/private/result.png' } as never)
+    expect(app.sent).toEqual([{ channel: ipcChannels.conversionEvent, payload: event }])
+
+    await app.invoke('conversion:unsubscribe')
+    expect(unsubscribe).toHaveBeenCalledOnce()
+
+    await app.invoke('conversion:subscribe')
+    await app.invoke(ipcChannels.authLogout)
+    expect(unsubscribe).toHaveBeenCalledTimes(2)
+
+    const destroyUnsubscribe = vi.fn()
+    const destroyed = harness(
+      'http://127.0.0.1:5173/chat',
+      { kind: 'development', origin: 'http://127.0.0.1:5173' },
+      (dependencies) => {
+        vi.mocked(dependencies.conversion.onEvent).mockReturnValue(destroyUnsubscribe)
+      },
+    )
+    await destroyed.invoke('conversion:subscribe')
+    destroyed.destroyWindow()
+    expect(destroyUnsubscribe).toHaveBeenCalledOnce()
+  })
+
+  it('requires a fresh authenticated subscription after an identity transition', async () => {
+    const listeners: Array<(event: never) => void> = []
+    const unsubscribes = [vi.fn(), vi.fn()]
+    let subscription = 0
+    const app = harness(
+      'http://127.0.0.1:5173/chat',
+      { kind: 'development', origin: 'http://127.0.0.1:5173' },
+      (dependencies) => {
+        vi.mocked(dependencies.conversion.onEvent).mockImplementation((listener) => {
+          listeners.push(listener as (event: never) => void)
+          return unsubscribes[subscription++]!
+        })
+      },
+    )
+
+    await app.invoke('conversion:subscribe')
+    await app.invoke(ipcChannels.authLoginWithPassword, {
+      account: 'Alice_1', password: 'password',
+    })
+    expect(unsubscribes[0]).toHaveBeenCalledOnce()
+    expect(app.dependencies.conversion.onEvent).toHaveBeenCalledTimes(1)
+
+    await app.invoke('conversion:subscribe')
+    expect(app.dependencies.conversion.onEvent).toHaveBeenCalledTimes(2)
+
+    const event = {
+      type: 'job_updated', job: {
+        jobId: 'job_2', executionId: 'execution_2', targetFormat: 'pdf',
+        status: 'interrupted', epoch: 0, progress: 50,
+        errorCode: 'CONVERSION_INTERRUPTED', artifacts: [],
+      },
+    }
+    listeners[1]!(event as never)
+    expect(app.sent).toContainEqual({ channel: ipcChannels.conversionEvent, payload: event })
+  })
+
+  it('restores and replays the prior conversion subscription after failed identity changes', async () => {
+    const replay = {
+      type: 'job_updated', job: {
+        jobId: 'job_restored', executionId: 'execution_restored', targetFormat: 'pdf',
+        status: 'interrupted', epoch: 0, progress: 50,
+        errorCode: 'CONVERSION_INTERRUPTED', artifacts: [],
+      },
+    } satisfies import('@autoforge/shared').ConversionJobEvent
+    const unsubscribes = [vi.fn(), vi.fn(), vi.fn()]
+    let subscription = 0
+    const app = harness(
+      'http://127.0.0.1:5173/chat',
+      { kind: 'development', origin: 'http://127.0.0.1:5173' },
+      (dependencies) => {
+        vi.mocked(dependencies.conversion.onEvent).mockImplementation((listener) => {
+          if (subscription > 0) listener(replay as never)
+          return unsubscribes[subscription++]!
+        })
+        vi.mocked(dependencies.auth.loginWithPassword)
+          .mockRejectedValue(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
+        vi.mocked(dependencies.auth.logout)
+          .mockRejectedValue(toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }))
+      },
+    )
+
+    await app.invoke(ipcChannels.conversionSubscribe)
+    await expect(app.invoke(ipcChannels.authLoginWithPassword, {
+      account: 'Alice_1', password: 'password',
+    })).rejects.toMatchObject({ code: 'AUTH_INVALID_CREDENTIALS' })
+    expect(unsubscribes[0]).toHaveBeenCalledOnce()
+    expect(app.dependencies.conversion.onEvent).toHaveBeenCalledTimes(2)
+    expect(app.sent).toContainEqual({ channel: ipcChannels.conversionEvent, payload: replay })
+
+    await expect(app.invoke(ipcChannels.authLogout))
+      .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+    expect(unsubscribes[1]).toHaveBeenCalledOnce()
+    expect(app.dependencies.conversion.onEvent).toHaveBeenCalledTimes(3)
+  })
+
+  it('closes the list-then-subscribe gap by replaying only after authenticated subscribe', async () => {
+    const terminal = {
+      type: 'job_updated', job: {
+        jobId: 'job_gap', executionId: 'execution_gap', targetFormat: 'pdf',
+        status: 'completed', epoch: 0, progress: 100, artifacts: [],
+      },
+    } satisfies import('@autoforge/shared').ConversionJobEvent
+    const app = harness(
+      'http://127.0.0.1:5173/chat',
+      { kind: 'development', origin: 'http://127.0.0.1:5173' },
+      (dependencies) => {
+        vi.mocked(dependencies.conversion.listForExecution).mockResolvedValue({ availability: 'local', jobs: [{ ...terminal.job }] })
+        vi.mocked(dependencies.conversion.onEvent).mockImplementation((listener) => {
+          listener(terminal as never)
+          return () => undefined
+        })
+      },
+    )
+
+    await expect(app.invoke(ipcChannels.conversionListForExecution, { executionId: 'execution_gap' }))
+      .resolves.toEqual({ availability: 'local', jobs: [terminal.job] })
+    expect(app.sent).toEqual([])
+    await app.invoke('conversion:subscribe')
+    expect(app.sent).toEqual([{ channel: ipcChannels.conversionEvent, payload: terminal }])
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalled()
   })
 
   it('validates owner-free cloud account methods before invoking Main services', async () => {

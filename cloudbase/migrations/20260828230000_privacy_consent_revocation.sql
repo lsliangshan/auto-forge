@@ -43,7 +43,8 @@ ALTER TABLE app_sync_mutations
   ADD CONSTRAINT app_sync_mutations_kind_check CHECK (kind IN (
     'conversation.create', 'conversation.rename', 'conversation.preferences',
     'conversation.delete', 'conversation.restore',
-    'message.append', 'legacy.import', 'privacy.consent', 'privacy.consent.revoke',
+    'message.append', 'message.conversion_block_terminal', 'legacy.import',
+    'privacy.consent', 'privacy.consent.revoke',
     'preferences.update', 'usage.record'
   ));
 
@@ -159,8 +160,8 @@ BEGIN
 
   widened := replace(
     definition,
-    $old$'message.append', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'$old$,
-    $new$'message.append', 'legacy.import', 'privacy.consent', 'privacy.consent.revoke',
+    $old$'message.append', 'message.conversion_block_terminal', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'$old$,
+    $new$'message.append', 'message.conversion_block_terminal', 'legacy.import', 'privacy.consent', 'privacy.consent.revoke',
       'preferences.update', 'usage.record'$new$
   );
   IF widened = definition THEN

@@ -1,18 +1,23 @@
 import {
   approvalDecisionSchema,
+  conversionTargetFormatSchema,
   toSafeAppError,
   type AppErrorCode,
   type ApprovalDecision,
   type Capability,
   type CapabilityScope,
+  type ConversionTargetFormat,
   type WorkflowDetail,
 } from '@autoforge/shared'
 import { estimateTextTokens, resolveChatInputBudget } from '../chat/conversation-context.js'
+import { sanitizeDisplayName } from '../chat/local-conversion-intent.js'
 import type { PermissionRecord, PermissionRequest } from '../permissions/policy-engine.js'
 import { scopeHash } from '../permissions/policy-engine.js'
 import type {
   ExecutionReservation,
+  ExecutionAttachmentBinding,
   ExecutionStartInput,
+  FileConvertAuthorization,
   StartedExecution,
 } from '../workflows/execution-service.js'
 import { validateWorkflowInput } from '../workflows/input-validation.js'
@@ -76,6 +81,7 @@ export interface PrepareWorkflowToolInput {
   candidate: WorkflowCandidate
   arguments: unknown
   developerMode: boolean
+  attachmentBindings?: readonly ExecutionAttachmentBinding[]
   budget: WorkflowToolRunBudget
 }
 
@@ -122,7 +128,14 @@ interface PendingBinding {
   readonly city: string | undefined
   readonly input: unknown
   readonly inputFingerprint: string
+  readonly attachmentBindings: readonly ExecutionAttachmentBinding[]
+  readonly fileConvertRequest?: ExactFileConvertRequest
   readonly preparedAt: number
+}
+
+interface ExactFileConvertRequest {
+  readonly attachments: readonly { index: number; sourceFingerprint: string }[]
+  readonly targetFormat: ConversionTargetFormat
 }
 
 interface ApprovalBinding {
@@ -140,6 +153,7 @@ interface PendingLifecycle {
   released: boolean
   permissionIndex: number
   approval: ApprovalBinding | undefined
+  fileConvertApproved: boolean
   binding: PendingBinding
 }
 
@@ -194,6 +208,10 @@ function candidateSnapshot(candidate: WorkflowCandidate): WorkflowCandidate {
   })
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 function parseArguments(candidate: WorkflowCandidate, value: unknown): ParsedArguments | ToolError {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return toolError('INVALID_INPUT')
   const record = value as Record<string, unknown>
@@ -212,6 +230,100 @@ function parseArguments(candidate: WorkflowCandidate, value: unknown): ParsedArg
     return { city: record.resolvedCity, input: record.input }
   }
   return { city: undefined, input: record.input }
+}
+
+function validSourceFingerprint(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+}
+
+function canonicalFileConversionInput(
+  workflow: WorkflowDetail,
+  value: unknown,
+): { files: number[]; targetFormat: unknown } | ToolError | undefined {
+  if (!workflow.permissions.some(({ capability }) => capability === 'file.convert')) return undefined
+  if (!isRecord(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    return toolError('INVALID_INPUT')
+  }
+  const inputKeys = Reflect.ownKeys(value)
+  if (inputKeys.length !== 2
+    || !inputKeys.every((key) => key === 'files' || key === 'targetFormat')
+    || !Object.prototype.propertyIsEnumerable.call(value, 'files')
+    || !Object.prototype.propertyIsEnumerable.call(value, 'targetFormat')) {
+    return toolError('INVALID_INPUT')
+  }
+  const files = value.files
+  if (!Array.isArray(files) || Object.getPrototypeOf(files) !== Array.prototype) {
+    return toolError('INVALID_INPUT')
+  }
+  const keys = Reflect.ownKeys(files)
+  if (keys.length !== files.length + 1 || keys.at(-1) !== 'length') return toolError('INVALID_INPUT')
+  const indexes = new Set<number>()
+  for (let index = 0; index < files.length; index += 1) {
+    if (keys[index] !== String(index)
+      || !Object.prototype.propertyIsEnumerable.call(files, index)) return toolError('INVALID_INPUT')
+    const item = files[index]
+    if (!Number.isInteger(item) || item < 0 || indexes.has(item)) return toolError('INVALID_INPUT')
+    indexes.add(item)
+  }
+  return { files: [...files] as number[], targetFormat: value.targetFormat }
+}
+
+function bindFileConversion(
+  workflow: WorkflowDetail,
+  input: unknown,
+  bindings: readonly ExecutionAttachmentBinding[] | undefined,
+): { attachmentBindings: readonly ExecutionAttachmentBinding[]; request: ExactFileConvertRequest } | ToolError | undefined {
+  const permissions = workflow.permissions.filter(({ capability }) => capability === 'file.convert')
+  if (permissions.length === 0) return undefined
+  if (permissions.length !== 1 || !isRecord(input)) {
+    return toolError('CAPABILITY_SCOPE_DENIED')
+  }
+  if (!Object.keys(input).every((key) => key === 'files' || key === 'targetFormat')) {
+    return toolError('INVALID_INPUT')
+  }
+  if (!Array.isArray(input.files)) return toolError('INVALID_INPUT')
+  const target = conversionTargetFormatSchema.safeParse(input.targetFormat)
+  const scope = permissions[0]!.scope
+  if (!target.success || !('formats' in scope) || !scope.formats.includes(target.data)) {
+    return toolError('CAPABILITY_SCOPE_DENIED')
+  }
+  const current = bindings ?? []
+  if (current.length === 0 || current.length > 5) return toolError('CAPABILITY_SCOPE_DENIED')
+  const attachmentBindings: ExecutionAttachmentBinding[] = []
+  let previousAttachmentIndex = -1
+  for (let index = 0; index < current.length; index += 1) {
+    const binding = current[index]!
+    if (binding.attachmentIndex <= previousAttachmentIndex
+      || binding.source.kind !== 'media'
+      || !binding.source.mediaAssetId.trim()
+      || !binding.ownerUserId.trim()
+      || !binding.conversationId?.trim()
+      || !binding.displayName.trim()
+      || !binding.mimeType.trim()
+      || !Number.isSafeInteger(binding.byteSize)
+      || binding.byteSize < 0
+      || !validSourceFingerprint(binding.sourceFingerprint)) {
+      return toolError('CAPABILITY_SCOPE_DENIED')
+    }
+    previousAttachmentIndex = binding.attachmentIndex
+    attachmentBindings.push(deepFreeze(structuredClone(binding)))
+  }
+  if (input.files.length !== attachmentBindings.length) return toolError('CAPABILITY_SCOPE_DENIED')
+  const indexes = new Set<number>()
+  const attachments: Array<{ index: number; sourceFingerprint: string }> = []
+  for (const [position, value] of input.files.entries()) {
+    if (!Number.isInteger(value) || value < 0 || indexes.has(value)
+      || value !== attachmentBindings[position]!.attachmentIndex) {
+      return toolError('CAPABILITY_SCOPE_DENIED')
+    }
+    const binding = attachmentBindings[position]!
+    indexes.add(value)
+    attachments.push(Object.freeze({ index: value, sourceFingerprint: binding.sourceFingerprint }))
+  }
+  return {
+    attachmentBindings: Object.freeze(attachmentBindings),
+    request: Object.freeze({ attachments: Object.freeze(attachments), targetFormat: target.data }),
+  }
 }
 
 function safeSummaryValue(value: unknown, seen: WeakSet<object>, depth = 0): unknown {
@@ -255,6 +367,20 @@ export function createWorkflowActionSummary(
     .slice(0, MAX_ACTION_SUMMARY_LENGTH)
 }
 
+function createFileConversionActionSummary(
+  workflow: WorkflowDetail,
+  request: ExactFileConvertRequest,
+  bindings: readonly ExecutionAttachmentBinding[],
+): string {
+  const bindingsByIndex = new Map(bindings.map((binding) => [binding.attachmentIndex, binding]))
+  const attachments = request.attachments.map(({ index }) => {
+    const name = sanitizeDisplayName(bindingsByIndex.get(index)!.displayName, index).slice(0, 60)
+    return `附件 ${index}：${name}`
+  }).join('、')
+  return `${workflow.name} · file.convert · ${attachments} · 目标格式：${request.targetFormat}`
+    .slice(0, MAX_ACTION_SUMMARY_LENGTH)
+}
+
 export class WorkflowToolExecutor {
   private readonly lifecycle = new WeakMap<PendingWorkflowTool, PendingLifecycle>()
   private readonly now: () => number
@@ -280,10 +406,14 @@ export class WorkflowToolExecutor {
     try { parsed = parseArguments(input.candidate, input.arguments) } catch { return toolError('INVALID_INPUT') }
     if ('kind' in parsed) return parsed
 
+    const canonicalFileInput = canonicalFileConversionInput(input.candidate.workflow, parsed.input)
+    if (canonicalFileInput && 'kind' in canonicalFileInput) return canonicalFileInput
+    const rawInput = canonicalFileInput ?? parsed.input
+
     let validatedInput: unknown
     let inputFingerprint: string
     try {
-      validatedInput = structuredClone(parsed.input)
+      validatedInput = structuredClone(rawInput)
       const validation = validateWorkflowInput(input.candidate.workflow.inputSchema, validatedInput)
       if (!validation.valid) return toolError('INVALID_INPUT', validation.message.slice(0, 500))
       inputFingerprint = canonicalJson(validatedInput)
@@ -295,6 +425,18 @@ export class WorkflowToolExecutor {
       const risk = classifyCapability(permission.capability)
       if (risk === 'unsupported' || risk === 'unknown') return toolError('CAPABILITY_SCOPE_DENIED')
     }
+
+    let fileConversion: ReturnType<typeof bindFileConversion>
+    try {
+      fileConversion = bindFileConversion(
+        input.candidate.workflow,
+        validatedInput,
+        input.attachmentBindings,
+      )
+    } catch {
+      return toolError('CAPABILITY_SCOPE_DENIED')
+    }
+    if (fileConversion && 'kind' in fileConversion) return fileConversion
 
     let reservation: ExecutionReservation
     try { reservation = this.dependencies.executions.reserve() } catch { return toolError('INTERNAL_ERROR') }
@@ -323,11 +465,13 @@ export class WorkflowToolExecutor {
       city: parsed.city,
       input: inputSnapshot,
       inputFingerprint,
+      attachmentBindings: fileConversion?.attachmentBindings ?? Object.freeze([]),
+      ...(fileConversion === undefined ? {} : { fileConvertRequest: fileConversion.request }),
       preparedAt: this.now(),
     })
     const state: PendingLifecycle = {
       phase: 'ready', cancelRequested: false, discarded: false, released: false,
-      permissionIndex: 0, approval: undefined, binding,
+      permissionIndex: 0, approval: undefined, fileConvertApproved: false, binding,
     }
     const pending = Object.freeze({
       candidate: binding.candidate,
@@ -370,6 +514,7 @@ export class WorkflowToolExecutor {
       this.cleanupPending(pending)
       return toolError('INTERNAL_ERROR')
     }
+    if (approval.capability === 'file.convert') lifecycle.fileConvertApproved = true
     lifecycle.permissionIndex += 1
     lifecycle.approval = undefined
     lifecycle.phase = 'ready'
@@ -407,6 +552,16 @@ export class WorkflowToolExecutor {
     }
     if (!this.pendingMatchesBinding(pending, lifecycle, false)) return toolError('CONFLICT')
     const binding = lifecycle.binding
+    if (binding.fileConvertRequest && (
+      !lifecycle.fileConvertApproved
+      || binding.attachmentBindings.some((attachment) => (
+        attachment.ownerUserId !== input.userId
+        || attachment.conversationId !== input.conversationId
+      ))
+    )) {
+      this.cleanupPending(pending)
+      return toolError('CAPABILITY_SCOPE_DENIED')
+    }
     if (binding.candidate.workflow.source === 'development') {
       let currentMode: boolean
       try { currentMode = this.dependencies.currentDeveloperMode() } catch {
@@ -512,6 +667,16 @@ export class WorkflowToolExecutor {
             })
           ))),
         }),
+        ...(binding.fileConvertRequest === undefined ? {} : {
+          attachmentBindings: binding.attachmentBindings,
+          fileConvertAuthorization: Object.freeze({
+            executionId: binding.executionId,
+            capability: 'file.convert',
+            decision: 'once',
+            attachments: binding.fileConvertRequest.attachments,
+            formats: Object.freeze([binding.fileConvertRequest.targetFormat]),
+          }) satisfies FileConvertAuthorization,
+        }),
       }, input.signal)
     } catch (error) {
       lifecycle.phase = 'started'
@@ -602,12 +767,18 @@ export class WorkflowToolExecutor {
         capability: permission.capability,
         scope,
         scopeHash: scopeHash(scope),
-        actionSummary: createWorkflowActionSummary(
-          binding.candidate.workflow,
-          permission.capability,
-          binding.city,
-          binding.input,
-        ),
+        actionSummary: permission.capability === 'file.convert' && binding.fileConvertRequest
+          ? createFileConversionActionSummary(
+              binding.candidate.workflow,
+              binding.fileConvertRequest,
+              binding.attachmentBindings,
+            )
+          : createWorkflowActionSummary(
+              binding.candidate.workflow,
+              permission.capability,
+              binding.city,
+              binding.input,
+            ),
       })
       lifecycle.phase = 'awaiting_approval'
       return { kind: 'awaiting_approval', pending }

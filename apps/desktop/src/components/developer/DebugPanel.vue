@@ -15,7 +15,12 @@
       <template v-else-if="objectFields.length">
         <label v-for="field in objectFields" :key="field.name" class="debug-field">
           <span>{{ field.title }}<em v-if="field.required">必填</em></span>
-          <select v-if="field.enumValues" :data-testid="`debug-field-${field.name}`" :required="field.required" :value="enumIndex(field)" @change="setPrimitive(field, ($event.target as HTMLSelectElement).value)">
+          <span v-if="field.control === 'file-picker'" :data-testid="`debug-file-picker-${field.name}`" class="file-picker">
+            <button type="button" :data-testid="`debug-pick-files-${field.name}`" :disabled="developer.developerAttachments.length >= 5" @click="developer.pickDeveloperAttachments">选择文件</button>
+            <small>{{ developer.developerAttachments.length }} / 5</small>
+            <ul><li v-for="draft in developer.developerAttachments" :key="draft.id" :data-testid="`debug-file-${field.name}-${draft.id}`"><span>{{ draft.name }} · {{ formatBytes(draft.byteSize) }}</span><button type="button" :data-testid="`debug-remove-file-${draft.id}`" @click="developer.removeDeveloperAttachment(draft.id)">移除</button></li></ul>
+          </span>
+          <select v-else-if="field.enumValues" :data-testid="`debug-field-${field.name}`" :required="field.required" :value="enumIndex(field)" @change="setPrimitive(field, ($event.target as HTMLSelectElement).value)">
             <option value="">请选择</option><option v-for="(value, index) in field.enumValues" :key="index" :value="String(index)">{{ enumLabel(value) }}</option>
           </select>
           <input v-else-if="field.kind === 'boolean'" :data-testid="`debug-field-${field.name}`" type="checkbox" :required="field.required" :checked="fieldValue(field.name) === true" @change="setField(field.name, ($event.target as HTMLInputElement).checked)">
@@ -49,6 +54,10 @@
       <ol v-if="developer.debugDetail?.steps.length" class="debug-steps"><li v-for="step in developer.debugDetail.steps" :key="step.id">{{ step.label }} · {{ step.status }}</li></ol>
       <div v-if="developer.debugDetail?.logs.length && !hasLiveLogs" class="debug-log"><p v-for="log in developer.debugDetail.logs" :key="log.id">[{{ log.level }}] {{ log.message }}</p></div>
       <pre v-if="developer.debugDetail?.output !== undefined">{{ JSON.stringify(developer.debugDetail.output, null, 2) }}</pre>
+      <ConversionBlock
+        v-if="developer.debugExecutionId && developer.debugExecutionConversionCapable"
+        :block="developerConversionBlock"
+      />
     </section>
   </div>
 </template>
@@ -56,10 +65,11 @@
 <script setup lang="ts">
 import type { CapabilityScope, ExecutionEvent } from '@autoforge/shared'
 import { computed, reactive, ref, watch } from 'vue'
+import ConversionBlock from '../conversion/ConversionBlock.vue'
 import { useDeveloperStore } from '../../stores/developer'
 
-type JsonSchema = { type?: string; title?: string; enum?: unknown[]; properties?: Record<string, JsonSchema>; required?: string[] }
-interface Field { name: string; title: string; kind: string; required: boolean; enumValues?: unknown[] }
+type JsonSchema = { type?: string; title?: string; enum?: unknown[]; properties?: Record<string, JsonSchema>; required?: string[]; 'x-autoforge-control'?: unknown }
+interface Field { name: string; title: string; kind: string; required: boolean; enumValues?: unknown[]; control?: 'file-picker' }
 const developer = useDeveloperStore()
 const complexDrafts = reactive<Record<string, string>>({})
 const draftErrors = reactive<Record<string, string>>({})
@@ -73,11 +83,19 @@ const objectFields = computed<Field[]>(() => {
   return Object.entries(schema.properties).map(([name, field]) => ({
     name, title: field.title || name, kind: field.type ?? 'complex', required: schema.required?.includes(name) ?? false,
     ...(Array.isArray(field.enum) ? { enumValues: field.enum } : {}),
+    ...(field.type === 'array' && field['x-autoforge-control'] === 'file-picker' ? { control: 'file-picker' as const } : {}),
   }))
 })
 const active = computed(() => ['starting', 'queued', 'awaiting_approval', 'running'].includes(developer.debugStatus))
 const statusLabel = computed(() => ({ idle: '未运行', starting: '启动中', queued: '排队中', awaiting_approval: '等待授权', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' })[developer.debugStatus])
 const hasLiveLogs = computed(() => developer.debugEvents.some((event) => event.type === 'log'))
+const developerConversionBlock = computed(() => ({
+  id: `developer:${developer.debugExecutionId}:conversion`,
+  type: 'conversion' as const,
+  blockId: `developer_${developer.debugExecutionId}_conversion`,
+  executionId: developer.debugExecutionId,
+  state: active.value ? 'active' as const : 'terminal' as const,
+}))
 
 function setPrimitive(field: Field, value: string) {
   if (!value) { delete inputObject()[field.name]; return }
@@ -139,14 +157,20 @@ function enumLabel(value: unknown) {
   if (typeof value === 'string') return `${JSON.stringify(value)} (string)`
   return `${String(value)} (${typeof value})`
 }
+function formatBytes(value: number) {
+  if (value < 1024) return `${value} B`
+  return `${(value / 1024).toFixed(1)} KiB`
+}
 function initializeDrafts() {
   Object.keys(complexDrafts).forEach((key) => delete complexDrafts[key])
   Object.keys(draftErrors).forEach((key) => delete draftErrors[key])
   developer.debugInput = {}
+  developer.configureDeveloperAttachmentField(objectFields.value.find(({ control }) => control === 'file-picker')?.name ?? '')
   rootDraft.value = '{}'
   if (objectFields.value.length) {
     for (const field of objectFields.value) {
       if (field.kind === 'boolean' && field.required) setField(field.name, false)
+      if (field.control === 'file-picker') { developer._syncDeveloperAttachmentInput(); continue }
       if (!['string', 'number', 'integer', 'boolean'].includes(field.kind) && field.required) {
         const value = field.kind === 'array' ? [] : {}
         complexDrafts[field.name] = JSON.stringify(value, null, 2)
@@ -173,6 +197,7 @@ watch(inputSchemaKey, initializeDrafts, { immediate: true })
 .diagnostics, .permissions { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 0.6875rem; }.diagnostics li { color: var(--af-danger); overflow-wrap: anywhere; }.permissions li { display: grid; gap: 2px; }.permissions small { color: var(--af-text-muted); overflow-wrap: anywhere; }
 .debug-field { display: grid; gap: 4px; font-size: 0.6875rem; }.debug-field > span:first-child { display: flex; justify-content: space-between; font-weight: 600; }.debug-field em { color: var(--af-danger); font-size: 0.5625rem; font-style: normal; }.debug-field input:not([type='checkbox']), .debug-field select, .debug-field textarea { width: 100%; border: 1px solid var(--af-border); border-radius: 4px; padding: 6px; color: var(--af-text); background: var(--af-surface); font: inherit; }.debug-field textarea { min-height: 64px; resize: vertical; font-family: ui-monospace, monospace; }.json-field { display: grid !important; gap: 4px; }.json-field small { color: var(--af-text-muted); font-weight: 400; }
 .draft-error { color: var(--af-danger) !important; }
+.file-picker { display: grid !important; gap: 6px; }.file-picker > button { justify-self: start; }.file-picker ul { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }.file-picker li { display: flex; align-items: center; justify-content: space-between; gap: 8px; }.file-picker li span { min-width: 0; overflow-wrap: anywhere; }
 .run-heading { display: flex; justify-content: space-between; }.run-heading small { color: var(--af-text-muted); }.approval { display: grid; gap: 7px; border: 1px solid var(--af-warning); border-radius: 5px; padding: 8px; font-size: 0.6875rem; }.approval div { display: flex; flex-wrap: wrap; gap: 4px; }.approval .el-button { margin: 0; }
 .debug-log { max-height: 180px; overflow: auto; color: #dbe4ef; background: #242a32; }.debug-log p { margin: 0; border-bottom: 1px solid #353d48; padding: 6px; font-family: ui-monospace, monospace; font-size: 0.625rem; overflow-wrap: anywhere; }.debug-panel pre { max-height: 180px; margin: 0; overflow: auto; padding: 8px; background: var(--af-surface-muted); font-size: 0.625rem; white-space: pre-wrap; }
 .debug-steps { display: grid; gap: 4px; margin: 0; padding-left: 18px; font-size: 0.6875rem; }

@@ -10,10 +10,13 @@ import {
   authOtpVerificationSchema,
   browserActionAuditEntrySchema,
   chatFileSupport,
+  chatMessageSchema,
   authSessionSchema,
   authUserSchema,
   authorizationSnapshotSchema,
   chatBlockSchema,
+  conversionBlockSchema,
+  conversionExecutionViewSchema,
   chatEventSchema,
   chatSendInputSchema,
   byokUsageEventSchema,
@@ -79,6 +82,52 @@ import {
 } from './index'
 
 describe('cross-process contracts', () => {
+  it('accepts only payload-free conversion chat blocks', () => {
+    const block = {
+      type: 'conversion' as const, blockId: 'conversion_block_1', executionId: 'execution_1', state: 'terminal' as const,
+    }
+    expect(conversionBlockSchema.parse(block)).toEqual(block)
+    expect(chatBlockSchema.parse(block)).toEqual(block)
+    for (const forbidden of ['bytes', 'path', 'sha256', 'artifactId', 'jobId', 'metadata', 'managedPath']) {
+      expect(chatBlockSchema.safeParse({ ...block, [forbidden]: 'private-value' }).success).toBe(false)
+    }
+  })
+
+  it('keeps conversion block updates and local availability strict', () => {
+    const block = { type: 'conversion' as const, blockId: 'conversion_1', executionId: 'execution_1', state: 'active' as const }
+    expect(chatEventSchema.parse({ type: 'block_update', conversationId: 'conversation_1', messageId: 'message_1', blockId: 'conversion_1', block })).toMatchObject({ block })
+    expect(conversionExecutionViewSchema.parse({ availability: 'unavailable', jobs: [] })).toEqual({ availability: 'unavailable', jobs: [] })
+    expect(conversionExecutionViewSchema.safeParse({ availability: 'unavailable', jobs: [{}] }).success).toBe(false)
+    expect(chatEventSchema.safeParse({ type: 'block_update', conversationId: 'conversation_1', messageId: 'message_1', blockId: 'conversion_1', block: { ...block, jobId: 'private' } }).success).toBe(false)
+  })
+
+  it('exposes stable, safe conversion errors', () => {
+    const conversionErrorCodes = [
+      'CONVERSION_FORMAT_UNSUPPORTED',
+      'CONVERSION_COMPONENT_UNAVAILABLE',
+      'CONVERSION_INPUT_INVALID',
+      'CONVERSION_OUTPUT_TOO_LARGE',
+      'CONVERSION_TIMEOUT',
+      'CONVERSION_CANCELLED',
+      'CONVERSION_INTERRUPTED',
+    ] as const
+
+    for (const code of conversionErrorCodes) {
+      expect(appErrorCodeSchema.parse(code)).toBe(code)
+      expect(toSafeAppError({ code, message: 'sensitive conversion detail' })).toMatchObject({ code })
+      expect(toSafeAppError({ code, message: 'sensitive conversion detail' }).message)
+        .not.toBe('sensitive conversion detail')
+    }
+  })
+
+  it('keeps conversion event subscription as a payload-free typed handshake', () => {
+    for (const channel of [ipcChannels.conversionSubscribe, ipcChannels.conversionUnsubscribe]) {
+      expect(ipcRequestSchemas[channel].parse(undefined)).toBeUndefined()
+      expect(ipcRequestSchemas[channel].safeParse({ ownerUserId: 'forged' }).success).toBe(false)
+      expect(ipcResponseSchemas[channel].parse(undefined)).toBeUndefined()
+    }
+  })
+
   it('requires an explicit typed discard confirmation for logout', () => {
     expect(logoutRequestSchema.parse(undefined)).toBeUndefined()
     expect(logoutRequestSchema.parse({ discardPending: true })).toEqual({ discardPending: true })
@@ -205,6 +254,44 @@ describe('cross-process contracts', () => {
     expect(syncMutationSchema.parse(messageAppend)).toEqual(messageAppend)
     expect(syncMutationSchema.safeParse({
       ...messageAppend, payload: { ...messageAppend.payload, userId: 'forged' },
+    }).success).toBe(false)
+    const canonicalProjection = {
+      version: 2 as const,
+      kind: 'local_conversion' as const,
+      targetFormat: 'pdf' as const,
+      attachmentCount: 1,
+      selectedAttachmentIndexes: [0],
+    }
+    expect(syncMutationSchema.parse({
+      ...messageAppend,
+      payload: {
+        ...messageAppend.payload,
+        blocks: [...messageAppend.payload.blocks, {
+          type: 'media', blockId: 'projection_block', assetId: 'projection_asset',
+          kind: 'file', purpose: 'input', name: '文件-1', mimeType: 'application/pdf', byteSize: 1,
+        }],
+        providerProjection: canonicalProjection,
+      },
+    })).toMatchObject({ payload: { providerProjection: canonicalProjection } })
+    expect(chatMessageSchema.safeParse({
+      ...messageAppend.payload, providerProjection: canonicalProjection,
+    }).success).toBe(false)
+    for (const providerProjection of [
+      { ...canonicalProjection, targetFormat: 'docx' },
+      { ...canonicalProjection, attachmentCount: 0 },
+      { ...canonicalProjection, selectedAttachmentIndexes: [] },
+      { ...canonicalProjection, selectedAttachmentIndexes: [1] },
+      { ...canonicalProjection, content: 'RAW_BASE64_CANARY' },
+      { version: 2, kind: 'ordinary', targetFormat: 'pdf', attachmentCount: 1, selectedAttachmentIndexes: [0] },
+    ]) {
+      expect(syncMutationSchema.safeParse({
+        ...messageAppend,
+        payload: { ...messageAppend.payload, providerProjection },
+      }).success).toBe(false)
+    }
+    expect(syncMutationSchema.safeParse({
+      ...messageAppend,
+      payload: { ...messageAppend.payload, providerProjection: canonicalProjection },
     }).success).toBe(false)
 
     const conversationMutations = [
@@ -440,10 +527,16 @@ describe('cross-process contracts', () => {
       id: 'preferences_mutation_1',
       kind: 'conversation.preferences' as const,
     }
+    const compactedConversionTerminal = {
+      ...compactedMessage,
+      id: 'conversion_terminal_mutation_1',
+      kind: 'message.conversion_block_terminal' as const,
+    }
 
     expect(pulledMutationSchema.parse(compactedMessage)).toEqual(compactedMessage)
     expect(pulledMutationSchema.parse(compactedDelete)).toEqual(compactedDelete)
     expect(pulledMutationSchema.parse(compactedPreferences)).toEqual(compactedPreferences)
+    expect(pulledMutationSchema.parse(compactedConversionTerminal)).toEqual(compactedConversionTerminal)
     expect(syncMutationSchema.safeParse(compactedMessage).success).toBe(false)
     for (const invalid of [
       { ...compactedMessage, payload: { blocks: [{ type: 'text', text: 'secret' }] } },
@@ -451,6 +544,8 @@ describe('cross-process contracts', () => {
       { ...compactedDelete, conversationId: 'conversation_1' },
       { ...compactedDelete, secret: 'not allowed' },
       { ...compactedPreferences, payload: { preferences: { outputType: 'image' } } },
+      { ...compactedConversionTerminal, payload: { state: 'terminal' } },
+      { ...compactedConversionTerminal, conversationId: undefined },
       { ...compactedDelete, kind: 'usage.record' },
     ]) {
       expect(pulledMutationSchema.safeParse(invalid).success).toBe(false)
@@ -1468,6 +1563,28 @@ describe('cross-process contracts', () => {
     expect(chatBlockSchema.safeParse({ ...approval, state: 'always' }).success).toBe(false)
   })
 
+  it('accepts only a declared formats scope for file conversion approval blocks', () => {
+    const approval = {
+      type: 'approval' as const,
+      blockId: 'approval_1',
+      state: 'pending' as const,
+      executionId: 'execution_1',
+      workflowId: 'workflow.convert', workflowName: 'Convert file', workflowVersion: '1.0.0',
+      source: 'installed' as const, actionSummary: 'Convert attachment 0 to PDF', permissionIndex: 0,
+      capability: 'file.convert' as const, scope: { formats: ['pdf'] },
+      scopeHash: 'a'.repeat(64),
+    }
+
+    expect(chatBlockSchema.parse(approval)).toMatchObject({
+      capability: 'file.convert', scope: { formats: ['pdf'] },
+    })
+    expect(chatBlockSchema.safeParse({ ...approval, scope: {} }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({
+      ...approval,
+      scope: { origins: ['https://example.com'] },
+    }).success).toBe(false)
+  })
+
   it('requires Main-owned execution availability with strict status semantics', () => {
     const status = {
       type: 'workflow_status' as const,
@@ -2213,6 +2330,34 @@ describe('cross-process contracts', () => {
     const result = { validationError: '搜索关键词不能为空' }
 
     expect(ipcResponseSchemas[ipcChannels.developerRun].safeParse(result).success).toBe(true)
+  })
+
+  it('binds a successful developer run id to its authoritative conversion capability snapshot', () => {
+    const result = { executionId: 'execution_1', conversionCapable: true }
+
+    expect(ipcResponseSchemas[ipcChannels.developerRun].parse(result)).toEqual(result)
+    expect(() => ipcResponseSchemas[ipcChannels.developerRun].parse({ executionId: 'execution_1' })).toThrow()
+  })
+
+  it('keeps developer file drafts opaque and attachment ids out of workflow input', () => {
+    const draft = { id: 'draft_1', name: 'same.png', mimeType: 'image/png', byteSize: 123 }
+    const channel = ipcChannels.developerPickFiles
+    expect(channel).toBe('developer:pick-files')
+    const responseSchema = ipcResponseSchemas[channel]
+    expect(responseSchema).toBeDefined()
+    expect(responseSchema!.parse([draft])).toEqual([draft])
+    expect(() => responseSchema!.parse([
+      { ...draft, path: '/private/source.png' },
+    ])).toThrow()
+    expect(ipcRequestSchemas[ipcChannels.developerRun].parse({
+      projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'],
+    })).toEqual({ projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'] })
+    expect(() => ipcRequestSchemas[ipcChannels.developerRun].parse({
+      projectId: 'project_1', input: { files: [0] }, attachmentIds: ['draft_1'], path: '/private/source.png',
+    })).toThrow()
+    expect(() => ipcRequestSchemas[ipcChannels.developerRun].parse({
+      projectId: 'project_1', input: { files: [0, 1] }, attachmentIds: ['draft_1', 'draft_1'],
+    })).toThrow()
   })
 
   it('accepts a semantic developer input validation result', () => {

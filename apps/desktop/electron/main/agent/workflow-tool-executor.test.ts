@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ApprovalDecision, WorkflowDetail } from '@autoforge/shared'
 import { estimateTextTokens } from '../chat/conversation-context.js'
 import { scopeHash } from '../permissions/policy-engine.js'
-import type { ExecutionReservation } from '../workflows/execution-service.js'
+import type {
+  ExecutionAttachmentBinding,
+  ExecutionReservation,
+  FileConvertAuthorization,
+} from '../workflows/execution-service.js'
 import type { ExactWorkflowSource, WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import type { WorkflowCandidate } from './workflow-catalog.js'
 import {
@@ -132,6 +136,31 @@ function onceDecision(pending: {
     scopeHash: pending.scopeHash,
     decision: 'once',
   }
+}
+
+function conversionBindings(): ExecutionAttachmentBinding[] {
+  return [
+    {
+      attachmentIndex: 0,
+      ownerUserId: 'user_1',
+      conversationId: 'conversation_1',
+      displayName: '../../private/\u202E附\u034F\u02D0件\u2066-目\uFE0F\u02D0标格\u0301式-\uA789-\u2236.pdf',
+      mimeType: 'application/pdf',
+      byteSize: 12,
+      source: { kind: 'media', mediaAssetId: 'media_private_0' },
+      sourceFingerprint: 'b'.repeat(64),
+    },
+    {
+      attachmentIndex: 1,
+      ownerUserId: 'user_1',
+      conversationId: 'conversation_1',
+      displayName: 'second.png',
+      mimeType: 'image/png',
+      byteSize: 34,
+      source: { kind: 'media', mediaAssetId: 'media_private_1' },
+      sourceFingerprint: 'c'.repeat(64),
+    },
+  ]
 }
 
 describe('WorkflowToolExecutor', () => {
@@ -297,6 +326,225 @@ describe('WorkflowToolExecutor', () => {
       expect(test.executions.startReserved).not.toHaveBeenCalled()
     },
   )
+
+  it('binds file conversion approval to exact current attachments and target format', async () => {
+    const detail = workflow({
+      cities: [],
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf', 'png'] } }],
+      inputSchema: {
+        type: 'object', additionalProperties: false, required: ['files', 'targetFormat'],
+        properties: {
+          files: {
+            type: 'array', items: { type: 'integer', minimum: 0 },
+            minItems: 1, maxItems: 5, uniqueItems: true,
+          },
+          targetFormat: { type: 'string', enum: ['pdf', 'png'] },
+        },
+      },
+    })
+    const test = harness({ detail })
+    const attachments = conversionBindings().slice(0, 1)
+    const originalAttachments = structuredClone(attachments)
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { input: { files: [0], targetFormat: 'pdf' } },
+      developerMode: true,
+      attachmentBindings: attachments,
+    })
+
+    expect(prepared).toMatchObject({
+      kind: 'awaiting_approval',
+      pending: { capability: 'file.convert', permissionIndex: 0 },
+    })
+    if (prepared.kind !== 'awaiting_approval') throw new Error('expected approval')
+    const actionSummary = prepared.pending.actionSummary!
+    expect(actionSummary).toContain('附件 0：文件-1')
+    expect(actionSummary).toContain('目标格式：pdf')
+    expect(actionSummary.match(/附件/gu)).toHaveLength(1)
+    expect(actionSummary.match(/目标格式/gu)).toHaveLength(1)
+    expect(actionSummary.match(/：/gu)).toHaveLength(2)
+    expect(actionSummary).not.toMatch(/[\p{Cc}\p{Cf}]/u)
+    expect(actionSummary).not.toMatch(/[\p{M}\p{Default_Ignorable_Code_Point}]/u)
+    expect(actionSummary).not.toMatch(/\p{Lm}|[\uA789\u2236]/u)
+    expect(actionSummary).not.toMatch(/media_private|b{32}/)
+
+    const once = onceDecision(prepared.pending)
+    const originalOnce = structuredClone(once)
+    const approved = await test.executor.approve(prepared.pending, once)
+    if (approved.kind !== 'ready') throw new Error('expected ready')
+    await expect(test.executor.start(approved.pending, {
+      userId: 'user_1', conversationId: 'conversation_1', chatRunId: 'run_1',
+    })).resolves.toMatchObject({ kind: 'started', executionId: 'execution_1' })
+
+    expect(attachments).toEqual(originalAttachments)
+    expect(once).toEqual(originalOnce)
+
+    expect(test.executions.startReserved).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        attachmentBindings: attachments,
+        fileConvertAuthorization: {
+          executionId: 'execution_1',
+          capability: 'file.convert',
+          decision: 'once',
+          attachments: [{ index: 0, sourceFingerprint: 'b'.repeat(64) }],
+          formats: ['pdf'],
+        },
+      }),
+      undefined,
+    )
+    const startInput = test.executions.startReserved.mock.calls[0]![1] as {
+      attachmentBindings: readonly ExecutionAttachmentBinding[]
+      fileConvertAuthorization: FileConvertAuthorization
+    }
+    expect(startInput.attachmentBindings).toEqual(attachments)
+    expect(startInput.attachmentBindings[0]).toMatchObject({
+      displayName: '../../private/\u202E附\u034F\u02D0件\u2066-目\uFE0F\u02D0标格\u0301式-\uA789-\u2236.pdf',
+      sourceFingerprint: 'b'.repeat(64),
+    })
+    expect(startInput.fileConvertAuthorization).toEqual({
+      executionId: 'execution_1',
+      capability: 'file.convert',
+      decision: 'once',
+      attachments: [{ index: 0, sourceFingerprint: 'b'.repeat(64) }],
+      formats: ['pdf'],
+    })
+    expect(startInput.fileConvertAuthorization.attachments)
+      .not.toContainEqual(expect.objectContaining({ index: 1 }))
+  })
+
+  it('passes only the exact nonzero selected attachment index to approval and the Worker', async () => {
+    const detail = workflow({
+      cities: [],
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf'] } }],
+      inputSchema: {
+        type: 'object', additionalProperties: false, required: ['files', 'targetFormat'],
+        properties: {
+          files: { type: 'array', items: { type: 'integer' }, minItems: 1, uniqueItems: true },
+          targetFormat: { const: 'pdf' },
+        },
+      },
+    })
+    const test = harness({ detail })
+    const selected = [conversionBindings()[1]!]
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { input: { files: [1], targetFormat: 'pdf' } },
+      developerMode: true,
+      attachmentBindings: selected,
+    })
+    if (prepared.kind !== 'awaiting_approval') throw new Error('expected approval')
+    expect(prepared.pending.actionSummary).toContain('附件 1：second.png')
+    const approved = await test.executor.approve(prepared.pending, onceDecision(prepared.pending))
+    if (approved.kind !== 'ready') throw new Error('expected ready')
+    await test.executor.start(approved.pending, {
+      userId: 'user_1', conversationId: 'conversation_1', chatRunId: 'run_1',
+    })
+    expect(test.executions.startReserved).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        attachmentBindings: selected,
+        fileConvertAuthorization: expect.objectContaining({
+          attachments: [{ index: 1, sourceFingerprint: 'c'.repeat(64) }],
+        }),
+      }),
+      undefined,
+    )
+  })
+
+  it('fails file conversion closed when tool arguments reference no current attachment', async () => {
+    const detail = workflow({
+      cities: [],
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf'] } }],
+      inputSchema: {
+        type: 'object', additionalProperties: false, required: ['files', 'targetFormat'],
+        properties: {
+          files: { type: 'array', items: { type: 'integer', minimum: 0 }, minItems: 1, uniqueItems: true },
+          targetFormat: { const: 'pdf' },
+        },
+      },
+    })
+    const test = harness({ detail })
+
+    await expect(test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { input: { files: [1], targetFormat: 'pdf' } },
+      developerMode: true,
+      attachmentBindings: conversionBindings().slice(0, 1),
+    })).resolves.toEqual({ kind: 'tool_error', code: 'CAPABILITY_SCOPE_DENIED' })
+    expect(test.executions.reserve).not.toHaveBeenCalled()
+  })
+
+  it('rejects extra file conversion input keys before approval or execution', async () => {
+    const detail = workflow({
+      cities: [],
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf'] } }],
+      inputSchema: {
+        type: 'object', additionalProperties: true, required: ['files', 'targetFormat'],
+        properties: {
+          files: { type: 'array', items: { type: 'integer' } },
+          targetFormat: { type: 'string' },
+        },
+      },
+    })
+    const test = harness({ detail })
+
+    await expect(test.executor.prepare({
+      candidate: test.candidate,
+      arguments: {
+        input: { files: [0], targetFormat: 'pdf', hiddenCommand: 'read /Users/Alice/private' },
+      },
+      developerMode: true,
+      attachmentBindings: conversionBindings().slice(0, 1),
+    })).resolves.toEqual({ kind: 'tool_error', code: 'INVALID_INPUT' })
+    expect(test.executions.reserve).not.toHaveBeenCalled()
+    expect(test.policy.evaluate).not.toHaveBeenCalled()
+    expect(test.policy.record).not.toHaveBeenCalled()
+    expect(test.executions.startReserved).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['enumerable array property', () => Object.assign([0], { extra: 'hidden' })],
+    ['array symbol property', () => {
+      const files = [0]
+      Object.defineProperty(files, Symbol('hidden'), { value: 'command', enumerable: true })
+      return files
+    }],
+    ['custom array prototype', () => {
+      const files = [0]
+      Object.setPrototypeOf(files, Object.create(Array.prototype))
+      return files
+    }],
+    ['sparse array', () => {
+      const files = new Array<number>(1)
+      return files
+    }],
+    ['duplicate indexes', () => [0, 0]],
+    ['string coercion', () => ['0']],
+  ])('rejects non-canonical file conversion arrays before approval: %s', async (_label, files) => {
+    const detail = workflow({
+      cities: [],
+      permissions: [{ capability: 'file.convert', scope: { formats: ['pdf'] } }],
+      inputSchema: {
+        type: 'object', additionalProperties: true, required: ['files', 'targetFormat'],
+        properties: {
+          files: { type: 'array' },
+          targetFormat: { type: 'string' },
+        },
+      },
+    })
+    const test = harness({ detail })
+
+    await expect(test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { input: { files: files(), targetFormat: 'pdf' } },
+      developerMode: true,
+      attachmentBindings: conversionBindings().slice(0, 1),
+    })).resolves.toEqual({ kind: 'tool_error', code: 'INVALID_INPUT' })
+    expect(test.executions.reserve).not.toHaveBeenCalled()
+    expect(test.policy.evaluate).not.toHaveBeenCalled()
+    expect(test.executions.startReserved).not.toHaveBeenCalled()
+  })
 
   it('fails unsupported and unknown capabilities before reserving or recording grants', async () => {
     for (const capability of ['network.fetch', 'future.unknown'] as const) {

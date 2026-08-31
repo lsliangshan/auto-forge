@@ -4,6 +4,11 @@ import { isHttpsUrlPattern } from './https-url-pattern.js'
 import { proxySettingsSchema } from './proxy-settings.js'
 import { appErrorCodeSchema } from './errors.js'
 import {
+  conversionJobStatusSchema,
+  conversionPresetSchema,
+  conversionTargetFormatSchema,
+} from './conversion.js'
+import {
   chatBlockSchema,
   attachmentKindSchema,
   knowledgeCoordinateSchema,
@@ -799,8 +804,48 @@ export const messagePageSchema = z.object({
 }).strict()
 export type MessagePage = Omit<z.infer<typeof messagePageSchema>, 'items'> & { items: ChatMessage[] }
 
-export const messageAppendMutationPayloadSchema = chatMessageSchema
+export const messageProviderProjectionSchema = z.object({
+  version: z.literal(2),
+  kind: z.literal('local_conversion'),
+  targetFormat: conversionTargetFormatSchema,
+  attachmentCount: z.number().int().min(1).max(5),
+  selectedAttachmentIndexes: z.array(z.number().int().min(0).max(4)).min(1).max(5),
+}).strict().superRefine((value, context) => {
+  if (value.selectedAttachmentIndexes.some((index, position) => (
+    index >= value.attachmentCount
+    || (position > 0 && index <= value.selectedAttachmentIndexes[position - 1]!)
+  ))) {
+    context.addIssue({
+      code: 'custom',
+      path: ['selectedAttachmentIndexes'],
+      message: 'Selected attachment indexes must be unique, ordered, and in range.',
+    })
+  }
+})
+export type MessageProviderProjection = z.infer<typeof messageProviderProjectionSchema>
+
+export const messageAppendMutationPayloadSchema = chatMessageSchema.extend({
+  providerProjection: messageProviderProjectionSchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (value.providerProjection === undefined) return
+  const attachmentCount = value.blocks.filter((block) => (
+    block.type === 'media' && block.purpose === 'input'
+  )).length
+  if (value.role !== 'user' || attachmentCount !== value.providerProjection.attachmentCount) {
+    context.addIssue({
+      code: 'custom',
+      path: ['providerProjection'],
+      message: 'Provider projection does not match the user attachment blocks.',
+    })
+  }
+})
 export type MessageAppendMutationPayload = z.infer<typeof messageAppendMutationPayloadSchema>
+export const messageConversionBlockTerminalMutationPayloadSchema = z.object({
+  messageId: identifierSchema,
+  blockId: identifierSchema,
+  executionId: identifierSchema,
+  state: z.literal('terminal'),
+}).strict()
 
 export const syncMutationKindSchema = z.enum([
   'conversation.create',
@@ -809,6 +854,7 @@ export const syncMutationKindSchema = z.enum([
   'conversation.delete',
   'conversation.restore',
   'message.append',
+  'message.conversion_block_terminal',
   'legacy.import',
   'privacy.consent',
   'privacy.consent.revoke',
@@ -998,6 +1044,7 @@ export const workflowPermissionSchema = z.object({
 }).strict().superRefine(({ capability, scope }, context) => {
   const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
   const needsPaths = capability.startsWith('filesystem.')
+  const needsFormats = capability === 'file.convert'
 
   if (needsOrigins && !('origins' in scope)) {
     context.addIssue({ code: 'custom', message: 'This capability requires origin scope' })
@@ -1005,7 +1052,10 @@ export const workflowPermissionSchema = z.object({
   if (needsPaths && !('paths' in scope)) {
     context.addIssue({ code: 'custom', message: 'This capability requires path scope' })
   }
-  if (!needsOrigins && !needsPaths && Object.keys(scope).length !== 0) {
+  if (needsFormats && !('formats' in scope)) {
+    context.addIssue({ code: 'custom', message: 'This capability requires conversion format scope' })
+  }
+  if (!needsOrigins && !needsPaths && !needsFormats && Object.keys(scope).length !== 0) {
     context.addIssue({ code: 'custom', message: 'This capability requires an empty scope' })
   }
 })
@@ -1121,15 +1171,27 @@ export const developerProjectSchema = z.object({
 
 export type DeveloperProject = z.infer<typeof developerProjectSchema>
 
+export const developerAttachmentDraftSchema = z.object({
+  id: identifierSchema,
+  name: nonEmptyStringSchema.max(255).refine((value) => !/[\\/\0]/.test(value)),
+  mimeType: nonEmptyStringSchema.max(255),
+  byteSize: z.number().int().positive(),
+}).strict()
+
+export type DeveloperAttachmentDraft = z.infer<typeof developerAttachmentDraftSchema>
+
 export const developerRunInputSchema = z.object({
   projectId: identifierSchema,
   input: z.unknown(),
+  attachmentIds: z.array(identifierSchema).min(1).max(5)
+    .refine((values) => new Set(values).size === values.length, 'Attachment ids must be unique')
+    .optional(),
 }).strict()
 
 export type DeveloperRunInput = z.infer<typeof developerRunInputSchema>
 
 export const developerRunResultSchema = z.union([
-  z.object({ executionId: identifierSchema }).strict(),
+  z.object({ executionId: identifierSchema, conversionCapable: z.boolean() }).strict(),
   z.object({ validationError: nonEmptyStringSchema.max(500) }).strict(),
 ])
 
@@ -1459,6 +1521,11 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...syncMutationBaseShape,
+    kind: z.literal('message.conversion_block_terminal'),
+    payload: messageConversionBlockTerminalMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
     kind: z.literal('legacy.import'),
     payload: legacyImportConfirmRequestSchema,
   }).strict(),
@@ -1488,6 +1555,9 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
     case 'message.append':
     case 'usage.record':
       payloadEntityId = mutation.payload.id
+      break
+    case 'message.conversion_block_terminal':
+      payloadEntityId = mutation.payload.messageId
       break
     case 'legacy.import':
       payloadEntityId = mutation.payload.batchId
@@ -1556,6 +1626,11 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...pulledMutationBaseShape,
+    kind: z.literal('message.conversion_block_terminal'),
+    payload: messageConversionBlockTerminalMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
     kind: z.literal('legacy.import'),
     payload: storedLegacyImportReceiptPayloadSchema,
   }).strict(),
@@ -1585,6 +1660,9 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
     case 'message.append':
     case 'usage.record':
       payloadEntityId = mutation.payload.id
+      break
+    case 'message.conversion_block_terminal':
+      payloadEntityId = mutation.payload.messageId
       break
     case 'legacy.import':
       payloadEntityId = mutation.payload.batchId
@@ -1634,6 +1712,11 @@ export const compactedPulledMutationSchema = z.discriminatedUnion('kind', [
   z.object({
     ...compactedPulledMutationBaseShape,
     kind: z.literal('message.append'),
+    conversationId: identifierSchema,
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('message.conversion_block_terminal'),
     conversationId: identifierSchema,
   }).strict(),
 ])
@@ -1800,6 +1883,102 @@ export const appInfoSchema = z.object({
 }).strict()
 export type AppInfo = z.infer<typeof appInfoSchema>
 
+const conversionOpaqueIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/)
+const conversionMimeTypeSchema = z.string().max(127).regex(
+  /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u,
+)
+const conversionDisplayNameSchema = z.string().trim().min(1).max(255).refine(
+  (value) => !/[\\/]/u.test(value)
+    && !Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 31 || codePoint === 127
+    })
+    && !/^(?:[A-Za-z]:|file:|https?:)/iu.test(value),
+  'A safe display name is required',
+)
+const conversionIconRepresentationSizeSchema = z.union([
+  z.literal(16), z.literal(24), z.literal(32), z.literal(48), z.literal(64),
+  z.literal(128), z.literal(256), z.literal(512), z.literal(1024),
+])
+const conversionIcnsRepresentationSchema = z.object({
+  sourceType: z.enum(['icp4', 'ic11', 'icp5', 'ic12', 'icp6', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10']),
+  logicalWidth: conversionIconRepresentationSizeSchema,
+  logicalHeight: conversionIconRepresentationSizeSchema,
+  pixelWidth: conversionIconRepresentationSizeSchema,
+  pixelHeight: conversionIconRepresentationSizeSchema,
+  scale: z.union([z.literal(1), z.literal(2)]),
+}).strict().superRefine((value, context) => {
+  const expected = ({
+    icp4: [16, 1, 16], ic11: [16, 2, 32], icp5: [32, 1, 32], ic12: [32, 2, 64],
+    icp6: [64, 1, 64], ic07: [128, 1, 128], ic13: [128, 2, 256],
+    ic08: [256, 1, 256], ic14: [256, 2, 512], ic09: [512, 1, 512], ic10: [512, 2, 1024],
+  } as const)[value.sourceType]
+  if (
+    value.logicalWidth !== expected[0] || value.logicalHeight !== expected[0]
+    || value.pixelWidth !== expected[2] || value.pixelHeight !== expected[2] || value.scale !== expected[1]
+  ) context.addIssue({ code: 'custom', message: 'ICNS representation metadata must match its source slot' })
+})
+const conversionIcoDimensionSchema = z.number().int().min(1).max(256)
+const conversionIcoRepresentationSchema = z.object({
+  sourceType: z.literal('ico'),
+  sourceIndex: z.number().int().min(1).max(256),
+  logicalWidth: conversionIcoDimensionSchema,
+  logicalHeight: conversionIcoDimensionSchema,
+  pixelWidth: conversionIcoDimensionSchema,
+  pixelHeight: conversionIcoDimensionSchema,
+  scale: z.literal(1),
+}).strict().superRefine((value, context) => {
+  if (value.logicalWidth !== value.pixelWidth || value.logicalHeight !== value.pixelHeight) {
+    context.addIssue({ code: 'custom', message: 'ICO representation metadata must preserve its pixel dimensions' })
+  }
+})
+const conversionArtifactMetadataSchema = z.object({
+  iconRepresentations: z.array(conversionIconRepresentationSizeSchema).min(1).max(9).optional(),
+  iconRepresentation: z.union([
+    conversionIcnsRepresentationSchema,
+    conversionIcoRepresentationSchema,
+  ]).optional(),
+  pdfPage: z.number().int().min(1).max(100).optional(),
+  frameSelection: z.literal('first').optional(),
+  transparentPadding: z.literal(true).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0)
+
+export const conversionArtifactViewSchema = z.object({
+  artifactId: conversionOpaqueIdSchema,
+  status: z.enum(['ready', 'deleted']),
+  displayName: conversionDisplayNameSchema,
+  detectedFormat: conversionTargetFormatSchema,
+  mimeType: conversionMimeTypeSchema,
+  byteSize: z.number().int().nonnegative().max(500 * 1024 * 1024),
+  metadata: conversionArtifactMetadataSchema.optional(),
+}).strict()
+export type ConversionArtifactView = z.infer<typeof conversionArtifactViewSchema>
+
+export const conversionJobViewSchema = z.object({
+  jobId: conversionOpaqueIdSchema,
+  executionId: conversionOpaqueIdSchema,
+  targetFormat: conversionTargetFormatSchema,
+  preset: conversionPresetSchema.optional(),
+  status: conversionJobStatusSchema,
+  epoch: z.number().int().nonnegative(),
+  progress: z.number().int().min(0).max(100),
+  errorCode: appErrorCodeSchema.optional(),
+  artifacts: z.array(conversionArtifactViewSchema).max(256),
+}).strict()
+export type ConversionJobView = z.infer<typeof conversionJobViewSchema>
+
+export const conversionExecutionViewSchema = z.union([
+  z.object({ availability: z.literal('local'), jobs: z.array(conversionJobViewSchema) }).strict(),
+  z.object({ availability: z.literal('unavailable'), jobs: z.array(conversionJobViewSchema).length(0) }).strict(),
+])
+export type ConversionExecutionView = z.infer<typeof conversionExecutionViewSchema>
+
+export const conversionJobEventSchema = z.object({
+  type: z.literal('job_updated'),
+  job: conversionJobViewSchema,
+}).strict()
+export type ConversionJobEvent = z.infer<typeof conversionJobEventSchema>
+
 export const ipcChannels = {
   authGetSession: 'auth:get-session',
   authRefreshAuthorization: 'auth:refresh-authorization',
@@ -1853,12 +2032,24 @@ export const ipcChannels = {
   developerDeleteEntry: 'developer:delete-entry',
   developerBuildProject: 'developer:build-project',
   developerValidate: 'developer:validate',
+  developerPickFiles: 'developer:pick-files',
+  developerRemoveAttachment: 'developer:remove-attachment',
+  developerClearAttachments: 'developer:clear-attachments',
   developerRun: 'developer:run',
   executionsList: 'executions:list',
   executionsGet: 'executions:get',
   executionsDecide: 'executions:decide',
   executionsCancel: 'executions:cancel',
   executionsEvent: 'executions:event',
+  conversionListForExecution: 'conversion:list-for-execution',
+  conversionCancel: 'conversion:cancel',
+  conversionRetry: 'conversion:retry',
+  conversionSaveCopy: 'conversion:save-copy',
+  conversionReveal: 'conversion:reveal',
+  conversionDeleteArtifact: 'conversion:delete-artifact',
+  conversionSubscribe: 'conversion:subscribe',
+  conversionUnsubscribe: 'conversion:unsubscribe',
+  conversionEvent: 'conversion:event',
   permissionsListGrants: 'permissions:list-grants',
   permissionsRevoke: 'permissions:revoke',
   settingsGet: 'settings:get',
@@ -1977,9 +2168,21 @@ export const deleteEntryRequestSchema = z.object({
   relativePath: nonEmptyStringSchema,
 }).strict()
 export const validateProjectRequestSchema = z.object({ projectId: identifierSchema }).strict()
+export const developerPickFilesRequestSchema = z.object({
+  projectId: identifierSchema,
+  existingAttachmentIds: z.array(identifierSchema).max(5)
+    .refine((values) => new Set(values).size === values.length, 'Attachment ids must be unique'),
+}).strict()
+export const developerAttachmentRequestSchema = z.object({
+  projectId: identifierSchema,
+  attachmentId: identifierSchema,
+}).strict()
 export const executionListRequestSchema = executionQuerySchema.optional()
 export const getExecutionRequestSchema = z.object({ executionId: identifierSchema }).strict()
 export const cancelExecutionRequestSchema = z.object({ executionId: identifierSchema }).strict()
+export const conversionExecutionRequestSchema = z.object({ executionId: conversionOpaqueIdSchema }).strict()
+export const conversionJobRequestSchema = z.object({ jobId: conversionOpaqueIdSchema }).strict()
+export const conversionArtifactRequestSchema = z.object({ artifactId: conversionOpaqueIdSchema }).strict()
 export const revokePermissionRequestSchema = z.object({ grantId: identifierSchema }).strict()
 export const settingsGetRequestSchema = z.undefined()
 export const settingsUpdateRequestSchema = appSettingsPatchSchema
@@ -2088,11 +2291,22 @@ export const ipcRequestSchemas = {
   [ipcChannels.developerDeleteEntry]: deleteEntryRequestSchema,
   [ipcChannels.developerBuildProject]: validateProjectRequestSchema,
   [ipcChannels.developerValidate]: validateProjectRequestSchema,
+  [ipcChannels.developerPickFiles]: developerPickFilesRequestSchema,
+  [ipcChannels.developerRemoveAttachment]: developerAttachmentRequestSchema,
+  [ipcChannels.developerClearAttachments]: validateProjectRequestSchema,
   [ipcChannels.developerRun]: developerRunInputSchema,
   [ipcChannels.executionsList]: executionListRequestSchema,
   [ipcChannels.executionsGet]: getExecutionRequestSchema,
   [ipcChannels.executionsDecide]: approvalDecisionSchema,
   [ipcChannels.executionsCancel]: cancelExecutionRequestSchema,
+  [ipcChannels.conversionListForExecution]: conversionExecutionRequestSchema,
+  [ipcChannels.conversionCancel]: conversionJobRequestSchema,
+  [ipcChannels.conversionRetry]: conversionJobRequestSchema,
+  [ipcChannels.conversionSaveCopy]: conversionArtifactRequestSchema,
+  [ipcChannels.conversionReveal]: conversionArtifactRequestSchema,
+  [ipcChannels.conversionDeleteArtifact]: conversionArtifactRequestSchema,
+  [ipcChannels.conversionSubscribe]: z.undefined(),
+  [ipcChannels.conversionUnsubscribe]: z.undefined(),
   [ipcChannels.permissionsListGrants]: z.undefined(),
   [ipcChannels.permissionsRevoke]: revokePermissionRequestSchema,
   [ipcChannels.settingsGet]: settingsGetRequestSchema,
@@ -2197,11 +2411,22 @@ export const ipcResponseSchemas = {
   [ipcChannels.developerDeleteEntry]: developerProjectSchema,
   [ipcChannels.developerBuildProject]: developerProjectSchema,
   [ipcChannels.developerValidate]: validationResultSchema,
+  [ipcChannels.developerPickFiles]: z.array(developerAttachmentDraftSchema).max(5),
+  [ipcChannels.developerRemoveAttachment]: voidResponseSchema,
+  [ipcChannels.developerClearAttachments]: voidResponseSchema,
   [ipcChannels.developerRun]: developerRunResultSchema,
   [ipcChannels.executionsList]: z.array(executionSummarySchema),
   [ipcChannels.executionsGet]: executionDetailSchema,
   [ipcChannels.executionsDecide]: voidResponseSchema,
   [ipcChannels.executionsCancel]: voidResponseSchema,
+  [ipcChannels.conversionListForExecution]: conversionExecutionViewSchema,
+  [ipcChannels.conversionCancel]: voidResponseSchema,
+  [ipcChannels.conversionRetry]: voidResponseSchema,
+  [ipcChannels.conversionSaveCopy]: z.object({ saved: z.boolean() }).strict(),
+  [ipcChannels.conversionReveal]: voidResponseSchema,
+  [ipcChannels.conversionDeleteArtifact]: voidResponseSchema,
+  [ipcChannels.conversionSubscribe]: voidResponseSchema,
+  [ipcChannels.conversionUnsubscribe]: voidResponseSchema,
   [ipcChannels.permissionsListGrants]: z.array(permissionGrantSchema),
   [ipcChannels.permissionsRevoke]: voidResponseSchema,
   [ipcChannels.settingsGet]: appSettingsSchema,
@@ -2322,6 +2547,9 @@ export interface DesktopAPI {
     deleteEntry(projectId: string, relativePath: string): Promise<DeveloperProject>
     build(projectId: string): Promise<DeveloperProject>
     validate(projectId: string): Promise<ValidationResult>
+    pickFiles(input: { projectId: string; existingAttachmentIds: string[] }): Promise<DeveloperAttachmentDraft[]>
+    removeAttachment(input: { projectId: string; attachmentId: string }): Promise<void>
+    clearAttachments(input: { projectId: string }): Promise<void>
     run(input: DeveloperRunInput): Promise<DeveloperRunResult>
   }
   executions: {
@@ -2330,6 +2558,15 @@ export interface DesktopAPI {
     decide(input: ApprovalDecision): Promise<void>
     cancel(executionId: string): Promise<void>
     onEvent(listener: (event: ExecutionEvent) => void): () => void
+  }
+  conversion: {
+    listForExecution(input: { executionId: string }): Promise<ConversionExecutionView>
+    cancel(input: { jobId: string }): Promise<void>
+    retry(input: { jobId: string }): Promise<void>
+    saveCopy(input: { artifactId: string }): Promise<{ saved: boolean }>
+    reveal(input: { artifactId: string }): Promise<void>
+    deleteArtifact(input: { artifactId: string }): Promise<void>
+    onEvent(listener: (event: ConversionJobEvent) => void): () => void
   }
   permissions: {
     listGrants(): Promise<PermissionGrant[]>

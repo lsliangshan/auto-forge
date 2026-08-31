@@ -15,12 +15,13 @@ export const useWorkflowStore = defineStore('workflow', {
   },
   actions: {
     async load(query?: WorkflowQuery) {
-      this.query = { ...(query ?? this.query) }
+      const requestQuery = { ...(query ?? this.query) }
+      this.query = requestQuery
       const version = ++this._loadVersion
       this.loading = true
       this.error = ''
       try {
-        const items = await getDesktopApi().workflows.list(this.query)
+        const items = await getDesktopApi().workflows.list(requestQuery)
         if (version === this._loadVersion) this.items = items
       } catch (error) { if (version === this._loadVersion) this.error = displayError(error, '工作流加载失败') }
       finally { if (version === this._loadVersion) this.loading = false }

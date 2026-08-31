@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -18,12 +19,17 @@ import type {
 import type { ModelProvider, ModelProviderSnapshot } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
 import {
+  createProviderAttachmentDisclosureAuthority,
+  protectProviderSnapshot,
+} from './provider-attachment-disclosure.js'
+import {
   VideoJobRunner,
   type VideoJobRunnerDependencies,
 } from './video-job-runner.js'
 
 const temporaryDirectories: string[] = []
 const userDataManagers: UserDataStoreManager[] = []
+const referenceInputSha = createHash('sha256').update(Buffer.from('iVBORw0KGgo=', 'base64')).digest('hex')
 
 afterEach(() => {
   vi.useRealTimers()
@@ -63,6 +69,29 @@ const submitInput = {
   userBlocks: [{ type: 'text', text: 'make a short harbor video' }] satisfies ChatBlock[],
   assetIds: [] as string[],
   route,
+}
+
+function ordinaryAttachmentAuthority(snapshot: ModelProviderSnapshot, assetIds: string[]) {
+  const attachmentFingerprints = assetIds.map(() => referenceInputSha)
+  const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+  const plan = authority.createPlan({
+    requestId: submitInput.requestId,
+    text: submitInput.prompt,
+    context: {
+      hasAttachments: true, requestedOutput: 'video', attachmentKinds: assetIds.map(() => 'image'),
+    },
+    attachments: assetIds.map((id, index) => ({
+      index, id, name: id === 'reference_image' ? 'reference.png' : `${id}.png`,
+      mimeType: 'image/png', byteSize: 12,
+      fingerprint: attachmentFingerprints[index]!,
+    })),
+  })
+  const attachmentDisclosure = authority.bindProvider(plan, snapshot)
+  return {
+    attachmentDisclosure,
+    attachmentFingerprints,
+    providerSnapshot: protectProviderSnapshot(snapshot, attachmentDisclosure, { purpose: 'main' }),
+  }
 }
 
 const submittedOutputAssetId = 'video_8072e20a4619b4b2251a7c9e4522ab22a9728450834087c29e18d2651db6f0c0'
@@ -177,7 +206,13 @@ function createHarness(
 ) {
   const database = overrides.database ?? createDatabase()
   const events: ChatEvent[] = []
-  const provider: Pick<ModelProvider, 'submitVideo' | 'pollVideo' | 'downloadVideo'> = {
+  const provider: Pick<
+    ModelProvider,
+    'listModels' | 'validateCredential' | 'stream' | 'submitVideo' | 'pollVideo' | 'downloadVideo'
+  > = {
+    listModels: vi.fn(async () => []),
+    validateCredential: vi.fn(async () => ({ valid: true })),
+    stream: vi.fn(async function* () {}),
     submitVideo: vi.fn(async () => ({
       providerJobId: 'provider_job_1',
       status: 'pending' as const,
@@ -273,6 +308,32 @@ async function flush(): Promise<void> {
 }
 
 describe('VideoJobRunner', () => {
+  it('rejects a changed attachment fingerprint before video Provider work', async () => {
+    const harness = createHarness()
+    const snapshot = await harness.dependencies.providers.acquire('openrouter')
+    const attachmentAuthority = ordinaryAttachmentAuthority(snapshot, ['reference_image'])
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit({
+      ...submitInput,
+      assetIds: ['reference_image'],
+      ...attachmentAuthority,
+      attachmentFingerprints: ['b'.repeat(64)],
+      route: {
+        ...route,
+        assets: [{
+          id: 'reference_image', kind: 'image', mimeType: 'image/png',
+          name: 'reference.png', byteSize: 12, conversationId: submitInput.conversationId,
+          absolutePath: '/managed/reference.png', relativePath: 'conversation_video_1/reference.png',
+          inlineSafe: true,
+        }],
+      },
+    })).rejects.toThrow('Attachment disclosure capability is missing or invalid')
+
+    expect(harness.media.modelInput).not.toHaveBeenCalled()
+    expect(harness.provider.submitVideo).not.toHaveBeenCalled()
+  })
+
   it('requests sync after the committed start and completed terminal mutations', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
@@ -1609,7 +1670,7 @@ describe('VideoJobRunner', () => {
       byteSize: 12,
       width: 1,
       height: 1,
-      sha256: 'a'.repeat(64),
+      sha256: referenceInputSha,
       status: 'ready',
       createdAt: 1,
       updatedAt: 1,
@@ -1659,11 +1720,16 @@ describe('VideoJobRunner', () => {
       },
     ]
     const runner = new VideoJobRunner(harness.dependencies)
+    const attachmentAuthority = ordinaryAttachmentAuthority(
+      await harness.dependencies.providers.acquire('openrouter'),
+      ['reference_image'],
+    )
 
     await runner.submit({
       ...submitInput,
       userBlocks,
       assetIds: ['reference_image'],
+      ...attachmentAuthority,
       route: referencedRoute,
     })
 
@@ -1711,11 +1777,16 @@ describe('VideoJobRunner', () => {
       createdAt: 1,
     }, ['claimed_reference'])
     const runner = new VideoJobRunner(harness.dependencies)
+    const attachmentAuthority = ordinaryAttachmentAuthority(
+      await harness.dependencies.providers.acquire('openrouter'),
+      ['claimed_reference'],
+    )
 
     await expect(runner.submit({
       ...submitInput,
       userBlocks: [referenceBlock],
       assetIds: ['claimed_reference'],
+      ...attachmentAuthority,
       route: {
         ...route,
         assets: [{
@@ -1764,6 +1835,10 @@ describe('VideoJobRunner', () => {
       updatedAt: 1,
     })
     const mismatchedRunner = new VideoJobRunner(mismatched.dependencies)
+    const attachmentAuthority = ordinaryAttachmentAuthority(
+      await mismatched.dependencies.providers.acquire('openrouter'),
+      ['mismatched_reference'],
+    )
 
     await expect(mismatchedRunner.submit({
       ...submitInput,
@@ -1778,6 +1853,7 @@ describe('VideoJobRunner', () => {
         byteSize: 13,
       }],
       assetIds: ['mismatched_reference'],
+      ...attachmentAuthority,
       route: {
         ...route,
         assets: [{

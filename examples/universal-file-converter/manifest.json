@@ -1,0 +1,208 @@
+{
+  "id": "file.convert.universal",
+  "version": "1.0.0",
+  "name": "万象转换",
+  "description": "将附件转换为明确指定的图片、图标、文档、音频或视频格式。",
+  "author": "AutoForge",
+  "category": "file",
+  "cities": [],
+  "entryPath": "dist/index.js",
+  "codeSha256": "9eca4296bdb10c34f52c7983c505216375cd537ff762af6b0b70c128565ede77",
+  "permissions": [
+    {
+      "capability": "file.convert",
+      "scope": {
+        "formats": [
+          "png",
+          "jpeg",
+          "webp",
+          "avif",
+          "tiff",
+          "bmp",
+          "gif",
+          "ico",
+          "icns",
+          "pdf",
+          "xlsx",
+          "mp3",
+          "wav",
+          "m4a",
+          "aac",
+          "flac",
+          "ogg",
+          "opus",
+          "mp4",
+          "webm",
+          "mov"
+        ]
+      }
+    }
+  ],
+  "activationExamples": [
+    "把这张图片转换成 ICO 图标",
+    "将附件中的文档转换成 PDF",
+    "把这个视频转换为 WebM"
+  ],
+  "activationNegativeExamples": [
+    "读取本地文件路径",
+    "用任意命令转换目录中的文件"
+  ],
+  "timeoutMs": 300000,
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "files",
+      "targetFormat"
+    ],
+    "properties": {
+      "files": {
+        "type": "array",
+        "title": "附件",
+        "items": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "minItems": 1,
+        "maxItems": 5,
+        "uniqueItems": true,
+        "x-autoforge-control": "file-picker"
+      },
+      "targetFormat": {
+        "type": "string",
+        "title": "目标格式",
+        "enum": [
+          "png",
+          "jpeg",
+          "webp",
+          "avif",
+          "tiff",
+          "bmp",
+          "gif",
+          "ico",
+          "icns",
+          "pdf",
+          "xlsx",
+          "mp3",
+          "wav",
+          "m4a",
+          "aac",
+          "flac",
+          "ogg",
+          "opus",
+          "mp4",
+          "webm",
+          "mov"
+        ]
+      },
+      "preset": {
+        "type": "string",
+        "enum": [
+          "default",
+          "favicon",
+          "app-icon"
+        ]
+      },
+      "background": {
+        "type": "boolean"
+      }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "workflow",
+      "results"
+    ],
+    "properties": {
+      "workflow": {
+        "const": "万象转换"
+      },
+      "results": {
+        "type": "array",
+        "items": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "accepted",
+                "status",
+                "outputs"
+              ],
+              "properties": {
+                "accepted": {
+                  "const": true
+                },
+                "status": {
+                  "enum": [
+                    "queued",
+                    "completed"
+                  ]
+                },
+                "outputs": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "name",
+                      "format",
+                      "byteSize"
+                    ],
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "format": {
+                        "type": "string"
+                      },
+                      "byteSize": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "accepted",
+                "status",
+                "error"
+              ],
+              "properties": {
+                "accepted": {
+                  "const": false
+                },
+                "status": {
+                  "const": "failed"
+                },
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "code",
+                    "message"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

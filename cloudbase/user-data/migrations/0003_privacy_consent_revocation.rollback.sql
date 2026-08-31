@@ -13,9 +13,9 @@ BEGIN
 
   restored := replace(
     definition,
-    $old$'message.append', 'legacy.import', 'privacy.consent', 'privacy.consent.revoke',
+    $old$'message.append', 'message.conversion_block_terminal', 'legacy.import', 'privacy.consent', 'privacy.consent.revoke',
       'preferences.update', 'usage.record'$old$,
-    $new$'message.append', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'$new$
+    $new$'message.append', 'message.conversion_block_terminal', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'$new$
   );
   IF restored = definition THEN
     RAISE EXCEPTION 'autoforge_sync_push consent kind rollback anchor was not found';

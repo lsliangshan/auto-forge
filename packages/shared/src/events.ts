@@ -113,11 +113,14 @@ export function sanitizeOpaqueWorkflowArgs(value: unknown): unknown {
 function declaredScopeMatchesCapability(capability: string, scope: Record<string, unknown>): boolean {
   const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
   const needsPaths = capability.startsWith('filesystem.')
+  const needsFormats = capability === 'file.convert'
   return needsOrigins
     ? 'origins' in scope
     : needsPaths
       ? 'paths' in scope
-      : Object.keys(scope).length === 0
+      : needsFormats
+        ? 'formats' in scope
+        : Object.keys(scope).length === 0
 }
 
 const workflowBlockContextSchema = z.object({
@@ -166,6 +169,13 @@ export const mediaGenerationBlockSchema = z.object({
   kind: mediaKindSchema,
   status: z.enum(['pending', 'in_progress', 'downloading', 'paused', 'failed']),
   errorCode: appErrorCodeSchema.optional(),
+}).strict()
+
+export const conversionBlockSchema = z.object({
+  type: z.literal('conversion'),
+  blockId: identifierSchema,
+  executionId: identifierSchema,
+  state: z.enum(['active', 'terminal']),
 }).strict()
 
 export const executionStatusSchema = z.enum([
@@ -339,6 +349,7 @@ const currentChatBlockSchema = z.discriminatedUnion('type', [
   knowledgeCitationBlockSchema,
   mediaBlockSchema,
   mediaGenerationBlockSchema,
+  conversionBlockSchema,
 ])
 
 function normalizeLegacyKnowledgeCitation(value: unknown): unknown {
@@ -396,7 +407,12 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     conversationId: identifierSchema,
     messageId: identifierSchema,
     blockId: identifierSchema,
-    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema, knowledgeStatusBlockSchema]),
+    block: z.union([
+      mediaBlockSchema,
+      mediaGenerationBlockSchema,
+      knowledgeStatusBlockSchema,
+      conversionBlockSchema,
+    ]),
   }).strict(),
   z.object({
     type: z.literal('conversation_title_updated'),

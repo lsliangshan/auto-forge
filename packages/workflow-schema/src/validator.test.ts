@@ -24,6 +24,26 @@ function validManifest() {
 }
 
 describe('validateManifest', () => {
+  it('accepts only non-empty, unique approved format scopes for file conversion', () => {
+    const conversionPermission = {
+      capability: 'file.convert',
+      scope: { formats: ['png', 'webp'] },
+    }
+
+    expect(validateManifest({ ...validManifest(), permissions: [conversionPermission] }).valid).toBe(true)
+    for (const scope of [
+      { formats: [] },
+      { formats: ['png', 'png'] },
+      { formats: ['docx'] },
+      { formats: ['png'], origins: ['https://example.com'] },
+      { formats: ['png'], paths: ['/tmp'] },
+    ]) {
+      expect(validateManifest({
+        ...validManifest(), permissions: [{ capability: 'file.convert', scope }],
+      }).valid).toBe(false)
+    }
+  })
+
   it('accepts omitted and bounded browser continuation metadata', () => {
     expect(validateManifest(validManifest()).valid).toBe(true)
     expect(validateManifest({

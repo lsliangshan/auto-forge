@@ -1,8 +1,9 @@
-import type { ChatEvent } from '@autoforge/shared'
+import { chatBlockSchema, type ChatEvent } from '@autoforge/shared'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
-import type { AppRepositories, Conversation } from '../database/repositories.js'
+import type { AppRepositories, Conversation, Message } from '../database/repositories.js'
 import { serializeHistoricalMessage } from './conversation-context.js'
 import type { ModelProviderSnapshot } from './model-provider.js'
+import type { ProviderAttachmentSafeText } from './provider-attachment-disclosure.js'
 
 const TITLE_SYSTEM_PROMPT = [
   '你正在为一段聊天生成简短的中文会话标题。',
@@ -24,6 +25,8 @@ export interface GenerateConversationTitleInput {
   requestId: string
   providerSnapshot: ModelProviderSnapshot
   model?: string
+  omitAttachmentProjections?: boolean
+  protectedTitleText?: ProviderAttachmentSafeText
   signal?: AbortSignal
 }
 
@@ -53,13 +56,29 @@ function boundedTitleContext(value: string): string {
   return `${characters.slice(0, MAX_TITLE_CONTEXT_CHARACTERS).join('')}…`
 }
 
-function completedTurn(repositories: ConversationTitleRepositories, conversationId: string) {
+function userTextOnly(message: Message): string | undefined {
+  const content = chatBlockSchema.array().parse(message.blocks)
+    .flatMap((block) => block.type === 'text' && block.text ? [block.text] : [])
+    .join('\n')
+    .trim()
+  return content || undefined
+}
+
+function completedTurn(
+  repositories: ConversationTitleRepositories,
+  conversationId: string,
+  omitAttachmentProjections = false,
+) {
   const messages = repositories.messages.listForConversation(conversationId)
   const assistantIndex = messages.map(({ role }) => role).lastIndexOf('assistant')
   if (assistantIndex < 1) return undefined
   const user = [...messages.slice(0, assistantIndex)].reverse().find((message) => message.role === 'user')
   const assistant = messages[assistantIndex]
   if (!user || !assistant) return undefined
+  if (omitAttachmentProjections) {
+    const userText = userTextOnly(user)
+    return userText ? { user: boundedTitleContext(userText) } : undefined
+  }
   const serializedUser = serializeHistoricalMessage(user)
   const serializedAssistant = serializeHistoricalMessage(assistant)
   if (!serializedUser || !serializedAssistant) return undefined
@@ -77,8 +96,14 @@ export class ConversationTitleService {
       return undefined
     }
     try {
-      const turn = completedTurn(this.dependencies.repositories, input.conversationId)
-      if (!turn) throw new Error('The first completed turn is unavailable')
+      const turn = completedTurn(
+        this.dependencies.repositories,
+        input.conversationId,
+        input.omitAttachmentProjections,
+      )
+      if (!turn && input.protectedTitleText === undefined) {
+        throw new Error('The first completed turn is unavailable')
+      }
       if (!input.model) throw new Error('The text model for conversation titles is unavailable')
       let response = ''
       let finishReason: string | undefined
@@ -95,7 +120,12 @@ export class ConversationTitleService {
           model: input.model,
           messages: [
             { role: 'system', content: TITLE_SYSTEM_PROMPT },
-            { role: 'user', content: `用户：${turn.user}\nAI：${turn.assistant}` },
+            {
+              role: 'user',
+              content: input.protectedTitleText?.text ?? (turn!.assistant === undefined
+                ? `用户：${turn!.user}`
+                : `用户：${turn!.user}\nAI：${turn!.assistant}`),
+            },
           ],
           maxOutputTokens: 64,
           endUserId: input.userId,

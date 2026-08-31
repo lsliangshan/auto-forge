@@ -1,6 +1,18 @@
-import { randomUUID } from 'node:crypto'
-import { appendFile, copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import { constants } from 'node:fs'
+import {
+  appendFile,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readdir,
+  realpath,
+  rename,
+  rm,
+} from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   accountDataPreferencesDefaults,
   accountDataPreferencesRecordSchema,
@@ -10,6 +22,8 @@ import {
   chatBlockSchema,
   cloudSyncConsentRevokeRequestSchema,
   conversationGenerationPreferencesSchema,
+  conversionTargetFormatSchema,
+  conversionJobViewSchema,
   legacyImportRequestSchema,
   openExternalRequestSchema,
   privacyConsentSchema,
@@ -22,6 +36,8 @@ import {
   type AuthSession,
   type ChatBlock,
   type ChatEvent,
+  type ConversionJobEvent as DesktopConversionJobEvent,
+  type ConversionJobView,
   type DeveloperProject,
   type ExecutionDetail,
   type ExecutionEvent,
@@ -71,7 +87,19 @@ import {
 } from './chat/model-provider-registry.js'
 import { OpenRouterProvider } from './chat/openrouter-provider.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
-import { projectAttachmentInputs } from './chat/file-attachment-projection.js'
+import {
+  AMBIGUOUS_CONVERSION_CLARIFICATION,
+} from './chat/local-conversion-intent.js'
+import { hasHighConfidenceMediaGenerationRequest } from './chat/attachment-conversion-policy.js'
+import {
+  assertAttachmentByteAccess,
+  createProviderAttachmentDisclosureAuthority,
+  createProviderAttachmentProjection,
+  protectProviderSnapshot,
+  type ProviderAttachmentDisclosure,
+  type ProviderAttachmentDisclosureAuthority,
+  type ProviderAttachmentSafeText,
+} from './chat/provider-attachment-disclosure.js'
 import { resolveChatRoute } from './chat/multimodal-router.js'
 import type { ModelContentPart } from './chat/model-provider.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
@@ -84,6 +112,8 @@ import { CloudBaseKnowledgeClient } from './knowledge/cloudbase-knowledge-client
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
+  type ConversionArtifact,
+  type ConversionJob,
   type Execution,
   type WorkflowProject,
 } from './database/repositories.js'
@@ -95,9 +125,12 @@ import { createMediaAssetService, type MediaAssetService } from './media/media-a
 import { ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { createProviderUsageReconciliationLoop } from './billing/provider-usage-reconciliation-loop.js'
 import { MediaLifecycle } from './media/media-lifecycle.js'
-import { resolveUserMediaRoot } from './media/user-media-root.js'
+import { resolveUserConversionRoot, resolveUserMediaRoot } from './media/user-media-root.js'
 import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pinned-media-transport.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
+import {
+  reconcileConversionBlockBinding,
+} from './conversion/conversion-block-coordinator.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
@@ -114,6 +147,9 @@ import {
 import {
   ExecutionService,
   NodeWorkerFactory,
+  type ExecutionAttachmentBinding,
+  type FileConversionPort,
+  type FileConversionTerminalResult,
   type WorkflowExecutionSource,
   type WorkflowExecutionSourceResolver,
 } from './workflows/execution-service.js'
@@ -131,6 +167,22 @@ import {
   type WorkflowSourceSelectorVault,
 } from './workflows/workflow-source-selector.js'
 import type { DesktopIpcServices } from './ipc/register-ipc.js'
+import {
+  createConversionArtifactService,
+  type ConversionArtifactService,
+} from './conversion/conversion-artifact-service.js'
+import {
+  createDeveloperAttachmentDraftService,
+  type DeveloperAttachmentDraftService,
+} from './conversion/developer-attachment-drafts.js'
+import {
+  createConversionJobRunner,
+  type ConversionJobEvent as RunnerConversionJobEvent,
+  type ConversionJobRunner,
+  type ConversionJobRuntime,
+} from './conversion/conversion-job-runner.js'
+import { ConverterPackManager } from './conversion/converter-pack-manager.js'
+import type { ProductionConversionRuntimeFactory } from './conversion/production-conversion-runtime.js'
 
 export interface ApplicationPaths {
   database: string
@@ -157,6 +209,7 @@ type ApplicationFailureSource =
   | 'media-cancel'
   | 'chat-drain'
   | 'execution-shutdown'
+  | 'conversion-stop'
   | 'continuation-shutdown'
   | 'browser-shutdown'
   | 'sync-pause'
@@ -217,6 +270,7 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'media-cancel': 50,
   'chat-drain': 60,
   'execution-shutdown': 70,
+  'conversion-stop': 75,
   'continuation-shutdown': 80,
   'browser-shutdown': 90,
   'sync-pause': 95,
@@ -274,6 +328,10 @@ export interface ApplicationRuntimeOptions {
   applyTheme?(theme: AppSettings['theme']): void
   /** @internal Test-only observation hook for the Main-owned Agent instance. */
   inspectAgent?(agent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'>): void
+  /** @internal Test-only observation hook for attachment disclosure lease cleanup. */
+  inspectAttachmentDisclosureAuthority?(
+    authority: Pick<ProviderAttachmentDisclosureAuthority, 'activeCount'>,
+  ): void
   /** @internal Test-only hooks for deterministic project mutation races. */
   projectServiceOptions?: WorkflowProjectServiceOptions
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
@@ -282,6 +340,10 @@ export interface ApplicationRuntimeOptions {
   logoutSyncTimeoutMs?: number
   /** @internal Allows deterministic knowledge lifecycle tests; production supplies the local service. */
   knowledgeService?: LocalKnowledgeService
+  /** @internal Trusted Main-only conversion runtime used by focused lifecycle tests and signed-pack integration. */
+  conversionRuntime?: ConversionJobRuntime
+  /** Main-owned owner-binding factory used by the ordinary production Electron entrypoint. */
+  conversionRuntimeFactory?: ProductionConversionRuntimeFactory
 }
 
 interface ObservedAuthService extends AuthService {
@@ -750,6 +812,773 @@ function executionSummary(execution: Execution): ExecutionSummary {
   }
 }
 
+const terminalConversionStatuses = new Set<ConversionJob['status']>([
+  'completed', 'failed', 'cancelled', 'interrupted',
+])
+const retryableConversionStatuses = new Set<ConversionJob['status']>([
+  'failed', 'cancelled', 'interrupted',
+])
+const conversionQuarantinePattern = /^(?<artifactId>[A-Za-z0-9][A-Za-z0-9._-]{0,255})\.quarantine-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+const conversionBatchPattern = /^batch-(?<id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u
+const conversionRollbackPattern = /^rollback-(?<id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u
+const conversionRollbackReservePattern = /^\.rollback-(?<id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.reserve$/u
+const conversionRollbackEvidencePattern = /^v1 (?<dev>[0-9]+) (?<ino>[0-9]+)\n$/u
+const conversionRecoveryConflictName = '.conversion-recovery-conflict'
+const conversionRecoveryConflictEvidence = 'v1\n'
+const conversionRollbackPayloadName = 'batch'
+
+function insidePath(root: string, candidate: string): boolean {
+  const path = relative(root, candidate)
+  return path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path)
+}
+
+function safeManagedRelativePath(path: string): boolean {
+  if (!path || isAbsolute(path) || path.includes('\\') || path.includes('\0')) return false
+  const segments = path.split('/')
+  return segments.every((segment) => segment.length > 0 && segment !== '.' && segment !== '..')
+}
+
+function safeConversionDisplayName(value: string): boolean {
+  return value.length > 0
+    && value.length <= 255
+    && value.trim() === value
+    && !value.includes('/')
+    && !value.includes('\\')
+    && !Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 31 || codePoint === 127
+    })
+    && !/^(?:[A-Za-z]:|file:|https?:)/iu.test(value)
+}
+
+function sameFileMetadata(
+  left: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+  right: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.nlink === right.nlink
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
+}
+
+function sameFileIdentity(
+  left: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+  right: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+}
+
+async function ensureManagedDirectory(path: string): Promise<string> {
+  await mkdir(path, { recursive: true, mode: 0o700 })
+  const metadata = await lstat(path)
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw failure('CONVERSION_INPUT_INVALID')
+  return realpath(path)
+}
+
+function sameDirectoryIdentity(
+  left: { dev: number | bigint; ino: number | bigint },
+  right: { dev: number | bigint; ino: number | bigint },
+): boolean {
+  return String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino)
+}
+
+function conversionBatchRelativePath(relativePath: string): { batchName: string; leaf: string } | undefined {
+  if (!safeManagedRelativePath(relativePath)) return undefined
+  const segments = relativePath.split('/')
+  if (segments.length !== 3 || segments[0] !== 'results' || !conversionBatchPattern.test(segments[1]!)) {
+    return undefined
+  }
+  return { batchName: segments[1]!, leaf: segments[2]! }
+}
+
+async function inspectManagedConversionDirectory(
+  parentRealPath: string,
+  path: string,
+): Promise<Awaited<ReturnType<typeof lstat>>> {
+  if (dirname(path) !== parentRealPath || !insidePath(parentRealPath, path)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const before = await lstat(path)
+  if (before.isSymbolicLink() || !before.isDirectory()) throw failure('CONVERSION_INPUT_INVALID')
+  const canonicalPath = await realpath(path)
+  if (canonicalPath !== path || !insidePath(parentRealPath, canonicalPath)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const after = await lstat(path)
+  if (after.isSymbolicLink() || !after.isDirectory() || !sameDirectoryIdentity(before, after)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  return after
+}
+
+async function assertManagedConversionDirectoryIdentity(
+  parentRealPath: string,
+  path: string,
+  expected: { dev: number | bigint; ino: number | bigint },
+): Promise<void> {
+  const current = await inspectManagedConversionDirectory(parentRealPath, path)
+  if (!sameDirectoryIdentity(expected, current)) throw failure('CONVERSION_INPUT_INVALID')
+}
+
+async function readConversionRollbackReservation(
+  trashRealPath: string,
+  path: string,
+): Promise<{ dev: bigint; ino: bigint } | undefined> {
+  if (dirname(path) !== trashRealPath || !insidePath(trashRealPath, path)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    const before = await lstat(path)
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size > 128) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    const canonicalPath = await realpath(path)
+    if (canonicalPath !== path || !insidePath(trashRealPath, canonicalPath)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const opened = await handle.stat()
+    if (!sameFileMetadata(before, opened)) throw failure('CONVERSION_INPUT_INVALID')
+    const evidence = await handle.readFile({ encoding: 'utf8' })
+    const after = await handle.stat()
+    if (!sameFileMetadata(opened, after)) throw failure('CONVERSION_INPUT_INVALID')
+    if (evidence.length === 0) return undefined
+    const match = conversionRollbackEvidencePattern.exec(evidence)
+    if (!match?.groups?.dev || !match.groups.ino) throw failure('CONVERSION_INPUT_INVALID')
+    return { dev: BigInt(match.groups.dev), ino: BigInt(match.groups.ino) }
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error
+      && String((error as { code: unknown }).code).startsWith('CONVERSION_')) throw error
+    throw failure('CONVERSION_INPUT_INVALID')
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function validateConversionRecoveryConflictMarker(trashRealPath: string): Promise<boolean> {
+  const markerPath = join(trashRealPath, conversionRecoveryConflictName)
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    const before = await lstat(markerPath)
+    if (before.isSymbolicLink()
+      || !before.isFile()
+      || before.nlink !== 1
+      || before.size !== Buffer.byteLength(conversionRecoveryConflictEvidence)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    if (await realpath(markerPath) !== markerPath) throw failure('CONVERSION_INPUT_INVALID')
+    handle = await open(markerPath, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const opened = await handle.stat()
+    if (!sameFileMetadata(before, opened)) throw failure('CONVERSION_INPUT_INVALID')
+    const evidence = await handle.readFile({ encoding: 'utf8' })
+    const after = await handle.stat()
+    if (evidence !== conversionRecoveryConflictEvidence || !sameFileMetadata(opened, after)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    if (typeof error === 'object' && error !== null && 'code' in error
+      && String((error as { code: unknown }).code).startsWith('CONVERSION_')) throw error
+    throw failure('CONVERSION_INPUT_INVALID')
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function markConversionRecoveryConflict(trashRealPath: string): Promise<void> {
+  const markerPath = join(trashRealPath, conversionRecoveryConflictName)
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    handle = await open(markerPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
+    await handle.writeFile(conversionRecoveryConflictEvidence)
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw failure('CONVERSION_INPUT_INVALID')
+    await validateConversionRecoveryConflictMarker(trashRealPath)
+  }
+}
+
+async function scrubConversionRollbackDirectory(
+  trashRealPath: string,
+  path: string,
+  expectedEvidence?: { dev: number | bigint; ino: number | bigint },
+): Promise<void> {
+  const directory = await inspectManagedConversionDirectory(trashRealPath, path)
+  if (expectedEvidence && !sameDirectoryIdentity(directory, expectedEvidence)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const opened: Array<{
+    path: string
+    handle: Awaited<ReturnType<typeof open>>
+    metadata: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>
+  }> = []
+  try {
+    const names = await readdir(path)
+    if (names.length > 256) throw failure('CONVERSION_INPUT_INVALID')
+    for (const name of names) {
+      if (!safeManagedRelativePath(name) || name.includes('/')) throw failure('CONVERSION_INPUT_INVALID')
+      await assertManagedConversionDirectoryIdentity(trashRealPath, path, directory)
+      const leafPath = join(path, name)
+      const before = await lstat(leafPath)
+      if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      const canonicalPath = await realpath(leafPath)
+      if (canonicalPath !== leafPath || !insidePath(path, canonicalPath)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      const handle = await open(leafPath, constants.O_RDWR | constants.O_NOFOLLOW)
+      const metadata = await handle.stat()
+      if (!sameFileMetadata(before, metadata)) {
+        await handle.close()
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      opened.push({ path: leafPath, handle, metadata })
+    }
+
+    await assertManagedConversionDirectoryIdentity(trashRealPath, path, directory)
+    for (const leaf of opened) {
+      const named = await lstat(leaf.path)
+      if (named.isSymbolicLink() || !named.isFile() || !sameFileMetadata(leaf.metadata, named)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+    }
+    for (const leaf of opened) {
+      await leaf.handle.truncate(0)
+      await leaf.handle.sync()
+      const scrubbed = await leaf.handle.stat()
+      if (!scrubbed.isFile()
+        || scrubbed.nlink !== 1
+        || scrubbed.size !== 0
+        || !sameDirectoryIdentity(leaf.metadata, scrubbed)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+    }
+    await assertManagedConversionDirectoryIdentity(trashRealPath, path, directory)
+    for (const leaf of opened) {
+      const named = await lstat(leaf.path)
+      if (named.isSymbolicLink()
+        || !named.isFile()
+        || named.nlink !== 1
+        || named.size !== 0
+        || !sameDirectoryIdentity(leaf.metadata, named)) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+    }
+  } finally {
+    await Promise.allSettled(opened.map(({ handle }) => handle.close()))
+  }
+}
+
+async function reconcileConversionRollbackStorage(trashRealPath: string): Promise<void> {
+  const entries = await readdir(trashRealPath)
+  const reservations = new Map<string, string>()
+  const rollbacks = new Map<string, string>()
+  for (const name of entries) {
+    const reservation = conversionRollbackReservePattern.exec(name)
+    if (reservation?.groups?.id) reservations.set(reservation.groups.id, join(trashRealPath, name))
+    const rollback = conversionRollbackPattern.exec(name)
+    if (rollback?.groups?.id) rollbacks.set(rollback.groups.id, join(trashRealPath, name))
+  }
+  const evidenceById = new Map<string, { dev: bigint; ino: bigint } | undefined>()
+  for (const [id, reservation] of reservations) {
+    evidenceById.set(id, await readConversionRollbackReservation(trashRealPath, reservation))
+  }
+  for (const [id, rollback] of rollbacks) {
+    if (!reservations.has(id)) throw failure('CONVERSION_INPUT_INVALID')
+    try {
+      const container = await inspectManagedConversionDirectory(trashRealPath, rollback)
+      const names = await readdir(rollback)
+      if (names.length === 0) continue
+      if (names.length === 1 && names[0] === conversionRollbackPayloadName) {
+        const evidence = evidenceById.get(id)
+        if (!evidence) throw failure('CONVERSION_INPUT_INVALID')
+        await scrubConversionRollbackDirectory(
+          rollback,
+          join(rollback, conversionRollbackPayloadName),
+          evidence,
+        )
+        await assertManagedConversionDirectoryIdentity(trashRealPath, rollback, container)
+      } else {
+        await scrubConversionRollbackDirectory(trashRealPath, rollback, evidenceById.get(id))
+      }
+    } catch (error) {
+      await markConversionRecoveryConflict(trashRealPath)
+      throw error
+    }
+  }
+}
+
+function ownedConversionResultBatches(
+  database: Pick<AppRepositories, 'executions' | 'conversionJobs' | 'conversionArtifacts'>,
+  ownerUserId: string,
+): {
+  batches: Map<string, Map<string, ConversionArtifact>>
+  invalidClaims: Set<string>
+} {
+  const batches = new Map<string, Map<string, ConversionArtifact>>()
+  const invalidClaims = new Set<string>()
+  for (const execution of database.executions.listForUser(ownerUserId)) {
+    const jobs = new Map(database.conversionJobs.listForExecution(execution.id, ownerUserId)
+      .map((job) => [job.id, job]))
+    for (const artifact of database.conversionArtifacts.listForExecution(execution.id, ownerUserId)) {
+      const batchPath = conversionBatchRelativePath(artifact.relativePath)
+      if (!batchPath || artifact.status === 'deleted') continue
+      const job = artifact.conversionJobId === undefined ? undefined : jobs.get(artifact.conversionJobId)
+      if (artifact.ownerUserId !== ownerUserId
+        || artifact.executionId !== execution.id
+        || artifact.role !== 'output'
+        || artifact.status !== 'ready'
+        || !job
+        || job.ownerUserId !== ownerUserId
+        || job.executionId !== execution.id
+        || job.status !== 'completed') {
+        invalidClaims.add(batchPath.batchName)
+        continue
+      }
+      const artifacts = batches.get(batchPath.batchName) ?? new Map<string, ConversionArtifact>()
+      if (artifacts.has(batchPath.leaf)) invalidClaims.add(batchPath.batchName)
+      else artifacts.set(batchPath.leaf, artifact)
+      batches.set(batchPath.batchName, artifacts)
+    }
+  }
+  return { batches, invalidClaims }
+}
+
+async function validateOwnedConversionBatch(
+  resultsRealPath: string,
+  path: string,
+  artifacts: Map<string, ConversionArtifact>,
+): Promise<void> {
+  const directory = await inspectManagedConversionDirectory(resultsRealPath, path)
+  const names = (await readdir(path)).sort()
+  const expectedNames = [...artifacts.keys()].sort()
+  if (names.length !== expectedNames.length || names.some((name, index) => name !== expectedNames[index])) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  for (const name of names) {
+    await assertManagedConversionDirectoryIdentity(resultsRealPath, path, directory)
+    const artifact = artifacts.get(name)!
+    const leafPath = join(path, name)
+    const metadata = await lstat(leafPath)
+    if (metadata.isSymbolicLink()
+      || !metadata.isFile()
+      || metadata.nlink !== 1
+      || metadata.size !== artifact.byteSize
+      || await realpath(leafPath) !== leafPath) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+  }
+  await assertManagedConversionDirectoryIdentity(resultsRealPath, path, directory)
+}
+
+async function quarantineOrphanConversionBatch(
+  resultsRealPath: string,
+  trashRealPath: string,
+  path: string,
+): Promise<void> {
+  const directory = await inspectManagedConversionDirectory(resultsRealPath, path)
+  const id = randomUUID()
+  const reservePath = join(trashRealPath, `.rollback-${id}.reserve`)
+  const destination = join(trashRealPath, `rollback-${id}`)
+  const payload = join(destination, conversionRollbackPayloadName)
+  let reservation: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    reservation = await open(reservePath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
+    await reservation.writeFile(`v1 ${directory.dev} ${directory.ino}\n`)
+    await reservation.sync()
+    await reservation.close()
+    reservation = undefined
+    const conflict = await lstat(destination).then(
+      () => true,
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw error
+      },
+    )
+    if (conflict) throw failure('CONVERSION_INPUT_INVALID')
+    await mkdir(destination, { mode: 0o700 })
+    const container = await inspectManagedConversionDirectory(trashRealPath, destination)
+    await assertManagedConversionDirectoryIdentity(resultsRealPath, path, directory)
+    await rename(path, payload)
+    const replacementAtSource = await lstat(path).then(
+      () => true,
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw error
+      },
+    )
+    await assertManagedConversionDirectoryIdentity(trashRealPath, destination, container)
+    const isolated = await inspectManagedConversionDirectory(destination, payload)
+    if (replacementAtSource || !sameDirectoryIdentity(directory, isolated)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    await scrubConversionRollbackDirectory(destination, payload, directory)
+    await assertManagedConversionDirectoryIdentity(trashRealPath, destination, container)
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error
+      && String((error as { code: unknown }).code).startsWith('CONVERSION_')) throw error
+    throw failure('CONVERSION_INPUT_INVALID')
+  } finally {
+    await reservation?.close().catch(() => undefined)
+  }
+}
+
+async function reconcileConversionResultBatches(
+  resultsRealPath: string,
+  trashRealPath: string,
+  database: Pick<AppRepositories, 'executions' | 'conversionJobs' | 'conversionArtifacts'>,
+  ownerUserId: string,
+): Promise<void> {
+  const { batches, invalidClaims } = ownedConversionResultBatches(database, ownerUserId)
+  for (const name of await readdir(resultsRealPath)) {
+    if (!conversionBatchPattern.test(name)) continue
+    const path = join(resultsRealPath, name)
+    try {
+      if (invalidClaims.has(name)) throw failure('CONVERSION_INPUT_INVALID')
+      const artifacts = batches.get(name)
+      if (artifacts && artifacts.size > 0) await validateOwnedConversionBatch(resultsRealPath, path, artifacts)
+      else await quarantineOrphanConversionBatch(resultsRealPath, trashRealPath, path)
+    } catch (error) {
+      await markConversionRecoveryConflict(trashRealPath)
+      throw error
+    }
+  }
+}
+
+async function openVerifiedConversionArtifact(
+  dataRoot: string,
+  ownerUserId: string,
+  artifact: ConversionArtifact,
+  requireOutput = true,
+) {
+  if (artifact.status !== 'ready' || (requireOutput && artifact.role !== 'output')) {
+    throw failure('NOT_FOUND')
+  }
+  if (!safeConversionDisplayName(artifact.displayName)) throw failure('CONVERSION_INPUT_INVALID')
+  if (!safeManagedRelativePath(artifact.relativePath)) throw failure('CONVERSION_INPUT_INVALID')
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    const dataRootRealPath = await realpath(dataRoot)
+    const root = resolveUserConversionRoot(dataRoot, ownerUserId)
+    const rootMetadata = await lstat(root)
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw failure('CONVERSION_INPUT_INVALID')
+    const rootRealPath = await realpath(root)
+    if (!insidePath(dataRootRealPath, rootRealPath)) throw failure('CONVERSION_INPUT_INVALID')
+    const path = resolve(root, artifact.relativePath)
+    const expectedCanonicalPath = resolve(rootRealPath, artifact.relativePath)
+    if (!insidePath(rootRealPath, expectedCanonicalPath)) throw failure('CONVERSION_INPUT_INVALID')
+    const before = await lstat(path)
+    if (before.isSymbolicLink()
+      || !before.isFile()
+      || before.nlink !== 1
+      || before.size !== artifact.byteSize) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    const canonicalPath = await realpath(path)
+    if (canonicalPath !== expectedCanonicalPath || !insidePath(rootRealPath, canonicalPath)) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const opened = await handle.stat()
+    if (!sameFileMetadata(before, opened)) throw failure('CONVERSION_INPUT_INVALID')
+    const digest = createHash('sha256')
+    for await (const chunk of handle.createReadStream({ autoClose: false, start: 0 })) digest.update(chunk)
+    const after = await handle.stat()
+    if (!sameFileMetadata(opened, after) || digest.digest('hex') !== artifact.sha256) {
+      throw failure('CONVERSION_INPUT_INVALID')
+    }
+    return { artifact, handle, path, root: rootRealPath, metadata: after }
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+      const code = String((error as { code: unknown }).code)
+      if (code === 'NOT_FOUND' || code.startsWith('CONVERSION_')) throw error
+    }
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+}
+
+async function inspectConversionArtifactNode(
+  rootRealPath: string,
+  path: string,
+  artifact: ConversionArtifact,
+): Promise<Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>> | undefined> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  try {
+    if (!insidePath(rootRealPath, path)) return undefined
+    const before = await lstat(path)
+    if (before.isSymbolicLink()
+      || !before.isFile()
+      || before.nlink !== 1
+      || before.size !== artifact.byteSize) return undefined
+    const canonicalPath = await realpath(path)
+    if (canonicalPath !== path || !insidePath(rootRealPath, canonicalPath)) return undefined
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const opened = await handle.stat()
+    if (!sameFileMetadata(before, opened)) return undefined
+    const digest = createHash('sha256')
+    for await (const chunk of handle.createReadStream({ autoClose: false, start: 0 })) {
+      digest.update(chunk)
+    }
+    const after = await handle.stat()
+    if (!sameFileMetadata(opened, after) || digest.digest('hex') !== artifact.sha256) {
+      return undefined
+    }
+    return after
+  } catch {
+    return undefined
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function quarantineManagedConversionArtifact(
+  dataRoot: string,
+  ownerUserId: string,
+  artifacts: AppRepositories['conversionArtifacts'],
+  artifact: ConversionArtifact,
+  purge = true,
+): Promise<void> {
+  const verified = await openVerifiedConversionArtifact(dataRoot, ownerUserId, artifact, false)
+  await verified.handle.close()
+  const trash = await ensureManagedDirectory(join(verified.root, '.trash'))
+  if (!insidePath(verified.root, trash)) throw failure('CONVERSION_INPUT_INVALID')
+  const quarantined = join(trash, `${artifact.id}.quarantine-${randomUUID()}`)
+  await rename(verified.path, quarantined)
+  const replacementAtSource = await lstat(verified.path).then(() => true, (error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  })
+  const quarantinedMetadata = await inspectConversionArtifactNode(
+    verified.root,
+    quarantined,
+    artifact,
+  )
+  if (replacementAtSource
+    || !quarantinedMetadata
+    || !sameFileIdentity(verified.metadata, quarantinedMetadata)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const sourceReappearedBeforeMark = await lstat(verified.path).then(
+    () => true,
+    (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
+    },
+  )
+  if (sourceReappearedBeforeMark) throw failure('CONVERSION_INPUT_INVALID')
+  if (!artifacts.markDeleted(artifact.id, ownerUserId, artifact)) throw failure('CONFLICT')
+  const beforePurge = await inspectConversionArtifactNode(verified.root, quarantined, artifact)
+  const sourceReappearedAfterMark = await lstat(verified.path).then(
+    () => true,
+    (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
+    },
+  )
+  if (sourceReappearedAfterMark
+    || !beforePurge
+    || !sameFileIdentity(quarantinedMetadata, beforePurge)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  if (purge) await rm(quarantined, { force: true })
+}
+
+async function purgeOwnerConversionStorage(dataRoot: string, ownerUserId: string): Promise<void> {
+  const root = resolveUserConversionRoot(dataRoot, ownerUserId)
+  let metadata: Awaited<ReturnType<typeof lstat>>
+  try {
+    metadata = await lstat(root)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const dataRootRealPath = await realpath(dataRoot)
+  const rootRealPath = await realpath(root)
+  if (!insidePath(dataRootRealPath, rootRealPath)) throw failure('CONVERSION_INPUT_INVALID')
+  await rm(rootRealPath, { recursive: true, force: true })
+}
+
+async function recoverOwnerConversionStorage(
+  dataRoot: string,
+  ownerUserId: string,
+  database: Pick<AppRepositories, 'executions' | 'conversionJobs' | 'conversionArtifacts'>,
+): Promise<void> {
+  const dataRootRealPath = await realpath(dataRoot)
+  const root = resolveUserConversionRoot(dataRoot, ownerUserId)
+  const rootRealPath = await ensureManagedDirectory(root)
+  if (!insidePath(dataRootRealPath, rootRealPath)) throw failure('CONVERSION_INPUT_INVALID')
+  const staging = await ensureManagedDirectory(join(rootRealPath, '.staging'))
+  const results = await ensureManagedDirectory(join(rootRealPath, 'results'))
+  const quarantine = await ensureManagedDirectory(join(rootRealPath, '.trash'))
+  if (!insidePath(rootRealPath, staging)
+    || !insidePath(rootRealPath, results)
+    || !insidePath(rootRealPath, quarantine)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  const resultsMetadata = await lstat(results)
+  const quarantineMetadata = await lstat(quarantine)
+  if (resultsMetadata.dev !== quarantineMetadata.dev) throw failure('CONVERSION_INPUT_INVALID')
+  if (await validateConversionRecoveryConflictMarker(quarantine)) {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  for (const name of await readdir(staging)) {
+    const candidate = join(staging, name)
+    if (!insidePath(staging, candidate)) throw failure('CONVERSION_INPUT_INVALID')
+    await rm(candidate, { recursive: true, force: true })
+  }
+  await reconcileConversionRollbackStorage(quarantine)
+  await reconcileConversionResultBatches(results, quarantine, database, ownerUserId)
+  const quarantinedByArtifact = new Map<string, string[]>()
+  const residueArtifactIds = new Set<string>()
+  for (const name of await readdir(quarantine)) {
+    const match = conversionQuarantinePattern.exec(name)
+    if (!match?.groups?.artifactId) continue
+    const candidate = join(quarantine, name)
+    const metadata = await lstat(candidate)
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw failure('CONVERSION_INPUT_INVALID')
+    const candidates = quarantinedByArtifact.get(match.groups.artifactId) ?? []
+    candidates.push(candidate)
+    quarantinedByArtifact.set(match.groups.artifactId, candidates)
+  }
+  for (const [artifactId, candidates] of quarantinedByArtifact) {
+    const artifact = database.conversionArtifacts.getOwned(artifactId, ownerUserId)
+    if (!artifact || artifact.status !== 'ready' || !safeManagedRelativePath(artifact.relativePath)) {
+      continue
+    }
+    const destination = resolve(rootRealPath, artifact.relativePath)
+    if (!insidePath(rootRealPath, destination)) throw failure('CONVERSION_INPUT_INVALID')
+    const destinationExists = await lstat(destination).then(() => true, (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
+    })
+    if (destinationExists) {
+      await inspectConversionArtifactNode(rootRealPath, destination, artifact)
+    }
+    await Promise.all(candidates.map(
+      (candidate) => inspectConversionArtifactNode(rootRealPath, candidate, artifact),
+    ))
+    const destinationExistsAfterVerification = await lstat(destination).then(
+      () => true,
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw error
+      },
+    )
+    if (destinationExistsAfterVerification) {
+      await inspectConversionArtifactNode(rootRealPath, destination, artifact)
+    }
+    residueArtifactIds.add(artifact.id)
+    if (!artifact.conversionJobId || artifact.role !== 'output') continue
+    const job = database.conversionJobs.getOwned(artifact.conversionJobId, ownerUserId)
+    if (!job
+      || job.executionId !== artifact.executionId
+      || job.status !== 'completed') continue
+    if (!database.conversionJobs.interruptCompletedForArtifactRecovery({
+      jobId: job.id,
+      ownerUserId,
+      expectedEpoch: job.epoch,
+    })) {
+      throw failure('CONFLICT')
+    }
+  }
+  for (const execution of database.executions.listForUser(ownerUserId)) {
+    for (const job of database.conversionJobs.listForExecution(execution.id, ownerUserId)) {
+      if (job.status === 'completed') continue
+      for (const artifact of database.conversionArtifacts.listForJob(job.id, ownerUserId)) {
+        if (artifact.status === 'ready'
+          && artifact.role === 'output'
+          && !residueArtifactIds.has(artifact.id)) {
+          await quarantineManagedConversionArtifact(
+            dataRoot,
+            ownerUserId,
+            database.conversionArtifacts,
+            artifact,
+            false,
+          )
+        }
+      }
+    }
+    const jobs = database.conversionJobs.listForExecution(execution.id, ownerUserId)
+    const referencedInputs = new Set(jobs.flatMap((job) => (
+      job.sourceKind === 'artifact' ? [job.sourceId] : []
+    )))
+    for (const artifact of database.conversionArtifacts.listForExecution(execution.id, ownerUserId)) {
+      if (artifact.status !== 'ready' || artifact.role !== 'input' || referencedInputs.has(artifact.id)) continue
+      await quarantineManagedConversionArtifact(
+        dataRoot,
+        ownerUserId,
+        database.conversionArtifacts,
+        artifact,
+        false,
+      )
+    }
+  }
+}
+
+function requireCompletedConversionArtifactParent(
+  database: Pick<AppRepositories, 'conversionJobs'>,
+  artifact: ConversionArtifact,
+  ownerUserId: string,
+): ConversionJob {
+  if (!artifact.conversionJobId) throw failure('NOT_FOUND')
+  const job = database.conversionJobs.getOwned(artifact.conversionJobId, ownerUserId)
+  if (!job
+    || job.status !== 'completed'
+    || job.executionId !== artifact.executionId
+    || artifact.role !== 'output'
+    || artifact.status !== 'ready') throw failure('NOT_FOUND')
+  return job
+}
+
+function conversionJobView(
+  database: Pick<AppRepositories, 'conversionArtifacts'>,
+  job: ConversionJob,
+): ConversionJobView {
+  return conversionJobViewSchema.parse({
+    jobId: job.id,
+    executionId: job.executionId,
+    targetFormat: job.targetFormat,
+    ...(job.preset === undefined ? {} : { preset: job.preset }),
+    status: job.status,
+    epoch: job.epoch,
+    progress: job.progress,
+    ...(job.errorCode === undefined ? {} : { errorCode: job.errorCode }),
+    artifacts: database.conversionArtifacts.listForJob(job.id, job.ownerUserId).map((artifact) => ({
+      artifactId: artifact.id,
+      status: artifact.status,
+      displayName: artifact.displayName,
+      detectedFormat: artifact.detectedFormat,
+      mimeType: artifact.mimeType,
+      byteSize: artifact.byteSize,
+      ...(artifact.metadata === undefined ? {} : { metadata: artifact.metadata }),
+    })),
+  })
+}
+
+function unavailableConversionRuntime(packManager: ConverterPackManager): ConversionJobRuntime {
+  const unavailable = async (): Promise<never> => {
+    await packManager.initialize()
+    throw failure('CONVERSION_COMPONENT_UNAVAILABLE')
+  }
+  return {
+    concurrencyClass: () => 'other',
+    acquirePack: unavailable,
+    prepare: unavailable,
+  }
+}
+
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
@@ -820,6 +1649,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let bindUserMedia: (session: AuthSession) => Promise<void> = async () => undefined
   let pauseUserMedia = (): void => undefined
   let deleteUserMedia: (userId: string) => Promise<void> = async () => undefined
+  let bindUserConversion: (session: AuthSession) => Promise<void> = async () => undefined
+  let pauseUserConversion: (
+    options?: { preserveListeners?: boolean },
+  ) => Promise<void> = async () => undefined
+  let clearExecutionAttachmentVaults: (userId: string) => Promise<void> = async () => undefined
   const knowledge = options.knowledgeService
   knowledge?.configureCloudRemote?.(
     cloudBasePorts ? new CloudBaseKnowledgeClient(cloudBasePorts.functions) : undefined,
@@ -917,6 +1751,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await refreshMembershipEntitlement(session)
         scheduleMembershipRefresh(session.user.id)
         await bindUserMedia(session)
+        await bindUserConversion(session)
         activateUserReconciliation(runtimeRecovered)
         await activateVideoJobs(runtimeRecovered)
         return
@@ -925,13 +1760,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await knowledge?.bind(session.user.id, currentCloudSyncConsentAccepted())
       await refreshMembershipEntitlement(session)
       await bindUserMedia(session)
+      await bindUserConversion(session)
+      await userDataSync.bootstrapSync()
+      applyCurrentCloudSyncConsent(session.user.id)
       boundUserId = session.user.id
       scheduleMembershipRefresh(session.user.id)
       const warningSince = userDataSync.status().warningSince
       if (warningSince !== undefined) {
         notifySyncWarning(userDataSync.captureBinding(session.user.id), warningSince)
       }
-      await pullUserData(session.user.id)
       activateUserReconciliation(runtimeRecovered)
       await activateVideoJobs(runtimeRecovered)
     })
@@ -943,6 +1780,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     knowledge?.invalidate()
     const operation = userDataLifecycleTail.then(async () => {
       await knowledge?.drain()
+      await pauseUserConversion()
+      if (boundUserId) await clearExecutionAttachmentVaults(boundUserId)
       await pauseVideoJobs()
       await pauseUserReconciliation()
       await userDataSync.pause()
@@ -958,6 +1797,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     knowledge?.invalidate()
     const operation = userDataLifecycleTail.then(async () => {
       await knowledge?.drain()
+      await pauseUserConversion()
+      if (boundUserId) await clearExecutionAttachmentVaults(boundUserId)
       await pauseVideoJobs()
       await pauseUserReconciliation()
       userDataSync.discard()
@@ -1093,6 +1934,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               id: value.id, conversationId: value.conversationId,
               role: value.role === 'user' ? 'user' : 'assistant',
               blocks: chatBlockSchema.array().parse(value.blocks),
+              ...(value.providerProjection === undefined
+                ? {}
+                : { providerProjection: value.providerProjection }),
               ...(value.executionId === undefined ? {} : { executionId: value.executionId }),
               createdAt: occurredAt,
             },
@@ -1217,11 +2061,380 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   deleteUserMedia = async (userId) => {
     await rm(resolveUserMediaRoot(options.paths.data, userId), { recursive: true, force: true })
   }
+  type ConversionTerminalWaiter = {
+    ownerUserId: string
+    resolve(value: FileConversionTerminalResult): void
+    reject(error: unknown): void
+    signal: AbortSignal
+    onAbort(): void
+  }
+  type BoundConversionLifecycle = {
+    generation: number
+    ownerUserId: string
+    artifacts: ConversionArtifactService
+    developerDrafts: DeveloperAttachmentDraftService
+    developerDraftReleases: Set<Promise<void>>
+    packManager: ConverterPackManager
+    runner: ConversionJobRunner
+  }
+  let boundConversion: BoundConversionLifecycle | undefined
+  let notifyAgentConversionJobSubmitted: (executionId: string) => void = () => undefined
+  let conversionGeneration = 0
+  const conversionEventListeners = new Set<(event: DesktopConversionJobEvent) => void>()
+  const conversionTerminalWaiters = new Map<string, Set<ConversionTerminalWaiter>>()
+  const conversionArtifactDeletionTails = new Map<string, Promise<void>>()
+
+  const currentConversion = (ownerUserId?: string): BoundConversionLifecycle => {
+    const lifecycle = boundConversion
+    if (!lifecycle || (ownerUserId !== undefined && lifecycle.ownerUserId !== ownerUserId)) {
+      throw failure('AUTH_REQUIRED')
+    }
+    return lifecycle
+  }
+  const terminalConversionResult = (job: ConversionJob): FileConversionTerminalResult => ({
+    status: job.status as 'completed' | 'failed' | 'cancelled' | 'interrupted',
+    ...(job.errorCode === undefined ? {} : { errorCode: job.errorCode }),
+    outputs: job.status !== 'completed' ? [] : database.conversionArtifacts
+      .listForJob(job.id, job.ownerUserId)
+      .filter((artifact) => artifact.status === 'ready' && artifact.role === 'output')
+      .map((artifact) => ({
+        displayName: artifact.displayName,
+        detectedFormat: artifact.detectedFormat,
+        byteSize: artifact.byteSize,
+      })),
+  })
+  const settleConversionWaiters = (job: ConversionJob): void => {
+    if (!terminalConversionStatuses.has(job.status)) return
+    const waiters = conversionTerminalWaiters.get(job.id)
+    if (!waiters) return
+    conversionTerminalWaiters.delete(job.id)
+    for (const waiter of waiters) {
+      waiter.signal.removeEventListener('abort', waiter.onAbort)
+      if (waiter.ownerUserId === job.ownerUserId) waiter.resolve(terminalConversionResult(job))
+      else waiter.reject(failure('NOT_FOUND'))
+    }
+  }
+  const reconcileConversionBlocks = (
+    lifecycle: BoundConversionLifecycle,
+    executionId: string,
+    reconcileOptions: { scheduleSync?: boolean } = {},
+  ): void => {
+    const store = currentUserData()
+    const transition = reconcileConversionBlockBinding({
+      repositories: {
+        durable: database,
+        chat: {
+          messages: store.messages,
+          chatRuns: store.chatRuns,
+          conversionBlockBindings: store.conversionBlockBindings,
+        },
+      },
+      ownerUserId: lifecycle.ownerUserId,
+      executionId,
+    })
+    if (!transition) return
+    if (reconcileOptions.scheduleSync !== false) queueUserDataFlush()
+    options.emitChat({
+      type: 'block_update',
+      conversationId: transition.conversationId,
+      messageId: transition.messageId,
+      blockId: transition.block.blockId,
+      block: transition.block,
+    })
+  }
+  const emitConversionJob = (
+    lifecycle: BoundConversionLifecycle,
+    job: ConversionJob,
+    reconcileOptions: { scheduleSync?: boolean } = {},
+  ): void => {
+    if (boundConversion !== lifecycle
+      || job.ownerUserId !== lifecycle.ownerUserId
+      || !auth.isAuthenticated()
+      || auth.currentUserId() !== job.ownerUserId) return
+    settleConversionWaiters(job)
+    reconcileConversionBlocks(lifecycle, job.executionId, reconcileOptions)
+    let event: DesktopConversionJobEvent
+    try {
+      event = { type: 'job_updated', job: conversionJobView(database, job) }
+    } catch {
+      return
+    }
+    for (const listener of conversionEventListeners) {
+      try { listener(event) } catch { /* Renderer event listeners are observational. */ }
+    }
+  }
+  const replayConversionJobs = (
+    lifecycle: BoundConversionLifecycle,
+    listener: (event: DesktopConversionJobEvent) => void,
+  ): void => {
+    const ownerUserId = lifecycle.ownerUserId
+    if (boundConversion !== lifecycle
+      || !auth.isAuthenticated()
+      || auth.currentUserId() !== ownerUserId) return
+    for (const execution of database.executions.listForUser(ownerUserId)) {
+      for (const job of database.conversionJobs.listForExecution(execution.id, ownerUserId)) {
+        try {
+          listener({ type: 'job_updated', job: conversionJobView(database, job) })
+        } catch {
+          // Invalid durable projections and listener failures do not widen the event boundary.
+        }
+      }
+    }
+  }
+  const runnerEvent = (
+    generation: number,
+    event: RunnerConversionJobEvent,
+  ): void => {
+    const lifecycle = boundConversion
+    if (!lifecycle
+      || lifecycle.generation !== generation
+      || event.ownerUserId !== lifecycle.ownerUserId) return
+    const job = database.conversionJobs.getOwned(event.jobId, event.ownerUserId)
+    if (job) emitConversionJob(lifecycle, job)
+  }
+  const rejectConversionWaiters = (ownerUserId: string): void => {
+    for (const [jobId, waiters] of conversionTerminalWaiters) {
+      const retained = new Set<ConversionTerminalWaiter>()
+      for (const waiter of waiters) {
+        if (waiter.ownerUserId !== ownerUserId) {
+          retained.add(waiter)
+          continue
+        }
+        waiter.signal.removeEventListener('abort', waiter.onAbort)
+        waiter.reject(failure('CONVERSION_INTERRUPTED'))
+      }
+      if (retained.size === 0) conversionTerminalWaiters.delete(jobId)
+      else conversionTerminalWaiters.set(jobId, retained)
+    }
+  }
+  pauseUserConversion = async (pauseOptions = {}) => {
+    const lifecycle = boundConversion
+    if (!lifecycle) return
+    let stopFailure: unknown
+    await Promise.allSettled([...lifecycle.developerDraftReleases])
+    try {
+      await lifecycle.developerDrafts.clearOwner()
+    } catch (error) {
+      stopFailure = error
+    }
+    try {
+      await lifecycle.runner.stop()
+    } catch (error) {
+      stopFailure ??= error
+    }
+    try {
+      await lifecycle.runner.idle()
+    } catch (error) {
+      throw stopFailure ?? error
+    }
+    rejectConversionWaiters(lifecycle.ownerUserId)
+    if (!pauseOptions.preserveListeners) conversionEventListeners.clear()
+    if (boundConversion === lifecycle) boundConversion = undefined
+    if (stopFailure !== undefined) throw stopFailure
+  }
+  bindUserConversion = async (session) => {
+    if (boundConversion?.ownerUserId === session.user.id) return
+    if (boundConversion) await pauseUserConversion()
+    const artifacts = createConversionArtifactService({
+      dataRoot: options.paths.data,
+      database: chatDatabase,
+    })
+    const developerDrafts = createDeveloperAttachmentDraftService({
+      dataRoot: options.paths.data,
+      ownerUserId: session.user.id,
+      artifacts: database.conversionArtifacts,
+    })
+    const productionBinding = options.conversionRuntime === undefined && options.conversionRuntimeFactory !== undefined
+      ? await options.conversionRuntimeFactory({
+        ownerUserId: session.user.id,
+        dataRoot: options.paths.data,
+        packsRoot: join(options.paths.data, 'converter-packs'),
+        database: chatDatabase,
+        artifacts,
+      })
+      : undefined
+    const packManager = productionBinding?.packManager ?? new ConverterPackManager({
+      packsRoot: join(options.paths.data, 'converter-packs'),
+    })
+    await packManager.initialize()
+    await recoverOwnerConversionStorage(options.paths.data, session.user.id, database)
+    await developerDrafts.recover()
+    const generation = ++conversionGeneration
+    const runner = createConversionJobRunner({
+      ownerUserId: session.user.id,
+      jobs: database.conversionJobs,
+      runtime: options.conversionRuntime ?? productionBinding?.runtime ?? unavailableConversionRuntime(packManager),
+      onEvent: (event) => { runnerEvent(generation, event) },
+    })
+    const lifecycle: BoundConversionLifecycle = {
+      generation,
+      ownerUserId: session.user.id,
+      artifacts,
+      developerDrafts,
+      developerDraftReleases: new Set(),
+      packManager,
+      runner,
+    }
+    boundConversion = lifecycle
+    runner.start()
+    for (const binding of currentUserData().conversionBlockBindings.listRecoverable(session.user.id)) {
+      reconcileConversionBlocks(lifecycle, binding.executionId, { scheduleSync: false })
+    }
+    for (const execution of database.executions.listForUser(session.user.id)) {
+      for (const job of database.conversionJobs.listForExecution(execution.id, session.user.id)) {
+        emitConversionJob(lifecycle, job, { scheduleSync: false })
+      }
+    }
+  }
+  const serializeConversionArtifactDelete = async <Result>(
+    ownerUserId: string,
+    artifactId: string,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const key = `${ownerUserId}\0${artifactId}`
+    const previous = conversionArtifactDeletionTails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const tail = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    conversionArtifactDeletionTails.set(key, tail)
+    await previous.catch(() => undefined)
+    try {
+      return await operation()
+    } finally {
+      release()
+      if (conversionArtifactDeletionTails.get(key) === tail) {
+        conversionArtifactDeletionTails.delete(key)
+      }
+    }
+  }
+  const conversionSourceFingerprintValue = (ownerUserId: string, sourceId: string, sha256: string): string => createHash('sha256')
+    .update('autoforge-file-conversion-source-v1\0')
+    .update(ownerUserId)
+    .update('\0')
+    .update(sourceId)
+    .update('\0')
+    .update(sha256)
+    .digest('hex')
+  const conversionSourceFingerprint = (binding: ExecutionAttachmentBinding): string => {
+    let sourceId: string
+    let sha256: string | undefined
+    if (binding.source.kind === 'media') {
+      sourceId = binding.source.mediaAssetId
+      const record = chatDatabase.mediaAssets.get(sourceId)
+      const conversation = record && chatDatabase.conversations.get(record.conversationId)
+      if (!record || conversation?.userId !== binding.ownerUserId || record.status !== 'ready') {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      sha256 = record.sha256
+    } else {
+      sourceId = binding.source.artifactId
+      const record = database.conversionArtifacts.getOwned(sourceId, binding.ownerUserId)
+      if (!record || record.status !== 'ready' || record.role !== 'input') {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      sha256 = record.sha256
+    }
+    if (!sha256 || !/^[a-f0-9]{64}$/u.test(sha256)) throw failure('CONVERSION_INPUT_INVALID')
+    return conversionSourceFingerprintValue(binding.ownerUserId, sourceId, sha256)
+  }
+  const fileConversion: FileConversionPort = {
+    async inspectAttachment(binding) {
+      const lifecycle = currentConversion(binding.ownerUserId)
+      if (conversionSourceFingerprint(binding) !== binding.sourceFingerprint) {
+        throw failure('CONVERSION_INPUT_INVALID')
+      }
+      const resolved = await lifecycle.artifacts.resolveOwnedInput(binding)
+      try {
+        if (conversionSourceFingerprint(binding) !== binding.sourceFingerprint) {
+          throw failure('CONVERSION_INPUT_INVALID')
+        }
+      } finally {
+        await resolved.close()
+      }
+      return Object.freeze({ ...binding, source: Object.freeze({ ...binding.source }) })
+    },
+    submit: (input) => {
+      const receipt = currentConversion().runner.submit(input)
+      notifyAgentConversionJobSubmitted(input.executionId)
+      return receipt
+    },
+    waitForTerminal: async (jobId, ownerUserId, signal) => {
+      currentConversion(ownerUserId)
+      const job = database.conversionJobs.getOwned(jobId, ownerUserId)
+      if (!job) throw failure('NOT_FOUND')
+      if (terminalConversionStatuses.has(job.status)) return terminalConversionResult(job)
+      if (signal.aborted) throw failure('CANCELLED')
+      return new Promise((resolvePromise, rejectPromise) => {
+        const waiters = conversionTerminalWaiters.get(jobId) ?? new Set<ConversionTerminalWaiter>()
+        const waiter: ConversionTerminalWaiter = {
+          ownerUserId,
+          resolve: resolvePromise,
+          reject: rejectPromise,
+          signal,
+          onAbort: () => {
+            signal.removeEventListener('abort', waiter.onAbort)
+            waiters.delete(waiter)
+            if (waiters.size === 0) conversionTerminalWaiters.delete(jobId)
+            rejectPromise(failure('CANCELLED'))
+          },
+        }
+        waiters.add(waiter)
+        conversionTerminalWaiters.set(jobId, waiters)
+        signal.addEventListener('abort', waiter.onAbort, { once: true })
+        if (signal.aborted) {
+          waiter.onAbort()
+          return
+        }
+        const current = database.conversionJobs.getOwned(jobId, ownerUserId)
+        if (current) settleConversionWaiters(current)
+      })
+    },
+    cancel: (jobId) => currentConversion().runner.cancel(jobId),
+  }
   const providerCredentialEpoch = new Map<ModelProviderId, number>()
+  const providerCredentialTransitions = new Map<ModelProviderId, Promise<void>>()
+  const attachmentDisclosureAuthority = createProviderAttachmentDisclosureAuthority({
+    currentCredentialEpoch: (provider) => providerCredentialEpoch.get(provider) ?? 0,
+    isCredentialTransitionActive: (provider) => providerCredentialTransitions.has(provider),
+  })
+  options.inspectAttachmentDisclosureAuthority?.(attachmentDisclosureAuthority)
   const modelCatalog = new Map<ModelProviderId, {
     credentialEpoch: number
     promise: Promise<Awaited<ReturnType<ModelProvider['listModels']>>>
   }>()
+  const invalidateProviderCredential = (provider: ModelProviderId): void => {
+    attachmentDisclosureAuthority.revokeProvider(provider)
+    providerCredentialEpoch.set(provider, (providerCredentialEpoch.get(provider) ?? 0) + 1)
+    modelCatalog.delete(provider)
+  }
+  const waitForProviderCredentialTransition = async (provider: ModelProviderId): Promise<void> => {
+    while (true) {
+      const transition = providerCredentialTransitions.get(provider)
+      if (!transition) return
+      await transition
+    }
+  }
+  const mutateProviderCredential = <Value>(
+    provider: ModelProviderId,
+    operation: () => Value | Promise<Value>,
+  ): Promise<Value> => {
+    const previous = providerCredentialTransitions.get(provider)
+    invalidateProviderCredential(provider)
+    const transitionRef: { marker?: Promise<void> } = {}
+    const result = (async () => {
+      if (previous) await previous
+      return operation()
+    })()
+    const admitted = result.finally(() => {
+      invalidateProviderCredential(provider)
+      if (providerCredentialTransitions.get(provider) === transitionRef.marker) {
+        providerCredentialTransitions.delete(provider)
+      }
+    })
+    const marker = admitted.then(() => undefined, () => undefined)
+    transitionRef.marker = marker
+    providerCredentialTransitions.set(provider, marker)
+    return admitted
+  }
   const getModelCatalog = (
     provider: ModelProviderId,
     refresh = false,
@@ -1393,7 +2606,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerSnapshot: ModelProviderSnapshot
     providerCredentialEpoch: number
     model?: string
+    omitAttachmentProjections?: boolean
+    protectedTitleText?: ProviderAttachmentSafeText
+    attachmentDisclosure?: ProviderAttachmentDisclosure
   }>()
+  const releaseConversationTitleContext = (requestId: string): void => {
+    const context = conversationTitleContexts.get(requestId)
+    conversationTitleContexts.delete(requestId)
+    if (context?.attachmentDisclosure) attachmentDisclosureAuthority.release(context.attachmentDisclosure)
+  }
   let acceptingWork = true
   const failureRecorder = createApplicationFailureRecorder(() => { acceptingWork = false })
   const recordFailure = failureRecorder.record
@@ -1433,6 +2654,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           activeRequests.delete(requestId)
         }
       }, (error: unknown) => {
+        releaseConversationTitleContext(requestId)
         recordFailure(error, 'background-chat')
         activeRequests.delete(requestId)
       })
@@ -1447,6 +2669,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       else activeExecutions.delete(event.executionId)
     }
     const ownerUserId = database.executions.get(event.executionId)?.ownerUserId
+    if (event.type === 'status' && ['completed', 'failed', 'cancelled', 'interrupted'].includes(event.status)
+      && ownerUserId !== undefined && boundConversion?.ownerUserId === ownerUserId) {
+      reconcileConversionBlocks(boundConversion, event.executionId)
+    }
     if (auth.isAuthenticated() && ownerUserId !== undefined && ownerUserId === auth.currentUserId()) {
       try { options.emitExecution(event) } catch { /* Renderer events are observational. */ }
     }
@@ -1457,6 +2683,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     policy,
     workers: new NodeWorkerFactory(options.paths.workflowRunner),
     capability: browser,
+    conversion: fileConversion,
     emit: emitExecution,
     temporaryDirectories: {
       create: async () => { await mkdir(options.paths.temporary, { recursive: true }); return mkdtemp(join(options.paths.temporary, 'autoforge-execution-')) },
@@ -1464,6 +2691,68 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         ?? ((path) => rm(path, { recursive: true, force: true })),
     },
   })
+  clearExecutionAttachmentVaults = async (ownerUserId) => {
+    const activeStatuses = new Set([
+      'queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval',
+    ])
+    const executionIds = database.executions.listForUser(ownerUserId)
+      .filter((execution) => activeStatuses.has(execution.status))
+      .map((execution) => execution.id)
+    const results = await Promise.allSettled(executionIds.map((executionId) => (
+      executions.cancel(executionId)
+    )))
+    const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (rejected) throw rejected.reason
+    while (executions.hasActiveExecutions()) {
+      await new Promise<void>((resolvePromise) => { setImmediate(resolvePromise) })
+    }
+  }
+  const conversionExecutionIdsForConversations = (
+    ownerUserId: string,
+    conversationIds: ReadonlySet<string>,
+  ): string[] => database.executions.listForUser(ownerUserId)
+    .filter((execution) => {
+      if (!execution.chatRunId) return false
+      const run = chatDatabase.chatRuns.get(execution.chatRunId)
+      return run?.userId === ownerUserId && conversationIds.has(run.conversationId)
+    })
+    .map((execution) => execution.id)
+  const drainAndPurgeConversionExecutions = async (
+    ownerUserId: string,
+    executionIds: readonly string[],
+  ): Promise<void> => {
+    if (executionIds.length === 0) return
+    const lifecycle = currentConversion(ownerUserId)
+    const jobs = executionIds.flatMap((executionId) => (
+      database.conversionJobs.listForExecution(executionId, ownerUserId)
+    ))
+    for (const job of jobs) {
+      if (!terminalConversionStatuses.has(job.status)) {
+        const cancelled = await lifecycle.runner.cancel(job.id)
+        const current = database.conversionJobs.getOwned(job.id, ownerUserId)
+        if (!cancelled && current && !terminalConversionStatuses.has(current.status)) {
+          throw failure('CONFLICT')
+        }
+      }
+    }
+    for (const job of jobs) {
+      for (const artifact of database.conversionArtifacts.listForJob(job.id, ownerUserId)) {
+        if (artifact.status !== 'ready') continue
+        await serializeConversionArtifactDelete(ownerUserId, artifact.id, async () => {
+          const current = database.conversionArtifacts.getOwned(artifact.id, ownerUserId)
+          if (!current || current.status !== 'ready') return
+          await quarantineManagedConversionArtifact(
+            options.paths.data,
+            ownerUserId,
+            database.conversionArtifacts,
+            current,
+          )
+        })
+      }
+      const current = database.conversionJobs.getOwned(job.id, ownerUserId)
+      if (current) emitConversionJob(lifecycle, current)
+    }
+  }
   const conversationTitles = new ConversationTitleService({
     repositories: chatDatabase,
     emit: (event) => emitChat(event),
@@ -1498,7 +2787,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
       const context = conversationTitleContexts.get(event.requestId)
       conversationTitleContexts.delete(event.requestId)
-      if (event.status !== 'completed') return
+      if (event.status !== 'completed') {
+        if (context?.attachmentDisclosure) attachmentDisclosureAuthority.release(context.attachmentDisclosure)
+        return
+      }
       const run = chatDatabase.chatRuns.getByRequestId(event.requestId)
       if (
         context
@@ -1517,9 +2809,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           requestId: event.requestId,
           providerSnapshot: context.providerSnapshot,
           ...(context.model === undefined ? {} : { model: context.model }),
+          ...(context.omitAttachmentProjections ? { omitAttachmentProjections: true } : {}),
+          ...(context.protectedTitleText === undefined
+            ? {}
+            : { protectedTitleText: context.protectedTitleText }),
           signal: controller.signal,
         }).then(() => undefined).finally(() => {
           activeConversationTitleWork.delete(event.requestId)
+          if (context.attachmentDisclosure) attachmentDisclosureAuthority.release(context.attachmentDisclosure)
         })
         activeConversationTitleWork.set(event.requestId, {
           conversationId: event.conversationId,
@@ -1528,6 +2825,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         })
       } else {
         chatDatabase.conversations.failPendingTitleGeneration(event.conversationId)
+        if (context?.attachmentDisclosure) attachmentDisclosureAuthority.release(context.attachmentDisclosure)
       }
     }
   }
@@ -1558,7 +2856,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const conversationContext = createConversationContextManager(chatDatabase)
   const agent = new AgentOrchestrator({
     workflows: registry,
-    persistence: createAgentPersistence(chatDatabase),
+    persistence: createAgentPersistence(chatDatabase, undefined, (_messageId, blocks) => {
+      const ownerUserId = auth.currentUserId()
+      if (!ownerUserId) return
+      const lifecycle = boundConversion
+      if (!lifecycle || lifecycle.ownerUserId !== ownerUserId) return
+      for (const block of blocks) {
+        if (block.type === 'conversion') reconcileConversionBlocks(lifecycle, block.executionId)
+      }
+    }),
     history: conversationContext,
     policy,
     executions,
@@ -1609,6 +2915,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
     }),
   })
+  notifyAgentConversionJobSubmitted = (executionId) => {
+    agent.onConversionJobSubmitted(executionId)
+  }
   isBrowserRunActive = (runId) => agent.ownsBrowserRun(runId)
   options.inspectAgent?.(agent)
   const pruneInactiveAgentRequests = () => {
@@ -2023,6 +3332,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               .filter((work) => work.conversationId === conversationId)
             for (const work of titleRequests) work.controller.abort()
             await Promise.all(titleRequests.map((work) => work.promise))
+            await drainAndPurgeConversionExecutions(
+              session.user.id,
+              conversionExecutionIdsForConversations(
+                session.user.id,
+                new Set([conversationId]),
+              ),
+            )
             await browserContinuations.revokeConversation(conversationId, 'CANCELLED')
             await currentMediaLifecycle().deleteConversation(conversationId)
           },
@@ -2046,59 +3362,158 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const preferences = conversationGenerationPreferencesSchema.parse(
             conversation.generationPreferences ?? defaultGenerationPreferences,
           )
+          const declaredMediaOutput = hasHighConfidenceMediaGenerationRequest(input.content)
           const requestedOutput = input.outputType === 'auto'
-            ? preferences.outputType
+            ? declaredMediaOutput ?? preferences.outputType
             : input.outputType
-          const credentialEpoch = providerCredentialEpoch.get(snapshot.activeProvider) ?? 0
-          const providerSnapshot = await providerRegistry.acquire(snapshot.activeProvider)
-          if (providerSnapshot.providerId !== snapshot.activeProvider) {
-            const error = new ProviderUsageConsistencyError()
-            recordFailure(error, 'preflight')
-            throw error
-          }
           const resolved = await resolvedInput(input.conversationId, input.assetIds)
-          if (
-            resolved.assets.some((asset) => asset.kind === 'file')
+          const requestId = randomUUID()
+          let requestAttachmentDisclosure: ProviderAttachmentDisclosure | undefined
+          try {
+          const protectedAssets = resolved.assets.map((asset) => {
+            const record = chatDatabase.mediaAssets.get(asset.id)
+            if (!record
+              || record.conversationId !== input.conversationId
+              || record.status !== 'ready'
+              || record.sha256 === undefined) throw failure('MEDIA_ASSET_UNAVAILABLE')
+            const sourceFingerprint = createHash('sha256')
+              .update('autoforge-file-conversion-source-v1\0')
+              .update(session.user.id)
+              .update('\0')
+              .update(asset.id)
+              .update('\0')
+              .update(record.sha256)
+              .digest('hex')
+            return {
+              asset,
+              record,
+              sourceFingerprint,
+            }
+          })
+          if ((declaredMediaOutput === 'image' || declaredMediaOutput === 'video')
+            && resolved.assets.some((asset) => asset.kind !== 'image')) {
+            throw failure('MODEL_MODALITY_UNSUPPORTED')
+          }
+          const privacyPlan = attachmentDisclosureAuthority.createPlan({
+            requestId,
+            text: input.content,
+            context: {
+              hasAttachments: resolved.assets.length > 0,
+              requestedOutput,
+              attachmentKinds: resolved.assets.map(({ kind }) => kind),
+            },
+            attachments: protectedAssets.map(({ asset, record, sourceFingerprint }, index) => ({
+              index,
+              id: asset.id,
+              name: asset.name,
+              mimeType: asset.mimeType,
+              byteSize: asset.byteSize,
+              fingerprint: record.sha256!,
+              forbiddenValues: [asset.absolutePath, asset.relativePath, sourceFingerprint],
+            })),
+          })
+          const attachmentDecision = privacyPlan.access.decision
+          const metadataOnlyAttachments = attachmentDecision !== 'ordinary'
+          const localConversionIntent = attachmentDecision === 'local'
+          if (!metadataOnlyAttachments
+            && resolved.assets.some((asset) => asset.kind === 'file')
             && requestedOutput !== 'auto'
-            && requestedOutput !== 'text'
-          ) throw failure('MODEL_MODALITY_UNSUPPORTED')
-          if (resolved.assets.some((asset) => (
+            && requestedOutput !== 'text') throw failure('MODEL_MODALITY_UNSUPPORTED')
+          if (!metadataOnlyAttachments && resolved.assets.some((asset) => (
             asset.kind === 'file'
             && chatFileSupport(snapshot.activeProvider, asset.name, asset.mimeType).mode === 'unsupported'
           ))) throw failure('MODEL_MODALITY_UNSUPPORTED')
-          if (
-            snapshot.activeProvider === 'deepseek'
+          if (!metadataOnlyAttachments
+            && snapshot.activeProvider === 'deepseek'
             && (resolved.assets.some((asset) => asset.kind !== 'file')
-              || (requestedOutput !== 'auto' && requestedOutput !== 'text'))
-          ) throw failure('MODEL_MODALITY_UNSUPPORTED')
-          await requireValidCredential(providerSnapshot)
-          const route = resolveChatRoute({
+              || (requestedOutput !== 'auto' && requestedOutput !== 'text'))) {
+            throw failure('MODEL_MODALITY_UNSUPPORTED')
+          }
+          const redactedContent = metadataOnlyAttachments
+            ? privacyPlan.titleText.replace(/^用户：/u, '')
+            : input.content
+          const ambiguousModel = input.model
+            ?? preferences.models.text
+            ?? snapshot.defaultModels[snapshot.activeProvider].text
+          let attachmentDisclosure: ProviderAttachmentDisclosure | undefined
+          let protectedProviderSnapshot: ModelProviderSnapshot | undefined
+          let summaryProviderSnapshot: ModelProviderSnapshot | undefined
+          const route = attachmentDecision === 'ambiguous' ? {
             provider: snapshot.activeProvider,
-            ...(input.model === undefined ? {} : { requestedModel: input.model }),
-            requestedOutput: input.outputType,
-            requestedGeneration: input.generation,
-            defaults: snapshot.defaultModels,
-            conversationPreferences: preferences,
-            models: await getModelCatalog(
-              snapshot.activeProvider,
-              false,
-              providerSnapshot,
-              credentialEpoch,
-            ),
-            assets: resolved.assets,
-          })
+            model: ambiguousModel ?? (() => { throw failure('INVALID_INPUT') })(),
+            supportsTools: false,
+            supportsImageInput: false,
+            outputType: 'text' as const,
+            assets: [],
+            generation: preferences.generation,
+          } : await (async () => {
+            let providerSnapshot: ModelProviderSnapshot
+            while (true) {
+              await waitForProviderCredentialTransition(snapshot.activeProvider)
+              const credentialEpoch = providerCredentialEpoch.get(snapshot.activeProvider) ?? 0
+              const acquired = await providerRegistry.acquire(snapshot.activeProvider)
+              if (providerCredentialTransitions.has(snapshot.activeProvider)
+                || credentialEpoch !== (providerCredentialEpoch.get(snapshot.activeProvider) ?? 0)) {
+                continue
+              }
+              providerSnapshot = acquired
+              break
+            }
+            if (providerSnapshot.providerId !== snapshot.activeProvider) {
+              const error = new ProviderUsageConsistencyError()
+              recordFailure(error, 'preflight')
+              throw error
+            }
+            attachmentDisclosure = attachmentDisclosureAuthority.bindProvider(privacyPlan, providerSnapshot)
+            requestAttachmentDisclosure = attachmentDisclosure
+            protectedProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+              purpose: 'main',
+            })
+            if (resolved.assets.length > 0 && attachmentDecision === 'ordinary') {
+              summaryProviderSnapshot = protectProviderSnapshot(providerSnapshot, attachmentDisclosure, {
+                purpose: 'summary',
+              })
+            }
+            await requireValidCredential(providerSnapshot)
+            const resolvedRoute = resolveChatRoute({
+                provider: snapshot.activeProvider,
+                ...(input.model === undefined ? {} : { requestedModel: input.model }),
+                requestedOutput: metadataOnlyAttachments ? 'text' : requestedOutput,
+                requestedGeneration: input.generation,
+                defaults: snapshot.defaultModels,
+                conversationPreferences: preferences,
+                models: await getModelCatalog(
+                  snapshot.activeProvider,
+                  false,
+                  providerSnapshot,
+                  attachmentDisclosure.credentialEpoch,
+                ),
+                assets: metadataOnlyAttachments ? [] : resolved.assets,
+              })
+            if ('selectionRequired' in resolvedRoute || 'modelRequired' in resolvedRoute) {
+              throw failure('INVALID_INPUT')
+            }
+            const titleModel = snapshot.defaultModels[providerSnapshot.providerId].text
+            const titleProviderSnapshot = resolved.assets.length > 0
+              ? protectProviderSnapshot(providerSnapshot, attachmentDisclosure, { purpose: 'title' })
+              : providerSnapshot
+            conversationTitleContexts.set(requestId, {
+              conversationId: input.conversationId,
+              userId: session.user.id,
+              providerSnapshot: titleProviderSnapshot,
+              providerCredentialEpoch: attachmentDisclosure.credentialEpoch,
+              attachmentDisclosure,
+              ...(titleModel === undefined ? {} : { model: titleModel }),
+              ...(resolved.assets.length > 0 ? { omitAttachmentProjections: true } : {}),
+              ...(resolved.assets.length > 0
+                ? { protectedTitleText: attachmentDisclosure.titleSafeText }
+                : {}),
+            })
+            return resolvedRoute
+          })()
           if ('selectionRequired' in route || 'modelRequired' in route) {
             throw failure('INVALID_INPUT')
           }
-          const requestId = randomUUID()
-          const titleModel = snapshot.defaultModels[providerSnapshot.providerId].text
-          conversationTitleContexts.set(requestId, {
-            conversationId: input.conversationId,
-            userId: session.user.id,
-            providerSnapshot,
-            providerCredentialEpoch: credentialEpoch,
-            ...(titleModel === undefined ? {} : { model: titleModel }),
-          })
           const userBlocks: ChatBlock[] = [
             ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
             ...resolved.userBlocks,
@@ -2109,18 +3524,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             prompt: input.content,
             userBlocks,
             assetIds: input.assetIds,
+            attachmentFingerprints: protectedAssets.map(({ record }) => record.sha256!),
             route,
+            ...(attachmentDisclosure === undefined ? {} : { attachmentDisclosure }),
+            ...(protectedProviderSnapshot === undefined ? {} : { providerSnapshot: protectedProviderSnapshot }),
             userId: session.user.id,
           }
           if (route.outputType === 'text') {
-            const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
-            const projectedAttachments = projectAttachmentInputs(route.provider, modelInputs)
-            const modelContent: string | ModelContentPart[] = projectedAttachments.length === 0
-              ? input.content
-              : [
-                  ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
-                  ...projectedAttachments,
-                ]
             const knowledgeSelection = {
               baseIds: [...(preferences.knowledgeBaseIds ?? [])],
               mode: preferences.knowledgeMode ?? 'mixed',
@@ -2130,25 +3540,83 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                   { userId: session.user.id }, knowledgeSelection.baseIds,
                 )
               : undefined
+            let modelContent: string | ModelContentPart[]
+            let currentMedia: CurrentMediaMetadata[]
+            let attachmentBindings: readonly ExecutionAttachmentBinding[]
+            if (localConversionIntent) {
+              modelContent = attachmentDisclosure!.mainSafeText.text
+              currentMedia = []
+              const selectedAttachmentIndexes = new Set(privacyPlan.selectedAttachmentIndexes!)
+              attachmentBindings = Object.freeze(protectedAssets.flatMap(({
+                asset, sourceFingerprint,
+              }, index) => {
+                if (!selectedAttachmentIndexes.has(index)) return []
+                return Object.freeze({
+                  attachmentIndex: index,
+                  ownerUserId: session.user.id,
+                  conversationId: input.conversationId,
+                  displayName: asset.name,
+                  mimeType: asset.mimeType,
+                  byteSize: asset.byteSize,
+                  source: Object.freeze({ kind: 'media' as const, mediaAssetId: asset.id }),
+                  sourceFingerprint,
+                })
+              }))
+            } else if (attachmentDecision === 'ambiguous') {
+              modelContent = privacyPlan.mainText
+              currentMedia = []
+              attachmentBindings = Object.freeze([])
+            } else {
+              assertAttachmentByteAccess(attachmentDisclosure, {
+                requestId,
+                providerId: route.provider,
+                assetIds: input.assetIds,
+                assetFingerprints: protectedAssets.map(({ record }) => record.sha256!),
+              })
+              const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
+              modelContent = createProviderAttachmentProjection(
+                attachmentDisclosure!,
+                route.provider,
+                modelInputs,
+              ).content
+              currentMedia = resolved.assets.flatMap<CurrentMediaMetadata>(({
+                kind, mimeType, byteSize, durationMs,
+              }) => {
+                if (kind === 'file') {
+                  return mimeType === 'text/plain' ? [] : [{ kind, byteSize }]
+                }
+                return [{ kind, ...(durationMs === undefined ? {} : { durationMs }) }]
+              })
+              attachmentBindings = Object.freeze([])
+            }
             trackChatWork(requestId, input.conversationId, async () => {
               return agent.run({
                 conversationId: input.conversationId,
-                content: input.content,
+                content: redactedContent,
                 userBlocks,
                 modelContent,
                 assetIds: input.assetIds,
-                currentMedia: resolved.assets.flatMap<CurrentMediaMetadata>(({
-                  kind, mimeType, byteSize, durationMs,
-                }) => {
-                  if (kind === 'file') {
-                    return mimeType === 'text/plain' ? [] : [{ kind, byteSize }]
-                  }
-                  return [{ kind, ...(durationMs === undefined ? {} : { durationMs }) }]
-                }),
-                allowTools: route.supportsTools,
+                attachmentFingerprints: protectedAssets.map(({ record }) => record.sha256!),
+                currentMedia,
+                ...(metadataOnlyAttachments ? {
+                  omitHistoricalAttachments: true,
+                  omitConversationHistory: true,
+                } : {}),
+                attachmentBindings,
+                allowTools: attachmentDecision === 'ambiguous' ? false : route.supportsTools,
+                ...(localConversionIntent ? {
+                  localConversionOnly: true,
+                  localConversionTarget: privacyPlan.targetFormat!,
+                  localConversionAttachmentIndexes: privacyPlan.selectedAttachmentIndexes!,
+                } : {}),
+                ...(attachmentDecision === 'ambiguous'
+                  ? { fixedResponse: AMBIGUOUS_CONVERSION_CLARIFICATION }
+                  : {}),
                 supportsImageInput: route.supportsImageInput,
                 userId: session.user.id,
-                providerSnapshot,
+                ...(protectedProviderSnapshot === undefined ? {} : { providerSnapshot: protectedProviderSnapshot }),
+                ...(summaryProviderSnapshot === undefined ? {} : { summaryProviderSnapshot }),
+                ...(attachmentDisclosure === undefined ? {} : { attachmentDisclosure }),
                 provider: route.provider,
                 model: route.model,
                 ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
@@ -2174,7 +3642,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 route: { ...route, outputType: 'video' },
               })
             } catch (error) {
-              conversationTitleContexts.delete(requestId)
+              releaseConversationTitleContext(requestId)
               if (error instanceof ProviderUsageConsistencyError) {
                 recordFailure(error, 'video-submit')
               }
@@ -2182,6 +3650,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             }
           }
           return { requestId }
+          } catch (error) {
+            releaseConversationTitleContext(requestId)
+            if (requestAttachmentDisclosure) {
+              attachmentDisclosureAuthority.release(requestAttachmentDisclosure)
+            }
+            throw error
+          }
         } finally {
           releaseStart()
           activeChatAdmissions.delete(admission)
@@ -2396,10 +3871,46 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         }
       },
       validate: (projectId) => projects.validate(projectId),
-      run: async ({ projectId, input }) => {
+      pickFiles: async ({ projectId, existingAttachmentIds }) => {
+        const session = await requireAuthenticatedSession()
+        if (!database.workflowProjects.get(projectId)) throw failure('NOT_FOUND')
+        const remainingSlots = 5 - existingAttachmentIds.length
+        if (remainingSlots <= 0) return []
+        const paths = (await options.chooseMediaFiles(remainingSlots)).filter(Boolean)
+        return currentConversion(session.user.id).developerDrafts.importPaths({
+          projectId,
+          existingAttachmentIds,
+          paths,
+        })
+      },
+      removeAttachment: async ({ projectId, attachmentId }) => {
+        const session = await requireAuthenticatedSession()
+        if (!database.workflowProjects.get(projectId)) throw failure('NOT_FOUND')
+        await currentConversion(session.user.id).developerDrafts.remove(projectId, attachmentId)
+      },
+      clearAttachments: async ({ projectId }) => {
+        const session = await requireAuthenticatedSession()
+        if (!database.workflowProjects.get(projectId)) throw failure('NOT_FOUND')
+        await currentConversion(session.user.id).developerDrafts.clearProject(projectId)
+      },
+      run: async ({ projectId, input, attachmentIds }) => {
         const releaseStart = maintenance.beginStart()
+        let draftService: DeveloperAttachmentDraftService | undefined
+        let claimedExecutionId: string | undefined
+        const selectedAttachmentIds = attachmentIds ?? []
+        const clearUnclaimedDrafts = async () => {
+          if (!draftService) return
+          await Promise.allSettled(selectedAttachmentIds.map((attachmentId) => (
+            draftService!.remove(projectId, attachmentId)
+          )))
+        }
         try {
-          const session = await auth.requireSession()
+          const session = await requireAuthenticatedSession()
+          const conversionLifecycle = currentConversion(session.user.id)
+          draftService = conversionLifecycle.developerDrafts
+          for (const attachmentId of selectedAttachmentIds) {
+            if (!draftService.get(projectId, attachmentId)) throw failure('NOT_FOUND')
+          }
           await beginDevelopmentRebuild(projectId)
           let built: WorkflowProject
           try {
@@ -2408,24 +3919,121 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             finishDevelopmentRebuild(projectId)
           }
           const manifest = built.manifest as WorkflowManifest
+          const schema = manifest.inputSchema as {
+            type?: unknown
+            properties?: Record<string, { type?: unknown; 'x-autoforge-control'?: unknown }>
+          }
+          const pickerFields = schema?.type === 'object' && schema.properties
+            ? Object.entries(schema.properties).filter(([, field]) => (
+                field.type === 'array' && field['x-autoforge-control'] === 'file-picker'
+              )).map(([name]) => name)
+            : []
+          const inputObject = input && typeof input === 'object' && !Array.isArray(input)
+            ? input as Record<string, unknown>
+            : undefined
+          if (selectedAttachmentIds.length > 0) {
+            const field = pickerFields.length === 1 ? pickerFields[0] : undefined
+            const indexes = field && inputObject ? inputObject[field] : undefined
+            if (!field
+              || !Array.isArray(indexes)
+              || indexes.length !== selectedAttachmentIds.length
+              || !indexes.every((value, index) => value === index)) {
+              await clearUnclaimedDrafts()
+              throw failure('INVALID_INPUT')
+            }
+          } else if (pickerFields.some((field) => (
+            Array.isArray(inputObject?.[field]) && (inputObject![field] as unknown[]).length > 0
+          ))) {
+            throw failure('INVALID_INPUT')
+          }
           try {
             const inputValidation = validateWorkflowInput(manifest.inputSchema, input)
-            if (!inputValidation.valid) return { validationError: inputValidation.message }
+            if (!inputValidation.valid) {
+              await clearUnclaimedDrafts()
+              return { validationError: inputValidation.message }
+            }
           } catch (error) {
             if (typeof error === 'object' && error !== null && 'code' in error) throw error
             throw failure('INVALID_INPUT')
           }
           const workflow = await registry.getDevelopmentProject(projectId)
           if (!workflow) throw failure('WORKFLOW_INTEGRITY_FAILED')
-          const started = await executions.start({
-            userId: session.user.id,
-            workflowId: manifest.id,
-            workflowVersion: manifest.version,
-            input,
-            sourceSelector: sourceSelectorVault.create(workflow),
-          })
+          const conversionCapable = manifest.permissions.some(
+            (permission) => permission.capability === 'file.convert',
+          )
+          let started: Awaited<ReturnType<ExecutionService['start']>>
+          if (selectedAttachmentIds.length === 0) {
+            started = await executions.start({
+              userId: session.user.id,
+              workflowId: manifest.id,
+              workflowVersion: manifest.version,
+              input,
+              sourceSelector: sourceSelectorVault.create(workflow),
+            })
+          } else {
+            const targetFormat = conversionTargetFormatSchema.safeParse(inputObject?.targetFormat)
+            if (!targetFormat.success) {
+              await clearUnclaimedDrafts()
+              throw failure('INVALID_INPUT')
+            }
+            const reservation = executions.reserve()
+            claimedExecutionId = reservation.executionId
+            const drafts = draftService.claim(projectId, reservation.executionId, selectedAttachmentIds)
+            const attachmentBindings: ExecutionAttachmentBinding[] = drafts.map((draft, attachmentIndex) => ({
+              attachmentIndex,
+              ownerUserId: session.user.id,
+              displayName: draft.name,
+              mimeType: draft.mimeType,
+              byteSize: draft.byteSize,
+              source: { kind: 'artifact', artifactId: draft.id },
+              sourceFingerprint: conversionSourceFingerprintValue(session.user.id, draft.id, draft.sha256),
+            }))
+            started = await executions.startReserved(reservation, {
+              userId: session.user.id,
+              workflowId: manifest.id,
+              workflowVersion: manifest.version,
+              input,
+              sourceSelector: sourceSelectorVault.create(workflow),
+              attachmentBindings,
+              prepareAttachmentBindings: (executionId) => draftService!.materialize(
+                executionId,
+                selectedAttachmentIds,
+              ),
+              fileConvertAuthorization: {
+                executionId: reservation.executionId,
+                capability: 'file.convert',
+                decision: 'once',
+                attachments: attachmentBindings.map((binding) => ({
+                  index: binding.attachmentIndex,
+                  sourceFingerprint: binding.sourceFingerprint,
+                })),
+                formats: [targetFormat.data],
+              },
+            })
+            let releaseTask!: Promise<void>
+            releaseTask = started.finished.then(async () => {
+              const referenced = new Set(database.conversionJobs
+                .listForExecution(started.id, session.user.id)
+                .filter((job) => job.sourceKind === 'artifact')
+                .map((job) => job.sourceId))
+              const release = () => draftService!.releaseExecution(started.id, referenced)
+              await userDataAdmission.run(release).catch(async (error) => {
+                if (userDataAdmission.acceptsNewWork()
+                  && boundConversion === conversionLifecycle
+                  && auth.currentUserId() === session.user.id) throw error
+                await release()
+              })
+            }).catch((error) => { recordFailure(error, 'conversion-stop') }).finally(() => {
+              conversionLifecycle.developerDraftReleases.delete(releaseTask)
+            })
+            conversionLifecycle.developerDraftReleases.add(releaseTask)
+          }
           void started.finished.catch(() => undefined)
-          return { executionId: started.id }
+          return { executionId: started.id, conversionCapable }
+        } catch (error) {
+          if (!claimedExecutionId) await clearUnclaimedDrafts()
+          else if (draftService) await draftService.releaseExecution(claimedExecutionId, new Set()).catch(() => undefined)
+          throw error
         } finally {
           releaseStart()
         }
@@ -2495,6 +4103,206 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await browser.closeExecution(executionId)
       },
     },
+    conversion: {
+      listForExecution: async ({ executionId }) => {
+        const session = await requireAuthenticatedSession()
+        if (!database.executions.getForUser(executionId, session.user.id)) {
+          return { availability: 'unavailable' as const, jobs: [] }
+        }
+        currentConversion(session.user.id)
+        return {
+          availability: 'local' as const,
+          jobs: database.conversionJobs.listForExecution(executionId, session.user.id)
+            .map((job) => conversionJobView(database, job)),
+        }
+      },
+      cancel: async ({ jobId }) => {
+        const session = await requireAuthenticatedSession()
+        const lifecycle = currentConversion(session.user.id)
+        const job = database.conversionJobs.getOwned(jobId, session.user.id)
+        if (!job) throw failure('NOT_FOUND')
+        if (terminalConversionStatuses.has(job.status)) throw failure('CONFLICT')
+        if (!await lifecycle.runner.cancel(jobId)) throw failure('CONFLICT')
+      },
+      retry: async ({ jobId }) => {
+        const session = await requireAuthenticatedSession()
+        const lifecycle = currentConversion(session.user.id)
+        const job = database.conversionJobs.getOwned(jobId, session.user.id)
+        if (!job) throw failure('NOT_FOUND')
+        if (!retryableConversionStatuses.has(job.status)) throw failure('CONFLICT')
+        if (!lifecycle.runner.retry(jobId)) throw failure('CONFLICT')
+      },
+      saveCopy: async ({ artifactId }) => {
+        const session = await requireAuthenticatedSession()
+        const artifact = database.conversionArtifacts.getOwned(artifactId, session.user.id)
+        if (!artifact || artifact.status !== 'ready') throw failure('NOT_FOUND')
+        requireCompletedConversionArtifactParent(database, artifact, session.user.id)
+        const verified = await openVerifiedConversionArtifact(
+          options.paths.data,
+          session.user.id,
+          artifact,
+        )
+        let destinationHandle: Awaited<ReturnType<typeof open>> | undefined
+        let openedDestination: {
+          path: string
+          metadata: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>
+        } | undefined
+        let saved = false
+        try {
+          const selected = await options.chooseMediaSavePath(artifact.displayName)
+          if (!selected) return { saved: false }
+          const destination = resolve(selected)
+          const selectedDirectory = dirname(destination)
+          const selectedDirectoryMetadata = await lstat(selectedDirectory)
+          if (selectedDirectoryMetadata.isSymbolicLink()
+            || !selectedDirectoryMetadata.isDirectory()) throw failure('INVALID_INPUT')
+          const destinationDirectory = await realpath(selectedDirectory)
+          const destinationDirectoryMetadata = await lstat(destinationDirectory)
+          if (insidePath(verified.root, destinationDirectory)
+            || insidePath(verified.root, destination)) {
+            throw failure('INVALID_INPUT')
+          }
+          const canonicalDestination = join(destinationDirectory, basename(destination))
+          try {
+            destinationHandle = await open(
+              canonicalDestination,
+              constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+              0o600,
+            )
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw failure('CONFLICT')
+            throw error
+          }
+          const destinationBefore = await destinationHandle.stat()
+          if (!destinationBefore.isFile()
+            || destinationBefore.nlink !== 1
+            || destinationBefore.size !== 0) throw failure('INVALID_INPUT')
+          openedDestination = { path: canonicalDestination, metadata: destinationBefore }
+          const digest = createHash('sha256')
+          let destinationOffset = 0
+          for await (const chunk of verified.handle.createReadStream({ autoClose: false, start: 0 })) {
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            digest.update(bytes)
+            let chunkOffset = 0
+            while (chunkOffset < bytes.byteLength) {
+              const { bytesWritten } = await destinationHandle.write(
+                bytes,
+                chunkOffset,
+                bytes.byteLength - chunkOffset,
+                destinationOffset,
+              )
+              if (bytesWritten <= 0) throw failure('INVALID_INPUT')
+              chunkOffset += bytesWritten
+              destinationOffset += bytesWritten
+            }
+          }
+          await destinationHandle.sync()
+          const after = await verified.handle.stat()
+          const managed = await lstat(verified.path)
+          if (!sameFileMetadata(verified.metadata, after)
+            || !sameFileMetadata(after, managed)
+            || after.size !== artifact.byteSize
+            || digest.digest('hex') !== artifact.sha256) {
+            throw failure('CONVERSION_INPUT_INVALID')
+          }
+          const destinationAfter = await destinationHandle.stat()
+          if (!destinationAfter.isFile()
+            || destinationAfter.nlink !== 1
+            || destinationAfter.dev !== destinationBefore.dev
+            || destinationAfter.ino !== destinationBefore.ino
+            || destinationAfter.size !== artifact.byteSize
+            || destinationOffset !== artifact.byteSize) {
+            throw failure('INVALID_INPUT')
+          }
+          const selectedDirectoryAfter = await lstat(selectedDirectory)
+          const destinationDirectoryAfter = await lstat(destinationDirectory)
+          if (selectedDirectoryAfter.isSymbolicLink()
+            || !selectedDirectoryAfter.isDirectory()
+            || selectedDirectoryAfter.dev !== selectedDirectoryMetadata.dev
+            || selectedDirectoryAfter.ino !== selectedDirectoryMetadata.ino
+            || destinationDirectoryAfter.dev !== destinationDirectoryMetadata.dev
+            || destinationDirectoryAfter.ino !== destinationDirectoryMetadata.ino
+            || await realpath(selectedDirectory) !== destinationDirectory) {
+            throw failure('INVALID_INPUT')
+          }
+          const copiedMetadata = await lstat(canonicalDestination)
+          if (copiedMetadata.isSymbolicLink()
+            || copiedMetadata.nlink !== 1
+            || !sameFileIdentity(destinationAfter, copiedMetadata)
+            || await realpath(canonicalDestination) !== canonicalDestination) {
+            throw failure('INVALID_INPUT')
+          }
+          const selectedDirectoryFinal = await lstat(selectedDirectory)
+          if (selectedDirectoryFinal.isSymbolicLink()
+            || selectedDirectoryFinal.dev !== selectedDirectoryMetadata.dev
+            || selectedDirectoryFinal.ino !== selectedDirectoryMetadata.ino
+            || await realpath(selectedDirectory) !== destinationDirectory) {
+            throw failure('INVALID_INPUT')
+          }
+          saved = true
+          return { saved: true }
+        } finally {
+          await verified.handle.close().catch(() => undefined)
+          if (destinationHandle) {
+            if (!saved) await destinationHandle.truncate(0).catch(() => undefined)
+            const finalMetadata = await destinationHandle.stat().catch(() => undefined)
+            await destinationHandle.close().catch(() => undefined)
+            if (!saved
+              && openedDestination
+              && finalMetadata
+              && openedDestination.metadata.dev === finalMetadata.dev
+              && openedDestination.metadata.ino === finalMetadata.ino) {
+              const current = await lstat(openedDestination.path).catch(() => undefined)
+              if (current
+                && current.dev === finalMetadata.dev
+                && current.ino === finalMetadata.ino) {
+                await rm(openedDestination.path, { force: true }).catch(() => undefined)
+              }
+            }
+          }
+        }
+      },
+      reveal: async ({ artifactId }) => {
+        const session = await requireAuthenticatedSession()
+        const artifact = database.conversionArtifacts.getOwned(artifactId, session.user.id)
+        if (!artifact || artifact.status !== 'ready') throw failure('NOT_FOUND')
+        requireCompletedConversionArtifactParent(database, artifact, session.user.id)
+        const verified = await openVerifiedConversionArtifact(
+          options.paths.data,
+          session.user.id,
+          artifact,
+        )
+        try {
+          options.revealPath(verified.path)
+        } finally {
+          await verified.handle.close().catch(() => undefined)
+        }
+      },
+      deleteArtifact: async ({ artifactId }) => {
+        const session = await requireAuthenticatedSession()
+        await serializeConversionArtifactDelete(session.user.id, artifactId, async () => {
+          const lifecycle = currentConversion(session.user.id)
+          const artifact = database.conversionArtifacts.getOwned(artifactId, session.user.id)
+          if (!artifact || artifact.status !== 'ready') throw failure('NOT_FOUND')
+          const job = requireCompletedConversionArtifactParent(database, artifact, session.user.id)
+          await quarantineManagedConversionArtifact(
+            options.paths.data,
+            session.user.id,
+            database.conversionArtifacts,
+            artifact,
+            false,
+          )
+          const currentJob = database.conversionJobs.getOwned(job.id, session.user.id)
+          if (currentJob) emitConversionJob(lifecycle, currentJob)
+        })
+      },
+      onEvent: (listener) => {
+        conversionEventListeners.add(listener)
+        const lifecycle = boundConversion
+        if (lifecycle) replayConversionJobs(lifecycle, listener)
+        return () => { conversionEventListeners.delete(listener) }
+      },
+    },
     permissions: {
       listGrants: async () => database.permissionGrants.list().map((grant): PermissionGrant => ({
         id: grant.id,
@@ -2550,17 +4358,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         settingsUpdateTail = transaction.then(() => undefined, () => undefined)
         return transaction
       },
-      saveProviderApiKey: async (provider, apiKey) => {
+      saveProviderApiKey: (provider, apiKey) => mutateProviderCredential(provider, async () => {
         await secretStore.set(credentialKeyForProvider(provider), apiKey)
-        providerCredentialEpoch.set(provider, (providerCredentialEpoch.get(provider) ?? 0) + 1)
-        modelCatalog.delete(provider)
         return { provider, configured: true, validation: 'unchecked' as const }
-      },
-      clearProviderApiKey: async (provider) => {
-        secretStore.delete(credentialKeyForProvider(provider))
-        providerCredentialEpoch.set(provider, (providerCredentialEpoch.get(provider) ?? 0) + 1)
-        modelCatalog.delete(provider)
-      },
+      }),
+      clearProviderApiKey: (provider) => mutateProviderCredential(provider, async () => {
+        await secretStore.delete(credentialKeyForProvider(provider))
+      }),
       validateProviderCredential: credentialStatus,
       listProviderModels: (provider, refresh = false) => getModelCatalog(provider, refresh),
       getTokenUsage: async () => {
@@ -2800,6 +4604,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       clearLocalData: async (scope, token) => {
         const binding = await consumeCurrentDataClearToken(token)
         if (!binding) return 'stale' as const
+        const session = await requireAuthenticatedSession()
+        if (session.user.id !== binding.userId) return 'stale' as const
         const cleared = await maintenance.runExclusive(
           () => activeRequests.size > 0
             || activeChatWork.size > 0
@@ -2812,11 +4618,33 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || browser.hasActiveContexts(),
           async () => {
             if (!await dataClearBindingIsCurrent(binding)) return false
-            if (scope === 'conversations' || scope === 'all') {
-              await currentMediaLifecycle().clearConversations()
+            const clearsConversations = scope === 'conversations' || scope === 'all'
+            const clearsExecutions = scope === 'executions' || scope === 'all'
+            if (clearsConversations) {
+              const conversationIds = new Set(
+                currentUserData().conversations.list().map((conversation) => conversation.id),
+              )
+              await drainAndPurgeConversionExecutions(
+                session.user.id,
+                conversionExecutionIdsForConversations(session.user.id, conversationIds),
+              )
             }
-            if (scope === 'executions' || scope === 'all') {
-              database.clearLocalData('executions')
+            let conversionPaused = false
+            try {
+              await pauseUserConversion({ preserveListeners: true })
+              conversionPaused = true
+              await clearExecutionAttachmentVaults(session.user.id)
+              if (clearsExecutions) {
+                await purgeOwnerConversionStorage(options.paths.data, session.user.id)
+              }
+              if (clearsConversations) await currentMediaLifecycle().clearConversations()
+              if (clearsExecutions) database.clearLocalData('executions')
+            } finally {
+              if (conversionPaused
+                && auth.isAuthenticated()
+                && auth.currentUserId() === session.user.id) {
+                await bindUserConversion(session)
+              }
             }
             return true
           },
@@ -2896,6 +4724,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     chat: gateUserDataService(ungatedServices.chat),
     media: gateUserDataService(ungatedServices.media),
     executions: gateUserDataService(ungatedServices.executions),
+    developer: gateUserDataService(ungatedServices.developer),
+    conversion: {
+      ...gateUserDataService(ungatedServices.conversion),
+      onEvent: ungatedServices.conversion.onEvent,
+    },
     knowledge: gateUserDataService(ungatedServices.knowledge),
     settings: {
       ...ungatedServices.settings,
@@ -3011,9 +4844,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           for (const result of titleResults) if (result.status === 'rejected') {
             recordFailure(result.reason, 'chat-drain')
           }
-          conversationTitleContexts.clear()
+          for (const requestId of conversationTitleContexts.keys()) {
+            releaseConversationTitleContext(requestId)
+          }
         })
         await capture('execution-shutdown', () => executions.shutdown())
+        await capture('conversion-stop', () => pauseUserConversion())
+        if (boundConversion) {
+          const terminalFailure = failureRecorder.select()
+          throw terminalFailure?.error ?? failure('CONVERSION_INTERRUPTED')
+        }
         await capture('continuation-shutdown', async () => {
           try { await browserContinuations.shutdown() } finally {
             browserLoginWait.dispose()

@@ -19,7 +19,7 @@
 - 输出先写用户专属临时目录，经格式探测、大小/页数/帧数检查和 SHA-256 后原子移动到托管结果区；任何失败、取消或超时都不得暴露半成品。
 - 全局最多并发 2 个任务；LibreOffice 同时 1 个，视频编码同时 1 个。图片/图标 2 分钟，文档/PDF 5 分钟，音频 10 分钟，视频 30 分钟。
 - 固定上限：每次最多 5 个附件；图片 20 MiB、音频 50 MiB、视频 200 MiB、普通文件 100 MiB、请求总量 250 MiB、输出总量 500 MiB；图片每帧 100 MP、总计 500 MP；PDF 最多 100 页。
-- 支持 macOS arm64/x64 和 Windows x64。正式根公钥、CDN 地址和生产签名包缺失时必须保持下载入口 fail-closed；测试包只能使用测试根密钥并明确标记为 fixture。
+- 首发支持 macOS arm64/x64；Windows 不在首发矩阵，生产 factory 必须在读取发布元数据或访问网络/index 前 fail-closed。正式根公钥、CDN 地址和生产签名包缺失时必须保持下载入口 fail-closed；测试包只能使用测试根密钥并明确标记为 fixture。Windows signed inventory 的路径、保留名和 active-content 角色校验继续保留，但不构成平台支持声明。
 - 新增的转换任务、组件缓存和产物均为 local-only，不进入 CloudBase outbox、同步 payload、备份导出或 Provider evidence。
 - 每个任务先写失败测试并实际确认 RED，再做最小实现、确认 GREEN 后独立提交；不得顺手重构相邻模块。
 
@@ -379,7 +379,7 @@ export interface ConverterAdapter {
 }
 ```
 
-运行器使用 `spawn(executable, args, { shell: false, windowsHide: true, cwd, env })`，env 只含 pack 需要的 `PATH`、临时目录和 locale；Windows 使用 Job Object 等价封装，macOS 终止进程组。错误对象只保留退出码、受限 stderr 摘要和稳定错误码。
+运行器使用 `spawn(executable, args, { shell: false, windowsHide: true, cwd, env })`，env 只含 pack 需要的 `PATH`、临时目录和 locale；首发 macOS 终止完整进程组。底层 Windows Job Object 端口契约及跨平台 signed inventory 安全校验可保留，但生产 factory 不接入 Windows。错误对象只保留退出码、受限 stderr 摘要和稳定错误码。
 
 - [ ] **Step 4: 实现四类确定性适配器**
 
@@ -895,7 +895,7 @@ pnpm --filter @autoforge/desktop verify:converter-packs
 
 - [ ] **Step 5: 记录正式发布外部门禁**
 
-在测试输出和 `README.md` 明确分开：本地测试根通过不等于生产接受。正式发布需要由发布负责人提供生产 root public key、HTTPS CDN、四类 pack 对 macOS arm64/x64 与 Windows x64 的签名索引、第三方许可证清单和各平台真实运行证据；缺任一项，正式组件下载保持关闭。
+在测试输出和 `README.md` 明确分开：本地测试根通过不等于生产接受。正式发布需要由发布负责人提供生产 root public key、HTTPS CDN、四类 pack 对 macOS arm64/x64 的八坐标签名索引、第三方许可证清单和两个首发目标的真实运行证据；缺任一项，正式组件下载保持关闭。
 
 - [ ] **Step 6: 提交**
 
@@ -920,7 +920,7 @@ git commit -m "test: verify signed converter packs"
 
 - [ ] **Step 1: 写端到端 RED 场景**
 
-聊天场景：附加 PNG 和 DOCX，输入“把图片转成 favicon ico，把文档转成 PDF”，断言 Provider fixture 收到 metadata 而非 bytes，出现精确附件审批，批准后卡片完成，保存副本的 magic bytes 正确。开发者场景：打开“万象转换”，native picker 选择 MP4，运行到 WebM，取消后 late process event 不得恢复 completed。重启场景：转换中退出再启动，显示 interrupted，可 retry 完成。
+聊天场景：附加 PNG 和 DOCX，先输入“把图片转成 favicon ico，把文档转成 PDF”并断言多动作请求 fail-closed；再分别提交两个绑定精确文件名的单动作请求，断言 Provider fixture 仅收到规范化附件数量/索引和目标格式，不收到名称、MIME、路径或 bytes，逐次出现精确附件审批，批准后卡片完成，保存副本的 magic bytes 正确。开发者场景：打开“万象转换”，native picker 选择 MP4，运行到 WebM，取消后 late process event 不得恢复 completed。重启场景：转换中退出再启动，显示 interrupted，可 retry 完成。
 
 - [ ] **Step 2: 运行并确认 RED**
 
@@ -951,7 +951,7 @@ pnpm --filter @autoforge/desktop verify:converter-packs
 git status --short
 ```
 
-Expected: 所有本地门禁通过，工作树只含本任务预期文件；任何生产 pack/CDN/Windows 真机门禁若未提供，必须在交付报告中列为未验证，不能用 fixture 结果替代。
+Expected: 所有本地门禁通过，工作树只含本任务预期文件；任何生产 pack/CDN/macOS x64 真机门禁若未提供，必须在交付报告中列为未验证，不能用 fixture 结果替代。Windows 明确不属于首发验收矩阵。
 
 - [ ] **Step 6: 规格一致性复核**
 

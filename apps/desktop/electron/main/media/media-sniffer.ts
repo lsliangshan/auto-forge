@@ -70,12 +70,12 @@ function detectIsoMedia(bytes: Uint8Array): DetectedMedia | undefined {
   return genericMp4 ? detected('video', 'video/mp4', 'mp4') : undefined
 }
 
-function detectSvg(bytes: Uint8Array): DetectedMedia | undefined {
+export function isSafeSvg(bytes: Uint8Array): boolean {
   let text: string
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   } catch {
-    return undefined
+    return false
   }
   text = text.replace(/^\uFEFF/, '')
   let previous: string
@@ -86,9 +86,22 @@ function detectSvg(bytes: Uint8Array): DetectedMedia | undefined {
       .replace(/^<\?xml(?:\s[^?]*)?\?>/i, '')
       .replace(/^<!--[\s\S]*?-->/, '')
   } while (text !== previous)
-  return /^<svg(?:\s|>)/i.test(text)
-    ? detected('image', 'image/svg+xml', 'svg', false)
-    : undefined
+  if (!/^<svg(?:\s|>)/i.test(text)) return false
+  const hasExternalAttribute = [...text.matchAll(/\b(?:href|src)\s*=\s*["']([^"']*)["']/gi)]
+    .some((match) => !/^(?:#|data:)/i.test(match[1]!.trim()))
+  const hasExternalCssUrl = [...text.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)]
+    .some((match) => !/^(?:#|data:)/i.test(match[1]!.trim()))
+  return !(
+    /<!DOCTYPE\b|<!ENTITY\b|<script\b|<foreignObject\b/i.test(text)
+    || /\son[a-z]+\s*=/i.test(text)
+    || /@import\b/i.test(text)
+    || hasExternalAttribute
+    || hasExternalCssUrl
+  )
+}
+
+function detectSvg(bytes: Uint8Array): DetectedMedia | undefined {
+  return isSafeSvg(bytes) ? detected('image', 'image/svg+xml', 'svg', false) : undefined
 }
 
 function isMp3Frame(bytes: Uint8Array): boolean {
@@ -109,15 +122,15 @@ function isId3Header(bytes: Uint8Array): boolean {
   return bytes.subarray(6, 10).every((value) => value < 0x80)
 }
 
-function isSupportedOggAudio(bytes: Uint8Array): boolean {
+function supportedOggAudio(bytes: Uint8Array): 'opus' | 'ogg' | undefined {
   if (
     bytes.byteLength < 28
     || ascii(bytes, 0, 4) !== 'OggS'
     || bytes[4] !== 0
     || (bytes[5]! & ~0x07) !== 0
-  ) return false
+  ) return undefined
   const segmentCount = bytes[26]!
-  if (segmentCount === 0 || 27 + segmentCount > bytes.byteLength) return false
+  if (segmentCount === 0 || 27 + segmentCount > bytes.byteLength) return undefined
   let pageBodyBytes = 0
   let firstPacketBytes = 0
   let firstPacketComplete = false
@@ -130,14 +143,14 @@ function isSupportedOggAudio(bytes: Uint8Array): boolean {
     }
   }
   const bodyOffset = 27 + segmentCount
-  if (!firstPacketComplete || bodyOffset + pageBodyBytes > bytes.byteLength) return false
+  if (!firstPacketComplete || bodyOffset + pageBodyBytes > bytes.byteLength) return undefined
   const packet = bytes.subarray(bodyOffset, bodyOffset + firstPacketBytes)
+  if (ascii(packet, 0, 8) === 'OpusHead') return 'opus'
   return (
-    ascii(packet, 0, 8) === 'OpusHead'
-    || (packet[0] === 0x01 && ascii(packet, 1, 6) === 'vorbis')
+    (packet[0] === 0x01 && ascii(packet, 1, 6) === 'vorbis')
     || (packet[0] === 0x7f && ascii(packet, 1, 4) === 'FLAC')
     || ascii(packet, 0, 8) === 'Speex   '
-  )
+  ) ? 'ogg' : undefined
 }
 
 interface Vint {
@@ -205,6 +218,19 @@ export function detectMediaType(prefix: Uint8Array): DetectedMedia | undefined {
   if (ascii(bytes, 0, 6) === 'GIF87a' || ascii(bytes, 0, 6) === 'GIF89a') {
     return detected('image', 'image/gif', 'gif')
   }
+  if (
+    startsWith(bytes, [0x49, 0x49, 0x2a, 0x00])
+    || startsWith(bytes, [0x4d, 0x4d, 0x00, 0x2a])
+  ) return detected('image', 'image/tiff', 'tiff', false)
+  if (ascii(bytes, 0, 2) === 'BM') return detected('image', 'image/bmp', 'bmp', false)
+  if (
+    bytes.byteLength >= 6
+    && bytes[0] === 0
+    && bytes[1] === 0
+    && (bytes[2] === 1 || bytes[2] === 2)
+    && bytes[3] === 0
+  ) return detected('image', 'image/vnd.microsoft.icon', 'ico', false)
+  if (ascii(bytes, 0, 4) === 'icns') return detected('image', 'image/icns', 'icns', false)
 
   const isoMedia = detectIsoMedia(bytes)
   if (isoMedia) return isoMedia
@@ -213,7 +239,9 @@ export function detectMediaType(prefix: Uint8Array): DetectedMedia | undefined {
   if (ascii(bytes, 0, 4) === 'RIFF' && ascii(bytes, 8, 4) === 'WAVE') {
     return detected('audio', 'audio/wav', 'wav')
   }
-  if (isSupportedOggAudio(bytes)) return detected('audio', 'audio/ogg', 'ogg')
+  const oggAudio = supportedOggAudio(bytes)
+  if (oggAudio === 'opus') return detected('audio', 'audio/opus', 'opus')
+  if (oggAudio === 'ogg') return detected('audio', 'audio/ogg', 'ogg')
   if (ascii(bytes, 0, 4) === 'fLaC') return detected('audio', 'audio/flac', 'flac')
 
   if (isWebm(bytes)) return detected('video', 'video/webm', 'webm')

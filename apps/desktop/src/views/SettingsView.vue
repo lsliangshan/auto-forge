@@ -866,6 +866,7 @@ async function confirmClearBrowserData() {
   } catch (error) { if (error !== 'cancel' && error !== 'close') return }
 }
 const capabilityLabels: Record<PermissionGrant['capability'], string> = {
+  'file.convert': '转换文件',
   'browser.open': '打开网页',
   'browser.fill': '填写网页内容',
   'browser.click': '操作网页',

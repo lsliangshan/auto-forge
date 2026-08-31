@@ -51,6 +51,7 @@ import {
   KnowledgeEntitlementVerifier,
 } from './knowledge/entitlement-verifier.js'
 import type { SafeStoragePort } from './security/secret-store.js'
+import { createProductionConversionRuntimeFactory } from './conversion/production-conversion-runtime.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
 
@@ -182,6 +183,9 @@ async function initialize(): Promise<ApplicationRuntime> {
       if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)
     },
   })
+  const converterPackResources = app.isPackaged
+    ? join(process.resourcesPath, 'converter-packs')
+    : join(app.getAppPath(), 'resources', 'converter-packs')
   return createApplicationRuntime({
     paths: {
       database: join(userData, 'autoforge.sqlite'),
@@ -194,6 +198,10 @@ async function initialize(): Promise<ApplicationRuntime> {
     },
     safeStorage: safeStoragePort,
     networkProxy,
+    conversionRuntimeFactory: createProductionConversionRuntimeFactory({
+      resourcesRoot: converterPackResources,
+      network: networkProxy,
+    }),
     browserWorkspace,
     knowledgeService,
     applyTheme: (theme) => {

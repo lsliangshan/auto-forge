@@ -184,4 +184,50 @@ describe('WorkflowCatalog', () => {
     expect(schema.$id).toBe(injectsId ? 'urn:autoforge:workflow-tool:workflow_1:input' : 'urn:autoforge:workflow:existing')
     expect(validate({ input: validInput })).toBe(true)
   })
+
+  it('recursively strips AutoForge UI annotations only from the model-visible schema', async () => {
+    const inputSchema = {
+      type: 'object', additionalProperties: false, required: ['files'],
+      'x-autoforge-form': { density: 'compact' },
+      properties: {
+        files: {
+          type: 'array', items: {
+            type: 'integer', minimum: 0,
+            'x-autoforge-item': { private: true },
+          },
+          'x-autoforge-control': 'file-picker',
+        },
+        nested: {
+          oneOf: [{
+            type: 'object', properties: {
+              value: { type: 'string', 'x-autoforge-widget': 'secret' },
+            },
+          }],
+        },
+      },
+    }
+    const workflow: WorkflowDetail = { ...beijingWorkflow, cities: [], inputSchema }
+    const [candidate] = await createWorkflowCatalog({
+      workflows: { list: async () => [workflow] },
+      selectorFor: createWorkflowSourceSelectorVault().create,
+    }).create({ developerMode: false })
+    const projected = (candidate!.tool.function.parameters as {
+      properties: { input: Record<string, unknown> }
+    }).properties.input
+
+    expect(JSON.stringify(projected)).not.toContain('x-autoforge-')
+    expect(projected).toEqual({
+      type: 'object', additionalProperties: false, required: ['files'],
+      properties: {
+        files: { type: 'array', items: { type: 'integer', minimum: 0 } },
+        nested: {
+          oneOf: [{
+            type: 'object', properties: { value: { type: 'string' } },
+          }],
+        },
+      },
+    })
+    expect(workflow.inputSchema).toEqual(inputSchema)
+    expect(JSON.stringify(workflow.inputSchema)).toContain('x-autoforge-control')
+  })
 })

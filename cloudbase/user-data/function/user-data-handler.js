@@ -56,9 +56,14 @@ const capabilities = new Set([
   'browser.open', 'browser.fill', 'browser.click', 'browser.url', 'browser.close',
   'network.fetch', 'filesystem.read', 'filesystem.write', 'clipboard.read',
   'clipboard.write', 'notification.send', 'artifact.create',
+  'file.convert',
 ])
 const executionStatuses = new Set([
   'queued', 'awaiting_approval', 'running', 'completed', 'failed', 'cancelled', 'interrupted',
+])
+const conversionTargetFormats = new Set([
+  'png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif', 'ico', 'icns', 'pdf', 'xlsx',
+  'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'mp4', 'webm', 'mov',
 ])
 const maximumRequestBytes = 1_048_576
 const maximumResponseBytes = 8 * 1024 * 1024
@@ -341,6 +346,14 @@ function validateScope(capability, scope) {
       && scope.paths.length > 0
       && scope.paths.every((path) => nonEmptyString(path))
   }
+  if (capability === 'file.convert') {
+    return hasStrictShape(scope, ['formats'])
+      && Array.isArray(scope.formats)
+      && scope.formats.length > 0
+      && new Set(scope.formats).size === scope.formats.length
+      && scope.formats.every((format) => typeof format === 'string'
+        && ['png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif', 'ico', 'icns', 'pdf', 'xlsx', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'mp4', 'webm', 'mov'].includes(format))
+  }
   return hasStrictShape(scope, [])
 }
 
@@ -359,7 +372,7 @@ function validateWorkflowContext(value) {
   return value.buildHash === undefined
 }
 
-function validateChatBlock(block) {
+function validateChatBlock(block, allowTerminalConversion = true) {
   if (!isRecord(block) || typeof block.type !== 'string') return false
   switch (block.type) {
     case 'text':
@@ -482,8 +495,9 @@ function validateChatBlock(block) {
       )
         && identifier(block.blockId)
         && identifier(block.assetId)
-        && ['image', 'audio', 'video'].includes(block.kind)
+        && ['image', 'audio', 'video', 'file'].includes(block.kind)
         && ['input', 'output'].includes(block.purpose)
+        && (block.kind !== 'file' || block.purpose === 'input')
         && nonEmptyString(block.name)
         && nonEmptyString(block.mimeType)
         && nonnegativeInteger(block.byteSize)
@@ -501,21 +515,57 @@ function validateChatBlock(block) {
         && ['image', 'audio', 'video'].includes(block.kind)
         && ['pending', 'in_progress', 'downloading', 'paused', 'failed'].includes(block.status)
         && (block.errorCode === undefined || appErrorCodes.has(block.errorCode))
+    case 'conversion':
+      return hasStrictShape(block, ['type', 'blockId', 'executionId', 'state'])
+        && identifier(block.blockId)
+        && identifier(block.executionId)
+        && (block.state === 'active' || (allowTerminalConversion && block.state === 'terminal'))
     default:
       return false
   }
 }
 
-function validateMessage(value, legacy = false) {
-  const optionalKeys = legacy ? ['executionId', 'sourceUnowned'] : ['executionId']
+function validateMessage(
+  value,
+  legacy = false,
+  allowTerminalConversion = true,
+  allowProviderProjection = true,
+) {
+  const optionalKeys = legacy
+    ? ['executionId', 'sourceUnowned']
+    : ['executionId', ...(allowProviderProjection ? ['providerProjection'] : [])]
   return hasStrictShape(value, ['id', 'conversationId', 'role', 'blocks', 'createdAt'], optionalKeys)
     && identifier(value.id)
     && identifier(value.conversationId)
     && ['user', 'assistant'].includes(value.role)
     && Array.isArray(value.blocks)
-    && value.blocks.every(validateChatBlock)
+    && value.blocks.every((block) => validateChatBlock(block, allowTerminalConversion))
     && timestamp(value.createdAt)
     && (value.executionId === undefined || identifier(value.executionId))
+    && (value.providerProjection === undefined || (
+      value.role === 'user'
+      && hasStrictShape(
+        value.providerProjection,
+        ['version', 'kind', 'targetFormat', 'attachmentCount', 'selectedAttachmentIndexes'],
+      )
+      && value.providerProjection.version === 2
+      && value.providerProjection.kind === 'local_conversion'
+      && conversionTargetFormats.has(value.providerProjection.targetFormat)
+      && positiveInteger(value.providerProjection.attachmentCount)
+      && value.providerProjection.attachmentCount <= 5
+      && Array.isArray(value.providerProjection.selectedAttachmentIndexes)
+      && value.providerProjection.selectedAttachmentIndexes.length >= 1
+      && value.providerProjection.selectedAttachmentIndexes.length <= 5
+      && value.providerProjection.selectedAttachmentIndexes.every((index, position, indexes) => (
+        Number.isInteger(index)
+        && index >= 0
+        && index < value.providerProjection.attachmentCount
+        && (position === 0 || index > indexes[position - 1])
+      ))
+      && value.blocks.filter((block) => (
+        block.type === 'media' && block.purpose === 'input'
+      )).length === value.providerProjection.attachmentCount
+    ))
     && (!legacy || value.sourceUnowned === undefined || typeof value.sourceUnowned === 'boolean')
 }
 
@@ -604,7 +654,12 @@ function validateUsage(value) {
     && timestamp(value.occurredAt)
 }
 
-function validateMutationPayload(kind, payload) {
+function validateMutationPayload(
+  kind,
+  payload,
+  allowTerminalConversion = true,
+  allowProviderProjection = true,
+) {
   switch (kind) {
     case 'conversation.create':
       return hasStrictShape(
@@ -629,7 +684,11 @@ function validateMutationPayload(kind, payload) {
     case 'conversation.restore':
       return hasStrictShape(payload, [])
     case 'message.append':
-      return validateMessage(payload)
+      return validateMessage(payload, false, allowTerminalConversion, allowProviderProjection)
+    case 'message.conversion_block_terminal':
+      return hasStrictShape(payload, ['messageId', 'blockId', 'executionId', 'state'])
+        && identifier(payload.messageId) && identifier(payload.blockId)
+        && identifier(payload.executionId) && payload.state === 'terminal'
     case 'legacy.import':
       return validateLegacyConfirm(payload)
     case 'privacy.consent':
@@ -647,13 +706,14 @@ function validateMutationPayload(kind, payload) {
 
 function mutationEntityMatches(kind, entityId, payload) {
   if (['message.append', 'usage.record'].includes(kind)) return entityId === payload.id
+  if (kind === 'message.conversion_block_terminal') return entityId === payload.messageId
   if (kind === 'legacy.import') return entityId === payload.batchId
   if (kind === 'privacy.consent') return entityId === payload.documentVersion
   if (kind === 'privacy.consent.revoke') return entityId === payload.purpose
   return true
 }
 
-function validateMutation(value) {
+function validateMutation(value, allowProviderProjection = true) {
   if (!hasStrictShape(
     value,
     ['id', 'entityId', 'baseRevision', 'occurredAt', 'kind', 'payload'],
@@ -661,7 +721,12 @@ function validateMutation(value) {
     || !identifier(value.entityId)
     || !nonnegativeInteger(value.baseRevision)
     || !timestamp(value.occurredAt)
-    || !validateMutationPayload(value.kind, value.payload)) return false
+    || !validateMutationPayload(
+      value.kind,
+      value.payload,
+      value.kind !== 'message.append',
+      allowProviderProjection,
+    )) return false
   return mutationEntityMatches(value.kind, value.entityId, value.payload)
 }
 
@@ -714,9 +779,11 @@ function parseSyncPushResponse(value) {
 function parsePulledMutation(value) {
   if (value?.compacted === true) {
     const isMessage = value.kind === 'message.append'
+      || value.kind === 'message.conversion_block_terminal'
     const allowedKind = [
       'conversation.create', 'conversation.rename', 'conversation.delete',
       'conversation.restore', 'conversation.preferences', 'message.append',
+      'message.conversion_block_terminal',
     ].includes(value.kind)
     const requiredKeys = [
       'id', 'kind', 'entityId', 'baseRevision', 'resultRevision', 'compacted', 'receivedAt',
@@ -822,6 +889,9 @@ function parseMessage(value) {
     conversationId: value.conversationId,
     role: value.role,
     blocks: value.blocks.map(sanitizeChatBlock),
+    ...(value.providerProjection === undefined
+      ? {}
+      : { providerProjection: cloneValidatedJson(value.providerProjection) }),
     ...(value.executionId === undefined ? {} : { executionId: value.executionId }),
     createdAt: value.createdAt,
   }
@@ -1013,6 +1083,18 @@ function upgradeRequired() {
 
 function protocolIsCurrent(event) {
   return event.protocolVersion === 1
+    || event.protocolVersion === 2
+    || event.protocolVersion === 3
+}
+
+function omitProviderProjections(value) {
+  if (Array.isArray(value)) return value.map(omitProviderProjections)
+  if (!isRecord(value)) return value
+  const output = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (key !== 'providerProjection') output[key] = omitProviderProjections(child)
+  }
+  return output
 }
 
 function createUserDataHandler({ rpc }) {
@@ -1031,10 +1113,13 @@ function createUserDataHandler({ rpc }) {
         if (event.mutations.length > maximumBatchItems) {
           return { ok: false, error: { code: 'OUTBOX_LIMIT_EXCEEDED' } }
         }
-        if (!event.mutations.every(validateMutation)) return invalid()
+        if (!event.mutations.every((mutation) => validateMutation(
+          mutation,
+          event.protocolVersion === 3,
+        ))) return invalid()
         return { ok: true, data: await rpc('autoforge_sync_push', {
           p_caller_user_id: uid,
-          p_protocol_version: event.protocolVersion,
+          p_protocol_version: event.protocolVersion === 3 ? 2 : event.protocolVersion,
           p_device_id: event.deviceId,
           p_mutations: event.mutations,
         }) }
@@ -1052,13 +1137,14 @@ function createUserDataHandler({ rpc }) {
           || (event.cursor !== undefined && !opaqueCursor(event.cursor))
           || !positiveInteger(limit)
           || limit > maximumBatchItems) return invalid()
-        return { ok: true, data: await rpc('autoforge_sync_pull', {
+        const data = await rpc('autoforge_sync_pull', {
           p_caller_user_id: uid,
-          p_protocol_version: event.protocolVersion,
+          p_protocol_version: event.protocolVersion === 3 ? 2 : event.protocolVersion,
           p_device_id: event.deviceId,
           p_cursor: event.cursor ?? null,
           p_limit: limit,
-        }) }
+        })
+        return { ok: true, data: event.protocolVersion === 3 ? data : omitProviderProjections(data) }
       }
 
       if (event.action === 'listConversations') {
@@ -1074,16 +1160,22 @@ function createUserDataHandler({ rpc }) {
       }
 
       if (event.action === 'listMessages') {
-        if (!hasStrictShape(event, ['action', 'conversationId', 'limit'], ['cursor'])
+        if (!hasStrictShape(
+          event,
+          ['action', 'conversationId', 'limit'],
+          ['cursor', 'protocolVersion'],
+        )
+          || (event.protocolVersion !== undefined && !protocolIsCurrent(event))
           || !identifier(event.conversationId)
           || event.limit !== 100
           || (event.cursor !== undefined && !opaqueCursor(event.cursor))) return invalid()
-        return { ok: true, data: await rpc('autoforge_list_messages', {
+        const data = await rpc('autoforge_list_messages', {
           p_caller_user_id: uid,
           p_conversation_id: event.conversationId,
           p_limit: event.limit,
           p_cursor: event.cursor ?? null,
-        }) }
+        })
+        return { ok: true, data: event.protocolVersion === 3 ? data : omitProviderProjections(data) }
       }
 
       if (event.action === 'previewLegacyImport') {
@@ -1108,7 +1200,7 @@ function createUserDataHandler({ rpc }) {
         )) {
           return invalidLegacyImport('shape')
         }
-        if (!protocolIsCurrent(event)) return upgradeRequired()
+        if (event.protocolVersion !== 1) return upgradeRequired()
         if (!identifier(event.deviceId) || !identifier(event.batchId)) {
           return invalidLegacyImport('identifier')
         }

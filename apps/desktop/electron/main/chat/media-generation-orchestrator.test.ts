@@ -31,6 +31,10 @@ import { createMediaAssetService } from '../media/media-asset-service.js'
 import type { ModelProvider } from './model-provider.js'
 import { OpenRouterProvider } from './openrouter-provider.js'
 import {
+  createProviderAttachmentDisclosureAuthority,
+  protectProviderSnapshot,
+} from './provider-attachment-disclosure.js'
+import {
   MediaGenerationOrchestrator,
   type MediaGenerationOrchestratorDependencies,
 } from './media-generation-orchestrator.js'
@@ -226,7 +230,66 @@ const input = {
   assetIds: [] as string[],
 }
 
+function ordinaryAttachmentAuthority(
+  snapshot: Awaited<ReturnType<MediaGenerationOrchestratorDependencies['providers']['acquire']>>,
+  requestId: string,
+  kind: 'image' | 'audio',
+  assets: Array<{ id: string; fingerprint: string; name?: string; mimeType?: string; byteSize?: number }>,
+) {
+  const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+  const plan = authority.createPlan({
+    requestId,
+    text: 'describe this image',
+    context: { hasAttachments: true, requestedOutput: kind, attachmentKinds: assets.map(() => 'image') },
+    attachments: assets.map((asset, index) => ({
+      index, id: asset.id, fingerprint: asset.fingerprint,
+      name: asset.name ?? `reference-${index}.png`,
+      mimeType: asset.mimeType ?? 'image/png',
+      byteSize: asset.byteSize ?? 12,
+    })),
+  })
+  const attachmentDisclosure = authority.bindProvider(plan, snapshot)
+  return {
+    attachmentDisclosure,
+    providerSnapshot: protectProviderSnapshot(snapshot, attachmentDisclosure, { purpose: 'main' }),
+  }
+}
+
 describe('MediaGenerationOrchestrator', () => {
+  it.each([
+    ['image', imageRoute],
+    ['audio', audioRoute],
+  ] as const)('rejects changed attachment fingerprints before %s Provider work', async (kind, route) => {
+    const harness = createHarness()
+    const snapshot = await harness.providers.acquire('openrouter')
+    const attachmentAuthority = ordinaryAttachmentAuthority(snapshot, input.requestId, kind, [{
+      id: 'reference_image', fingerprint: 'a'.repeat(64), name: 'reference.png',
+    }])
+    const boundRoute = {
+      ...route,
+      assets: [{
+        id: 'reference_image', kind: 'image' as const, mimeType: 'image/png',
+        name: 'reference.png', byteSize: 12, conversationId: input.conversationId,
+        absolutePath: '/managed/reference.png', relativePath: 'conversation_1/reference.png',
+        inlineSafe: true,
+      }],
+    }
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+    const run = kind === 'image' ? orchestrator.runImage.bind(orchestrator) : orchestrator.runAudio.bind(orchestrator)
+
+    await expect(run({
+      ...input,
+      assetIds: ['reference_image'],
+      attachmentFingerprints: ['b'.repeat(64)],
+      ...attachmentAuthority,
+      route: boundRoute,
+    })).rejects.toThrow('Attachment disclosure capability is missing or invalid')
+
+    expect(harness.media.modelInput).not.toHaveBeenCalled()
+    expect(harness.provider.generateImage).not.toHaveBeenCalled()
+    expect(harness.provider.stream).not.toHaveBeenCalled()
+  })
+
   it('keeps image wire credentials and ledger attribution on one snapshot across a key switch', async () => {
     let apiKey = 'sk-image-a'
     const authorizations: string[] = []
@@ -962,9 +1025,10 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
       database.conversations.insert({ id: 'conversation_atomic', title: 'Atomic start' })
       database.mediaAssets.insert(asset)
       arrange(database)
+      const providerSnapshot = { providerId: 'openrouter' as const, provider }
       const harness = createHarness({
         providers: {
-          acquire: async (providerId) => ({ providerId, provider }),
+          acquire: async () => providerSnapshot,
         },
         persistence: createAgentPersistence(database),
         emit: (event) => { events.push(event) },
@@ -974,6 +1038,15 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
       const run = kind === 'image'
         ? orchestrator.runImage.bind(orchestrator)
         : orchestrator.runAudio.bind(orchestrator)
+      const attachmentAuthority = ordinaryAttachmentAuthority(
+        providerSnapshot,
+        'request_atomic',
+        kind,
+        [{
+          id: asset.id, fingerprint: asset.sha256, name: asset.originalName,
+          mimeType: asset.mimeType, byteSize: asset.byteSize,
+        }],
+      )
       const result = await run({
         userId: 'user_atomic',
         requestId: 'request_atomic',
@@ -993,6 +1066,8 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
           },
         ],
         assetIds: [asset.id],
+        attachmentFingerprints: [asset.sha256],
+        ...attachmentAuthority,
         route: {
           ...(kind === 'image' ? imageRoute : audioRoute),
           assets: [{

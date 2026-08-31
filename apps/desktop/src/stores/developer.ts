@@ -1,6 +1,7 @@
 import { acceptHMRUpdate, defineStore } from 'pinia'
 import type {
   ApprovalDecision,
+  DeveloperAttachmentDraft,
   DeveloperProject,
   ExecutionDetail,
   ExecutionEvent,
@@ -29,15 +30,37 @@ interface DeveloperRuntime {
   unsubscribe?: () => void
   pendingEvents: ExecutionEvent[]
   lifecycleWrapped: boolean
+  pickerGeneration: number
+  retryableCleanup: Map<string, Set<string>>
+  disposed: boolean
 }
 
 const runtimeKey = Symbol.for('autoforge.developer.runtime')
+const retryableCleanupKey = Symbol.for('autoforge.developer.retryable-cleanup')
+
+function retryableCleanupRegistry(): Map<string, Set<string>> {
+  const global = globalThis as unknown as Record<PropertyKey, unknown>
+  const existing = global[retryableCleanupKey]
+  if (existing instanceof Map) return existing as Map<string, Set<string>>
+  const created = new Map<string, Set<string>>()
+  global[retryableCleanupKey] = created
+  return created
+}
+
+function rememberCleanup(projectId: string, ids: readonly string[]): void {
+  if (!projectId || !ids.length) return
+  const registry = retryableCleanupRegistry()
+  const pending = registry.get(projectId) ?? new Set<string>()
+  ids.forEach((id) => pending.add(id))
+  registry.set(projectId, pending)
+}
 
 function runtime(store: object): DeveloperRuntime {
   const existing = Reflect.get(store, runtimeKey) as DeveloperRuntime | undefined
   if (existing) return existing
   const created: DeveloperRuntime = {
     timers: new Map(), queues: new Map(), pendingEvents: [], lifecycleWrapped: false,
+    pickerGeneration: 0, retryableCleanup: new Map(), disposed: false,
   }
   Reflect.defineProperty(store, runtimeKey, { configurable: true, value: created })
   return created
@@ -93,9 +116,12 @@ export const useDeveloperStore = defineStore('developer', {
     debugInput: {} as unknown,
     debugDraftValid: true,
     debugDraftError: '',
+    developerAttachmentField: '',
+    developerAttachments: [] as DeveloperAttachmentDraft[],
     debugEvents: [] as ExecutionEvent[],
     debugDetail: undefined as ExecutionDetail | undefined,
     debugExecutionId: '',
+    debugExecutionConversionCapable: false,
     debugStatus: 'idle' as 'idle' | 'starting' | 'queued' | 'awaiting_approval' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted',
     debugError: '',
   }),
@@ -137,10 +163,15 @@ export const useDeveloperStore = defineStore('developer', {
       state.lifecycleWrapped = true
       const dispose = this.$dispose.bind(this)
       this.$dispose = () => {
+        state.disposed = true
+        state.pickerGeneration += 1
+        rememberCleanup(this.selectedProjectId, this.developerAttachments.map(({ id }) => id))
         void this.flushPendingSaves()
+        void this._clearDeveloperAttachments()
         for (const timer of state.timers.values()) clearTimeout(timer)
         state.timers.clear()
         state.unsubscribe?.()
+        this.resetDebug()
         Reflect.deleteProperty(this, runtimeKey)
         dispose()
       }
@@ -156,6 +187,7 @@ export const useDeveloperStore = defineStore('developer', {
           this.selectedProjectId = first?.id ?? ''
           this.selectedPath = ''
           if (first) await this.selectProject(first.id)
+          else this.resetDebug()
         }
       } catch (error) {
         this.error = displayError(error, '项目列表加载失败')
@@ -186,6 +218,12 @@ export const useDeveloperStore = defineStore('developer', {
     async selectProject(projectId: string) {
       const project = this.projects.find(({ id }) => id === projectId)
       if (!project) return
+      if (this.selectedProjectId && this.selectedProjectId !== projectId) {
+        rememberCleanup(this.selectedProjectId, this.developerAttachments.map(({ id }) => id))
+        runtime(this).pickerGeneration += 1
+        const cleared = await this._clearDeveloperAttachments(this.selectedProjectId)
+        if (!cleared) return
+      }
       this._selectionGeneration += 1
       this._runToken += 1
       this.selectedProjectId = projectId
@@ -194,6 +232,8 @@ export const useDeveloperStore = defineStore('developer', {
       this.debugInput = {}
       this.debugDraftValid = true
       this.debugDraftError = ''
+      this.developerAttachmentField = ''
+      this.developerAttachments = []
       this.resetDebug()
       const preferred = project.files.includes('src/index.ts') ? 'src/index.ts' : project.files[0]
       this.selectedPath = ''
@@ -458,6 +498,131 @@ export const useDeveloperStore = defineStore('developer', {
       this.debugDraftValid = valid
       this.debugDraftError = valid ? '' : error
     },
+    configureDeveloperAttachmentField(name: string) {
+      if (this.developerAttachmentField === name) return
+      this._ensureLifecycle()
+      runtime(this).pickerGeneration += 1
+      if (this.developerAttachmentField || this.developerAttachments.length > 0) {
+        rememberCleanup(this.selectedProjectId, this.developerAttachments.map(({ id }) => id))
+        const previous = [...this.developerAttachments]
+        void this._clearDeveloperAttachments().then((cleared) => {
+          if (!cleared && this.developerAttachmentField === name && this.developerAttachments.length === 0) {
+            this.developerAttachments = previous
+            this._syncDeveloperAttachmentInput()
+          }
+        })
+      }
+      this.developerAttachmentField = name
+      this.developerAttachments = []
+      this._syncDeveloperAttachmentInput()
+    },
+    _syncDeveloperAttachmentInput() {
+      const name = this.developerAttachmentField
+      if (!name || !this.debugInput || typeof this.debugInput !== 'object' || Array.isArray(this.debugInput)) return
+      ;(this.debugInput as Record<string, unknown>)[name] = this.developerAttachments.map((_draft, index) => index)
+    },
+    async pickDeveloperAttachments() {
+      this._ensureLifecycle()
+      if (!await this._retryDeveloperAttachmentCleanup()) return
+      const projectId = this.selectedProjectId
+      const field = this.developerAttachmentField
+      if (!projectId || !field || this.developerAttachments.length >= 5) return
+      const existingIds = this.developerAttachments.map(({ id }) => id)
+      const lifecycle = runtime(this)
+      const generation = lifecycle.pickerGeneration
+      try {
+        const selected = await getDesktopApi().developer.pickFiles({
+          projectId,
+          existingAttachmentIds: existingIds,
+        })
+        if (lifecycle.disposed || lifecycle.pickerGeneration !== generation
+          || this.selectedProjectId !== projectId || this.developerAttachmentField !== field) {
+          await this._cleanupStaleDeveloperAttachments(projectId, selected.map(({ id }) => id))
+          return
+        }
+        const known = new Set(existingIds)
+        const accepted = selected.filter(({ id }) => !known.has(id)).slice(0, 5 - existingIds.length)
+        const rejected = selected.filter(({ id }) => !accepted.some((draft) => draft.id === id))
+        if (rejected.length) {
+          await Promise.allSettled(rejected.map(({ id }) => getDesktopApi().developer.removeAttachment({
+            projectId, attachmentId: id,
+          })))
+        }
+        this.developerAttachments = [...this.developerAttachments, ...accepted]
+        this._syncDeveloperAttachmentInput()
+      } catch (error) {
+        if (this.selectedProjectId === projectId) this.debugError = displayError(error, '文件导入失败')
+      }
+    },
+    async removeDeveloperAttachment(attachmentId: string) {
+      const projectId = this.selectedProjectId
+      if (!projectId || !this.developerAttachments.some(({ id }) => id === attachmentId)) return
+      try {
+        await getDesktopApi().developer.removeAttachment({ projectId, attachmentId })
+        if (this.selectedProjectId !== projectId) return
+        this.developerAttachments = this.developerAttachments.filter(({ id }) => id !== attachmentId)
+        this._syncDeveloperAttachmentInput()
+      } catch (error) {
+        if (this.selectedProjectId === projectId) this.debugError = displayError(error, '文件移除失败')
+      }
+    },
+    async _clearDeveloperAttachments(projectId?: string) {
+      projectId ??= this.selectedProjectId
+      if (!projectId) return
+      const shouldReset = projectId === this.selectedProjectId
+      try {
+        await getDesktopApi().developer.clearAttachments({ projectId })
+        runtime(this).retryableCleanup.delete(projectId)
+        retryableCleanupRegistry().delete(projectId)
+        if (shouldReset) {
+          this.developerAttachments = []
+          this._syncDeveloperAttachmentInput()
+        }
+        return true
+      } catch (error) {
+        if (shouldReset) this.debugError = displayError(error, '文件清理失败')
+        return false
+      }
+    },
+    async _cleanupStaleDeveloperAttachments(projectId: string, ids: readonly string[]) {
+      const state = runtime(this)
+      const pending = new Set(ids)
+      state.retryableCleanup.get(projectId)?.forEach((id) => pending.add(id))
+      retryableCleanupRegistry().get(projectId)?.forEach((id) => pending.add(id))
+      if (!pending.size) return true
+      const results = await Promise.allSettled([...pending].map((id) => getDesktopApi().developer.removeAttachment({
+        projectId, attachmentId: id,
+      })))
+      const failed = results.some(({ status }) => status === 'rejected')
+      if (!failed) {
+        state.retryableCleanup.delete(projectId)
+        retryableCleanupRegistry().delete(projectId)
+        return true
+      }
+      try {
+        await getDesktopApi().developer.clearAttachments({ projectId })
+        state.retryableCleanup.delete(projectId)
+        retryableCleanupRegistry().delete(projectId)
+        return true
+      } catch (error) {
+        state.retryableCleanup.set(projectId, pending)
+        retryableCleanupRegistry().set(projectId, new Set(pending))
+        this.debugError = displayError(error, '文件清理失败，请重试')
+        return false
+      }
+    },
+    async _retryDeveloperAttachmentCleanup() {
+      const state = runtime(this)
+      const registry = retryableCleanupRegistry()
+      for (const [projectId, ids] of registry) {
+        state.retryableCleanup.set(projectId, new Set(ids))
+      }
+      let clean = true
+      for (const [projectId, ids] of [...state.retryableCleanup]) {
+        if (!await this._cleanupStaleDeveloperAttachments(projectId, [...ids])) clean = false
+      }
+      return clean
+    },
     ensureExecutionSubscription() { this._ensureLifecycle() },
     async runDebug() {
       const projectId = this.selectedProjectId
@@ -490,6 +655,7 @@ export const useDeveloperStore = defineStore('developer', {
         if (Object.values(this.files).some((file) => file.projectId === projectId && ['dirty', 'saving', 'error'].includes(file.saveState))) {
           this.debugStatus = 'failed'
           this.debugError = '存在未保存文件，请修复保存问题后重试。'
+          if (this.developerAttachments.length) await this._clearDeveloperAttachments(projectId)
           return
         }
         const built = await getDesktopApi().developer.build(projectId)
@@ -499,8 +665,22 @@ export const useDeveloperStore = defineStore('developer', {
         const validation = await getDesktopApi().developer.validate(projectId)
         if (!isCurrent()) return
         this._applyValidation(validation)
-        if (!validation.valid) { this.debugStatus = 'idle'; this.debugError = '项目校验未通过。'; return }
-        const runResult = await getDesktopApi().developer.run({ projectId, input })
+        if (!validation.valid) {
+          this.debugStatus = 'idle'
+          this.debugError = '项目校验未通过。'
+          if (this.developerAttachments.length) await this._clearDeveloperAttachments(projectId)
+          return
+        }
+        const attachmentIds = this.developerAttachments.map(({ id }) => id)
+        const runResult = await getDesktopApi().developer.run({
+          projectId,
+          input,
+          ...(attachmentIds.length ? { attachmentIds } : {}),
+        })
+        if (attachmentIds.length && isCurrent()) {
+          this.developerAttachments = []
+          this._syncDeveloperAttachmentInput()
+        }
         if (!isCurrent()) {
           if ('executionId' in runResult) {
             try { await getDesktopApi().executions.cancel(runResult.executionId) } catch { /* A stale execution may already be terminal. */ }
@@ -512,22 +692,30 @@ export const useDeveloperStore = defineStore('developer', {
           this.debugError = runResult.validationError
           return
         }
-        const { executionId } = runResult
-        this.debugExecutionId = executionId
-        this.debugStatus = 'queued'
+        const { executionId, conversionCapable } = runResult
+        this.$patch({
+          debugExecutionId: executionId,
+          debugExecutionConversionCapable: conversionCapable,
+          debugStatus: 'queued',
+        })
         for (const event of state.pendingEvents) if (event.executionId === executionId) this._applyExecutionEvent(event)
       } catch (error) {
         if (!isCurrent()) return
+        if (this.developerAttachments.length) await this._clearDeveloperAttachments(projectId)
         this.debugStatus = 'failed'
         this.debugError = displayError(error, '调试运行失败')
       } finally { if (isCurrent()) state.pendingEvents = [] }
     },
     resetDebug() {
-      this.debugEvents = []
-      this.debugDetail = undefined
-      this.debugExecutionId = ''
-      this.debugStatus = 'idle'
-      this.debugError = ''
+      this._runToken += 1
+      this.$patch({
+        debugEvents: [],
+        debugDetail: undefined,
+        debugExecutionId: '',
+        debugExecutionConversionCapable: false,
+        debugStatus: 'idle',
+        debugError: '',
+      })
       const state = runtime(this)
       state.pendingEvents = []
     },

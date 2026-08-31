@@ -28,6 +28,13 @@ import type {
   ModelProviderSnapshotSource,
 } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
+import {
+  assertAttachmentByteAccess,
+  assertProtectedProviderSnapshot,
+  createProviderAttachmentProjection,
+  createProviderMediaProjection,
+  type ProviderAttachmentDisclosure,
+} from './provider-attachment-disclosure.js'
 
 export interface MediaGenerationOrchestratorDependencies {
   providers: ModelProviderSnapshotSource
@@ -50,7 +57,10 @@ export interface MediaGenerationRunInput extends UsageAttribution {
   prompt: string
   userBlocks: ChatBlock[]
   assetIds: string[]
+  attachmentFingerprints?: readonly string[]
   route: ResolvedChatRoute
+  attachmentDisclosure?: ProviderAttachmentDisclosure
+  providerSnapshot?: ModelProviderSnapshot
 }
 
 interface ActiveGeneration {
@@ -124,6 +134,22 @@ export class MediaGenerationOrchestrator {
     input: MediaGenerationRunInput,
     kind: 'image' | 'audio',
   ): Promise<AgentRunResult> {
+    if (input.assetIds.length > 0) {
+      assertAttachmentByteAccess(input.attachmentDisclosure, {
+        requestId: input.requestId,
+        providerId: input.route.provider,
+        assetIds: input.assetIds,
+        assetFingerprints: input.attachmentFingerprints ?? [],
+      })
+      if (!input.providerSnapshot) throw new Error('Attachment provider snapshot is missing')
+      assertProtectedProviderSnapshot(input.providerSnapshot, input.attachmentDisclosure, {
+        requestId: input.requestId,
+        providerId: input.route.provider,
+        assetIds: input.assetIds,
+        assetFingerprints: input.attachmentFingerprints ?? [],
+        purpose: 'main',
+      })
+    }
     if (input.route.outputType !== kind) {
       return {
         requestId: input.requestId,
@@ -133,7 +159,7 @@ export class MediaGenerationOrchestrator {
     }
     if (
       input.assetIds.length !== input.route.assets.length
-      || input.assetIds.some((assetId) => !input.route.assets.some((asset) => asset.id === assetId))
+      || input.assetIds.some((assetId, index) => input.route.assets[index]?.id !== assetId)
       || new Set(input.assetIds).size !== input.assetIds.length
     ) {
       return {
@@ -170,7 +196,8 @@ export class MediaGenerationOrchestrator {
         status: 'running',
       })
 
-      const providerSnapshot = await this.dependencies.providers.acquire(input.route.provider)
+      const providerSnapshot = input.providerSnapshot
+        ?? await this.dependencies.providers.acquire(input.route.provider)
       if (providerSnapshot.providerId !== input.route.provider) {
         throw new ProviderUsageConsistencyError()
       }
@@ -274,6 +301,15 @@ export class MediaGenerationOrchestrator {
     if (modelInputs.some((asset) => asset.kind !== 'image')) {
       throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
     }
+    const protectedProjection = input.attachmentDisclosure === undefined
+      ? undefined
+      : createProviderMediaProjection(
+          input.attachmentDisclosure,
+          input.route.provider,
+          'image',
+          input.prompt,
+          modelInputs,
+        )
     const operationKey = `image:${input.requestId}`
     const recordsProviderUsage = providerSnapshot.providerId === 'openrouter'
     let costReported = false
@@ -297,10 +333,11 @@ export class MediaGenerationOrchestrator {
     try {
       result = await provider.generateImage({
         model: input.route.model,
-        prompt: input.prompt,
+        prompt: protectedProjection?.prompt ?? input.prompt,
         options: input.route.generation.image,
         parameterSupport: input.route.imageParameterSupport,
-        references: modelInputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
+        references: protectedProjection?.references
+          ?? modelInputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
         signal: active.controller.signal,
       })
       if (recordsProviderUsage && result.usage?.costUsd !== undefined) {
@@ -398,6 +435,9 @@ export class MediaGenerationOrchestrator {
       input.conversationId,
       input.route.assets.map((asset) => asset.id),
     )
+    const protectedProjection = input.attachmentDisclosure === undefined
+      ? undefined
+      : createProviderAttachmentProjection(input.attachmentDisclosure, input.route.provider, modelInputs)
     if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
     const writer = await this.dependencies.media.createGeneratedWriter({
       conversationId: input.conversationId,
@@ -412,13 +452,10 @@ export class MediaGenerationOrchestrator {
     let finishReason: string | undefined
     let generationId: string | undefined
     let usage: { inputTokens?: number; outputTokens?: number; costUsd?: string } | undefined
-    const content = [
+    const content = protectedProjection?.content ?? [
       { type: 'text' as const, text: input.prompt },
       ...modelInputs.map(({ kind, mimeType, dataBase64 }) => ({
-        type: 'media' as const,
-        kind,
-        mimeType,
-        dataBase64,
+        type: 'media' as const, kind, mimeType, dataBase64,
       })),
     ]
     const operationKey = `audio:${input.requestId}`
