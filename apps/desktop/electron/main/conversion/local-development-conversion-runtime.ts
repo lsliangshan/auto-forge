@@ -2,11 +2,13 @@ import { constants } from 'node:fs'
 import type { FileHandle } from 'node:fs/promises'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
+import { imageIconAdapter } from './adapters/image-icon.js'
 import { ConverterPackManager } from './converter-pack-manager.js'
 import type { SignedConverterPackIndex } from './converter-pack-types.js'
 import {
   createNodeConversionProcessTreePort,
   createConversionProcessRunner,
+  type ConverterAdapter,
 } from './conversion-process-runner.js'
 import {
   createProductionConversionJobRuntime,
@@ -17,6 +19,15 @@ export interface LocalDevelopmentConverterRelease {
   readonly packsRoot: string
   readonly rootPublicKeyPem: Buffer
   readonly signedIndex: SignedConverterPackIndex
+}
+
+const localDevelopmentImageAdapter: ConverterAdapter = {
+  ...imageIconAdapter,
+  supports(input, target) {
+    return (input.format === 'jpeg' || input.format === 'png')
+      && (target === 'jpeg' || target === 'png')
+      && imageIconAdapter.supports(input, target)
+  },
 }
 
 async function readStableFile(path: string, maximumBytes: number): Promise<Buffer> {
@@ -105,6 +116,7 @@ export function createLocalDevelopmentConversionRuntimeFactory(options: {
         packManager,
         signedIndex: async () => release.signedIndex,
         processRunner,
+        adapters: [{ adapter: localDevelopmentImageAdapter, pack: 'image-icon' }],
       }),
     }
   }

@@ -130,5 +130,9 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     expect((await readFile(batchOutput)).subarray(0, 8)).toEqual(Buffer.from('89504e470d0a1a0a', 'hex'))
     await attempt.abort()
     lease.release()
+    await expect(binding.runtime.acquirePack(
+      { ...job, id: 'unsupported-job', targetFormat: 'webp' },
+      controller.signal,
+    )).rejects.toMatchObject({ code: 'CONVERSION_FORMAT_UNSUPPORTED' })
   })
 })
