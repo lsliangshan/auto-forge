@@ -84,6 +84,7 @@
     <article
       v-else-if="safeHtml && !error"
       class="document-page rich-document"
+      :class="{ 'markdown-document': preview.mimeType === 'text/markdown' }"
       v-html="safeHtml"
     />
     <!-- eslint-enable vue/no-v-html -->
@@ -107,6 +108,7 @@
 <script setup lang="ts">
 /* global document, Element, HTMLCanvasElement, HTMLDivElement, HTMLElement, HTMLImageElement, TextDecoder */
 import type { KnowledgeDocumentPreview } from '@autoforge/shared'
+import MarkdownIt from 'markdown-it'
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.mjs?url'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
 
@@ -117,6 +119,7 @@ type PdfRenderTask = ReturnType<Awaited<ReturnType<PdfDocument['getPage']>>['ren
 interface PdfPageLayout { number: number; width: number; height: number }
 
 const props = defineProps<{ preview: OriginalPreview }>()
+const markdown = new MarkdownIt({ html: false, breaks: true, linkify: true })
 
 const pdfContainer = ref<HTMLDivElement>()
 const loading = ref(true)
@@ -139,7 +142,7 @@ const isPdf = computed(() => props.preview.mimeType === 'application/pdf')
 const previewLabel = computed(() => {
   if (props.preview.mimeType === 'application/pdf') return 'PDF 原页预览'
   if (props.preview.mimeType.includes('wordprocessingml')) return 'Word 原文预览'
-  if (props.preview.mimeType === 'text/markdown') return 'Markdown 原文'
+  if (props.preview.mimeType === 'text/markdown') return 'Markdown 内容预览'
   if (props.preview.mimeType === 'text/html') return 'HTML 原文预览'
   return '文本原文'
 })
@@ -367,7 +370,9 @@ async function loadPreview(): Promise<void> {
     } else {
       const text = new TextDecoder('utf-8', { fatal: true }).decode(props.preview.bytes)
       if (props.preview.mimeType === 'text/html') safeHtml.value = sanitizeDocumentHtml(text)
-      else originalText.value = text
+      else if (props.preview.mimeType === 'text/markdown') {
+        safeHtml.value = sanitizeDocumentHtml(markdown.render(text))
+      } else originalText.value = text
     }
   } catch {
     if (generation === loadGeneration) error.value = true
@@ -415,6 +420,7 @@ onBeforeUnmount(() => {
 .document-page { width: min(820px, calc(100% - 40px)); min-height: 560px; box-sizing: border-box; margin: 20px auto 32px; border: 1px solid var(--af-border); padding: 44px 52px 60px; color: var(--af-text); background: var(--af-surface); box-shadow: 0 10px 34px rgb(32 36 43 / 10%); }
 .original-text { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--af-knowledge-font-document); line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
 .rich-document { font-size: var(--af-knowledge-font-document); line-height: 1.75; }.rich-document :deep(h1), .rich-document :deep(h2), .rich-document :deep(h3) { color: var(--af-graphite); }.rich-document :deep(table) { width: 100%; border-collapse: collapse; }.rich-document :deep(td), .rich-document :deep(th) { border: 1px solid var(--af-border-strong); padding: 6px 8px; }.rich-document :deep(img) { max-width: 100%; height: auto; }
+.markdown-document { overflow-wrap: anywhere; }.markdown-document > :deep(:first-child) { margin-top: 0; }.markdown-document > :deep(:last-child) { margin-bottom: 0; }.markdown-document :deep(h1), .markdown-document :deep(h2), .markdown-document :deep(h3), .markdown-document :deep(h4), .markdown-document :deep(h5), .markdown-document :deep(h6) { margin: 1.5em 0 .65em; line-height: 1.3; }.markdown-document :deep(h1) { padding-bottom: .35em; border-bottom: 1px solid var(--af-border); font-size: 1.75em; }.markdown-document :deep(h2) { font-size: 1.4em; }.markdown-document :deep(h3) { font-size: 1.18em; }.markdown-document :deep(p) { margin: 0 0 1em; }.markdown-document :deep(ul), .markdown-document :deep(ol) { margin: .75em 0 1em; padding-left: 2em; }.markdown-document :deep(ul) { list-style: disc outside; }.markdown-document :deep(ol) { list-style: decimal outside; }.markdown-document :deep(li + li) { margin-top: .25em; }.markdown-document :deep(blockquote) { margin: 1em 0; border-left: 3px solid var(--af-border-strong); padding-left: 1em; color: var(--af-text-muted); }.markdown-document :deep(code) { border-radius: 4px; padding: 2px 5px; background: var(--af-surface-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }.markdown-document :deep(pre) { max-width: 100%; margin: 1em 0; overflow-x: auto; border-radius: 8px; padding: 14px 16px; color: #e6edf3; background: #0d1117; }.markdown-document :deep(pre code) { display: block; padding: 0; color: inherit; background: transparent; line-height: 1.6; white-space: pre; overflow-wrap: normal; }.markdown-document :deep(hr) { margin: 1.5em 0; border: 0; border-top: 1px solid var(--af-border); }.markdown-document :deep(table) { display: block; max-width: 100%; margin: 1em 0; overflow-x: auto; text-align: left; }.markdown-document :deep(th) { background: var(--af-surface-muted); }
 .preview-fallback { display: grid; min-height: 100%; align-content: center; gap: 10px; padding: 28px; color: var(--af-text-muted); text-align: center; }.preview-fallback.standalone { min-height: 420px; }.preview-fallback strong { color: var(--af-graphite); font-size: var(--af-knowledge-font-label); }.preview-fallback p { margin: 0; font-size: var(--af-knowledge-font-small); }.preview-fallback pre { max-width: 760px; max-height: 480px; margin: 0 auto; overflow: auto; border: 1px solid var(--af-border); border-radius: 8px; padding: 18px; color: var(--af-text); background: var(--af-surface); font: inherit; font-size: var(--af-knowledge-font-body); line-height: 1.7; text-align: left; white-space: pre-wrap; }
 @media (max-width: 950px) { .document-page { width: calc(100% - 24px); padding: 30px 28px 44px; }.pdf-controls span { display: none; } }
 </style>

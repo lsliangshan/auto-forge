@@ -116,6 +116,47 @@ describe('personal knowledge workspace', () => {
     expect(wrapper.get('[data-testid="knowledge-workbench"]').text()).not.toContain('ready')
   })
 
+  it('renders Markdown documents as formatted content without enabling embedded HTML', async () => {
+    const markdownDocument = {
+      ...document('guide', 'base_1'),
+      name: 'guide.md',
+      mimeType: 'text/markdown',
+    } as KnowledgeDocumentSummary
+    const client = api({
+      list: vi.fn().mockResolvedValue([base('base_1', '产品资料')]),
+      listDocuments: vi.fn().mockResolvedValue([markdownDocument]),
+      getDocumentPreview: vi.fn().mockResolvedValue({
+        kind: 'original', mimeType: 'text/markdown',
+        bytes: new TextEncoder().encode([
+          '# 使用指南',
+          '',
+          '这是 **重要说明**。',
+          '',
+          '- 第一步',
+          '- 第二步',
+          '',
+          '`pnpm test`',
+          '',
+          '<script>globalThis.compromised = true</script>',
+        ].join('\n')),
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia] } })
+    await useKnowledgeStore().bindOwner('alice')
+    await flushPromises()
+
+    const preview = wrapper.get('[data-testid="knowledge-original-preview"]')
+    expect(preview.get('h1').text()).toBe('使用指南')
+    expect(preview.get('.rich-document strong').text()).toBe('重要说明')
+    expect(preview.findAll('li').map(item => item.text())).toEqual(['第一步', '第二步'])
+    expect(preview.get('code').text()).toBe('pnpm test')
+    expect(preview.find('script').exists()).toBe(false)
+    expect(preview.text()).toContain('<script>globalThis.compromised = true</script>')
+  })
+
   it('turns empty states into contextual next actions', async () => {
     const client = api()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
