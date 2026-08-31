@@ -1,4 +1,4 @@
-import { spawn as spawnChild } from 'node:child_process'
+import { spawn as spawnChild, spawnSync as spawnChildSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
@@ -11,6 +11,34 @@ export function resolvePinnedElectronViteCli() {
   return join(packageDirectory, 'bin', 'electron-vite.js')
 }
 
+export function resolvePinnedTsupCli() {
+  const packageDirectory = dirname(desktopRequire.resolve('tsup/package.json'))
+  return join(packageDirectory, 'dist', 'cli-default.js')
+}
+
+export function buildWorkflowRunner({
+  cli = resolvePinnedTsupCli(),
+  executable = process.execPath,
+  cwd = process.cwd(),
+  environment = process.env,
+  spawnSync = spawnChildSync,
+} = {}) {
+  const result = spawnSync(executable, [
+    cli,
+    'electron/workers/workflow-runner.ts',
+    '--format', 'cjs',
+    '--platform', 'node',
+    '--out-dir', 'out/workers',
+    '--clean', 'false',
+  ], {
+    cwd,
+    env: environment,
+    stdio: 'inherit',
+  })
+  if (result.error) throw result.error
+  return result.status ?? 1
+}
+
 export function localDevelopmentConverterReleaseRoot(cwd) {
   return resolve(cwd, 'node_modules', '.cache', 'autoforge-converter-packs', 'release')
 }
@@ -21,9 +49,12 @@ export async function runElectronViteDev({
   cwd = process.cwd(),
   environment = process.env,
   platform = process.platform,
+  buildWorkflowRunner: buildRunner = buildWorkflowRunner,
   spawn = spawnChild,
   signals = process,
 } = {}) {
+  const buildStatus = buildRunner({ cwd, environment })
+  if (buildStatus !== 0) return Promise.resolve(buildStatus)
   return new Promise((resolveStatus, reject) => {
     const childEnvironment = {
       ...environment,

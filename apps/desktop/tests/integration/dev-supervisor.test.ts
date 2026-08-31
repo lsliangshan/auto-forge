@@ -1,9 +1,14 @@
 import { EventEmitter } from 'node:events'
+import { spawnSync } from 'node:child_process'
+import { rm, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
 interface SupervisorModule {
+  buildWorkflowRunner(options: Record<string, unknown>): number
   localDevelopmentConverterReleaseRoot(cwd: string): string
   resolvePinnedElectronViteCli(): string
+  resolvePinnedTsupCli(): string
   runElectronViteDev(options: Record<string, unknown>): Promise<number>
 }
 
@@ -18,8 +23,10 @@ async function loadSupervisor(): Promise<SupervisorModule> {
 function createHarness(platform: NodeJS.Platform = 'darwin') {
   const child = new FakeChild()
   const signals = new EventEmitter()
+  const buildWorkflowRunner = vi.fn(() => 0)
   const spawn = vi.fn(() => child)
   return {
+    buildWorkflowRunner,
     child,
     signals,
     spawn,
@@ -29,6 +36,7 @@ function createHarness(platform: NodeJS.Platform = 'darwin') {
       cwd: '/workspace/apps/desktop',
       environment: { EXISTING: 'preserved' },
       platform,
+      buildWorkflowRunner,
       spawn,
       signals,
     },
@@ -48,6 +56,67 @@ describe('development supervisor', () => {
     expect(supervisor.resolvePinnedElectronViteCli()).toMatch(
       /electron-vite.+bin[/\\]electron-vite\.js$/,
     )
+  })
+
+  it('builds the workflow runner before launching electron-vite', async () => {
+    const supervisor = await loadSupervisor()
+    const harness = createHarness()
+    const order: string[] = []
+    harness.buildWorkflowRunner.mockImplementation(() => { order.push('build'); return 0 })
+    harness.spawn.mockImplementation(() => { order.push('spawn'); return harness.child })
+
+    const status = supervisor.runElectronViteDev(harness.options)
+    harness.child.emit('close', 0, null)
+
+    await expect(status).resolves.toBe(0)
+    expect(order).toEqual(['build', 'spawn'])
+  })
+
+  it('does not launch electron-vite when the workflow runner build fails', async () => {
+    const supervisor = await loadSupervisor()
+    const harness = createHarness()
+    harness.buildWorkflowRunner.mockReturnValue(9)
+
+    const status = supervisor.runElectronViteDev(harness.options)
+    harness.child.emit('close', 0, null)
+
+    await expect(status).resolves.toBe(9)
+    expect(harness.spawn).not.toHaveBeenCalled()
+  })
+
+  it('builds a runner that accepts the current workflow inspection protocol', async () => {
+    const supervisor = await loadSupervisor()
+    const desktopRoot = resolve(import.meta.dirname, '../..')
+    const workflowEntry = join(desktopRoot, 'node_modules', '.cache', 'autoforge-dev-worker-protocol.mjs')
+    await writeFile(workflowEntry, 'export default { async run() { return null } }\n')
+
+    try {
+      expect(supervisor.buildWorkflowRunner({ cwd: desktopRoot })).toBe(0)
+      const result = spawnSync(process.execPath, [
+        '--experimental-vm-modules',
+        join(desktopRoot, 'out', 'workers', 'workflow-runner.cjs'),
+      ], {
+        cwd: desktopRoot,
+        encoding: 'utf8',
+        env: { ...process.env, AUTOFORGE_EXECUTION_NONCE: 'dev-supervisor-protocol-test' },
+        input: `${JSON.stringify({
+          type: 'inspect_config',
+          inspectionId: 'inspection_test',
+          workflowId: 'workflow.test',
+          workflowVersion: '1.0.0',
+          entryPath: workflowEntry,
+        })}\n`,
+      })
+
+      expect(result.status, result.stderr).toBe(0)
+      expect(JSON.parse(result.stdout.trim())).toEqual({
+        type: 'workflow_config',
+        inspectionId: 'inspection_test',
+        implemented: false,
+      })
+    } finally {
+      await rm(workflowEntry, { force: true })
+    }
   })
 
   it('forwards one interrupt and reports intentional shutdown as success', async () => {
