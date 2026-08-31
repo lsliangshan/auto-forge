@@ -54,12 +54,14 @@ dimensions, PDF pages, animation frames, canonical `ffprobe` container names,
 exact stream types/codecs, duration, stripped sentinels/chapters, and
 first-frame metadata.
 
-Passing with a test root is local evidence only. Production release remains
-blocked until release engineering supplies the production root public key,
-HTTPS CDN, a signed compatible index and all four signed pack families for
-macOS arm64, macOS x64, and Windows x64, complete third-party license/source
-notices, and real runs plus signing/notarization evidence on every platform.
-The download kill switch stays off when any one of those inputs is absent.
+Passing with a test root is local evidence only. The first production release
+matrix is macOS arm64 and macOS x64. Release engineering must supply the root
+public key, HTTPS CDN/COS configuration, Apple signing/notarization credentials,
+all four pack families for both targets, complete third-party license/source
+notices, and accepted real-engine evidence. The document family carries the
+verified LibreOffice DMG plus the signed read-only mount launcher; it does not
+expand the application bundle past the pack entry and byte limits. The checked-in
+download kill switch stays off when any protected release input is absent.
 
 The Task 12 Cloud dependency is unchanged: deploy the v1-safe/v2 Cloud
 SQL/handler reader-first, then prove PostgreSQL locking, RLS, purge, receipt,

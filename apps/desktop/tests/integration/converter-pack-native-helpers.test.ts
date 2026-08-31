@@ -13,6 +13,7 @@ let harness = ''
 let harnessRoot = ''
 let imageHelper = ''
 let pdfHelper = ''
+let sofficeHelper = ''
 
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true })
@@ -77,6 +78,16 @@ beforeAll(() => {
     '-o', pdfHelper,
   ], { encoding: 'utf8' })
   expect(pdfBuild.status, pdfBuild.stderr).toBe(0)
+
+  sofficeHelper = join(binRoot, 'autoforge-soffice-launcher')
+  const sofficeBuild = spawnSync('/usr/bin/clang', [
+    '-std=c11', '-Wall', '-Wextra', '-Werror',
+    join(nativeRoot, 'common', 'process.c'),
+    join(nativeRoot, 'soffice-launcher', 'main.c'),
+    '-I', join(nativeRoot, 'common'),
+    '-o', sofficeHelper,
+  ], { encoding: 'utf8' })
+  expect(sofficeBuild.status, sofficeBuild.stderr).toBe(0)
 })
 
 afterAll(() => {
@@ -84,7 +95,7 @@ afterAll(() => {
 })
 
 describe('native converter helper contracts', () => {
-  it('builds the two current-architecture Mach-O helpers into the exact pack paths', () => {
+  it('builds the three current-architecture Mach-O helpers into the exact pack paths', () => {
     const root = temporaryRoot()
     const output = join(root, 'helpers')
     const target = `darwin-${process.arch}`
@@ -93,8 +104,8 @@ describe('native converter helper contracts', () => {
     ], { encoding: 'utf8' })
 
     expect(result.status, result.stderr).toBe(0)
-    for (const name of ['autoforge-image-converter', 'autoforge-pdf-raster']) {
-      const path = join(output, 'bin', name)
+    for (const relativePath of ['bin/autoforge-image-converter', 'bin/autoforge-pdf-raster', 'program/soffice']) {
+      const path = join(output, relativePath)
       expect(lstatSync(path).isFile()).toBe(true)
       expect(lstatSync(path).mode & 0o111).not.toBe(0)
       const identified = spawnSync('/usr/bin/file', ['-b', path], { encoding: 'utf8' })
@@ -103,6 +114,37 @@ describe('native converter helper contracts', () => {
       expect(identified.stdout).toContain(process.arch === 'arm64' ? 'arm64' : 'x86_64')
     }
   })
+
+  it('mounts the pinned LibreOffice DMG read-only, forwards arguments, and detaches it', () => {
+    const root = temporaryRoot()
+    const source = join(root, 'dmg-source', 'LibreOffice.app', 'Contents', 'MacOS')
+    const packProgram = join(root, 'pack', 'program')
+    const packShare = join(root, 'pack', 'share')
+    const observed = join(root, 'observed-arguments.txt')
+    mkdirSync(source, { recursive: true })
+    mkdirSync(packProgram, { recursive: true })
+    mkdirSync(packShare, { recursive: true })
+    writeFileSync(join(source, 'soffice'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$AUTOFORGE_LAUNCHER_TEST_OUTPUT"\n')
+    chmodSync(join(source, 'soffice'), 0o755)
+    const image = spawnSync('/usr/bin/hdiutil', [
+      'create', '-quiet', '-srcfolder', join(root, 'dmg-source'), '-format', 'UDZO', join(packShare, 'LibreOffice.dmg'),
+    ], { encoding: 'utf8' })
+    expect(image.status, image.stderr).toBe(0)
+    copyFileSync(sofficeHelper, join(packProgram, 'soffice'))
+    chmodSync(join(packProgram, 'soffice'), 0o755)
+
+    const result = spawnSync(join(packProgram, 'soffice'), [
+      '--headless', '--convert-to', 'pdf', '--outdir', join(root, 'output'), join(root, 'input.docx'),
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, AUTOFORGE_LAUNCHER_TEST_OUTPUT: observed },
+    })
+
+    expect(result.status, result.stderr).toBe(0)
+    expect(readFileSync(observed, 'utf8')).toBe([
+      '--headless', '--convert-to', 'pdf', '--outdir', join(root, 'output'), join(root, 'input.docx'), '',
+    ].join('\n'))
+  }, 20_000)
 
   it('accepts one exact option set and preserves the post-delimiter input verbatim', () => {
     const result = run(['parse', '--format', 'png', '--all', '--', '-hostile-looking-input.jpg'])

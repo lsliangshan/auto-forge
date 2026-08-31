@@ -19,11 +19,13 @@
     "converter-packs:create-bootstrap": "node scripts/converter-packs/create-production-bootstrap.mjs",
     "converter-packs:acquire": "node scripts/converter-packs/acquire-sources.mjs",
     "converter-packs:publish": "node scripts/converter-packs/publish-release.mjs",
+    "converter-packs:prepare-staging": "node scripts/converter-packs/prepare-production-staging.mjs",
     "converter-packs:sign": "node scripts/converter-packs/sign-index.mjs",
     "converter-packs:sign-payload": "node scripts/converter-packs/sign-pack-payload.mjs",
     "converter-packs:stage": "node scripts/converter-packs/stage-production-packs.mjs",
     "converter-packs:verify-evidence": "node scripts/converter-packs/verify-release-evidence.mjs",
     "converter-packs:verify-sources": "node scripts/converter-packs/source-lock.mjs",
+    "converter-packs:verify-workflows": "node scripts/converter-packs/validate-workflows.mjs",
     "verify:converter-packs": "node scripts/verify-converter-packs.mjs",
     "verify:packaged-native": "node scripts/verify-packaged-native.mjs",
     "dist:dir": "pnpm prepare:native-electron && electron-builder --dir --config electron-builder.yml && pnpm verify:packaged-native && pnpm verify:converter-packs",
@@ -79,6 +81,7 @@
     "typescript": "6.0.3",
     "vite": "7.3.6",
     "vitest": "4.1.10",
-    "vue-tsc": "3.3.7"
+    "vue-tsc": "3.3.7",
+    "yaml": "2.9.0"
   }
 }

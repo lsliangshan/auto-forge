@@ -33,9 +33,18 @@ Typical protected-job order:
 1. `converter-packs:verify-sources`
 2. `converter-packs:acquire`
 3. `converter-packs:build-native`
-4. install or mount only the verified inputs and generate the canonical staging plan
-5. `converter-packs:stage -- --plan <absolute-plan-path>`
+4. `converter-packs:prepare-staging` to extract the verified bottles, select
+   source-license notices, and generate the canonical staging plan
+5. `converter-packs:stage --plan <absolute-plan-path>`
 6. sign/notarize the staged payloads before building and publishing the index
+
+The document pack deliberately does not expand the LibreOffice application
+bundle into the pack protocol. The locked application contains far more files
+and expanded bytes than the bounded archive contract permits. Instead the
+pack carries the hash-verified DMG as one data entry and a signed native
+`program/soffice` launcher. The launcher mounts that pack-local image read-only
+at a unique private mount point, forwards the fixed adapter arguments to the
+contained `soffice`, and always detaches it before returning.
 
 The COS publisher invokes one absolute COSCLI binary with `cp`,
 `--forbid-overwrite` for immutable objects, and a private external

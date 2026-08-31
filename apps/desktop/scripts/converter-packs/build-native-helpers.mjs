@@ -14,6 +14,7 @@ const targetArchitectures = Object.freeze({
 const helpers = Object.freeze([
   Object.freeze({
     name: 'autoforge-image-converter',
+    destination: 'bin/autoforge-image-converter',
     sources: [
       'common/arguments.c',
       'common/process.c',
@@ -24,7 +25,14 @@ const helpers = Object.freeze([
   }),
   Object.freeze({
     name: 'autoforge-pdf-raster',
+    destination: 'bin/autoforge-pdf-raster',
     sources: ['common/arguments.c', 'common/process.c', 'pdf-raster/main.c'],
+    includes: ['common'],
+  }),
+  Object.freeze({
+    name: 'autoforge-soffice-launcher',
+    destination: 'program/soffice',
+    sources: ['common/process.c', 'soffice-launcher/main.c'],
     includes: ['common'],
   }),
 ])
@@ -51,7 +59,8 @@ export async function buildNativeHelpers({ target, output, compiler }) {
     const bin = join(output, 'bin')
     await mkdir(bin, { mode: 0o755 })
     for (const helper of helpers) {
-      const executable = join(bin, helper.name)
+      const executable = join(output, ...helper.destination.split('/'))
+      await mkdir(dirname(executable), { recursive: true, mode: 0o755 })
       const args = [
         '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
         '-mmacosx-version-min=11.0', '-arch', architecture,
@@ -65,7 +74,7 @@ export async function buildNativeHelpers({ target, output, compiler }) {
       if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error('Compiler did not produce a regular helper executable.')
       await chmod(executable, 0o755)
     }
-    return helpers.map(({ name }) => join(bin, name))
+    return helpers.map(({ destination }) => join(output, ...destination.split('/')))
   } catch (error) {
     await rm(output, { recursive: true, force: true })
     throw error

@@ -103,13 +103,14 @@
 
   Commit message: `build: acquire verified converter sources`
 
-### Task 3: Native image and PDF helper contracts
+### Task 3: Native image, PDF, and LibreOffice launcher contracts
 
 **Files:**
 - Create: `apps/desktop/converter-packs/native/image-converter/main.c`
 - Create: `apps/desktop/converter-packs/native/image-converter/icon-container.c`
 - Create: `apps/desktop/converter-packs/native/image-converter/icon-container.h`
 - Create: `apps/desktop/converter-packs/native/pdf-raster/main.c`
+- Create: `apps/desktop/converter-packs/native/soffice-launcher/main.c`
 - Create: `apps/desktop/converter-packs/native/common/arguments.c`
 - Create: `apps/desktop/converter-packs/native/common/arguments.h`
 - Create: `apps/desktop/converter-packs/native/common/process.c`
@@ -125,6 +126,8 @@
 **Interfaces:**
 - Image helper preserves the adapter commands `convert`, `create-icon`, and `extract-icon`.
 - PDF helper preserves `raster --format <png|jpeg> --pages all --page-number-width 3 --output-pattern <path> -- <input>`.
+- LibreOffice launcher mounts only the verified pack-local DMG read-only,
+  forwards the adapter arguments, and detaches it after the child exits.
 - Pack executable validation additionally permits the exact sibling `vips` and
   Poppler raster executables required by the helpers.
 
@@ -342,7 +345,9 @@
 - Create: `.github/workflows/converter-pack-check.yml`
 - Create: `.github/workflows/converter-pack-release.yml`
 - Create: `apps/desktop/scripts/converter-packs/validate-workflows.mjs`
+- Create: `apps/desktop/scripts/converter-packs/prepare-production-staging.mjs`
 - Create: `apps/desktop/tests/integration/converter-pack-workflows.test.ts`
+- Create: `apps/desktop/tests/integration/converter-pack-prepare-staging.test.ts`
 - Modify: `apps/desktop/tests/fixtures/conversion/README.md`
 - Modify: `apps/desktop/package.json`
 
@@ -350,38 +355,48 @@
 - Check workflow has no production credentials and runs deterministic validation.
 - Release workflow accepts explicit `version` and `sequence`, builds both native targets, then enters one protected production job for signing and publication.
 
-- [ ] **Step 1: Write failing workflow behavior tests**
+- [x] **Step 1: Write failing workflow behavior tests**
 
   Parse workflow YAML as data. Assert separate arm64/Intel jobs, exact target
   mapping, pinned action revisions, least-privilege permissions, protected
   `production` environment, explicit inputs, artifact handoff, no pull-request
   access to secrets, and invocation of every tested release CLI.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
   Expected: workflows absent.
 
-- [ ] **Step 3: Implement check and release workflows**
+- [x] **Step 3: Implement check and release workflows**
 
   Use native GitHub macOS runners, frozen pnpm install, cache keyed by the
   canonical source lock, bounded artifact retention and concurrency protection.
   Materialize secrets only in the protected job and remove temporary key/cert
   files in an always-run cleanup step.
 
-- [ ] **Step 4: Run credential-free dry run and repository verification**
+- [x] **Step 4: Run credential-free dry run and repository verification**
 
   Run workflow validator, source-lock validation, helper contract tests,
   acquisition/staging/publication/bootstrap tests, existing converter pack
   tests, Desktop typecheck, ESLint and build. Do not run a headed browser.
 
-- [ ] **Step 5: Run final real-engine acceptance where local inputs permit**
+  Verification note: all changed-file ESLint checks pass. Repository-wide
+  ESLint still reports the two unrelated existing errors in
+  `application.test.ts` and `application.ts`; no adjacent code was changed.
+
+- [x] **Step 5: Run final real-engine acceptance where local inputs permit**
 
   Point `AUTOFORGE_TEST_CONVERTER_PACK_ROOT` at the locally produced signed
   fixture root and run `conversion-engines.test.ts`. Record Apple/COS steps as
   externally blocked unless real protected credentials are present; do not
   weaken or bypass those gates.
 
-- [ ] **Step 6: Commit**
+  Local evidence: the locked arm64 LibreOffice DMG hash and application layout
+  were inspected, and a real read-only DMG launcher smoke passed. The aggregate
+  converter test run skips the 11 credential/input-gated real-engine cases.
+  Developer ID notarization and COS publication remain protected-environment
+  operations because those credentials are not present locally.
+
+- [x] **Step 6: Commit**
 
   Commit message: `ci: publish signed converter packs`
 
