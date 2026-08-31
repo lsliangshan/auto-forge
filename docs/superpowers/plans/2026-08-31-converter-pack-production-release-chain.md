@@ -223,30 +223,30 @@
 - Consumes: a staged target root and credential paths supplied outside that root.
 - Produces: signed payload bytes plus canonical provenance, SBOM, license and notarization evidence; returns no secret material.
 
-- [ ] **Step 1: Write failing evidence tests**
+- [x] **Step 1: Write failing evidence tests**
 
   Use injected command results to reject unsigned Mach-O, wrong team identity,
   missing hardened runtime, unaccepted notarization, absent source offers,
   incomplete licenses and architecture mismatch. Prove evidence serialization
   contains no environment values or private-key markers.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
   Expected: missing module failure.
 
-- [ ] **Step 3: Implement inside-out signing and evidence verification**
+- [x] **Step 3: Implement inside-out signing and evidence verification**
 
   Enumerate Mach-O files from the staged manifest, sign libraries before
   executables, verify strict signatures, submit a deterministic ZIP wrapper to
   `notarytool`, and record only request ID/status/team ID/tool versions and
   artifact hashes.
 
-- [ ] **Step 4: Verify credential-free fail-closed behavior**
+- [x] **Step 4: Verify credential-free fail-closed behavior**
 
   Run without signing variables and assert a stable nonzero exit before index
   generation; run tests with injected accepted evidence and verify GREEN.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   Commit message: `build: gate converter pack release evidence`
 
