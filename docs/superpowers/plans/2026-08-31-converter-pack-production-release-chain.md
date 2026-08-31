@@ -160,7 +160,7 @@
   create/extract ICO and ICNS, and raster a generated three-page PDF. Inspect
   magic bytes, dimensions and exact zero-padded output names.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   Commit message: `feat: add native converter pack helpers`
 
@@ -177,37 +177,37 @@
 - Consumes: exact target record, acquired engine roots, helper build root, version, sequence and HTTPS archive base URL.
 - Produces: the normalized `release-input/` tree consumed unchanged by existing `build-index.mjs`.
 
-- [ ] **Step 1: Write failing Mach-O closure and staging tests**
+- [x] **Step 1: Write failing Mach-O closure and staging tests**
 
   Inject literal `otool` output and a command runner. Prove transitive closure,
   system-library exclusion, basename collision rejection, architecture mismatch
   rejection, unresolved Homebrew path rejection, required data/license copying
   and exactly four staged families for one target.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
   Expected: module-not-found failure for the staging modules.
 
-- [ ] **Step 3: Implement dependency closure and relocation plan**
+- [x] **Step 3: Implement dependency closure and relocation plan**
 
   Return a data plan before mutating files. Copy regular files through stable
   handles, rewrite install names to `@loader_path`-relative paths, then rescan
   every Mach-O and fail if a non-system absolute dependency remains.
 
-- [ ] **Step 4: Implement pack staging and capability probes**
+- [x] **Step 4: Implement pack staging and capability probes**
 
   Build canonical `pack.json` files with explicit `executable`, `code`, `data`
   and `license` roles. Probe libvips formats, FFmpeg encoders/muxers, Poppler
   utilities and LibreOffice conversion before declaring the pack complete.
 
-- [ ] **Step 5: Verify current-architecture staging through existing production builder**
+- [x] **Step 5: Verify current-architecture staging through existing production builder**
 
   Combine two copies of controlled fixture staging only inside the test to
   exercise the exact eight-coordinate production validator. Run build, sign
   with a generated test-only key passed explicitly in `--mode test` where
   applicable, and verify archives and entry hashes.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   Commit message: `build: stage relocatable converter packs`
 
