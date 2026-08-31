@@ -65,7 +65,7 @@
 
   Commit message: `build: lock converter pack sources`
 
-### Task 2: Verified acquisition and safe extraction
+### Task 2: Verified acquisition and immutable caching
 
 **Files:**
 - Create: `apps/desktop/scripts/converter-packs/acquire-sources.mjs`
@@ -74,34 +74,32 @@
 
 **Interfaces:**
 - Consumes: the Task 1 target record, an absolute cache directory and injected `fetch` for tests.
-- Produces: an immutable acquisition directory keyed by SHA-256 and a manifest of regular extracted files.
+- Produces: immutable source and runtime archive files keyed by SHA-256. Extraction is owned by Task 4 after Homebrew revision selection or read-only DMG mounting.
 
-- [ ] **Step 1: Write failing acquisition tests**
+- [x] **Step 1: Write failing acquisition tests**
 
-  Exercise real in-memory response bodies and tiny tar/DMG-independent archive
-  fixtures. Prove byte caps, exact hashes, HTTPS redirect allowlists, cache
-  revalidation, no-follow output creation, and rejection of symlinks, hardlinks,
-  devices, absolute paths and `..` entries. The mutation caught is trusting an
-  upstream archive before its identity and layout are proven.
+  Exercise real response streams. Prove byte caps, exact hashes, HTTPS redirect
+  termination, anonymous GHCR bearer authentication, cache revalidation and
+  no-follow output creation. The mutation caught is trusting upstream bytes
+  before their identity is proven.
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
   Expected: module-not-found failure for `acquire-sources.mjs`.
 
-- [ ] **Step 3: Implement bounded download and restricted extraction**
+- [x] **Step 3: Implement bounded download and immutable caching**
 
   Reuse stable-file and safe-entry primitives from `pack-tooling-lib.mjs`.
   Downloads write to exclusive temporary files, verify SHA-256 before rename,
-  and never overwrite a mismatched cache entry. Extraction runs a fixed absolute
-  system tool selected by platform, first lists and validates entries, then
-  extracts into a new mode-0700 directory.
+  and never overwrite a mismatched cache entry. The module acquires both exact
+  source and runtime archives and returns only verified local identities.
 
-- [ ] **Step 4: Verify GREEN and mutation cases**
+- [x] **Step 4: Verify GREEN and mutation cases**
 
-  Run the focused test with a hash-mismatch case and a symlink archive case,
-  then rerun Task 1 tests.
+  Run the focused test with download/cache hash mismatches, size overflow,
+  insecure URL, HTTP error and GHCR challenge cases, then rerun Task 1 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   Commit message: `build: acquire verified converter sources`
 

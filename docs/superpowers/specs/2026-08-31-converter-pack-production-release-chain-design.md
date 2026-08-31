@@ -58,8 +58,9 @@ upstream DMG. The release also retains the exact source archives needed to
 satisfy source-availability obligations.
 
 A source-lock module exposes one small interface: validate the whole lock and
-return the exact target record. Callers do not understand Homebrew metadata or
-upstream archive layouts.
+return the exact target record. An acquisition module then performs bounded
+HTTPS downloads, the anonymous GHCR bearer challenge, hash verification and
+immutable caching. It does not extract upstream archives.
 
 ### 2. Native helpers
 
@@ -91,8 +92,12 @@ release-input/
       payload/
 ```
 
-The staging module copies only the transitive Mach-O dependency closure needed
-by declared executables, rewrites Homebrew absolute install names to
+Under the locked Homebrew revisions, staging installs the verified bottles;
+LibreOffice is mounted from its verified DMG read-only. Homebrew bottles may
+contain their normal Cellar symlinks, so the staging module dereferences inputs
+while copying and then rejects every symlink or multiply-linked file in its
+output. It copies only the transitive Mach-O dependency closure needed by
+declared executables, rewrites Homebrew absolute install names to
 `@loader_path`-relative paths, copies required data directories and license
 files, and rejects unresolved non-system dependencies. LibreOffice retains its
 internal application layout under the pack's `program/` seam.
@@ -150,8 +155,8 @@ sequence and version and cannot fall back to test keys or fixture URLs.
 
 ## Failure Model
 
-- Missing source, hash mismatch or redirected unapproved origin: stop before
-  extraction.
+- Missing source, hash mismatch or a redirect terminating without HTTPS: stop
+  before installation or mounting.
 - Unsupported engine capability: stop before staging.
 - Unresolved or wrong-architecture Mach-O dependency: stop before signing.
 - Missing license/source evidence: stop before index generation.
