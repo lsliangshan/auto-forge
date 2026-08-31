@@ -15,6 +15,7 @@
     "test": "node scripts/run-vitest-electron.mjs run --config vitest.config.ts && node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts",
     "prepare:native-electron": "install-electron && node scripts/prepare-native-electron.mjs",
     "converter-packs:build": "node scripts/converter-packs/build-index.mjs",
+    "converter-packs:build-native": "node scripts/converter-packs/build-native-helpers.mjs",
     "converter-packs:acquire": "node scripts/converter-packs/acquire-sources.mjs",
     "converter-packs:sign": "node scripts/converter-packs/sign-index.mjs",
     "converter-packs:verify-sources": "node scripts/converter-packs/source-lock.mjs",

@@ -24,14 +24,15 @@ bundle with this shape:
 ```
 
 The fixture index is built, signed, and verified only with explicit
-`--mode test`; the production default requires the exact 12-coordinate
+`--mode test`; the production default requires the exact 8-coordinate
 inventory and rejects this single-platform subset. The index must contain all
 four pack families for the running platform and architecture. Every signed
 entry includes an explicit `executable`, `code`, `license`, or `data` role,
 and the preinstalled trees must exactly match the signed entry hashes and
-target modes. `image-icon` declares `bin/autoforge-image-converter`,
+target modes. `image-icon` declares `bin/autoforge-image-converter` plus
+`bin/vips`,
 `document` declares `program/soffice`, `pdf` declares
-`bin/autoforge-pdf-raster` plus `bin/pdfinfo`, and `media` declares `bin/ffmpeg`
+`bin/autoforge-pdf-raster` plus `bin/pdfinfo` and `bin/pdftocairo`, and `media` declares `bin/ffmpeg`
 plus `bin/ffprobe`. Tests execute only these lease-resolved absolute paths;
 they never search or fall back to system `PATH`. An invalid or unsigned bundle
 fails before any converter process starts.

@@ -115,9 +115,9 @@ function stageWindowsPack(root: string): string {
 }
 
 const targetExecutablePaths = {
-  'image-icon': { darwin: ['bin/autoforge-image-converter'], win32: ['bin/autoforge-image-converter.exe'] },
+  'image-icon': { darwin: ['bin/autoforge-image-converter', 'bin/vips'], win32: ['bin/autoforge-image-converter.exe', 'bin/vips.exe'] },
   document: { darwin: ['program/soffice'], win32: ['program/soffice.exe'] },
-  pdf: { darwin: ['bin/autoforge-pdf-raster', 'bin/pdfinfo'], win32: ['bin/autoforge-pdf-raster.exe', 'bin/pdfinfo.exe'] },
+  pdf: { darwin: ['bin/autoforge-pdf-raster', 'bin/pdfinfo', 'bin/pdftocairo'], win32: ['bin/autoforge-pdf-raster.exe', 'bin/pdfinfo.exe', 'bin/pdftocairo.exe'] },
   media: { darwin: ['bin/ffmpeg', 'bin/ffprobe'], win32: ['bin/ffmpeg.exe', 'bin/ffprobe.exe'] },
 } as const
 

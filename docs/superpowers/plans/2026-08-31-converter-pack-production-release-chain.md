@@ -112,37 +112,44 @@
 - Create: `apps/desktop/converter-packs/native/pdf-raster/main.c`
 - Create: `apps/desktop/converter-packs/native/common/arguments.c`
 - Create: `apps/desktop/converter-packs/native/common/arguments.h`
-- Create: `apps/desktop/converter-packs/native/tests/helper-contract.test.mjs`
+- Create: `apps/desktop/converter-packs/native/common/process.c`
+- Create: `apps/desktop/converter-packs/native/common/process.h`
+- Create: `apps/desktop/converter-packs/native/tests/helper-contract-harness.c`
+- Create: `apps/desktop/converter-packs/native/tests/fake-engine.c`
 - Create: `apps/desktop/scripts/converter-packs/build-native-helpers.mjs`
+- Create: `apps/desktop/tests/integration/converter-pack-native-helpers.test.ts`
+- Modify: `apps/desktop/scripts/verify-converter-packs.mjs`
 - Modify: `apps/desktop/scripts/converter-packs/pack-tooling-lib.mjs`
 - Modify: `apps/desktop/tests/integration/converter-pack-tooling.test.ts`
 
 **Interfaces:**
 - Image helper preserves the adapter commands `convert`, `create-icon`, and `extract-icon`.
 - PDF helper preserves `raster --format <png|jpeg> --pages all --page-number-width 3 --output-pattern <path> -- <input>`.
-- Pack executable validation additionally permits the exact internal Poppler raster executable required by the PDF helper.
+- Pack executable validation additionally permits the exact sibling `vips` and
+  Poppler raster executables required by the helpers.
 
-- [ ] **Step 1: Write failing parser and container tests**
+- [x] **Step 1: Write failing parser and container tests**
 
   Compile the common argument and icon-container code without libvips. Assert
   literal ICO/ICNS headers, lengths, ordered representations, malformed length
   rejection, unknown/duplicate option rejection and `--` positional handling.
   Add a tooling test proving any undeclared executable still fails.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
   Expected: compilation/module failure because helper sources are absent.
 
-- [ ] **Step 3: Implement strict parsers and icon containers**
+- [x] **Step 3: Implement strict parsers and icon containers**
 
   Use bounded integer arithmetic and explicit big/little-endian reads/writes.
   Do not invoke a shell. Keep the parser interface limited to parsed command
   structs consumed by each helper.
 
-- [ ] **Step 4: Implement libvips image operations and Poppler delegation**
+- [x] **Step 4: Implement libvips image operations and Poppler delegation**
 
-  The image helper loads only the requested first frame unless extracting all
-  signed representations, uses contain-plus-transparent-padding for icons, and
+  The image helper delegates fixed argument vectors to a signed sibling `vips`,
+  loads only the requested first frame unless extracting all signed
+  representations, uses contain-plus-transparent-padding for icons, and
   emits PNG-backed ICO/ICNS entries. The PDF helper resolves a signed sibling
   executable relative to its own real path, spawns it with a fixed argument
   vector, and normalizes outputs only after a zero exit status.

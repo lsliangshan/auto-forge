@@ -43,7 +43,9 @@ const forbiddenSegments = new Set([
 const forbiddenEngineNames = new Set([
   'ffmpeg', 'ffmpeg.exe', 'ffprobe', 'ffprobe.exe', 'soffice', 'soffice.exe',
   'autoforge-image-converter', 'autoforge-image-converter.exe',
+  'vips', 'vips.exe',
   'autoforge-pdf-raster', 'autoforge-pdf-raster.exe', 'pdfinfo', 'pdfinfo.exe',
+  'pdftocairo', 'pdftocairo.exe',
 ])
 
 function sameFile(left, right) {

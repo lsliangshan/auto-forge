@@ -64,10 +64,12 @@ immutable caching. It does not extract upstream archives.
 
 ### 2. Native helpers
 
-The image helper is a native command-line program linked to the staged libvips
-closure. It implements only the existing `convert`, `create-icon`, and
-`extract-icon` commands. ICO and ICNS containers are assembled and parsed by
-the helper; pixel decoding, resize and encoding remain behind libvips.
+The image helper is a native command-line program that validates the fixed
+adapter contract and delegates only to the pack-owned `vips` executable through
+an absolute sibling path. It implements only the existing `convert`,
+`create-icon`, and `extract-icon` commands. ICO and ICNS containers are
+assembled and parsed by the helper; pixel decoding, resize and encoding remain
+behind libvips. Both the helper and `vips` are declared and signed executables.
 
 The PDF helper is a native command-line program that validates the existing
 `raster` command and delegates only to the pack-owned Poppler raster executable
