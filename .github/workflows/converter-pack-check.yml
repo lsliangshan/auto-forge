@@ -1,0 +1,44 @@
+name: Converter pack checks
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/converter-pack-*.yml'
+      - 'apps/desktop/converter-packs/**'
+      - 'apps/desktop/scripts/converter-packs/**'
+      - 'apps/desktop/tests/integration/converter-pack-*.test.ts'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/converter-pack-*.yml'
+      - 'apps/desktop/converter-packs/**'
+      - 'apps/desktop/scripts/converter-packs/**'
+      - 'apps/desktop/tests/integration/converter-pack-*.test.ts'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9
+        with:
+          version: '11.15.0'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24.13.3'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify workflow and source contracts
+        run: |
+          pnpm --filter @autoforge/desktop converter-packs:verify-workflows
+          pnpm --filter @autoforge/desktop converter-packs:verify-sources --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target darwin-arm64
+          pnpm --filter @autoforge/desktop converter-packs:verify-sources --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target darwin-x64
+      - name: Run credential-free converter tests
+        run: pnpm exec vitest run apps/desktop/tests/integration/converter-pack-*.test.ts

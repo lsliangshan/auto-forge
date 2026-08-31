@@ -417,6 +417,51 @@ describe('production conversion runtime', () => {
     app.database.close()
   })
 
+  it('rejects the known development root key before production network access', async () => {
+    const app = await fixture({
+      name: 'annual-report.pdf', mimeType: 'application/pdf', format: 'pdf', bytes: pdf(3),
+    })
+    const resourcesRoot = join(app.dataRoot, 'development-key-resources')
+    await mkdir(resourcesRoot)
+    await writeFile(join(resourcesRoot, 'bootstrap.json'), JSON.stringify({
+      schemaVersion: 1, downloadsEnabled: true,
+      indexUrl: 'https://packs.example.test/releases/index.json', rootPublicKeyFile: 'root-public-key.pem',
+      requiredPackFamilies: ['image-icon', 'document', 'pdf', 'media'],
+      supportedTargets: ['darwin-arm64', 'darwin-x64'],
+    }))
+    await writeFile(
+      join(resourcesRoot, 'root-public-key.pem'),
+      await readFile(new URL('./fixtures/test-converter-root-public-key.pem', import.meta.url)),
+    )
+    const fetch = vi.fn(async () => new Response('{}', { status: 200 }))
+    const withTransportLease = vi.fn(async (operation: () => Promise<unknown>) => operation())
+    const create = createProductionConversionRuntimeFactory({
+      resourcesRoot,
+      network: { fetch, withTransportLease } as never,
+      platform: 'darwin',
+      arch: 'arm64',
+    })
+    const binding = await create({
+      ownerUserId: 'alice', dataRoot: app.dataRoot, packsRoot: join(app.dataRoot, 'installed-packs'),
+      database: {
+        conversations: app.database.conversations,
+        mediaAssets: app.database.mediaAssets,
+        conversionArtifacts: app.database.conversionArtifacts,
+        conversionJobs: app.database.conversionJobs,
+      },
+      artifacts: app.artifacts,
+    })
+    const job = app.database.conversionJobs.create({
+      id: 'development-key-job', ownerUserId: 'alice', executionId: 'execution',
+      sourceKind: 'artifact', sourceId: 'source', targetFormat: 'png', status: 'queued', createdAt: 2,
+    })
+
+    await expect(binding.runtime.acquirePack(job, new AbortController().signal))
+      .rejects.toMatchObject({ code: 'CONVERSION_COMPONENT_UNAVAILABLE' })
+    expect(fetch).not.toHaveBeenCalled()
+    app.database.close()
+  })
+
   it('loads only the packaged root and fetches the HTTPS index and signature under one network lease', async () => {
     const app = await fixture({
       name: 'annual-report.pdf', mimeType: 'application/pdf', format: 'pdf', bytes: pdf(3),
@@ -443,6 +488,7 @@ describe('production conversion runtime', () => {
       network: { fetch, withTransportLease } as never,
       platform: 'darwin',
       arch: 'arm64',
+      allowUnsafeTestRootKey: true,
     })
     const binding = await create({
       ownerUserId: 'alice', dataRoot: app.dataRoot, packsRoot: join(app.dataRoot, 'valid-installed-packs'),
@@ -503,6 +549,7 @@ describe('production conversion runtime', () => {
       resourcesRoot,
       network: { fetch, withTransportLease: async (operation: () => Promise<unknown>) => operation() } as never,
       platform: 'darwin', arch: 'arm64',
+      allowUnsafeTestRootKey: true,
     })
     const binding = await create({
       ownerUserId: 'alice', dataRoot: app.dataRoot, packsRoot: join(app.dataRoot, 'stream-installed-packs'),

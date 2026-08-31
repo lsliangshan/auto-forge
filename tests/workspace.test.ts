@@ -22,7 +22,7 @@ describe('workspace', () => {
       'build:e2e:universal-file-converter': 'pnpm --filter @autoforge/desktop exec tsup tests/e2e/universal-file-converter-fixture.ts --format esm --platform node --external electron --external better-sqlite3 --loader .sql=text --out-dir .e2e/main --clean false',
     })
     expect(desktop.scripts).toMatchObject({
-      predev: 'pnpm prepare:native-electron',
+      predev: 'pnpm prepare:native-electron && node scripts/converter-packs/create-local-development-image-release.mjs',
       pretest: 'pnpm prepare:native-electron',
       test: 'node scripts/run-vitest-electron.mjs run --config vitest.config.ts && node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts',
       'prepare:native-electron': 'install-electron && node scripts/prepare-native-electron.mjs',

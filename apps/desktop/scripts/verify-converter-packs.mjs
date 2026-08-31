@@ -30,6 +30,7 @@ import {
   validateIndex,
   verifyRestrictedUstar,
 } from './converter-packs/pack-tooling-lib.mjs'
+import { isDisallowedProductionConverterRootKey } from './converter-packs/root-key-policy.mjs'
 
 const desktopRoot = fileURLToPath(new URL('..', import.meta.url))
 // Electron's Node runtime otherwise treats every `.asar` path as a virtual
@@ -43,7 +44,9 @@ const forbiddenSegments = new Set([
 const forbiddenEngineNames = new Set([
   'ffmpeg', 'ffmpeg.exe', 'ffprobe', 'ffprobe.exe', 'soffice', 'soffice.exe',
   'autoforge-image-converter', 'autoforge-image-converter.exe',
+  'vips', 'vips.exe',
   'autoforge-pdf-raster', 'autoforge-pdf-raster.exe', 'pdfinfo', 'pdfinfo.exe',
+  'pdftocairo', 'pdftocairo.exe',
 ])
 
 function sameFile(left, right) {
@@ -201,26 +204,53 @@ function expectedMetadataBytes(name) {
   return bytes
 }
 
-function validateBootstrap(root) {
+function validateBootstrap(root, metadataMode) {
   requireStableDirectorySync(root, 'Packaged converter metadata')
   const allowed = ['bootstrap.json', 'index.schema.json', 'root-public-key.pem']
   const names = readdirSync(root).sort(compareUtf8)
   if (names.some((name) => !allowed.includes(name))) fail('Packaged converter metadata contains an unexpected file.')
   if (!names.includes('bootstrap.json') || !names.includes('index.schema.json')) fail('Packaged converter metadata is incomplete.')
-  for (const name of ['bootstrap.json', 'index.schema.json']) {
-    const packaged = readStableRegularFileSync(join(root, name), `Packaged ${name}`)
-    if (!packaged.equals(expectedMetadataBytes(name))) fail(`Packaged ${name} does not have exact canonical content.`)
+  const schema = readStableRegularFileSync(join(root, 'index.schema.json'), 'Packaged index.schema.json')
+  if (!schema.equals(expectedMetadataBytes('index.schema.json'))) fail('Packaged index.schema.json does not have exact canonical content.')
+  const bootstrapBytes = readStableRegularFileSync(join(root, 'bootstrap.json'), 'Packaged bootstrap.json')
+  let bootstrap
+  try { bootstrap = JSON.parse(bootstrapBytes.toString('utf8')) } catch { fail('Packaged converter bootstrap is invalid.') }
+  if (!bootstrapBytes.equals(canonicalBytes(bootstrap))) fail('Packaged converter bootstrap is not canonical.')
+  const common = bootstrap.schemaVersion === 1
+    && JSON.stringify(bootstrap.requiredPackFamilies) === JSON.stringify(['image-icon', 'document', 'pdf', 'media'])
+    && JSON.stringify(bootstrap.supportedTargets) === JSON.stringify(['darwin-arm64', 'darwin-x64'])
+  if (metadataMode === 'disabled') {
+    if (
+      !common
+      || !bootstrapBytes.equals(expectedMetadataBytes('bootstrap.json'))
+      || bootstrap.downloadsEnabled !== false
+      || bootstrap.indexUrl !== null
+      || bootstrap.rootPublicKeyFile !== null
+    ) fail('Packaged converter bootstrap must remain fail-closed.')
+    if (names.includes('root-public-key.pem')) fail('Packaged root key is present while the converter download kill switch is disabled.')
+    return
   }
-  const bootstrap = JSON.parse(readStableRegularFileSync(join(root, 'bootstrap.json'), 'Packaged bootstrap.json').toString('utf8'))
+  let index
+  try { index = new URL(bootstrap.indexUrl) } catch { fail('Production converter bootstrap index URL is invalid.') }
   if (
-    bootstrap.schemaVersion !== 1
-    || bootstrap.downloadsEnabled !== false
-    || bootstrap.indexUrl !== null
-    || bootstrap.rootPublicKeyFile !== null
-    || JSON.stringify(bootstrap.requiredPackFamilies) !== JSON.stringify(['image-icon', 'document', 'pdf', 'media'])
-    || JSON.stringify(bootstrap.supportedTargets) !== JSON.stringify(['darwin-arm64', 'darwin-x64'])
-  ) fail('Packaged converter bootstrap must remain fail-closed.')
-  if (names.includes('root-public-key.pem')) fail('Packaged root key is present while the converter download kill switch is disabled.')
+    !common
+    || bootstrap.downloadsEnabled !== true
+    || bootstrap.rootPublicKeyFile !== 'root-public-key.pem'
+    || index.protocol !== 'https:'
+    || index.username !== ''
+    || index.password !== ''
+    || index.search !== ''
+    || index.hash !== ''
+    || !index.pathname.endsWith('/index.json')
+    || index.href !== bootstrap.indexUrl
+    || names.join('\0') !== allowed.sort(compareUtf8).join('\0')
+  ) fail('Production converter bootstrap is invalid.')
+  const publicKeyBytes = readStableRegularFileSync(join(root, 'root-public-key.pem'), 'Packaged root public key')
+  if (privateKeyPattern.test(publicKeyBytes.toString('utf8'))) fail('Production converter root key contains private material.')
+  let publicKey
+  try { publicKey = createPublicKey(publicKeyBytes) } catch { fail('Production converter root public key is invalid.') }
+  if (publicKey.asymmetricKeyType !== 'ed25519') fail('Production converter root public key must use Ed25519.')
+  if (isDisallowedProductionConverterRootKey(publicKey)) fail('Production converter root public key must not use a development or test key.')
 }
 
 function packagedResources(app, platform) {
@@ -228,16 +258,21 @@ function packagedResources(app, platform) {
   fail('Packaged converter verification supports first-release macOS targets only.')
 }
 
-export function verifyPackagedConverterBoundary(appPath, { platform = process.platform, arch = process.arch } = {}) {
+export function verifyPackagedConverterBoundary(appPath, {
+  platform = process.platform,
+  arch = process.arch,
+  metadataMode = 'disabled',
+} = {}) {
   requireAbsolutePath(appPath, 'Packaged app path')
   if (!firstReleaseTarget(platform, arch)) fail('Packaged converter target is outside the first-release matrix.')
+  if (metadataMode !== 'disabled' && metadataMode !== 'production') fail('Packaged converter metadata mode is invalid.')
   requireStableDirectorySync(appPath, 'Packaged app path')
   const resources = packagedResources(appPath, platform)
   requireStableDirectorySync(resources, 'Packaged resources')
   const appAsar = join(resources, 'app.asar')
   const converterMetadata = join(resources, 'converter-packs')
   if (!existsSync(appAsar) || !existsSync(converterMetadata)) fail('Packaged converter boundary is incomplete.')
-  validateBootstrap(converterMetadata)
+  validateBootstrap(converterMetadata, metadataMode)
   const archive = decodeAsar(appAsar)
   scanCanonicalAsarEntries(archive)
 
@@ -269,7 +304,7 @@ export function verifyPackagedConverterBoundary(appPath, { platform = process.pl
     }
   }
   visit(appPath)
-  process.stdout.write(`verified ${platform}-${arch} packaged converter boundary: kill switch off, no private key, unsigned engine, archive, signature, test, e2e, or stale material\n`)
+  process.stdout.write(`verified ${platform}-${arch} packaged converter boundary (${metadataMode} metadata): no private key, unsigned engine, archive, signature, test, e2e, or stale material\n`)
 }
 
 export async function verifyConverterPackRelease({ root, publicKeyPath, mode = 'production' }) {
@@ -280,14 +315,17 @@ export async function verifyConverterPackRelease({ root, publicKeyPath, mode = '
   const indexBytes = await readStableRegularFile(join(root, 'index.json'), 'Index')
   const signatureBytes = await readStableRegularFile(join(root, 'index.sig'), 'Signature')
   const publicKeyBytes = await readStableRegularFile(publicKeyPath, 'Public key')
+  let publicKey
+  try { publicKey = createPublicKey(publicKeyBytes) } catch { fail('Public key is invalid.') }
+  if (mode === 'production' && isDisallowedProductionConverterRootKey(publicKey)) {
+    fail('Production converter root public key must not use a development or test key.')
+  }
   let index
   try { index = validateIndex(JSON.parse(indexBytes.toString('utf8')), mode) } catch { fail('Signed index is invalid.') }
   if (!indexBytes.equals(canonicalBytes(index))) fail('Signed index is not canonical.')
   const signatureText = signatureBytes.toString('utf8').trim()
   const signature = Buffer.from(signatureText, 'base64')
   if (signature.byteLength !== 64 || signature.toString('base64') !== signatureText) fail('Signed index signature is invalid.')
-  let publicKey
-  try { publicKey = createPublicKey(publicKeyBytes) } catch { fail('Public key is invalid.') }
   if (publicKey.asymmetricKeyType !== 'ed25519' || !verifySignature(null, indexBytes, publicKey, signature)) {
     fail('Signed index signature is invalid.')
   }
@@ -320,9 +358,13 @@ const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(entry).href) {
   if (process.argv.length === 2) {
     verifyPackagedConverterBoundary(defaultPackagedApp())
-  } else if (process.argv[2] === '--packaged-app') {
-    const args = parseArguments(process.argv.slice(2), ['--packaged-app', '--platform', '--arch'], ['--packaged-app'])
-    verifyPackagedConverterBoundary(args['--packaged-app'], { platform: args['--platform'] ?? process.platform, arch: args['--arch'] ?? process.arch })
+  } else if (process.argv[2] === '--packaged-app' || process.argv[2] === '--metadata-mode') {
+    const args = parseArguments(process.argv.slice(2), ['--packaged-app', '--platform', '--arch', '--metadata-mode'], [])
+    verifyPackagedConverterBoundary(args['--packaged-app'] ?? defaultPackagedApp(), {
+      platform: args['--platform'] ?? process.platform,
+      arch: args['--arch'] ?? process.arch,
+      metadataMode: args['--metadata-mode'] ?? 'disabled',
+    })
   } else {
     const args = parseArguments(process.argv.slice(2), ['--root', '--public-key', '--mode'], ['--root', '--public-key'])
     await verifyConverterPackRelease({ root: args['--root'], publicKeyPath: args['--public-key'], mode: args['--mode'] })

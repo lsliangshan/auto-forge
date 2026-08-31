@@ -42,6 +42,7 @@ describe('main process build', () => {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> }
     const builderConfigPath = fileURLToPath(new URL('../../electron-builder.yml', import.meta.url))
     const builderConfig = readFileSync(builderConfigPath, 'utf8')
+    const productionBuilderConfig = readFileSync(fileURLToPath(new URL('../../electron-builder.production.cjs', import.meta.url)), 'utf8')
     const resourceRoot = fileURLToPath(new URL('../../resources/converter-packs/', import.meta.url))
     const bootstrap = JSON.parse(readFileSync(`${resourceRoot}/bootstrap.json`, 'utf8')) as Record<string, unknown>
     const resourceNames = readdirSync(resourceRoot).sort()
@@ -64,18 +65,25 @@ describe('main process build', () => {
     expect(builderConfig).not.toMatch(/private[-_]?key|\.tar|\.exe|ffmpeg|soffice|autoforge-image-converter|autoforge-pdf-raster/iu)
     expect(packageJson.scripts?.['converter-packs:build']).toContain('build-index.mjs')
     expect(packageJson.scripts?.['converter-packs:sign']).toContain('sign-index.mjs')
+    expect(packageJson.scripts?.['converter-packs:create-bootstrap']).toContain('create-production-bootstrap.mjs')
+    expect(packageJson.scripts?.['dist:production']).toContain('electron-builder.production.cjs')
+    expect(packageJson.scripts?.['dist:production']).toContain('--metadata-mode production')
+    expect(productionBuilderConfig).toContain('AUTOFORGE_CONVERTER_METADATA_ROOT')
+    expect(productionBuilderConfig).not.toContain('from: resources/converter-packs')
     expect(packageJson.scripts?.['verify:converter-packs']).toContain('verify-converter-packs.mjs')
     expect(packageJson.scripts?.['dist:dir']).toContain('verify:converter-packs')
   })
 
-  it('wires the ordinary Electron Main entrypoint to the production conversion runtime factory', () => {
+  it('uses signed local conversion only in development and keeps packaged builds on the production factory', () => {
     const mainEntryPath = fileURLToPath(new URL('./index.ts', import.meta.url))
     const source = readFileSync(mainEntryPath, 'utf8')
 
     expect(source).toContain("import { createProductionConversionRuntimeFactory } from './conversion/production-conversion-runtime.js'")
+    expect(source).toContain("import { selectConversionRuntimeFactory } from './conversion/local-development-conversion-runtime.js'")
     expect(source).toContain("join(process.resourcesPath, 'converter-packs')")
     expect(source).toContain("join(app.getAppPath(), 'resources', 'converter-packs')")
-    expect(source).toMatch(/conversionRuntimeFactory:\s*createProductionConversionRuntimeFactory\(\{[\s\S]*resourcesRoot:\s*converterPackResources,[\s\S]*network:\s*networkProxy/u)
-    expect(source).not.toMatch(/process\.env[^\n]*(?:converter|pack|public.?key|index)/iu)
+    expect(source).toMatch(/const productionConversionRuntimeFactory = createProductionConversionRuntimeFactory\(\{[\s\S]*resourcesRoot:\s*converterPackResources,[\s\S]*network:\s*networkProxy/u)
+    expect(source).toMatch(/conversionRuntimeFactory:\s*selectConversionRuntimeFactory\(\{[\s\S]*packaged:\s*app\.isPackaged,[\s\S]*developmentReleaseRoot:\s*process\.env\.AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT,[\s\S]*productionFactory:\s*productionConversionRuntimeFactory/u)
+    expect(source).not.toContain('allowUnsafeTestRootKey')
   })
 })

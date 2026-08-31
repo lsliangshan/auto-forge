@@ -24,9 +24,15 @@ const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const launchableExtension = /\.(?:exe|com|cmd|bat|ps1|scr|msi)$/iu
 const codeExtension = /(?:\.(?:dll|dylib|node|jar|py|pyc|pyd|pl|rb|sh|bash|zsh|fish|hta|vbs|vbe|js|jse|mjs|cjs|wsf|wsh|cpl|lnk|reg|url)|\.so(?:\.[0-9]+)*)$/iu
 const exactExecutablePaths = Object.freeze({
-  'image-icon': Object.freeze({ darwin: ['bin/autoforge-image-converter'], win32: ['bin/autoforge-image-converter.exe'] }),
+  'image-icon': Object.freeze({
+    darwin: ['bin/autoforge-image-converter', 'bin/vips'],
+    win32: ['bin/autoforge-image-converter.exe', 'bin/vips.exe'],
+  }),
   document: Object.freeze({ darwin: ['program/soffice'], win32: ['program/soffice.exe'] }),
-  pdf: Object.freeze({ darwin: ['bin/autoforge-pdf-raster', 'bin/pdfinfo'], win32: ['bin/autoforge-pdf-raster.exe', 'bin/pdfinfo.exe'] }),
+  pdf: Object.freeze({
+    darwin: ['bin/autoforge-pdf-raster', 'bin/pdfinfo', 'bin/pdftocairo'],
+    win32: ['bin/autoforge-pdf-raster.exe', 'bin/pdfinfo.exe', 'bin/pdftocairo.exe'],
+  }),
   media: Object.freeze({ darwin: ['bin/ffmpeg', 'bin/ffprobe'], win32: ['bin/ffmpeg.exe', 'bin/ffprobe.exe'] }),
 })
 const requiredExecutablePaths = Object.freeze({

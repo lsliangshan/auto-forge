@@ -1,4 +1,4 @@
-import { createPrivateKey, sign } from 'node:crypto'
+import { createPrivateKey, createPublicKey, sign } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -12,6 +12,7 @@ import {
   validateIndex,
   withStableRegularFile,
 } from './pack-tooling-lib.mjs'
+import { isDisallowedProductionConverterRootKey } from './root-key-policy.mjs'
 
 export async function signConverterPackIndex({ indexPath, privateKeyPath, mode = 'production' }) {
   mode = releaseMode(mode)
@@ -32,6 +33,9 @@ export async function signConverterPackIndex({ indexPath, privateKeyPath, mode =
     fail('Private key is invalid.')
   }
   if (privateKey.asymmetricKeyType !== 'ed25519') fail('Private key is invalid.')
+  if (mode === 'production' && isDisallowedProductionConverterRootKey(createPublicKey(privateKey))) {
+    fail('Production converter root key must not use a development or test key.')
+  }
   const signature = sign(null, indexBytes, privateKey).toString('base64')
   const signaturePath = join(dirname(indexPath), 'index.sig')
   const handle = await open(signaturePath, 'wx', 0o600).catch(() => fail('Signature output already exists.'))

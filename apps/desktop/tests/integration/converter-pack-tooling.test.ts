@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync, sign as signBytes } from 'node:crypto'
+import { createHash, createPrivateKey, generateKeyPairSync, sign as signBytes } from 'node:crypto'
 import {
   chmodSync,
   copyFileSync,
@@ -19,6 +19,7 @@ import { basename, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
+import { createProductionBootstrap } from '../../scripts/converter-packs/create-production-bootstrap.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const buildScript = join(desktopRoot, 'scripts/converter-packs/build-index.mjs')
@@ -115,9 +116,9 @@ function stageWindowsPack(root: string): string {
 }
 
 const targetExecutablePaths = {
-  'image-icon': { darwin: ['bin/autoforge-image-converter'], win32: ['bin/autoforge-image-converter.exe'] },
+  'image-icon': { darwin: ['bin/autoforge-image-converter', 'bin/vips'], win32: ['bin/autoforge-image-converter.exe', 'bin/vips.exe'] },
   document: { darwin: ['program/soffice'], win32: ['program/soffice.exe'] },
-  pdf: { darwin: ['bin/autoforge-pdf-raster', 'bin/pdfinfo'], win32: ['bin/autoforge-pdf-raster.exe', 'bin/pdfinfo.exe'] },
+  pdf: { darwin: ['bin/autoforge-pdf-raster', 'bin/pdfinfo', 'bin/pdftocairo'], win32: ['bin/autoforge-pdf-raster.exe', 'bin/pdfinfo.exe', 'bin/pdftocairo.exe'] },
   media: { darwin: ['bin/ffmpeg', 'bin/ffprobe'], win32: ['bin/ffmpeg.exe', 'bin/ffprobe.exe'] },
 } as const
 
@@ -248,10 +249,46 @@ describe('converter pack release tooling', () => {
       process.noAsar = previousNoAsar
     }
     expect(rawSize).toBeGreaterThan(100 * 1024 * 1024)
+    const bootstrap = JSON.parse(readFileSync(join(actualDarwinApp, 'Contents', 'Resources', 'converter-packs', 'bootstrap.json'), 'utf8')) as { downloadsEnabled?: unknown }
+    const metadataMode = bootstrap.downloadsEnabled === true ? 'production' : 'disabled'
     const result = run(verifyScript, [
-      '--packaged-app', actualDarwinApp, '--platform', 'darwin', '--arch', 'arm64',
+      '--packaged-app', actualDarwinApp, '--platform', 'darwin', '--arch', 'arm64', '--metadata-mode', metadataMode,
     ])
     expect(result.status, result.stderr).toBe(0)
+  })
+
+  it('accepts enabled Ed25519 metadata only in explicit production metadata mode', async () => {
+    const root = temporaryRoot()
+    const fixture = packagedApp(root, 'darwin')
+    const keys = keyPair(root)
+    const generated = join(root, 'generated-metadata')
+    await createProductionBootstrap({
+      indexUrl: 'https://cdn.example.test/converter-packs/stable/index.json',
+      publicKeyPath: keys.publicKey,
+      output: generated,
+    })
+    rmSync(fixture.converter, { recursive: true, force: true })
+    mkdirSync(fixture.converter)
+    for (const name of ['bootstrap.json', 'index.schema.json', 'root-public-key.pem']) {
+      copyFileSync(join(generated, name), join(fixture.converter, name))
+    }
+
+    const disabled = run(verifyScript, ['--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64'])
+    expect(disabled.status).not.toBe(0)
+    const production = run(verifyScript, [
+      '--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64', '--metadata-mode', 'production',
+    ])
+    expect(production.status, production.stderr).toBe(0)
+
+    copyFileSync(
+      join(desktopRoot, 'electron/main/conversion/fixtures/test-converter-root-public-key.pem'),
+      join(fixture.converter, 'root-public-key.pem'),
+    )
+    const developmentKey = run(verifyScript, [
+      '--packaged-app', fixture.app, '--platform', 'darwin', '--arch', 'arm64', '--metadata-mode', 'production',
+    ])
+    expect(developmentKey.status).not.toBe(0)
+    expect(developmentKey.stderr).toMatch(/development|test/iu)
   })
 
   it('builds canonical archives and indexes byte-identically, signs with an explicit key, and verifies every hash', () => {
@@ -481,6 +518,31 @@ describe('converter pack release tooling', () => {
     expect(index.packs).toHaveLength(8)
     expect(run(signScript, ['--index', join(productionRelease, 'index.json'), '--private-key', productionKeys.privateKey]).status).toBe(0)
     expect(run(verifyScript, ['--root', productionRelease, '--public-key', productionKeys.publicKey]).status).toBe(0)
+
+    const developmentPrivateKey = createPrivateKey({
+      key: Buffer.from(
+        '302e020100300506032b6570042204209d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60',
+        'hex',
+      ),
+      format: 'der',
+      type: 'pkcs8',
+    })
+    const developmentPrivateKeyPath = join(productionRoot, 'development-private.pem')
+    const developmentPublicKeyPath = join(desktopRoot, 'electron/main/conversion/fixtures/test-converter-root-public-key.pem')
+    writeFileSync(developmentPrivateKeyPath, developmentPrivateKey.export({ format: 'pem', type: 'pkcs8' }), { mode: 0o600 })
+    rmSync(join(productionRelease, 'index.sig'))
+    const rejectedSignature = run(signScript, [
+      '--index', join(productionRelease, 'index.json'), '--private-key', developmentPrivateKeyPath,
+    ])
+    expect(rejectedSignature.status).not.toBe(0)
+    expect(rejectedSignature.stderr).toMatch(/development|test/iu)
+    expect(existsSync(join(productionRelease, 'index.sig'))).toBe(false)
+
+    const indexBytes = readFileSync(join(productionRelease, 'index.json'))
+    writeFileSync(join(productionRelease, 'index.sig'), `${signBytes(null, indexBytes, developmentPrivateKey).toString('base64')}\n`)
+    const rejectedRelease = verifyRelease(productionRelease, developmentPublicKeyPath, 'production')
+    expect(rejectedRelease.status).not.toBe(0)
+    expect(rejectedRelease.stderr).toMatch(/development|test/iu)
   })
 
   it('uses UTF-8 byte ordering and produces identical bytes under en_US and tr_TR locales', () => {

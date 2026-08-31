@@ -5,7 +5,7 @@
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
-    "predev": "pnpm prepare:native-electron",
+    "predev": "pnpm prepare:native-electron && node scripts/converter-packs/create-local-development-image-release.mjs",
     "dev": "node scripts/dev.mjs",
     "build": "electron-vite build && tsup electron/workers/workflow-runner.ts --format cjs --platform node --out-dir out/workers --clean false",
     "build:knowledge-parser-smoke": "pnpm build && tsup electron/e2e/knowledge-parser-smoke-main.ts --format esm --platform node --out-dir out/e2e --external electron",
@@ -15,10 +15,21 @@
     "test": "node scripts/run-vitest-electron.mjs run --config vitest.config.ts && node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts",
     "prepare:native-electron": "install-electron && node scripts/prepare-native-electron.mjs",
     "converter-packs:build": "node scripts/converter-packs/build-index.mjs",
+    "converter-packs:build-native": "node scripts/converter-packs/build-native-helpers.mjs",
+    "converter-packs:create-bootstrap": "node scripts/converter-packs/create-production-bootstrap.mjs",
+    "converter-packs:acquire": "node scripts/converter-packs/acquire-sources.mjs",
+    "converter-packs:publish": "node scripts/converter-packs/publish-release.mjs",
+    "converter-packs:prepare-staging": "node scripts/converter-packs/prepare-production-staging.mjs",
     "converter-packs:sign": "node scripts/converter-packs/sign-index.mjs",
+    "converter-packs:sign-payload": "node scripts/converter-packs/sign-pack-payload.mjs",
+    "converter-packs:stage": "node scripts/converter-packs/stage-production-packs.mjs",
+    "converter-packs:verify-evidence": "node scripts/converter-packs/verify-release-evidence.mjs",
+    "converter-packs:verify-sources": "node scripts/converter-packs/source-lock.mjs",
+    "converter-packs:verify-workflows": "node scripts/converter-packs/validate-workflows.mjs",
     "verify:converter-packs": "node scripts/verify-converter-packs.mjs",
     "verify:packaged-native": "node scripts/verify-packaged-native.mjs",
-    "dist:dir": "pnpm prepare:native-electron && electron-builder --dir --config electron-builder.yml && pnpm verify:packaged-native && pnpm verify:converter-packs"
+    "dist:dir": "pnpm prepare:native-electron && electron-builder --dir --config electron-builder.yml && pnpm verify:packaged-native && pnpm verify:converter-packs",
+    "dist:production": "pnpm prepare:native-electron && electron-builder --dir --config electron-builder.production.cjs && pnpm verify:packaged-native && pnpm verify:converter-packs --metadata-mode production"
   },
   "dependencies": {
     "@autoforge/shared": "workspace:*",
@@ -70,6 +81,7 @@
     "typescript": "6.0.3",
     "vite": "7.3.6",
     "vitest": "4.1.10",
-    "vue-tsc": "3.3.7"
+    "vue-tsc": "3.3.7",
+    "yaml": "2.9.0"
   }
 }

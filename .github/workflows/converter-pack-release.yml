@@ -1,0 +1,165 @@
+name: Publish converter packs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer converter pack version
+        required: true
+        type: string
+      sequence:
+        description: Monotonic non-negative release sequence
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: converter-pack-production
+  cancel-in-progress: false
+
+jobs:
+  stage_arm64:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      AUTOFORGE_CONVERTER_TARGET: darwin-arm64
+    steps: &stage_steps
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9
+        with:
+          version: '11.15.0'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24.13.3'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306
+        with:
+          path: ${{ runner.temp }}/converter-source-cache
+          key: converter-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('apps/desktop/converter-packs/sources.lock.json') }}
+      - name: Set deterministic release time
+        run: echo "AUTOFORGE_GENERATED_AT=$(node -p \"new Date(require('child_process').execFileSync('git',['show','-s','--format=%cI','HEAD'],{encoding:'utf8'}).trim()).toISOString()\")" >> "$GITHUB_ENV"
+      - name: Install locked bottle dependencies
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg vips poppler
+      - name: Verify and acquire locked sources
+        run: |
+          mkdir -p "$RUNNER_TEMP/converter-source-cache"
+          pnpm --filter @autoforge/desktop converter-packs:verify-sources --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target "$AUTOFORGE_CONVERTER_TARGET"
+          pnpm --filter @autoforge/desktop converter-packs:acquire --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target "$AUTOFORGE_CONVERTER_TARGET" --cache "$RUNNER_TEMP/converter-source-cache"
+      - name: Build helpers and create staging plan
+        run: |
+          pnpm --filter @autoforge/desktop converter-packs:build-native --target "$AUTOFORGE_CONVERTER_TARGET" --output "$RUNNER_TEMP/converter-helpers" --compiler /usr/bin/clang
+          pnpm --filter @autoforge/desktop converter-packs:prepare-staging --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target "$AUTOFORGE_CONVERTER_TARGET" --cache "$RUNNER_TEMP/converter-source-cache" --helpers "$RUNNER_TEMP/converter-helpers" --workspace "$RUNNER_TEMP/converter-prepared" --staging "$RUNNER_TEMP/converter-stage-$AUTOFORGE_CONVERTER_TARGET" --plan "$RUNNER_TEMP/converter-stage-plan.json" --version "${{ inputs.version }}" --sequence "${{ inputs.sequence }}" --generated-at "$AUTOFORGE_GENERATED_AT" --archive-base-url "${{ vars.CONVERTER_PUBLIC_BASE_URL }}/releases/${{ inputs.sequence }}"
+          pnpm --filter @autoforge/desktop converter-packs:stage --plan "$RUNNER_TEMP/converter-stage-plan.json"
+      - name: Preserve staged permissions
+        run: tar -cf "$RUNNER_TEMP/converter-stage-$AUTOFORGE_CONVERTER_TARGET.tar" -C "$RUNNER_TEMP" "converter-stage-$AUTOFORGE_CONVERTER_TARGET"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: converter-stage-${{ env.AUTOFORGE_CONVERTER_TARGET }}
+          path: ${{ runner.temp }}/converter-stage-${{ env.AUTOFORGE_CONVERTER_TARGET }}.tar
+          archive: false
+          retention-days: 1
+          if-no-files-found: error
+
+  stage_x64:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      AUTOFORGE_CONVERTER_TARGET: darwin-x64
+    steps: *stage_steps
+
+  production:
+    needs: [stage_arm64, stage_x64]
+    environment: production
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9
+        with:
+          version: '11.15.0'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24.13.3'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: converter-stage-*
+          path: ${{ runner.temp }}/converter-artifacts
+      - name: Restore staged trees
+        run: |
+          tar -xf "$RUNNER_TEMP/converter-artifacts/converter-stage-darwin-arm64/converter-stage-darwin-arm64.tar" -C "$RUNNER_TEMP"
+          tar -xf "$RUNNER_TEMP/converter-artifacts/converter-stage-darwin-x64/converter-stage-darwin-x64.tar" -C "$RUNNER_TEMP"
+      - name: Materialize protected credentials
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          INDEX_PRIVATE_KEY_BASE64: ${{ secrets.CONVERTER_INDEX_PRIVATE_KEY_BASE64 }}
+          COSCLI_CONFIG_BASE64: ${{ secrets.COSCLI_CONFIG_BASE64 }}
+        run: |
+          umask 077
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/converter-certificate.p12"
+          security create-keychain -p "$GITHUB_RUN_ID" "$RUNNER_TEMP/converter-signing.keychain-db"
+          security unlock-keychain -p "$GITHUB_RUN_ID" "$RUNNER_TEMP/converter-signing.keychain-db"
+          security import "$RUNNER_TEMP/converter-certificate.p12" -k "$RUNNER_TEMP/converter-signing.keychain-db" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$GITHUB_RUN_ID" "$RUNNER_TEMP/converter-signing.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/converter-signing.keychain-db"
+          xcrun notarytool store-credentials autoforge-converter-release --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --keychain "$RUNNER_TEMP/converter-signing.keychain-db"
+          printf '%s' "$INDEX_PRIVATE_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/converter-index-private.pem"
+          openssl pkey -in "$RUNNER_TEMP/converter-index-private.pem" -pubout -out "$RUNNER_TEMP/converter-index-public.pem"
+          printf '%s' "$COSCLI_CONFIG_BASE64" | base64 --decode > "$RUNNER_TEMP/coscli.yaml"
+      - name: Sign, notarize, and verify both targets
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          generated_at=$(node -p "new Date(require('child_process').execFileSync('git',['show','-s','--format=%cI','HEAD'],{encoding:'utf8'}).trim()).toISOString()")
+          for target in darwin-arm64 darwin-x64; do
+            pnpm --filter @autoforge/desktop converter-packs:sign-payload --staging "$RUNNER_TEMP/converter-stage-$target" --evidence "$RUNNER_TEMP/evidence-$target.json" --source-lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target "$target" --identity "$APPLE_SIGNING_IDENTITY" --team-id "$APPLE_TEAM_ID" --keychain-profile autoforge-converter-release --generated-at "$generated_at"
+            pnpm --filter @autoforge/desktop converter-packs:verify-evidence --staging "$RUNNER_TEMP/converter-stage-$target" --evidence "$RUNNER_TEMP/evidence-$target.json" --team-id "$APPLE_TEAM_ID"
+          done
+      - name: Build and sign the combined release
+        run: |
+          mkdir -p "$RUNNER_TEMP/converter-combined/packs"
+          cp -R "$RUNNER_TEMP/converter-stage-darwin-arm64/packs/." "$RUNNER_TEMP/converter-combined/packs/"
+          cp -R "$RUNNER_TEMP/converter-stage-darwin-x64/packs/." "$RUNNER_TEMP/converter-combined/packs/"
+          cmp "$RUNNER_TEMP/converter-stage-darwin-arm64/release.json" "$RUNNER_TEMP/converter-stage-darwin-x64/release.json"
+          cp "$RUNNER_TEMP/converter-stage-darwin-arm64/release.json" "$RUNNER_TEMP/converter-combined/release.json"
+          pnpm --filter @autoforge/desktop converter-packs:build --input "$RUNNER_TEMP/converter-combined" --output "$RUNNER_TEMP/converter-release" --mode production
+          pnpm --filter @autoforge/desktop converter-packs:sign --index "$RUNNER_TEMP/converter-release/index.json" --private-key "$RUNNER_TEMP/converter-index-private.pem" --mode production
+          pnpm --filter @autoforge/desktop verify:converter-packs --root "$RUNNER_TEMP/converter-release" --public-key "$RUNNER_TEMP/converter-index-public.pem" --mode production
+      - name: Publish immutable objects and stable pair
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install coscli
+          mkdir -p "$RUNNER_TEMP/coscli-scratch"
+          pnpm --filter @autoforge/desktop converter-packs:publish --release "$RUNNER_TEMP/converter-release" --public-key "$RUNNER_TEMP/converter-index-public.pem" --public-base-url "${{ vars.CONVERTER_PUBLIC_BASE_URL }}" --sequence "${{ inputs.sequence }}" --coscli "$(realpath "$(command -v coscli)")" --cos-config "$RUNNER_TEMP/coscli.yaml" --cos-bucket "${{ vars.CONVERTER_COS_BUCKET }}" --cos-scratch "$RUNNER_TEMP/coscli-scratch" --mode production
+      - name: Build production Desktop bootstrap
+        run: |
+          pnpm --filter @autoforge/desktop converter-packs:create-bootstrap --index-url "${{ vars.CONVERTER_INDEX_URL }}" --public-key "$RUNNER_TEMP/converter-index-public.pem" --output "$RUNNER_TEMP/converter-bootstrap"
+          pnpm build
+          AUTOFORGE_CONVERTER_METADATA_ROOT="$RUNNER_TEMP/converter-bootstrap" pnpm --filter @autoforge/desktop dist:production
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: converter-production-evidence-${{ inputs.sequence }}
+          path: |
+            ${{ runner.temp }}/evidence-darwin-arm64.json
+            ${{ runner.temp }}/evidence-darwin-x64.json
+          retention-days: 1
+          if-no-files-found: error
+      - name: Remove protected credentials
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/converter-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/converter-certificate.p12" "$RUNNER_TEMP/converter-index-private.pem" "$RUNNER_TEMP/coscli.yaml"

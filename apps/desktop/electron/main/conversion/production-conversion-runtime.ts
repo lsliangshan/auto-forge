@@ -22,6 +22,7 @@ import type {
   ManagedConversionAttempt,
 } from './conversion-job-runner.js'
 import { ConverterPackManager } from './converter-pack-manager.js'
+import { isDisallowedProductionConverterRootKey } from './converter-root-key-policy.js'
 import type {
   ConverterPackName,
   SignedConverterPackIndex,
@@ -430,6 +431,8 @@ export interface ProductionConversionRuntimeFactoryOptions {
   windowsJobObject?: WindowsJobObjectProcessTreePort
   /** @internal Deterministic no-follow resource race seam for focused Main tests. */
   resourceFileOpen?: (path: string, flags: number) => Promise<FileHandle>
+  /** @internal Test fixtures only. Ordinary and packaged application entrypoints must never set this. */
+  allowUnsafeTestRootKey?: boolean
 }
 
 function exactObject(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -529,6 +532,7 @@ async function loadProductionRelease(
   platform: NodeJS.Platform,
   arch: string,
   openResourceFile: (path: string, flags: number) => Promise<FileHandle>,
+  allowUnsafeTestRootKey: boolean,
 ): Promise<ProductionReleaseConfig> {
   try {
     if (!isAbsolute(resourcesRoot)) throw failure('CONVERSION_COMPONENT_UNAVAILABLE')
@@ -559,6 +563,9 @@ async function loadProductionRelease(
     const index = releaseUrl(bootstrap.indexUrl)
     const signature = new URL('index.sig', index)
     const rootPublicKeyPem = await canonicalRegularFile(root, bootstrap.rootPublicKeyFile, maximumBootstrapBytes, openResourceFile)
+    if (!allowUnsafeTestRootKey && isDisallowedProductionConverterRootKey(rootPublicKeyPem)) {
+      throw failure('CONVERSION_COMPONENT_UNAVAILABLE')
+    }
     return { indexUrl: index.href, signatureUrl: signature.href, rootPublicKeyPem }
   } catch (error) {
     if (typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'CONVERSION_COMPONENT_UNAVAILABLE') {
@@ -654,6 +661,7 @@ export function createProductionConversionRuntimeFactory(
     platform,
     arch,
     options.resourceFileOpen ?? ((path, flags) => open(path, flags)),
+    options.allowUnsafeTestRootKey === true,
   ))
   let processRunner: ConversionProcessRunner | undefined
   try {

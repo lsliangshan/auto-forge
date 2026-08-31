@@ -24,14 +24,15 @@ bundle with this shape:
 ```
 
 The fixture index is built, signed, and verified only with explicit
-`--mode test`; the production default requires the exact 12-coordinate
+`--mode test`; the production default requires the exact 8-coordinate
 inventory and rejects this single-platform subset. The index must contain all
 four pack families for the running platform and architecture. Every signed
 entry includes an explicit `executable`, `code`, `license`, or `data` role,
 and the preinstalled trees must exactly match the signed entry hashes and
-target modes. `image-icon` declares `bin/autoforge-image-converter`,
+target modes. `image-icon` declares `bin/autoforge-image-converter` plus
+`bin/vips`,
 `document` declares `program/soffice`, `pdf` declares
-`bin/autoforge-pdf-raster` plus `bin/pdfinfo`, and `media` declares `bin/ffmpeg`
+`bin/autoforge-pdf-raster` plus `bin/pdfinfo` and `bin/pdftocairo`, and `media` declares `bin/ffmpeg`
 plus `bin/ffprobe`. Tests execute only these lease-resolved absolute paths;
 they never search or fall back to system `PATH`. An invalid or unsigned bundle
 fails before any converter process starts.
@@ -53,12 +54,14 @@ dimensions, PDF pages, animation frames, canonical `ffprobe` container names,
 exact stream types/codecs, duration, stripped sentinels/chapters, and
 first-frame metadata.
 
-Passing with a test root is local evidence only. Production release remains
-blocked until release engineering supplies the production root public key,
-HTTPS CDN, a signed compatible index and all four signed pack families for
-macOS arm64, macOS x64, and Windows x64, complete third-party license/source
-notices, and real runs plus signing/notarization evidence on every platform.
-The download kill switch stays off when any one of those inputs is absent.
+Passing with a test root is local evidence only. The first production release
+matrix is macOS arm64 and macOS x64. Release engineering must supply the root
+public key, HTTPS CDN/COS configuration, Apple signing/notarization credentials,
+all four pack families for both targets, complete third-party license/source
+notices, and accepted real-engine evidence. The document family carries the
+verified LibreOffice DMG plus the signed read-only mount launcher; it does not
+expand the application bundle past the pack entry and byte limits. The checked-in
+download kill switch stays off when any protected release input is absent.
 
 The Task 12 Cloud dependency is unchanged: deploy the v1-safe/v2 Cloud
 SQL/handler reader-first, then prove PostgreSQL locking, RLS, purge, receipt,
