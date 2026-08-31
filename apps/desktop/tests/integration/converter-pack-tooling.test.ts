@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync, sign as signBytes } from 'node:crypto'
+import { createHash, createPrivateKey, generateKeyPairSync, sign as signBytes } from 'node:crypto'
 import {
   chmodSync,
   copyFileSync,
@@ -518,6 +518,31 @@ describe('converter pack release tooling', () => {
     expect(index.packs).toHaveLength(8)
     expect(run(signScript, ['--index', join(productionRelease, 'index.json'), '--private-key', productionKeys.privateKey]).status).toBe(0)
     expect(run(verifyScript, ['--root', productionRelease, '--public-key', productionKeys.publicKey]).status).toBe(0)
+
+    const developmentPrivateKey = createPrivateKey({
+      key: Buffer.from(
+        '302e020100300506032b6570042204209d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60',
+        'hex',
+      ),
+      format: 'der',
+      type: 'pkcs8',
+    })
+    const developmentPrivateKeyPath = join(productionRoot, 'development-private.pem')
+    const developmentPublicKeyPath = join(desktopRoot, 'electron/main/conversion/fixtures/test-converter-root-public-key.pem')
+    writeFileSync(developmentPrivateKeyPath, developmentPrivateKey.export({ format: 'pem', type: 'pkcs8' }), { mode: 0o600 })
+    rmSync(join(productionRelease, 'index.sig'))
+    const rejectedSignature = run(signScript, [
+      '--index', join(productionRelease, 'index.json'), '--private-key', developmentPrivateKeyPath,
+    ])
+    expect(rejectedSignature.status).not.toBe(0)
+    expect(rejectedSignature.stderr).toMatch(/development|test/iu)
+    expect(existsSync(join(productionRelease, 'index.sig'))).toBe(false)
+
+    const indexBytes = readFileSync(join(productionRelease, 'index.json'))
+    writeFileSync(join(productionRelease, 'index.sig'), `${signBytes(null, indexBytes, developmentPrivateKey).toString('base64')}\n`)
+    const rejectedRelease = verifyRelease(productionRelease, developmentPublicKeyPath, 'production')
+    expect(rejectedRelease.status).not.toBe(0)
+    expect(rejectedRelease.stderr).toMatch(/development|test/iu)
   })
 
   it('uses UTF-8 byte ordering and produces identical bytes under en_US and tr_TR locales', () => {

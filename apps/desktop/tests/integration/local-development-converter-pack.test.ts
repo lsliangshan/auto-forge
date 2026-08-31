@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, open, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -10,7 +10,10 @@ import {
   loadLocalDevelopmentConverterRelease,
   selectConversionRuntimeFactory,
 } from '../../electron/main/conversion/local-development-conversion-runtime.js'
-import { createLocalDevelopmentImageRelease } from '../../scripts/converter-packs/create-local-development-image-release.mjs'
+import {
+  createLocalDevelopmentImageRelease,
+  replaceLocalDevelopmentImageRelease,
+} from '../../scripts/converter-packs/create-local-development-image-release.mjs'
 
 const roots: string[] = []
 
@@ -49,6 +52,38 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
       arch: process.arch,
     })).rejects.toThrow(/exist|output/iu)
     await expect(readFile(sentinel, 'utf8')).resolves.toBe('preserve me')
+  })
+
+  it('does not follow a symbolic local cache root while replacing the generated release', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-image-cache-')))
+    roots.push(root)
+    const cacheParent = join(root, 'node_modules', '.cache')
+    const external = join(root, 'external')
+    await mkdir(join(external, 'release'), { recursive: true })
+    await mkdir(cacheParent, { recursive: true })
+    const sentinel = join(external, 'release', 'sentinel.txt')
+    await writeFile(sentinel, 'preserve me')
+    await symlink(external, join(cacheParent, 'autoforge-converter-packs'))
+
+    await expect(replaceLocalDevelopmentImageRelease({
+      cacheParent,
+      platform: 'darwin',
+      arch: process.arch,
+    })).rejects.toThrow(/symbolic|canonical|cache/iu)
+    await expect(readFile(sentinel, 'utf8')).resolves.toBe('preserve me')
+  })
+
+  it('rejects a symbolic installed directory', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-image-installed-')))
+    roots.push(root)
+    const releaseRoot = join(root, 'release')
+    const external = join(root, 'external-installed')
+    await createLocalDevelopmentImageRelease({ output: releaseRoot, platform: 'darwin', arch: process.arch })
+    await rm(join(releaseRoot, 'installed'), { recursive: true })
+    await mkdir(external)
+    await symlink(external, join(releaseRoot, 'installed'))
+
+    await expect(loadLocalDevelopmentConverterRelease(releaseRoot)).rejects.toThrow(/installation/iu)
   })
 
   it('is signed, installed, and converts JPEG input to PNG through the pack executable', async () => {

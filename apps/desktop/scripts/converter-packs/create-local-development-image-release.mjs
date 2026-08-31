@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer'
 import { createPrivateKey, createPublicKey, sign } from 'node:crypto'
 import { chmod, lstat, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import {
@@ -128,15 +128,32 @@ export async function createLocalDevelopmentImageRelease({ output, platform, arc
   }
 }
 
+async function requireCanonicalDirectory(path, label) {
+  if (!isAbsolute(path)) throw new Error(`${label} must be absolute.`)
+  const metadata = await lstat(path)
+  if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(path) !== path) {
+    throw new Error(`${label} must be a canonical directory without symbolic components.`)
+  }
+}
+
+export async function replaceLocalDevelopmentImageRelease({ cacheParent, platform, arch }) {
+  await mkdir(cacheParent, { recursive: true, mode: 0o700 })
+  await requireCanonicalDirectory(cacheParent, 'Local development cache parent')
+  const cacheRoot = join(cacheParent, 'autoforge-converter-packs')
+  await mkdir(cacheRoot, { recursive: true, mode: 0o700 })
+  await requireCanonicalDirectory(cacheRoot, 'Local development converter cache root')
+  const output = join(cacheRoot, 'release')
+  const existing = await lstat(output).catch(() => undefined)
+  if (existing?.isSymbolicLink()) throw new Error('Local development converter release cache must not be symbolic.')
+  await rm(output, { recursive: true, force: true })
+  await createLocalDevelopmentImageRelease({ output, platform, arch })
+  return output
+}
+
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(resolve(entry)).href) {
-  const cacheRoot = join(desktopRoot, 'node_modules', '.cache', 'autoforge-converter-packs')
-  await mkdir(cacheRoot, { recursive: true, mode: 0o700 })
-  const canonicalCacheRoot = await realpath(cacheRoot)
-  const output = join(canonicalCacheRoot, 'release')
-  await rm(output, { recursive: true, force: true })
-  await createLocalDevelopmentImageRelease({
-    output,
+  await replaceLocalDevelopmentImageRelease({
+    cacheParent: join(desktopRoot, 'node_modules', '.cache'),
     platform: process.platform,
     arch: process.arch,
   })

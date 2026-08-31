@@ -187,4 +187,36 @@ describe('converter pack immutable publication', () => {
     })).rejects.toThrow(/https/iu)
     expect(readdirSync(objectRoot)).toEqual([])
   })
+
+  it('rejects the development root key before calling the production object store', async () => {
+    const root = temporaryRoot()
+    const fixture = await releaseFixture(root, 1, 'https://cdn.example.test/converter-packs')
+    const developmentPublicKeyPath = join(
+      root,
+      'development-public.pem',
+    )
+    writeFileSync(
+      developmentPublicKeyPath,
+      readFileSync(join(
+        process.cwd(),
+        'electron/main/conversion/fixtures/test-converter-root-public-key.pem',
+      )),
+    )
+    const calls: string[] = []
+    const store = {
+      putImmutable: async () => { calls.push('putImmutable') },
+      read: async () => { calls.push('read'); return Buffer.alloc(0) },
+      promoteStable: async () => { calls.push('promoteStable') },
+    }
+
+    await expect(publishConverterPackRelease({
+      releaseRoot: fixture.release,
+      publicKeyPath: developmentPublicKeyPath,
+      publicBaseUrl: 'https://cdn.example.test/converter-packs',
+      sequence: 1,
+      mode: 'production',
+      store,
+    })).rejects.toThrow(/development|test/iu)
+    expect(calls).toEqual([])
+  })
 })

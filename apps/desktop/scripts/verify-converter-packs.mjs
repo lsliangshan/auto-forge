@@ -315,14 +315,17 @@ export async function verifyConverterPackRelease({ root, publicKeyPath, mode = '
   const indexBytes = await readStableRegularFile(join(root, 'index.json'), 'Index')
   const signatureBytes = await readStableRegularFile(join(root, 'index.sig'), 'Signature')
   const publicKeyBytes = await readStableRegularFile(publicKeyPath, 'Public key')
+  let publicKey
+  try { publicKey = createPublicKey(publicKeyBytes) } catch { fail('Public key is invalid.') }
+  if (mode === 'production' && isDisallowedProductionConverterRootKey(publicKey)) {
+    fail('Production converter root public key must not use a development or test key.')
+  }
   let index
   try { index = validateIndex(JSON.parse(indexBytes.toString('utf8')), mode) } catch { fail('Signed index is invalid.') }
   if (!indexBytes.equals(canonicalBytes(index))) fail('Signed index is not canonical.')
   const signatureText = signatureBytes.toString('utf8').trim()
   const signature = Buffer.from(signatureText, 'base64')
   if (signature.byteLength !== 64 || signature.toString('base64') !== signatureText) fail('Signed index signature is invalid.')
-  let publicKey
-  try { publicKey = createPublicKey(publicKeyBytes) } catch { fail('Public key is invalid.') }
   if (publicKey.asymmetricKeyType !== 'ed25519' || !verifySignature(null, indexBytes, publicKey, signature)) {
     fail('Signed index signature is invalid.')
   }

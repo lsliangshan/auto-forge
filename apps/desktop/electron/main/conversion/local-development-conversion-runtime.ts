@@ -98,9 +98,11 @@ export async function loadLocalDevelopmentConverterRelease(
   }
   const signature = signatureBytes.toString('ascii').trim()
   if (!/^[A-Za-z0-9+/]+={0,2}$/u.test(signature)) throw new Error('Local development converter signature is invalid.')
-  const packsRoot = await realpath(join(releaseRoot, 'installed'))
-  const packs = await lstat(packsRoot)
+  const lexicalPacksRoot = join(releaseRoot, 'installed')
+  const packs = await lstat(lexicalPacksRoot)
   if (packs.isSymbolicLink() || !packs.isDirectory()) throw new Error('Local development converter installation is invalid.')
+  const packsRoot = await realpath(lexicalPacksRoot)
+  if (packsRoot !== lexicalPacksRoot) throw new Error('Local development converter installation is invalid.')
   return Object.freeze({
     packsRoot,
     rootPublicKeyPem,
