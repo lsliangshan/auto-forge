@@ -261,36 +261,36 @@
 - Consumes: verified release output, HTTPS public base URL, sequence and an object-store adapter.
 - Produces: immutable release objects followed by stable `index.json` and `index.sig`; read-back verification result.
 
-- [ ] **Step 1: Write failing filesystem-adapter publication tests**
+- [x] **Step 1: Write failing filesystem-adapter publication tests**
 
   Exercise real files. Assert archives and sequence metadata exist and hash-match
   before stable metadata changes; a simulated read-back mismatch must leave the
   previous stable pair byte-for-byte unchanged. Reject unknown files, private
   keys, mutable archive destinations and non-HTTPS public URLs.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
   Expected: missing publisher module failure.
 
-- [ ] **Step 3: Implement release planning and filesystem adapter**
+- [x] **Step 3: Implement release planning and filesystem adapter**
 
   Generate explicit object keys and content metadata, write immutable objects
   with create-only semantics, read them back, and update the stable pair through
   a generation directory plus final promotion.
 
-- [ ] **Step 4: Implement COS command adapter**
+- [x] **Step 4: Implement COS command adapter**
 
   Invoke one explicitly configured absolute `coscli` executable without a shell.
   Pass bucket/region/token through environment, redact command errors, use
   create-only archive keys, download every uploaded object for SHA-256
   verification, and promote stable metadata only after all checks pass.
 
-- [ ] **Step 5: Verify GREEN and interrupted publication recovery**
+- [x] **Step 5: Verify GREEN and interrupted publication recovery**
 
   Run filesystem publication twice, inject a failure between index and signature
   staging, then prove the old stable pair remains valid and the retry succeeds.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   Commit message: `feat: publish immutable converter pack releases`
 

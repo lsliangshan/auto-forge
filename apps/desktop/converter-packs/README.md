@@ -37,5 +37,13 @@ Typical protected-job order:
 5. `converter-packs:stage -- --plan <absolute-plan-path>`
 6. sign/notarize the staged payloads before building and publishing the index
 
+The COS publisher invokes one absolute COSCLI binary with `cp`,
+`--forbid-overwrite` for immutable objects, and a private external
+`--config-path`. COSCLI's official contract is config-file based, so protected
+CI must materialize that file outside the release tree with mode `0600`, use a
+short-lived token, and remove it in an always-run cleanup step. The adapter
+disables COSCLI logs, redacts command failures, downloads every object for hash
+verification, and promotes stable metadata only after immutable read-back.
+
 The repository bootstrap remains disabled. Development packaging must not use
 production plans, signing identities, cloud credentials, or private keys.
