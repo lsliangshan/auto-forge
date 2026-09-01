@@ -50,7 +50,7 @@
       { path: 'a', bytes: Buffer.from('one') },
       { path: 'b', bytes: Buffer.from('two') },
     ],
-  })).toBe('a hand-computed fixed SHA-256 literal produced once for this framing')
+  })).toBe('ff854d97f63725260c0c5cc96dde6006aa48f8db5912303ec6532bc0d6a355af')
   ```
 
   Also prove input order cannot change the result after canonical sorting, target
@@ -109,6 +109,7 @@
 **Interfaces:**
 - Add `writeRestrictedUstarEntries({ archive, descriptor, destination })` to `pack-tooling-lib.mjs`; it verifies the existing restricted archive contract while writing regular entries beneath one new canonical destination.
 - Add `buildLocalDevelopmentRelease({ stagingRoot, outputRoot, privateKeyPath, publicKeyPath }) -> Promise<void>`.
+- Add `verifyLocalDevelopmentReleaseIntegrity({ releaseRoot, platform, arch }) -> Promise<void>`; it verifies the exact release layout, index signature, four current-target descriptors, and every installed entry hash/mode without executing an engine.
 - The output layout is exactly `index.json`, `index.sig`, `root-public-key.pem`, and `installed/`.
 
 - [ ] **Step 1: Write the failing restricted-extraction tests**
@@ -170,6 +171,11 @@
   canonical `index.json`, `index.sig`, and `root-public-key.pem` into the final
   output. Build under a private temporary root and rename only after all four
   families exist.
+
+  Implement `verifyLocalDevelopmentReleaseIntegrity` with `validateIndex`,
+  `createPublicKey`, `verify`, stable file reads, and the descriptor entry
+  hashes. Reject extra top-level files, extra installed coordinates, symlinks,
+  executable mode mismatches, absent families, and wrong platform/architecture.
 
 - [ ] **Step 7: Run focused tests and verify GREEN**
 
@@ -248,9 +254,8 @@
 
 - [ ] **Step 5: Implement warm-cache verification**
 
-  Before reuse, verify exact top-level layout, canonical index/signature/key,
-  and acquire/release all four families through a small Node-compatible release
-  verifier. A failed derived verification removes only
+  Before reuse, call `verifyLocalDevelopmentReleaseIntegrity` from Task 2. A
+  failed derived verification removes only
   `releases/<fingerprint>` and runs the cold path. Do not remove or overwrite a
   content-addressed source archive whose hash check failed.
 
@@ -273,7 +278,7 @@
   Delete it only after its signed-release, canonical-path, atomic-cleanup, and
   image-to-PDF expectations are represented by the new builder/preparation
   tests. Confirm `rg -n "create-local-development-image-release" apps/desktop`
-  returns only historical documentation if any.
+  returns no source, package-script, or test references.
 
 - [ ] **Step 8: Commit the isolated task if safe**
 
@@ -420,8 +425,8 @@
 - Modify: `apps/desktop/scripts/converter-packs/prepare-local-development-release.mjs`
 
 **Interfaces:**
-- Export `verifyLocalDevelopmentRelease({ releaseRoot, workRoot, run }) -> Promise<void>`.
-- The verifier acquires all four leases, generates bounded fixtures inside `workRoot`, runs representative conversions through existing adapter process plans, and validates output magic/probes/counts.
+- Export `smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, run }) -> Promise<void>`.
+- The verifier first calls `verifyLocalDevelopmentReleaseIntegrity`, resolves only descriptor-declared executable paths, generates bounded fixtures inside `workRoot`, runs the fixed pack command contracts, and validates output magic/counts.
 - Add `converter-packs:verify-development` for explicit reruns against the active marker.
 
 - [ ] **Step 1: Write the failing verifier contract tests**
@@ -449,11 +454,12 @@
 
 - [ ] **Step 3: Implement bounded fixture generation and adapter execution**
 
-  Reuse `ConverterPackManager`, `createConversionProcessRunner`, the four
-  adapters, and `probeConversionInput`. Direct engine calls are allowed only for
-  generating bounded source fixtures and use exact argument arrays. Apply the
-  existing document/media timeouts, cap every generated source/output with
-  existing conversion limits, and delete `workRoot` in `finally`.
+  Call the declared pack executables with the same fixed argument contracts as
+  the four adapters; this verifier is plain Node ESM and does not import
+  Electron TypeScript modules. Direct `ffmpeg`/`soffice` calls are allowed only
+  for generating bounded source fixtures. Use explicit document/media timeouts,
+  hard caps of 64 MiB per generated source/output and 32 output files, and
+  delete `workRoot` in `finally`.
 
 - [ ] **Step 4: Gate activation on one successful cold-cache smoke run**
 
