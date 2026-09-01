@@ -2,7 +2,7 @@ import { z } from 'zod'
 
 export const CONVERSION_TARGET_FORMATS = [
   'png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif', 'ico', 'icns',
-  'pdf', 'xlsx', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus',
+  'pdf', 'docx', 'xlsx', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus',
   'mp4', 'webm', 'mov',
 ] as const
 

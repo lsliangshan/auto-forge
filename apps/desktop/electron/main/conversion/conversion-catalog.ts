@@ -1153,6 +1153,7 @@ export function resolveConversionRoute(input: ProbedConversionInput, targetForma
     || ((sourceFormat === 'ico' || sourceFormat === 'icns') && staticTargets.has(targetFormat))
     || (iconSources.has(sourceFormat) && (targetFormat === 'ico' || targetFormat === 'icns'))
     || (documents.has(sourceFormat) && targetFormat === 'pdf')
+    || (sourceFormat === 'markdown' && targetFormat === 'docx')
     || (sourceFormat === 'csv' && targetFormat === 'xlsx')
     || (sourceFormat === 'pdf' && (targetFormat === 'png' || targetFormat === 'jpeg'))
     || (audioFormats.has(sourceFormat) && audioTargets.has(targetFormat))

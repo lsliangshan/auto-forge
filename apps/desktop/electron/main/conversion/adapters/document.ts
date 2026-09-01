@@ -18,7 +18,11 @@ const documentFormats = new Set<ProbedConversionInput['format']>([
 ])
 
 function ownedRoute(input: ProbedConversionInput, target: ConversionTargetFormat): boolean {
-  return documentFormats.has(input.format) && (target === 'pdf' || (input.format === 'csv' && target === 'xlsx'))
+  return documentFormats.has(input.format) && (
+    target === 'pdf'
+    || (input.format === 'markdown' && target === 'docx')
+    || (input.format === 'csv' && target === 'xlsx')
+  )
 }
 
 function executable(lease: ConverterPackLease): string {

@@ -8,7 +8,7 @@
   "category": "file",
   "cities": [],
   "entryPath": "dist/index.js",
-  "codeSha256": "9eca4296bdb10c34f52c7983c505216375cd537ff762af6b0b70c128565ede77",
+  "codeSha256": "c282d77901fcaad47c0bc682e3cad875c6308a7a4f9c60fe56880d9185842cb0",
   "permissions": [
     {
       "capability": "file.convert",
@@ -24,6 +24,7 @@
           "ico",
           "icns",
           "pdf",
+          "docx",
           "xlsx",
           "mp3",
           "wav",
@@ -42,6 +43,7 @@
   "activationExamples": [
     "把这张图片转换成 ICO 图标",
     "将附件中的文档转换成 PDF",
+    "将 Markdown 附件转换成 DOCX",
     "把这个视频转换为 WebM"
   ],
   "activationNegativeExamples": [
@@ -83,6 +85,7 @@
           "ico",
           "icns",
           "pdf",
+          "docx",
           "xlsx",
           "mp3",
           "wav",

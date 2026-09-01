@@ -332,7 +332,6 @@ describe('provider attachment disclosure', () => {
   it.each([
     'convert this attachment to PDF, then save it as WebP',
     'convert this attachment not to PDF',
-    'convert this attachment to DOCX',
   ])('keeps untrusted or conflicting conversion targets unbindable: %s', (text) => {
     const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
     const plan = authority.createPlan({
@@ -346,6 +345,22 @@ describe('provider attachment disclosure', () => {
 
     expect(plan.access.decision).toBe('ambiguous')
     expect(plan.targetFormat).toBeUndefined()
+  })
+
+  it('binds an explicit DOCX conversion command to the current attachment', () => {
+    const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+    const plan = authority.createPlan({
+      requestId: 'request_docx_target', text: 'convert this attachment to DOCX',
+      context: { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['file'] },
+      attachments: [{
+        index: 0, id: 'asset_private', name: 'private.md', mimeType: 'text/markdown',
+        byteSize: bytesA.length, fingerprint: fingerprintA,
+      }],
+    })
+
+    expect(plan.access.decision).toBe('local')
+    expect(plan.targetFormat).toBe('docx')
+    expect(plan.selectedAttachmentIndexes).toEqual([0])
   })
 
   it('does not issue a summary capability for local conversion disclosure', () => {

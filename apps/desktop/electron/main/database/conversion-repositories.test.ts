@@ -268,9 +268,14 @@ describe('conversion repositories', () => {
     database.close()
   })
 
-  it('applies the conversion migration with the owner queue index', () => {
+  it('applies the conversion migration with the owner queue index and DOCX target', () => {
     const { database, path } = openTestDatabase()
-    expect(database.schemaVersion()).toBe(20)
+    createExecution(database, 'execution_docx_target')
+    expect(database.conversionJobs.create({
+      id: 'job_docx_target', ownerUserId: 'alice', executionId: 'execution_docx_target',
+      sourceKind: 'media', sourceId: 'source_docx_target', targetFormat: 'docx', createdAt: 1,
+    })).toMatchObject({ targetFormat: 'docx' })
+    expect(database.schemaVersion()).toBe(21)
     database.close()
 
     const sqlite = new Database(path, { readonly: true })

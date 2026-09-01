@@ -1,5 +1,7 @@
 import { Buffer } from 'node:buffer'
+import { execFileSync } from 'node:child_process'
 import { createPrivateKey, createPublicKey, sign } from 'node:crypto'
+import { closeSync, openSync, readSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { chmod, lstat, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
@@ -15,6 +17,25 @@ import {
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const require = createRequire(import.meta.url)
 const electronPath = require('electron')
+const localSofficePath = (() => {
+  try {
+    const candidate = execFileSync('/usr/bin/which', ['soffice'], { encoding: 'utf8' }).trim()
+    return isAbsolute(candidate) ? candidate : ''
+  } catch {
+    return ''
+  }
+})()
+const localSofficeIsScript = (() => {
+  if (localSofficePath === '') return false
+  const descriptor = openSync(localSofficePath, 'r')
+  try {
+    const prefix = Buffer.alloc(2)
+    return readSync(descriptor, prefix, 0, prefix.byteLength, 0) === prefix.byteLength
+      && prefix.toString('ascii') === '#!'
+  } finally {
+    closeSync(descriptor)
+  }
+})()
 const privatePkcs8Prefix = Buffer.from('302e020100300506032b657004220420', 'hex')
 const developmentSeed = Buffer.from(
   '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60',
@@ -100,19 +121,27 @@ app.whenReady().then(async () => {
 const documentConverter = Buffer.from(`#!/bin/sh
 set -eu
 electron_path=${shellQuote(electronPath)}
+soffice_path=${shellQuote(localSofficePath)}
+soffice_is_script=${localSofficeIsScript ? '1' : '0'}
 output_format=
 output_dir=
 input_path=
+profile_arg=
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    -env:UserInstallation=*|--headless|--invisible|--nologo|--nodefault|--nolockcheck|--norestore) shift ;;
+    -env:UserInstallation=*) profile_arg=$1; shift ;;
+    --headless|--invisible|--nologo|--nodefault|--nolockcheck|--norestore) shift ;;
     --convert-to) [ "$#" -ge 2 ] || exit 64; output_format=$2; shift 2 ;;
     --outdir) [ "$#" -ge 2 ] || exit 64; output_dir=$2; shift 2 ;;
     --) shift; [ "$#" -eq 1 ] || exit 64; input_path=$1; shift ;;
     *) exit 64 ;;
   esac
 done
-[ "$output_format" = "pdf" ] && [ -n "$output_dir" ] && [ -n "$input_path" ] || exit 64
+[ -n "$output_dir" ] && [ -n "$input_path" ] || exit 64
+case "$output_format" in
+  pdf|docx) ;;
+  *) exit 65 ;;
+esac
 input_name=\${input_path##*/}
 case "$input_name" in
   *.html) input_kind=html ;;
@@ -121,7 +150,24 @@ case "$input_name" in
 esac
 output_name=\${input_name%.*}.pdf
 umask 077
-if [ "$input_kind" = html ]; then
+if [ "$output_format" = docx ]; then
+  [ "$input_kind" = html ] || exit 65
+  output_name=\${input_name%.*}.docx
+  if [ -n "$soffice_path" ] && [ -x "$soffice_path" ]; then
+    [ -n "$profile_arg" ] || exit 64
+    if [ "$soffice_is_script" = 1 ]; then
+      PATH=/usr/bin:/bin /bin/bash "$soffice_path" "$profile_arg" \
+        --headless --invisible --nologo --nodefault --nolockcheck --norestore \
+        --convert-to 'docx:Office Open XML Text' --outdir "$output_dir" "$input_path"
+    else
+      "$soffice_path" "$profile_arg" \
+        --headless --invisible --nologo --nodefault --nolockcheck --norestore \
+        --convert-to 'docx:Office Open XML Text' --outdir "$output_dir" "$input_path"
+    fi
+  else
+    /usr/bin/textutil -convert docx -output "$output_dir/$output_name" "$input_path"
+  fi
+elif [ "$input_kind" = html ]; then
   script_dir=\${0%/*}
   "$electron_path" "$script_dir/render-html-to-pdf.cjs" "$input_path" "$output_dir/$output_name" "$output_dir/electron-profile"
 else

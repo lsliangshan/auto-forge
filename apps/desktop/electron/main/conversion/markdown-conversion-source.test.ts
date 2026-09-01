@@ -32,4 +32,14 @@ describe('Markdown conversion source rendering', () => {
     expect(html).not.toContain('https://private.example')
     expect(html).toContain('remote diagram')
   })
+
+  it('emits a bounded table width that office document importers preserve', () => {
+    const html = renderMarkdownConversionDocument([
+      '| Rule | Example | Exception |',
+      '| --- | --- | --- |',
+      '| Compound nouns | mother-in-law → mothers-in-law | grown-up → grown-ups |',
+    ].join('\n'))
+
+    expect(html).toContain('<table width="90%">')
+  })
 })

@@ -3,7 +3,7 @@ import type { ConversionPreset, ConversionTargetFormat } from '@autoforge/shared
 
 const targetFormats = new Set<ConversionTargetFormat>([
   'png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif', 'ico', 'icns',
-  'pdf', 'xlsx', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus',
+  'pdf', 'docx', 'xlsx', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus',
   'mp4', 'webm', 'mov',
 ])
 const presets = new Set<ConversionPreset>(['default', 'favicon', 'app-icon'])

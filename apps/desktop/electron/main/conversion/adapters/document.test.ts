@@ -73,6 +73,14 @@ describe('document conversion adapter', () => {
     expect(plan.outputs).toEqual([{ path: '/work/data.xlsx', format: 'xlsx' }])
   })
 
+  it('plans rendered Markdown HTML as DOCX', () => {
+    const plan = documentAdapter.plan(input('markdown'), {
+      inputPath: '/work/input.html', targetFormat: 'docx',
+    }, lease, '/work')
+    expect(plan.args).toContain('docx')
+    expect(plan.outputs).toEqual([{ path: '/work/input.docx', format: 'docx' }])
+  })
+
   it('fails closed for routes outside the trusted catalog document matrix', () => {
     expect(documentAdapter.supports(input('docx'), 'xlsx')).toBe(false)
     expect(() => documentAdapter.plan(input('docx'), {

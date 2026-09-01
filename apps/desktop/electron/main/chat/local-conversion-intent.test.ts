@@ -21,6 +21,8 @@ describe('local conversion intent', () => {
     ['Convert /Users/Alice/PDF/secret.txt to WebP', 'webp', 'secret.txt'],
     ['转换 /Users/张三/PDF/资料.txt 为 WebP', 'webp', '资料.txt'],
     ['把这个附件保存为 JPG', 'jpeg', 'report.pdf'],
+    ['转换成 docx', 'docx', 'report.pdf'],
+    ['Convert this attachment to DOCX', 'docx', 'report.pdf'],
   ] as const)('extracts the one trusted supported target from %s', (text, targetFormat, name) => {
     expect(classifyAttachmentConversionRequest(text, [{ ...attachments[0]!, name }])).toEqual({
       decision: 'local',
@@ -31,7 +33,6 @@ describe('local conversion intent', () => {
 
   it.each([
     'Convert report.pdf',
-    'Convert this attachment to DOCX',
     'Convert this attachment to PDF, then save it as WEBP',
     'Convert this attachment not to PDF',
     '转换这个附件，不要转为 PDF',

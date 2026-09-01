@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, open, readFile, realpath, rm, symlink, writeFile } from
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import * as mammoth from 'mammoth'
 import { ConverterPackManager } from '../../electron/main/conversion/converter-pack-manager.js'
 import {
   createLocalDevelopmentConversionRuntimeFactory,
@@ -188,8 +189,54 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     lease.release()
   })
 
+  it('converts rendered Markdown HTML to DOCX through the signed document pack executable', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-markdown-docx-pack-')))
+    roots.push(root)
+    const releaseRoot = join(root, 'release')
+    await createLocalDevelopmentImageRelease({ output: releaseRoot, platform: 'darwin', arch: process.arch })
+    const release = await loadLocalDevelopmentConverterRelease(releaseRoot)
+    const manager = new ConverterPackManager({
+      packsRoot: release.packsRoot,
+      rootPublicKeyPem: release.rootPublicKeyPem,
+      platform: 'darwin',
+      arch: process.arch,
+    })
+    const lease = await manager.acquire({ signedIndex: release.signedIndex, name: 'document' })
+    const executable = lease.executables['program/soffice']!
+    const source = join(root, 'source.html')
+    const output = join(root, 'source.docx')
+    await writeFile(source, renderMarkdownConversionDocument([
+      '# AutoForge 中文标题',
+      '',
+      '- 第一项',
+      '- 第二项',
+      '',
+      '| 项目 | 状态 |',
+      '| --- | --- |',
+      '| Markdown 渲染 | 通过 |',
+    ].join('\n')))
+
+    const converted = spawnSync(executable, [
+      `-env:UserInstallation=file://${join(root, 'profile')}`,
+      '--headless', '--invisible', '--nologo', '--nodefault', '--nolockcheck', '--norestore',
+      '--convert-to', 'docx', '--outdir', root, '--', source,
+    ])
+
+    expect(converted.status, converted.stderr.toString()).toBe(0)
+    const bytes = await readFile(output)
+    expect(bytes.subarray(0, 4)).toEqual(Buffer.from('504b0304', 'hex'))
+    expect(bytes.includes(Buffer.from('word/document.xml'))).toBe(true)
+    const rendered = await mammoth.convertToHtml({ buffer: bytes })
+    expect(rendered.value).toContain('<h1>AutoForge 中文标题</h1>')
+    expect(rendered.value).toContain('<ul>')
+    expect(rendered.value).toMatch(/<li>第一项\s*<\/li>/u)
+    expect(rendered.value).toContain('<table>')
+    expect(rendered.value).toMatch(/<td><p>通过<\/p><\/td>|<td>通过<\/td>/u)
+    lease.release()
+  })
+
   it('binds the workflow runtime to the signed local release', async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-runtime-')))
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge local runtime-')))
     roots.push(root)
     const releaseRoot = join(root, 'release')
     await createLocalDevelopmentImageRelease({ output: releaseRoot, platform: 'darwin', arch: process.arch })
@@ -203,12 +250,14 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     expect(spawnSync('/usr/bin/sips', ['-s', 'format', 'jpeg', sourcePng, '--out', source]).status).toBe(0)
     const sourcePngBytes = await readFile(sourcePng)
     const sourceBytes = await readFile(source)
-    await writeFile(sourceMarkdown, '# AutoForge\n\nMarkdown to PDF\n')
+    await writeFile(sourceMarkdown, '# AutoForge\n\n- 第一项\n- 第二项\n')
     const sourceMarkdownBytes = await readFile(sourceMarkdown)
     const batchOutput = join(root, 'batch-output.png')
     const batchPdfOutput = join(root, 'batch-output.pdf')
+    const batchDocxOutput = join(root, 'batch-output.docx')
     await writeFile(batchOutput, Buffer.alloc(0), { mode: 0o600 })
     await writeFile(batchPdfOutput, Buffer.alloc(0), { mode: 0o600 })
+    await writeFile(batchDocxOutput, Buffer.alloc(0), { mode: 0o600 })
     const factory = createLocalDevelopmentConversionRuntimeFactory({
       releaseRoot,
       platform: 'darwin',
@@ -259,7 +308,9 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
         createOutputWriter: async () => { throw new Error('unexpected createOutputWriter') },
         createOutputBatch: async (outputs) => ({
           atomicJobCompletion: true,
-          outputs: [{ tempPath: outputs[0]?.targetFormat === 'pdf' ? batchPdfOutput : batchOutput }],
+          outputs: [{ tempPath: outputs[0]?.targetFormat === 'docx'
+            ? batchDocxOutput
+            : outputs[0]?.targetFormat === 'pdf' ? batchPdfOutput : batchOutput }],
           commit: async () => [],
           abort: async () => undefined,
         }),
@@ -290,6 +341,16 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     expect((await readFile(batchPdfOutput)).subarray(0, 5).toString('ascii')).toBe('%PDF-')
     await documentAttempt.abort()
     documentLease.release()
+    const markdownDocxJob = {
+      ...job, id: 'markdown-to-docx-job', sourceId: 'source-markdown', targetFormat: 'docx',
+    } as const
+    const docxLease = await binding.runtime.acquirePack(markdownDocxJob, controller.signal)
+    const docxAttempt = await binding.runtime.prepare(markdownDocxJob, docxLease, controller.signal)
+    await docxAttempt.execute({ signal: controller.signal, onProgress: () => true })
+    expect(docxLease.name).toBe('document')
+    expect((await readFile(batchDocxOutput)).subarray(0, 4)).toEqual(Buffer.from('504b0304', 'hex'))
+    await docxAttempt.abort()
+    docxLease.release()
     const pdfLease = await binding.runtime.acquirePack(
       { ...job, id: 'png-to-pdf-job', sourceId: 'source-png', targetFormat: 'pdf' },
       controller.signal,

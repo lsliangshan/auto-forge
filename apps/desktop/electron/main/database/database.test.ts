@@ -381,7 +381,7 @@ describe('openAppDatabase', () => {
     temporaryDirectories.push(directory)
     const path = join(directory, 'autoforge.sqlite')
     const database = openProductionAppDatabase(path)
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     database.close()
 
     const inspection = new Database(path)
@@ -599,7 +599,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     const inspection = new Database(path, { readonly: true })
     expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string; on_delete: string }>)
       .map(({ table, on_delete }) => ({ table, on_delete })))
@@ -665,7 +665,7 @@ describe('openAppDatabase', () => {
     })
     expect(database.chatRuns.get('user_cache_run_not_in_global_chat_runs')).toBeUndefined()
     expect(database.chatRuns.get('updated_user_cache_run_not_in_global_chat_runs')).toBeUndefined()
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     database.close()
 
     const inspection = new Database(path)
@@ -740,7 +740,7 @@ describe('openAppDatabase', () => {
       .toMatchObject({ status: 'completed' })
     expect(database.executionSteps.listForUser('owned_execution', 'other_user')).toEqual([])
     expect(database.executionLogs.listForUser('owned_execution', 'other_user')).toEqual([])
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     database.close()
 
     const inspection = new Database(path, { readonly: true })
@@ -865,7 +865,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     expect(database.conversations.get('conversation_v1')).toMatchObject({
       title: 'Persisted v1',
       titleState: 'user_named',
@@ -879,7 +879,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -890,7 +890,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
@@ -910,7 +910,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -1889,7 +1889,7 @@ describe('openAppDatabase', () => {
     sqlite.close()
 
     const database = openAppDatabase(path)
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     expect(database.messages.get('current_message')?.blocks).toEqual([currentApproval])
     expect(database.messages.hasWorkflowApproval('current_execution')).toBe(true)
     expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(true)
@@ -2414,7 +2414,7 @@ describe('openAppDatabase', () => {
 
     const database = openAppDatabase(path)
 
-    expect(database.schemaVersion()).toBe(20)
+    expect(database.schemaVersion()).toBe(21)
     expect(database.mediaAssets.get('asset_v14_file_attachment')).toMatchObject({
       id: 'asset_v14_file_attachment',
       kind: 'image',

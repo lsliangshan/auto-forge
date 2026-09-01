@@ -726,6 +726,7 @@ describe('conversion catalog routes', () => {
     ['svg', 'pdf'],
     ['ico', 'png'],
     ['docx', 'pdf'],
+    ['markdown', 'docx'],
     ['csv', 'xlsx'],
     ['pdf', 'png'],
     ['mp3', 'flac'],

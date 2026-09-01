@@ -11,6 +11,7 @@ var targetFormats = /* @__PURE__ */ new Set([
   "ico",
   "icns",
   "pdf",
+  "docx",
   "xlsx",
   "mp3",
   "wav",

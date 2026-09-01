@@ -106,7 +106,7 @@ async function renderedInputPath(
 }
 
 function concurrencyClass(job: ConversionJob): ConversionConcurrencyClass {
-  if (['pdf', 'xlsx'].includes(job.targetFormat)) return 'document'
+  if (['pdf', 'docx', 'xlsx'].includes(job.targetFormat)) return 'document'
   if (['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'mp4', 'webm', 'mov'].includes(job.targetFormat)) return 'video'
   return 'other'
 }

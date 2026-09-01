@@ -279,7 +279,7 @@ describe('cross-process contracts', () => {
       ...messageAppend.payload, providerProjection: canonicalProjection,
     }).success).toBe(false)
     for (const providerProjection of [
-      { ...canonicalProjection, targetFormat: 'docx' },
+      { ...canonicalProjection, targetFormat: 'zip' },
       { ...canonicalProjection, attachmentCount: 0 },
       { ...canonicalProjection, selectedAttachmentIndexes: [] },
       { ...canonicalProjection, selectedAttachmentIndexes: [1] },

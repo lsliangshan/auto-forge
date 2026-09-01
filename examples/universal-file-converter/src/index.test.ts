@@ -13,7 +13,7 @@ describe('万象转换 workflow', () => {
     { files: [], targetFormat: 'png' },
     { files: [0, 0], targetFormat: 'png' },
     { files: [0, 1, 2, 3, 4, 5], targetFormat: 'png' },
-    { files: [0], targetFormat: 'docx' },
+    { files: [0], targetFormat: 'zip' },
     { files: [0], targetFormat: 'png', preset: 'unsafe' },
   ])('rejects invalid workflow input %#', (input) => {
     expect(validateInput(input)).toBe(false)

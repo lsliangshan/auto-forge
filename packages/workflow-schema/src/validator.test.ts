@@ -27,14 +27,14 @@ describe('validateManifest', () => {
   it('accepts only non-empty, unique approved format scopes for file conversion', () => {
     const conversionPermission = {
       capability: 'file.convert',
-      scope: { formats: ['png', 'webp'] },
+      scope: { formats: ['png', 'webp', 'docx'] },
     }
 
     expect(validateManifest({ ...validManifest(), permissions: [conversionPermission] }).valid).toBe(true)
     for (const scope of [
       { formats: [] },
       { formats: ['png', 'png'] },
-      { formats: ['docx'] },
+      { formats: ['zip'] },
       { formats: ['png'], origins: ['https://example.com'] },
       { formats: ['png'], paths: ['/tmp'] },
     ]) {

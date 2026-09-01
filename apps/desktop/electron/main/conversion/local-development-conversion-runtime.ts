@@ -35,8 +35,8 @@ const localDevelopmentImageAdapter: ConverterAdapter = {
 const localDevelopmentDocumentAdapter: ConverterAdapter = {
   ...documentAdapter,
   supports(input, target) {
-    return (input.format === 'markdown' || input.format === 'txt')
-      && target === 'pdf'
+    return ((input.format === 'markdown' && (target === 'pdf' || target === 'docx'))
+      || (input.format === 'txt' && target === 'pdf'))
       && documentAdapter.supports(input, target)
   },
 }
