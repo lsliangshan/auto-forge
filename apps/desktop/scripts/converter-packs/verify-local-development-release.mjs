@@ -22,8 +22,32 @@ const supportingEntries = Object.freeze({
   ffprobe: Object.freeze({ family: 'media', entry: 'bin/ffprobe' }),
 })
 const icoSizes = Object.freeze([16, 24, 32, 48, 64, 128, 256])
-const icnsTypes = Object.freeze(['icp4', 'ic11', 'icp5', 'ic12', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10'])
+const icnsSlots = Object.freeze([
+  Object.freeze({ type: 'icp4', pixelSize: 16 }),
+  Object.freeze({ type: 'ic11', pixelSize: 32 }),
+  Object.freeze({ type: 'icp5', pixelSize: 32 }),
+  Object.freeze({ type: 'ic12', pixelSize: 64 }),
+  Object.freeze({ type: 'ic07', pixelSize: 128 }),
+  Object.freeze({ type: 'ic13', pixelSize: 256 }),
+  Object.freeze({ type: 'ic08', pixelSize: 256 }),
+  Object.freeze({ type: 'ic14', pixelSize: 512 }),
+  Object.freeze({ type: 'ic09', pixelSize: 512 }),
+  Object.freeze({ type: 'ic10', pixelSize: 1024 }),
+])
 const pngFixture = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJYQAAAABJRU5ErkJggg==', 'base64')
+const sourceFixtureFiles = new Set(['sources/source.txt', 'sources/source.csv', 'sources/source.png'])
+const expectedRegularFiles = new Set([
+  ...sourceFixtureFiles,
+  'sources/source.wav', 'sources/source.mp4',
+  'source-doc/source.doc', 'source-docx/source.docx', 'document/source.pdf', 'documentx/source.pdf',
+  'spreadsheet/source.xlsx', 'xlsx-roundtrip/source.csv', 'jpeg/output.jpeg', 'image-pdf/output.pdf',
+  'ico/output.ico', 'icns/output.icns', 'pdf-png/page-001.png', 'pdf-jpeg/page-001.jpeg',
+  'pdf-probe/generated.png', 'pdf-probe/generated.jpeg', 'audio/output.mp3', 'video/output.webm', 'extract/output.mp3',
+])
+const allowedDirectories = new Set([
+  'sources', 'source-doc', 'source-docx', 'document', 'documentx', 'spreadsheet', 'xlsx-roundtrip',
+  'jpeg', 'image-pdf', 'ico', 'icns', 'pdf-png', 'pdf-jpeg', 'pdf-probe', 'audio', 'video', 'extract',
+])
 
 function fail() {
   throw new Error('Local development converter release smoke verification failed')
@@ -46,6 +70,43 @@ async function regularFile(path) {
   if (!metadata?.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || metadata.size < 1 || metadata.size > maximumFileBytes) fail()
   if (await realpath(path).catch(() => undefined) !== path) fail()
   return metadata
+}
+
+async function containedPath(root, candidate, { directory = false } = {}) {
+  if (typeof candidate !== 'string' || !isAbsolute(candidate) || resolve(candidate) !== candidate || !inside(root, candidate)) fail()
+  const segments = relative(root, candidate).split('/').filter(Boolean)
+  let current = root
+  for (const [index, segment] of segments.entries()) {
+    current = join(current, segment)
+    const metadata = await lstat(current).catch(() => undefined)
+    if (!metadata) {
+      if (directory) fail()
+      return candidate
+    }
+    if (metadata.isSymbolicLink() || (index < segments.length - 1 && !metadata.isDirectory())) fail()
+    if (index === segments.length - 1 && directory && !metadata.isDirectory()) fail()
+    if (await realpath(current).catch(() => undefined) !== current) fail()
+  }
+  return candidate
+}
+
+function argumentPaths(args) {
+  const paths = []
+  for (const argument of args) {
+    if (isAbsolute(argument)) paths.push(argument)
+    else if (argument.startsWith('-env:UserInstallation=')) {
+      try { paths.push(fileURLToPath(argument.slice('-env:UserInstallation='.length))) } catch { fail() }
+    }
+  }
+  return paths
+}
+
+async function validateRunRequest({ executable, args, cwd, env }, { releaseRoot, workRoot }) {
+  if (!inside(releaseRoot, executable)) fail()
+  await regularFile(executable)
+  await containedPath(workRoot, cwd, { directory: true })
+  for (const path of argumentPaths(args)) await containedPath(workRoot, path)
+  if (env?.TEMP !== workRoot || env?.TMP !== workRoot || env?.TMPDIR !== workRoot || env?.PATH !== dirname(executable)) fail()
 }
 
 function formatOf(bytes) {
@@ -79,6 +140,7 @@ function validPng(bytes, expectedSize) {
   let height
   let channels
   let idat = false
+  let idatEnded = false
   const payloads = []
   let ended = false
   while (offset + 12 <= bytes.length) {
@@ -87,43 +149,145 @@ function validPng(bytes, expectedSize) {
     const end = offset + 12 + length
     if (end > bytes.length || bytes.readUInt32BE(offset + 8 + length) !== crc32(bytes.subarray(offset + 4, offset + 8 + length))) return false
     if (type.toString('ascii') === 'IHDR') {
-      if (length !== 13 || width !== undefined) return false
+      if (offset !== 8 || length !== 13 || width !== undefined) return false
       width = bytes.readUInt32BE(offset + 8); height = bytes.readUInt32BE(offset + 12)
-      const bitDepth = bytes[offset + 16]; const colorType = bytes[offset + 17]; const interlace = bytes[offset + 20]
+      const bitDepth = bytes[offset + 16]; const colorType = bytes[offset + 17]
+      const compression = bytes[offset + 18]; const filter = bytes[offset + 19]; const interlace = bytes[offset + 20]
       channels = colorType === 2 ? 3 : colorType === 6 ? 4 : undefined
-      if (!width || !height || bitDepth !== 8 || channels === undefined || interlace !== 0) return false
-    } else if (type.toString('ascii') === 'IDAT') { idat ||= length > 0; payloads.push(bytes.subarray(offset + 8, offset + 8 + length)) }
+      if (!width || !height || bitDepth !== 8 || channels === undefined || compression !== 0 || filter !== 0 || interlace !== 0) return false
+    } else if (type.toString('ascii') === 'IDAT') {
+      if (width === undefined || idatEnded) return false
+      idat ||= length > 0
+      payloads.push(bytes.subarray(offset + 8, offset + 8 + length))
+    }
     else if (type.toString('ascii') === 'IEND') { ended = length === 0 && end === bytes.length; break }
+    else if (idat) idatEnded = true
     offset = end
   }
   if (!width || !height || !idat || !ended || (expectedSize !== undefined && (width !== expectedSize || height !== expectedSize))) return false
   try {
-    const decoded = inflateSync(Buffer.concat(payloads))
-    if (decoded.length !== height * (1 + width * channels)) return false
+    const decodedBytes = height * (1 + width * channels)
+    if (!Number.isSafeInteger(decodedBytes) || decodedBytes > maximumFileBytes) return false
+    const decoded = inflateSync(Buffer.concat(payloads), { maxOutputLength: maximumFileBytes + 1 })
+    if (decoded.length !== decodedBytes) return false
     for (let offset = 0; offset < decoded.length; offset += 1 + width * channels) if (decoded[offset] > 4) return false
     return true
   } catch { return false }
 }
 
 function validJpeg(bytes) {
-  if (bytes.length < 20 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes.at(-2) !== 0xff || bytes.at(-1) !== 0xd9) return false
+  if (bytes.length < 20 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return false
   let offset = 2
-  let frame = false
-  let scan = false
-  let dqt = false
-  let dht = false
-  while (offset + 4 <= bytes.length - 2) {
+  let frameMarker
+  let frameComponents
+  const quantizationTables = new Set()
+  const dcTables = new Set()
+  const acTables = new Set()
+  let scans = 0
+  while (offset < bytes.length) {
     if (bytes[offset] !== 0xff) return false
-    const marker = bytes[offset + 1]
-    if (marker === 0xda) { scan = offset + 2 + bytes.readUInt16BE(offset + 2) < bytes.length - 2; break }
-    const length = bytes.readUInt16BE(offset + 2)
-    if (length < 2 || offset + 2 + length > bytes.length) return false
-    if (marker >= 0xc0 && marker <= 0xc3 && length >= 8 && bytes.readUInt16BE(offset + 5) > 0 && bytes.readUInt16BE(offset + 7) > 0) frame = true
-    if (marker === 0xdb) dqt = true
-    if (marker === 0xc4) dht = true
-    offset += 2 + length
+    let markerOffset = offset + 1
+    while (bytes[markerOffset] === 0xff) markerOffset += 1
+    const marker = bytes[markerOffset]
+    if (marker === undefined || marker === 0x00 || marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7)) return false
+    const segmentOffset = markerOffset + 1
+    if (marker === 0xd9) {
+      if (segmentOffset !== bytes.length || !frameComponents || scans < 1 || quantizationTables.size < 1 || dcTables.size < 1 || acTables.size < 1) return false
+      return [...frameComponents.values()].every(({ quantizationTable }) => quantizationTables.has(quantizationTable))
+    }
+    if (marker === 0x01) { offset = segmentOffset; continue }
+    if (segmentOffset + 2 > bytes.length) return false
+    const length = bytes.readUInt16BE(segmentOffset)
+    const payloadOffset = segmentOffset + 2
+    const end = segmentOffset + length
+    if (length < 2 || end > bytes.length) return false
+    if (marker === 0xdb) {
+      for (let cursor = payloadOffset; cursor < end;) {
+        const information = bytes[cursor++]
+        const precision = information >>> 4
+        const identifier = information & 0x0f
+        const tableBytes = precision === 0 ? 64 : precision === 1 ? 128 : 0
+        if (!tableBytes || identifier > 3 || cursor + tableBytes > end) return false
+        quantizationTables.add(identifier)
+        cursor += tableBytes
+      }
+    } else if (marker === 0xc4) {
+      for (let cursor = payloadOffset; cursor < end;) {
+        const information = bytes[cursor++]
+        const tableClass = information >>> 4
+        const identifier = information & 0x0f
+        if (tableClass > 1 || identifier > 3 || cursor + 16 > end) return false
+        let symbols = 0
+        let availableCodes = 1
+        for (let index = 0; index < 16; index += 1) {
+          const count = bytes[cursor + index]
+          symbols += count
+          availableCodes = availableCodes * 2 - count
+          if (availableCodes < 0) return false
+        }
+        cursor += 16
+        if (symbols < 1 || cursor + symbols > end) return false
+        cursor += symbols
+        ;(tableClass === 0 ? dcTables : acTables).add(identifier)
+      }
+    } else {
+      const isFrame = marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)
+      if (isFrame) {
+        if (![0xc0, 0xc1, 0xc2].includes(marker) || frameComponents) return false
+        const componentCount = bytes[payloadOffset + 5]
+        if (bytes[payloadOffset] !== 8 || !bytes.readUInt16BE(payloadOffset + 1) || !bytes.readUInt16BE(payloadOffset + 3)
+          || componentCount < 1 || componentCount > 4 || length !== 8 + 3 * componentCount) return false
+        frameMarker = marker
+        frameComponents = new Map()
+        for (let index = 0; index < componentCount; index += 1) {
+          const componentOffset = payloadOffset + 6 + index * 3
+          const identifier = bytes[componentOffset]
+          const sampling = bytes[componentOffset + 1]
+          const horizontal = sampling >>> 4
+          const vertical = sampling & 0x0f
+          const quantizationTable = bytes[componentOffset + 2]
+          if (frameComponents.has(identifier) || horizontal < 1 || horizontal > 4 || vertical < 1 || vertical > 4 || quantizationTable > 3) return false
+          frameComponents.set(identifier, { quantizationTable })
+        }
+      } else if (marker === 0xda) {
+        const scanComponents = bytes[payloadOffset]
+        if (!frameComponents || scanComponents < 1 || scanComponents > frameComponents.size || length !== 6 + 2 * scanComponents) return false
+        const identifiers = new Set()
+        for (let index = 0; index < scanComponents; index += 1) {
+          const selectorOffset = payloadOffset + 1 + index * 2
+          const identifier = bytes[selectorOffset]
+          const tables = bytes[selectorOffset + 1]
+          if (!frameComponents.has(identifier) || identifiers.has(identifier) || !dcTables.has(tables >>> 4) || !acTables.has(tables & 0x0f)) return false
+          identifiers.add(identifier)
+        }
+        const spectralStart = bytes[payloadOffset + 1 + 2 * scanComponents]
+        const spectralEnd = bytes[payloadOffset + 2 + 2 * scanComponents]
+        const approximation = bytes[payloadOffset + 3 + 2 * scanComponents]
+        if (frameMarker !== 0xc2) {
+          if (spectralStart !== 0 || spectralEnd !== 63 || approximation !== 0) return false
+        } else if (spectralStart > spectralEnd || spectralEnd > 63 || approximation >>> 4 > 13 || (approximation & 0x0f) > 13 || (spectralStart > 0 && scanComponents !== 1)) return false
+        let cursor = end
+        let entropyBytes = 0
+        while (cursor < bytes.length) {
+          if (bytes[cursor] !== 0xff) { entropyBytes += 1; cursor += 1; continue }
+          let codeOffset = cursor + 1
+          while (bytes[codeOffset] === 0xff) codeOffset += 1
+          const code = bytes[codeOffset]
+          if (code === undefined) return false
+          if (code === 0x00) { entropyBytes += 1; cursor = codeOffset + 1; continue }
+          if (code >= 0xd0 && code <= 0xd7) { cursor = codeOffset + 1; continue }
+          if (entropyBytes < 1) return false
+          offset = cursor
+          scans += 1
+          break
+        }
+        if (cursor >= bytes.length) return false
+        continue
+      }
+    }
+    offset = end
   }
-  return frame && scan && dqt && dht
+  return false
 }
 
 async function verifyOutput(path, expectedFormat) {
@@ -145,47 +309,66 @@ async function verifyOutputDirectory(root, expectedNames, allowedDirectories = [
   for (const name of names) await regularFile(join(root, name))
 }
 
-async function auditTree(root, prefix = '') {
-  const files = []
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    const path = join(root, entry.name)
-    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name
-    if (entry.isSymbolicLink()) fail()
-    if (entry.isDirectory()) files.push(...await auditTree(path, relativePath))
-    else { await regularFile(path); files.push(relativePath) }
+async function auditTree(root, prefix = '', result = { files: new Set(), directories: new Set() }) {
+  const names = await readdir(root)
+  if (prefix && names.length === 0) fail()
+  for (const name of names) {
+    const path = join(root, name)
+    const relativePath = prefix ? `${prefix}/${name}` : name
+    const metadata = await lstat(path).catch(() => undefined)
+    if (!metadata || metadata.isSymbolicLink()) fail()
+    if (metadata.isDirectory()) {
+      result.directories.add(relativePath)
+      await auditTree(path, relativePath, result)
+    } else if (metadata.isFile()) {
+      await regularFile(path)
+      result.files.add(relativePath)
+    } else fail()
   }
-  return files
+  return result
+}
+
+function sameSet(actual, expected) {
+  return actual.size === expected.size && [...actual].every((value) => expected.has(value))
 }
 
 function verifyIco(bytes) {
-  if (bytes.length < 6 || bytes.readUInt16LE(4) !== icoSizes.length) fail()
+  if (bytes.length < 6 || bytes.readUInt16LE(0) !== 0 || bytes.readUInt16LE(2) !== 1 || bytes.readUInt16LE(4) !== icoSizes.length) fail()
+  const directoryEnd = 6 + icoSizes.length * 16
   const sizes = []
+  const payloads = []
   for (let index = 0; index < icoSizes.length; index += 1) {
     const offset = 6 + index * 16
     if (offset + 16 > bytes.length) fail()
     const size = bytes[offset] || 256
+    const height = bytes[offset + 1] || 256
     const payloadLength = bytes.readUInt32LE(offset + 8)
     const payloadOffset = bytes.readUInt32LE(offset + 12)
-    if (!payloadLength || payloadOffset + payloadLength > bytes.length || !validPng(bytes.subarray(payloadOffset, payloadOffset + payloadLength), size)) fail()
+    const payloadEnd = payloadOffset + payloadLength
+    if (height !== size || !payloadLength || payloadOffset < directoryEnd || payloadEnd > bytes.length || payloadEnd < payloadOffset
+      || !validPng(bytes.subarray(payloadOffset, payloadEnd), size)) fail()
     sizes.push(size)
+    payloads.push({ start: payloadOffset, end: payloadEnd })
   }
   if (sizes.some((size, index) => size !== icoSizes[index])) fail()
+  payloads.sort((left, right) => left.start - right.start)
+  if (payloads.some((payload, index) => index > 0 && payload.start < payloads[index - 1].end)) fail()
 }
 
 function verifyIcns(bytes) {
-  if (bytes.length < 8 || bytes.readUInt32BE(4) !== bytes.length) fail()
+  if (bytes.length < 8 || bytes.subarray(0, 4).toString('ascii') !== 'icns' || bytes.readUInt32BE(4) !== bytes.length) fail()
   const types = []
-  const sizes = [16, 32, 32, 64, 128, 256, 256, 512, 512, 1024]
   for (let offset = 8; offset < bytes.length;) {
     if (offset + 8 > bytes.length) fail()
     const length = bytes.readUInt32BE(offset + 4)
     if (length < 8 || offset + length > bytes.length) fail()
-    const index = types.length
-    types.push(bytes.subarray(offset, offset + 4).toString('ascii'))
-    if (!validPng(bytes.subarray(offset + 8, offset + length), sizes[index])) fail()
+    const slot = icnsSlots[types.length]
+    const type = bytes.subarray(offset, offset + 4).toString('ascii')
+    if (!slot || type !== slot.type || !validPng(bytes.subarray(offset + 8, offset + length), slot.pixelSize)) fail()
+    types.push(type)
     offset += length
   }
-  if (types.length !== icnsTypes.length || types.some((type, index) => type !== icnsTypes[index])) fail()
+  if (types.length !== icnsSlots.length) fail()
 }
 
 async function defaultRun({ executable, args, cwd, env, signal }) {
@@ -194,21 +377,46 @@ async function defaultRun({ executable, args, cwd, env, signal }) {
     const stdout = []
     child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)))
     let aborted = false
-    const abort = () => { aborted = true; if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL') }
-    signal?.addEventListener('abort', abort, { once: true })
-    child.once('error', rejectRun)
-    child.once('close', (code, closeSignal) => { signal?.removeEventListener('abort', abort); if (aborted) rejectRun(new Error('timeout')); else resolveRun({ code, signal: closeSignal, stdout: Buffer.concat(stdout).toString('utf8') }) })
+    let spawnError
+    let terminationError
+    const abort = () => {
+      aborted = true
+      if (child.pid === undefined) return
+      try {
+        if (process.platform === 'win32') child.kill('SIGKILL')
+        else process.kill(-child.pid, 'SIGKILL')
+      } catch (error) {
+        if (error?.code !== 'ESRCH') terminationError = error
+      }
+    }
+    if (signal?.aborted) abort()
+    else signal?.addEventListener('abort', abort, { once: true })
+    child.once('error', (error) => { spawnError = error })
+    child.once('close', (code, closeSignal) => {
+      signal?.removeEventListener('abort', abort)
+      if (spawnError) rejectRun(spawnError)
+      else if (aborted) rejectRun(terminationError ?? new Error('timeout'))
+      else resolveRun({ code, signal: closeSignal, stdout: Buffer.concat(stdout).toString('utf8') })
+    })
   })
 }
 
 async function runCommand(run, request, timeoutMs) {
+  // Injected runners have a cooperative contract: observe AbortSignal, finish
+  // asynchronous cleanup, and settle. This single timer owns the deadline;
+  // deliberately do not race a runner that ignores the signal forever.
   const controller = new AbortController()
   let timedOut = false
   const timer = setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
-  const outcome = await Promise.resolve(run({ ...request, signal: controller.signal })).catch(() => fail()).finally(() => clearTimeout(timer))
+  const outcome = await Promise.resolve().then(() => run({ ...request, signal: controller.signal })).catch(() => fail()).finally(() => clearTimeout(timer))
   if (timedOut) fail()
   if (!outcome || outcome.code !== 0 || outcome.signal) fail()
   return outcome
+}
+
+export async function runDefaultCommandForTest({ timeoutMs, ...request } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) fail()
+  return runCommand(defaultRun, request, timeoutMs)
 }
 
 function commandEnvironment(executable, workRoot) {
@@ -262,20 +470,29 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     const image = join(sources, 'source.png')
     await Promise.all([writeFile(text, 'AutoForge smoke fixture\n'), writeFile(csv, 'name,value\nauto-forge,1\n'), writeFile(image, pngFixture)])
     await Promise.all([regularFile(text), regularFile(csv), regularFile(image)])
-    const invoke = (executable, args, cwd, kind) => runCommand(run, { executable, args, cwd, env: commandEnvironment(executable, workRoot) }, timeoutMs ?? timeouts[kind])
+    const invoke = async (executable, args, cwd, kind) => {
+      const request = { executable, args, cwd, env: commandEnvironment(executable, workRoot) }
+      await validateRunRequest(request, { releaseRoot, workRoot })
+      return runCommand(run, request, timeoutMs ?? timeouts[kind])
+    }
     const invokeDocument = async (input, target, root) => {
-      await invoke(executables.document, documentArguments(input, target, root), root, 'document')
-      await rm(join(root, 'libreoffice-profile'), { recursive: true, force: true })
+      try {
+        await invoke(executables.document, documentArguments(input, target, root), root, 'document')
+      } finally {
+        await rm(join(root, 'libreoffice-profile'), { recursive: true, force: true })
+      }
     }
     const probePdf = async (path) => {
       const result = await invoke(executables.pdfinfo, ['-f', '1', '-l', '1', path], workRoot, 'pdf')
-      if (!/^Pages:\s+1$/mu.test(result.stdout ?? '')) fail()
+      if (!/^Pages:\s+1$/mu.test(result.stdout ?? '') || !/^PDF version:\s+\d+\.\d+$/mu.test(result.stdout ?? '')) fail()
     }
-    const probeMedia = async (path, container, stream) => {
+    const probeMedia = async (path, containers, streams) => {
       const result = await invoke(executables.ffprobe, ['-v', 'error', '-show_entries', 'format=format_name:stream=codec_type,codec_name', '-of', 'json', path], workRoot, 'media')
       try {
         const parsed = JSON.parse(result.stdout)
-        if (typeof parsed?.format?.format_name !== 'string' || !parsed.format.format_name.split(',').includes(container) || !parsed.streams?.some((value) => value.codec_type === stream && typeof value.codec_name === 'string')) fail()
+        const actualContainers = typeof parsed?.format?.format_name === 'string' ? parsed.format.format_name.split(',') : []
+        if (!containers.every((container) => actualContainers.includes(container)) || !Array.isArray(parsed?.streams) || parsed.streams.length !== streams.length
+          || streams.some((expected, index) => parsed.streams[index]?.codec_type !== expected.type || parsed.streams[index]?.codec_name !== expected.codec)) fail()
       } catch { fail() }
     }
 
@@ -349,7 +566,10 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     await invoke(executables.media, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-nostats', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:a', 'pcm_s16le', '-f', 'wav', '-y', wav], sources, 'media')
     await invoke(executables.media, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-nostats', '-f', 'lavfi', '-i', 'color=c=black:s=16x16:d=1', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-f', 'mp4', '-y', mp4], sources, 'media')
     await Promise.all([verifyOutput(wav, 'wav'), verifyOutput(mp4, 'mp4')])
-    await Promise.all([probeMedia(wav, 'wav', 'audio'), probeMedia(mp4, 'mov', 'video')])
+    await Promise.all([
+      probeMedia(wav, ['wav'], [{ type: 'audio', codec: 'pcm_s16le' }]),
+      probeMedia(mp4, ['mov', 'mp4'], [{ type: 'video', codec: 'h264' }, { type: 'audio', codec: 'aac' }]),
+    ])
     const audioRoot = join(workRoot, 'audio')
     const videoRoot = join(workRoot, 'video')
     const extractRoot = join(workRoot, 'extract')
@@ -362,18 +582,14 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     await invoke(executables.media, mediaArguments(mp4, video, 'webm'), videoRoot, 'media')
     await invoke(executables.media, mediaArguments(mp4, extracted, 'mp3'), extractRoot, 'media')
     await Promise.all([verifyOutputDirectory(audioRoot, ['output.mp3']), verifyOutput(audio, 'mp3'), verifyOutputDirectory(videoRoot, ['output.webm']), verifyOutput(video, 'webm'), verifyOutputDirectory(extractRoot, ['output.mp3']), verifyOutput(extracted, 'mp3')])
-    await Promise.all([probeMedia(audio, 'mp3', 'audio'), probeMedia(video, 'webm', 'video'), probeMedia(extracted, 'mp3', 'audio')])
-    const roots = ['sources', 'source-doc', 'source-docx', 'document', 'documentx', 'spreadsheet', 'xlsx-roundtrip', 'jpeg', 'image-pdf', 'ico', 'icns', 'pdf-png', 'pdf-jpeg', 'pdf-probe', 'audio', 'video', 'extract']
-    const entries = await readdir(workRoot, { withFileTypes: true })
-    if (entries.length !== roots.length || entries.some((entry) => !entry.isDirectory() || entry.isSymbolicLink() || !roots.includes(entry.name))) fail()
-    const files = await auditTree(workRoot)
-    const expectedFiles = [
-      'sources/source.txt', 'sources/source.csv', 'sources/source.png', 'sources/source.wav', 'sources/source.mp4',
-      'source-doc/source.doc', 'source-docx/source.docx', 'document/source.pdf', 'documentx/source.pdf', 'spreadsheet/source.xlsx', 'xlsx-roundtrip/source.csv',
-      'jpeg/output.jpeg', 'image-pdf/output.pdf', 'ico/output.ico', 'icns/output.icns', 'pdf-png/page-001.png', 'pdf-jpeg/page-001.jpeg', 'pdf-probe/generated.png', 'pdf-probe/generated.jpeg',
-      'audio/output.mp3', 'video/output.webm', 'extract/output.mp3',
-    ].sort()
-    if (files.length > maximumOutputs || files.sort().join('\0') !== expectedFiles.join('\0')) fail()
+    await Promise.all([
+      probeMedia(audio, ['mp3'], [{ type: 'audio', codec: 'mp3' }]),
+      probeMedia(video, ['webm'], [{ type: 'video', codec: 'vp9' }, { type: 'audio', codec: 'opus' }]),
+      probeMedia(extracted, ['mp3'], [{ type: 'audio', codec: 'mp3' }]),
+    ])
+    const tree = await auditTree(workRoot)
+    const outputCount = [...tree.files].filter((path) => !sourceFixtureFiles.has(path)).length
+    if (outputCount > maximumOutputs || !sameSet(tree.files, expectedRegularFiles) || !sameSet(tree.directories, allowedDirectories)) fail()
   } catch {
     fail()
   } finally {
