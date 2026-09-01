@@ -574,19 +574,35 @@ async function initialize(): Promise<void> {
   const knowledgeStoreFactory = new KnowledgeStoreFactory(join(userData, 'knowledge'), safeStoragePort)
   const knowledgeService = createLocalKnowledgeService({
     openStore: ownerId => knowledgeStoreFactory.open(ownerId),
-    selectImportFiles: async () => [{
-      name: 'e2e-guide.txt',
-      mimeType: 'text/plain',
+    selectImportFiles: async () => [knowledgeReleaseSmoke ? {
+      name: 'e2e-guide.md', mimeType: 'text/markdown',
+      bytes: Buffer.from('# AutoForge knowledge smoke\n\n班级名称：高一（3）班'),
+    } : {
+      name: 'e2e-guide.txt', mimeType: 'text/plain',
       bytes: Buffer.from('AutoForge knowledge smoke\n班级名称：高一（3）班'),
     }],
     createParser: async () => ({
-      parse: async () => ({
-        mediaType: 'text/plain',
+      parse: async () => knowledgeReleaseSmoke ? ({
+        mediaType: 'text/markdown' as const,
+        text: 'AutoForge knowledge smoke\n班级名称：高一（3）班',
+        blocks: [
+          {
+            id: 'md-1', text: 'AutoForge knowledge smoke', coordinate: {
+              kind: 'markdown' as const, path: ['AutoForge knowledge smoke'], blockIndex: 0,
+            },
+          },
+          {
+            id: 'md-2', text: '班级名称：高一（3）班', coordinate: {
+              kind: 'markdown' as const, path: ['AutoForge knowledge smoke'], blockIndex: 1,
+            },
+          },
+        ],
+      }) : ({
+        mediaType: 'text/plain' as const,
         text: 'AutoForge knowledge smoke\n班级名称：高一（3）班',
         blocks: [{
-          id: 'e2e-block-1',
-          text: 'AutoForge knowledge smoke\n班级名称：高一（3）班',
-          coordinate: { kind: 'txt', lineStart: 1, lineEnd: 2, charStart: 0, charEnd: 37 },
+          id: 'e2e-block-1', text: 'AutoForge knowledge smoke\n班级名称：高一（3）班',
+          coordinate: { kind: 'txt' as const, lineStart: 1, lineEnd: 2, charStart: 0, charEnd: 37 },
         }],
       }),
       terminateAll: async () => undefined,
