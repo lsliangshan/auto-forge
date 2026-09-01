@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { Buffer } from 'node:buffer'
-import { mkdir, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
@@ -25,6 +25,8 @@ const licenseNames = Object.freeze({
   libvips: Object.freeze(['COPYING', 'LICENSE']),
   poppler: Object.freeze(['COPYING', 'COPYING3', 'LICENSE']),
 })
+const maximumSourceLicenseWrappers = 64
+const maximumSourceLicenseCandidates = 32
 
 async function extractArchive(archive, output) {
   requireAbsolutePath(archive, 'Verified archive')
@@ -59,14 +61,45 @@ function uniqueSuffix(files, suffix, label) {
   return matches[0]
 }
 
-function selectedLicense(files, names, label) {
-  for (const name of names) {
-    const matches = files.filter((path) => path.endsWith(`/${name}`))
-    if (matches.length === 1) return matches[0]
-    if (matches.length > 1) {
-      matches.sort((left, right) => left.length - right.length || Buffer.from(left).compare(Buffer.from(right)))
-      return matches[0]
+export async function selectVerifiedSourceLicense(root, names, label) {
+  const acceptedNames = new Set(names)
+  const candidates = []
+  const byUtf8Name = (left, right) => Buffer.from(left.name).compare(Buffer.from(right.name))
+  const inspectEntries = async (directory, entries) => {
+    for (const entry of entries) {
+      if (!acceptedNames.has(entry.name)) continue
+      const path = join(directory, entry.name)
+      const metadata = await lstat(path)
+      if (!entry.isFile() || !metadata.isFile()) {
+        fail(`${label} license has an unsupported file type in the verified source archive.`)
+      }
+      candidates.push({ name: entry.name, path })
+      if (candidates.length > maximumSourceLicenseCandidates) {
+        fail(`${label} license has too many candidates in the verified source archive.`)
+      }
     }
+  }
+
+  const rootEntries = (await readdir(root, { withFileTypes: true })).sort(byUtf8Name)
+  await inspectEntries(root, rootEntries)
+  const wrappers = rootEntries.filter((entry) => entry.isDirectory())
+  if (wrappers.length > maximumSourceLicenseWrappers) {
+    fail(`${label} license search has too many directories in the verified source archive.`)
+  }
+  for (const wrapper of wrappers) {
+    const directory = join(root, wrapper.name)
+    if (!(await lstat(directory)).isDirectory()) {
+      fail(`${label} license search encountered an unsupported source wrapper.`)
+    }
+    const entries = (await readdir(directory, { withFileTypes: true })).sort(byUtf8Name)
+    await inspectEntries(directory, entries)
+  }
+
+  for (const name of names) {
+    const matches = candidates.filter((candidate) => candidate.name === name)
+    if (matches.length === 0) continue
+    matches.sort((left, right) => left.path.length - right.path.length || Buffer.from(left.path).compare(Buffer.from(right.path)))
+    return matches[0].path
   }
   fail(`${label} license is missing from the verified source archive.`)
 }
@@ -75,8 +108,7 @@ async function defaultPrepareEngine({ engine, workspace }) {
   const sourceRoot = join(workspace, 'sources', engine.name)
   await mkdir(dirname(sourceRoot), { recursive: true, mode: 0o700 })
   await extractArchive(engine.sourceArchive.path, sourceRoot)
-  const sourceFiles = await collectRegularFiles(sourceRoot)
-  const licensePath = selectedLicense(sourceFiles, licenseNames[engine.name], engine.name)
+  const licensePath = await selectVerifiedSourceLicense(sourceRoot, licenseNames[engine.name], engine.name)
   if (engine.name === 'libreoffice') return { executables: {}, licensePath }
   const runtimeRoot = join(workspace, 'runtime', engine.name)
   await mkdir(dirname(runtimeRoot), { recursive: true, mode: 0o700 })

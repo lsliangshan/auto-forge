@@ -1,4 +1,4 @@
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -12,6 +12,7 @@ import {
 } from '../../scripts/converter-packs/macho-closure.mjs'
 import { probeConverterFamily, stageProductionPacks } from '../../scripts/converter-packs/stage-production-packs.mjs'
 import { buildConverterPackIndex } from '../../scripts/converter-packs/build-index.mjs'
+import { selectVerifiedSourceLicense } from '../../scripts/converter-packs/prepare-production-staging.mjs'
 
 const temporaryRoots: string[] = []
 
@@ -31,6 +32,66 @@ function fixtureFile(root: string, relative: string): string {
   writeFileSync(path, basename(path))
   return realpathSync(path)
 }
+
+describe('verified converter source license selection', () => {
+  it('searches only the source root and its first wrapper level', async () => {
+    const root = temporaryRoot()
+    const wrapper = join(root, 'libreoffice-26.8.0.3')
+    const expected = fixtureFile(wrapper, 'COPYING')
+    const deep = join(wrapper, 'vendor', 'large-source-tree')
+    mkdirSync(deep, { recursive: true })
+    for (let index = 0; index < 512; index += 1) {
+      writeFileSync(join(deep, `unrelated-${index.toString().padStart(4, '0')}`), 'fixture')
+    }
+    fixtureFile(deep, 'COPYING')
+    chmodSync(deep, 0o000)
+
+    try {
+      await expect(selectVerifiedSourceLicense(root, ['COPYING', 'LICENSE'], 'libreoffice')).resolves.toBe(expected)
+    } finally {
+      chmodSync(deep, 0o700)
+    }
+  })
+
+  it('uses license-name priority, shortest path, and UTF-8 byte order deterministically', async () => {
+    const root = temporaryRoot()
+    fixtureFile(root, 'LICENSE')
+    const byteFirst = fixtureFile(root, 'a/COPYING')
+    fixtureFile(root, 'z/COPYING')
+
+    await expect(selectVerifiedSourceLicense(root, ['COPYING', 'LICENSE'], 'libreoffice')).resolves.toBe(byteFirst)
+
+    const shortest = fixtureFile(root, 'COPYING')
+    await expect(selectVerifiedSourceLicense(root, ['COPYING', 'LICENSE'], 'libreoffice')).resolves.toBe(shortest)
+  })
+
+  it('fails closed when an exact license-name match is symbolic or non-regular', async () => {
+    const symbolicRoot = temporaryRoot()
+    const valid = fixtureFile(symbolicRoot, 'COPYING')
+    mkdirSync(join(symbolicRoot, 'wrapper'))
+    symlinkSync(valid, join(symbolicRoot, 'wrapper', 'COPYING'))
+    await expect(selectVerifiedSourceLicense(symbolicRoot, ['COPYING', 'LICENSE'], 'libreoffice')).rejects.toThrow(/unsupported/iu)
+
+    const nonRegularRoot = temporaryRoot()
+    fixtureFile(nonRegularRoot, 'COPYING')
+    mkdirSync(join(nonRegularRoot, 'wrapper', 'LICENSE'), { recursive: true })
+    await expect(selectVerifiedSourceLicense(nonRegularRoot, ['COPYING', 'LICENSE'], 'libreoffice')).rejects.toThrow(/unsupported/iu)
+  })
+
+  it('fails closed for missing, excessive-wrapper, and excessive-candidate inventories', async () => {
+    const missingRoot = temporaryRoot()
+    fixtureFile(missingRoot, 'wrapper/COPYING.txt')
+    await expect(selectVerifiedSourceLicense(missingRoot, ['COPYING', 'LICENSE'], 'libreoffice')).rejects.toThrow(/missing/iu)
+
+    const wrapperRoot = temporaryRoot()
+    for (let index = 0; index < 65; index += 1) mkdirSync(join(wrapperRoot, `wrapper-${index.toString().padStart(2, '0')}`))
+    await expect(selectVerifiedSourceLicense(wrapperRoot, ['COPYING'], 'libreoffice')).rejects.toThrow(/too many directories/iu)
+
+    const candidateRoot = temporaryRoot()
+    for (let index = 0; index < 33; index += 1) fixtureFile(candidateRoot, `wrapper-${index.toString().padStart(2, '0')}/COPYING`)
+    await expect(selectVerifiedSourceLicense(candidateRoot, ['COPYING'], 'libreoffice')).rejects.toThrow(/too many candidates/iu)
+  })
+})
 
 describe('converter pack Mach-O closure', () => {
   it('parses literal otool dependency and rpath output without locale-sensitive text matching', () => {
