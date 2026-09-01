@@ -122,7 +122,7 @@ export async function developmentFingerprintInputs(desktopRoot) {
 
 function validateDependencies(dependencies) {
   if (!isPlainRecord(dependencies) || [
-    'buildHelpers', 'preparePlan', 'stagePacks', 'buildRelease', 'verifyRelease', 'activateRelease',
+    'buildHelpers', 'preparePlan', 'stagePacks', 'buildRelease', 'verifyRelease', 'smokeRelease', 'activateRelease',
   ].some((name) => typeof dependencies[name] !== 'function')) {
     throw new Error('Local development preparation dependencies are invalid')
   }
@@ -171,25 +171,28 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     await writeFile(publicKeyPath, createPublicKey(developmentPrivateKey).export({ format: 'pem', type: 'spki' }), { flag: 'wx', mode: 0o600 })
     const version = `0.0.0-dev+${fingerprint.slice(0, 12)}`
     const archiveBaseUrl = `https://local-development.invalid/converter-packs/${fingerprint}`
-    await dependencies.buildHelpers({ target, output: helpersRoot, compiler: request.compiler })
-    await dependencies.preparePlan({
+    try {
+      await dependencies.buildHelpers({ target, output: helpersRoot, compiler: request.compiler })
+      await dependencies.preparePlan({
       lockPath: join(desktopRoot, 'converter-packs', 'sources.lock.json'), cacheRoot: paths.sources, helpersRoot,
       workspace, staging: stagingRoot, planPath, target, version, sequence: 1,
       generatedAt: new Date().toISOString(), archiveBaseUrl,
-    })
-    const plan = JSON.parse(await readFile(planPath, 'utf8'))
-    await dependencies.stagePacks({ plan, output: stagingRoot })
-    await dependencies.buildRelease({
+      })
+      const plan = JSON.parse(await readFile(planPath, 'utf8'))
+      await dependencies.stagePacks({ plan, output: stagingRoot })
+      await dependencies.buildRelease({
       stagingRoot, outputRoot: paths.release, privateKeyPath, publicKeyPath, platform: request.platform, arch: request.arch,
-    })
-    await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
-    if (typeof dependencies.smokeRelease === 'function') {
+      })
+      await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
       const smokeWorkRoot = join(privateRoot, 'smoke')
       await mkdir(smokeWorkRoot, { mode: 0o700 })
       await dependencies.smokeRelease({ releaseRoot: paths.release, workRoot: smokeWorkRoot })
+      await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
+      return { fingerprint, releaseRoot: paths.release, reused: false }
+    } catch (error) {
+      await rm(paths.release, { recursive: true, force: true })
+      throw error
     }
-    await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
-    return { fingerprint, releaseRoot: paths.release, reused: false }
   } finally {
     await rm(privateRoot, { recursive: true, force: true })
   }

@@ -81,6 +81,7 @@ function dependencies(events: string[], overrides: Record<string, unknown> = {})
       await releaseBuilder({ outputRoot })
     },
     verifyRelease: async () => { events.push('verify') },
+    smokeRelease: async () => { events.push('smoke') },
     activateRelease: async ({ releaseRoot }: { releaseRoot: string }) => {
       events.push('activate')
       return releaseRoot
@@ -97,7 +98,7 @@ it('prepares a cold development cache in order and activates only after verifica
 
   expect(result.reused).toBe(false)
   expect(result.releaseRoot).toBe(join(cacheRoot, 'releases', result.fingerprint))
-  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'activate'])
+  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
 })
 
 it('reuses a verified matching release without build callbacks', async () => {
@@ -155,7 +156,7 @@ it('passes the requested x64 target to the release builder', async () => {
     injected,
   )
 
-  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'activate'])
+  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
 })
 
 it('rejects symbolic fingerprint inputs instead of following them outside the desktop root', async () => {
@@ -173,6 +174,7 @@ it.each([
   ['probe staging', 'stagePacks'],
   ['release signing', 'buildRelease'],
   ['release verification', 'verifyRelease'],
+  ['release smoke verification', 'smokeRelease'],
 ] as const)('retains the literal previous marker when %s fails', async (_name, failingDependency) => {
   const { desktopRoot, cacheRoot } = fixture()
   const previous = 'a'.repeat(64)
@@ -188,6 +190,29 @@ it.each([
 
   await expect(readFile(join(cacheRoot, 'active-release.json'), 'utf8')).resolves.toBe(marker)
   expect(events).not.toContain('activate')
+})
+
+it('removes a smoke-failed cold release, preserves the prior marker, and rebuilds on the next request', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const previous = 'a'.repeat(64)
+  const marker = `{"fingerprint":"${previous}","schemaVersion":1}\n`
+  await mkdir(join(cacheRoot, 'releases', previous), { recursive: true })
+  await writeFile(join(cacheRoot, 'active-release.json'), marker)
+  const firstEvents: string[] = []
+  let releaseRoot = ''
+  const failing = dependencies(firstEvents, {
+    buildRelease: async ({ outputRoot }: { outputRoot: string }) => { firstEvents.push('build'); releaseRoot = outputRoot; await releaseBuilder({ outputRoot }) },
+    smokeRelease: async () => { firstEvents.push('smoke'); throw new Error('smoke failed') },
+  })
+
+  await expect(prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), failing)).rejects.toThrow('smoke failed')
+  expect(existsSync(releaseRoot)).toBe(false)
+  await expect(readFile(join(cacheRoot, 'active-release.json'), 'utf8')).resolves.toBe(marker)
+  expect(firstEvents).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke'])
+
+  const secondEvents: string[] = []
+  await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies(secondEvents))
+  expect(secondEvents).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
 })
 
 it('removes only a corrupted derived release before rebuilding and activation', async () => {
@@ -219,7 +244,7 @@ it('removes only a corrupted derived release before rebuilding and activation', 
   const result = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)
 
   expect(result.reused).toBe(false)
-  expect(events).toEqual(['verify', 'helpers', 'plan', 'stage', 'build', 'verify', 'activate'])
+  expect(events).toEqual(['verify', 'helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
   await expect(readFile(join(cacheRoot, 'sources', 'keep.archive'), 'utf8')).resolves.toBe('source cache')
 })
 

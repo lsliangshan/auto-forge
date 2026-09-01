@@ -15,6 +15,11 @@ const executableEntries = Object.freeze({
   pdf: 'bin/autoforge-pdf-raster',
   media: 'bin/ffmpeg',
 })
+const supportingEntries = Object.freeze({
+  pdfinfo: Object.freeze({ family: 'pdf', entry: 'bin/pdfinfo' }),
+  pdftocairo: Object.freeze({ family: 'pdf', entry: 'bin/pdftocairo' }),
+  ffprobe: Object.freeze({ family: 'media', entry: 'bin/ffprobe' }),
+})
 const icoSizes = Object.freeze([16, 24, 32, 48, 64, 128, 256])
 const icnsTypes = Object.freeze(['icp4', 'ic11', 'icp5', 'ic12', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10'])
 const pngFixture = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJYQAAAABJRU5ErkJggg==', 'base64')
@@ -43,8 +48,8 @@ async function regularFile(path) {
 }
 
 function formatOf(bytes) {
-  if (bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return 'png'
-  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes.at(-2) === 0xff && bytes.at(-1) === 0xd9) return 'jpeg'
+  if (validPng(bytes)) return 'png'
+  if (validJpeg(bytes)) return 'jpeg'
   if (bytes.subarray(0, 5).toString('ascii') === '%PDF-') return 'pdf'
   if (bytes.subarray(0, 8).equals(Buffer.from('d0cf11e0a1b11ae1', 'hex'))) return 'doc'
   if (bytes.subarray(0, 4).equals(Buffer.from('504b0304', 'hex'))) return 'zip'
@@ -55,6 +60,55 @@ function formatOf(bytes) {
   if (bytes.subarray(0, 4).toString('ascii') === 'icns') return 'icns'
   if (bytes.length >= 6 && bytes.readUInt16LE(0) === 0 && bytes.readUInt16LE(2) === 1) return 'ico'
   return undefined
+}
+
+function crc32(bytes) {
+  let value = 0xffffffff
+  for (const byte of bytes) {
+    value ^= byte
+    for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? (value >>> 1) ^ 0xedb88320 : value >>> 1
+  }
+  return (value ^ 0xffffffff) >>> 0
+}
+
+function validPng(bytes, expectedSize) {
+  if (!bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return false
+  let offset = 8
+  let width
+  let height
+  let idat = false
+  let ended = false
+  while (offset + 12 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset)
+    const type = bytes.subarray(offset + 4, offset + 8)
+    const end = offset + 12 + length
+    if (end > bytes.length || bytes.readUInt32BE(offset + 8 + length) !== crc32(bytes.subarray(offset + 4, offset + 8 + length))) return false
+    if (type.toString('ascii') === 'IHDR') {
+      if (length !== 13 || width !== undefined) return false
+      width = bytes.readUInt32BE(offset + 8); height = bytes.readUInt32BE(offset + 12)
+      if (!width || !height) return false
+    } else if (type.toString('ascii') === 'IDAT') idat ||= length > 0
+    else if (type.toString('ascii') === 'IEND') { ended = length === 0 && end === bytes.length; break }
+    offset = end
+  }
+  return Boolean(width && height && idat && ended && (expectedSize === undefined || (width === expectedSize && height === expectedSize)))
+}
+
+function validJpeg(bytes) {
+  if (bytes.length < 20 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes.at(-2) !== 0xff || bytes.at(-1) !== 0xd9) return false
+  let offset = 2
+  let frame = false
+  let scan = false
+  while (offset + 4 <= bytes.length - 2) {
+    if (bytes[offset] !== 0xff) return false
+    const marker = bytes[offset + 1]
+    if (marker === 0xda) { scan = true; break }
+    const length = bytes.readUInt16BE(offset + 2)
+    if (length < 2 || offset + 2 + length > bytes.length) return false
+    if (marker >= 0xc0 && marker <= 0xc3 && length >= 8 && bytes.readUInt16BE(offset + 5) > 0 && bytes.readUInt16BE(offset + 7) > 0) frame = true
+    offset += 2 + length
+  }
+  return frame && scan
 }
 
 async function verifyOutput(path, expectedFormat) {
@@ -82,7 +136,11 @@ function verifyIco(bytes) {
   for (let index = 0; index < icoSizes.length; index += 1) {
     const offset = 6 + index * 16
     if (offset + 16 > bytes.length) fail()
-    sizes.push(bytes[offset] || 256)
+    const size = bytes[offset] || 256
+    const payloadLength = bytes.readUInt32LE(offset + 8)
+    const payloadOffset = bytes.readUInt32LE(offset + 12)
+    if (!payloadLength || payloadOffset + payloadLength > bytes.length || !validPng(bytes.subarray(payloadOffset, payloadOffset + payloadLength))) fail()
+    sizes.push(size)
   }
   if (sizes.some((size, index) => size !== icoSizes[index])) fail()
 }
@@ -94,29 +152,35 @@ function verifyIcns(bytes) {
     if (offset + 8 > bytes.length) fail()
     const length = bytes.readUInt32BE(offset + 4)
     if (length < 8 || offset + length > bytes.length) fail()
+    const index = types.length
     types.push(bytes.subarray(offset, offset + 4).toString('ascii'))
+    if (!validPng(bytes.subarray(offset + 8, offset + length))) fail()
     offset += length
   }
   if (types.length !== icnsTypes.length || types.some((type, index) => type !== icnsTypes[index])) fail()
 }
 
-async function defaultRun({ executable, args, cwd, env, timeoutMs }) {
+async function defaultRun({ executable, args, cwd, env, signal }) {
   return await new Promise((resolveRun, rejectRun) => {
-    const child = spawn(executable, args, { cwd, env, shell: false, windowsHide: true, stdio: 'ignore' })
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL')
-      rejectRun(new Error('timeout'))
-    }, timeoutMs)
-    child.once('error', (error) => { clearTimeout(timer); rejectRun(error) })
-    child.once('exit', (code, signal) => { clearTimeout(timer); resolveRun({ code, signal }) })
+    const child = spawn(executable, args, { cwd, env, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], detached: true })
+    const stdout = []
+    child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)))
+    let aborted = false
+    const abort = () => { aborted = true; if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL') }
+    signal?.addEventListener('abort', abort, { once: true })
+    child.once('error', rejectRun)
+    child.once('close', (code, closeSignal) => { signal?.removeEventListener('abort', abort); if (aborted) rejectRun(new Error('timeout')); else resolveRun({ code, signal: closeSignal, stdout: Buffer.concat(stdout).toString('utf8') }) })
   })
 }
 
 async function runCommand(run, request, timeoutMs) {
-  let timer
-  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), timeoutMs) })
-  const outcome = await Promise.race([Promise.resolve(run({ ...request, timeoutMs })), timeout]).catch(() => fail()).finally(() => clearTimeout(timer))
+  const controller = new AbortController()
+  let timedOut = false
+  const timer = setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
+  const outcome = await Promise.resolve(run({ ...request, signal: controller.signal })).catch(() => fail()).finally(() => clearTimeout(timer))
+  if (timedOut) fail()
   if (!outcome || outcome.code !== 0 || outcome.signal) fail()
+  return outcome
 }
 
 function commandEnvironment(executable, workRoot) {
@@ -144,14 +208,22 @@ async function resolveExecutables(releaseRoot) {
     await regularFile(executable)
     result[name] = executable
   }
+  for (const [name, { family, entry }] of Object.entries(supportingEntries)) {
+    const descriptor = index.packs.find((candidate) => candidate?.name === family)
+    if (!descriptor?.entries.some((candidate) => candidate?.path === entry && candidate.executable === true)) fail()
+    const executable = join(releaseRoot, 'installed', family, descriptor.version, `${descriptor.platform}-${descriptor.arch}`, ...entry.split('/'))
+    if (!inside(releaseRoot, executable)) fail()
+    await regularFile(executable)
+    result[name] = executable
+  }
   return result
 }
 
 export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, run = defaultRun, timeoutMs } = {}) {
-  await canonicalDirectory(releaseRoot, 'Release root')
-  await canonicalDirectory(workRoot, 'Work root')
-  if (typeof run !== 'function' || (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1))) fail()
+  const canonicalWorkRoot = await canonicalDirectory(workRoot, 'Work root')
   try {
+    await canonicalDirectory(releaseRoot, 'Release root')
+    if (typeof run !== 'function' || (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1))) fail()
     if ((await readdir(workRoot)).length !== 0) fail()
     await verifyLocalDevelopmentReleaseIntegrity({ releaseRoot, platform: 'darwin', arch: process.arch === 'x64' ? 'x64' : 'arm64' })
     const executables = await resolveExecutables(releaseRoot)
@@ -163,6 +235,17 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     await Promise.all([writeFile(text, 'AutoForge smoke fixture\n'), writeFile(csv, 'name,value\nauto-forge,1\n'), writeFile(image, pngFixture)])
     await Promise.all([regularFile(text), regularFile(csv), regularFile(image)])
     const invoke = (executable, args, cwd, kind) => runCommand(run, { executable, args, cwd, env: commandEnvironment(executable, workRoot) }, timeoutMs ?? timeouts[kind])
+    const probePdf = async (path) => {
+      const result = await invoke(executables.pdfinfo, ['-f', '1', '-l', '1', path], workRoot, 'pdf')
+      if (!/^Pages:\s+1$/mu.test(result.stdout ?? '')) fail()
+    }
+    const probeMedia = async (path, container, stream) => {
+      const result = await invoke(executables.ffprobe, ['-v', 'error', '-show_entries', 'format=format_name:stream=codec_type,codec_name', '-of', 'json', path], workRoot, 'media')
+      try {
+        const parsed = JSON.parse(result.stdout)
+        if (typeof parsed?.format?.format_name !== 'string' || !parsed.format.format_name.split(',').includes(container) || !parsed.streams?.some((value) => value.codec_type === stream && typeof value.codec_name === 'string')) fail()
+      } catch { fail() }
+    }
 
     const docSourceRoot = join(workRoot, 'source-doc')
     const docxSourceRoot = join(workRoot, 'source-docx')
@@ -185,6 +268,14 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
       verifyOutputDirectory(documentXRoot, ['source.pdf'], ['libreoffice-profile']), verifyOutput(join(documentXRoot, 'source.pdf'), 'pdf'),
       verifyOutputDirectory(spreadsheetRoot, ['source.xlsx'], ['libreoffice-profile']), verifyOutput(join(spreadsheetRoot, 'source.xlsx'), 'zip'),
     ])
+    await Promise.all([probePdf(join(documentRoot, 'source.pdf')), probePdf(join(documentXRoot, 'source.pdf'))])
+    const roundtripRoot = join(workRoot, 'xlsx-roundtrip')
+    await mkdir(roundtripRoot)
+    const spreadsheet = join(spreadsheetRoot, 'source.xlsx')
+    await invoke(executables.document, documentArguments(spreadsheet, 'csv', roundtripRoot), roundtripRoot, 'document')
+    const roundtrip = join(roundtripRoot, 'source.csv')
+    await regularFile(roundtrip)
+    if ((await readFile(roundtrip, 'utf8')).replace(/^\ufeff/u, '').trim() !== 'name,value\nauto-forge,1') fail()
 
     const jpegRoot = join(workRoot, 'jpeg')
     const imagePdfRoot = join(workRoot, 'image-pdf')
@@ -204,6 +295,7 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     await Promise.all([verifyOutputDirectory(jpegRoot, ['output.jpeg']), verifyOutput(jpeg, 'jpeg'), verifyOutputDirectory(imagePdfRoot, ['output.pdf']), verifyOutput(generatedPdf, 'pdf'), verifyOutputDirectory(icoRoot, ['output.ico']), verifyOutputDirectory(icnsRoot, ['output.icns'])])
     verifyIco(icoBytes)
     verifyIcns(icnsBytes)
+    await probePdf(generatedPdf)
 
     const pdfPngRoot = join(workRoot, 'pdf-png')
     const pdfJpegRoot = join(workRoot, 'pdf-jpeg')
@@ -212,12 +304,20 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     await invoke(executables.pdf, pdfArguments('png', pdfPngRoot), pdfPngRoot, 'pdf')
     await invoke(executables.pdf, pdfArguments('jpeg', pdfJpegRoot), pdfJpegRoot, 'pdf')
     await Promise.all([verifyOutputDirectory(pdfPngRoot, ['page-001.png']), verifyOutput(join(pdfPngRoot, 'page-001.png'), 'png'), verifyOutputDirectory(pdfJpegRoot, ['page-001.jpeg']), verifyOutput(join(pdfJpegRoot, 'page-001.jpeg'), 'jpeg')])
+    const probeRoot = join(workRoot, 'pdf-probe')
+    await mkdir(probeRoot)
+    const probePng = join(probeRoot, 'generated.png')
+    const probeJpeg = join(probeRoot, 'generated.jpeg')
+    await invoke(executables.pdftocairo, ['-png', '-singlefile', generatedPdf, join(probeRoot, 'generated')], probeRoot, 'pdf')
+    await invoke(executables.pdftocairo, ['-jpeg', '-singlefile', generatedPdf, join(probeRoot, 'generated')], probeRoot, 'pdf')
+    await Promise.all([verifyOutput(probePng, 'png'), verifyOutput(probeJpeg, 'jpeg')])
 
     const wav = join(sources, 'source.wav')
     const mp4 = join(sources, 'source.mp4')
     await invoke(executables.media, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-nostats', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:a', 'pcm_s16le', '-f', 'wav', '-y', wav], sources, 'media')
     await invoke(executables.media, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-nostats', '-f', 'lavfi', '-i', 'color=c=black:s=16x16:d=1', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-f', 'mp4', '-y', mp4], sources, 'media')
     await Promise.all([verifyOutput(wav, 'wav'), verifyOutput(mp4, 'mp4')])
+    await Promise.all([probeMedia(wav, 'wav', 'audio'), probeMedia(mp4, 'mov', 'video')])
     const audioRoot = join(workRoot, 'audio')
     const videoRoot = join(workRoot, 'video')
     const extractRoot = join(workRoot, 'extract')
@@ -230,13 +330,14 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     await invoke(executables.media, mediaArguments(mp4, video, 'webm'), videoRoot, 'media')
     await invoke(executables.media, mediaArguments(mp4, extracted, 'mp3'), extractRoot, 'media')
     await Promise.all([verifyOutputDirectory(audioRoot, ['output.mp3']), verifyOutput(audio, 'mp3'), verifyOutputDirectory(videoRoot, ['output.webm']), verifyOutput(video, 'webm'), verifyOutputDirectory(extractRoot, ['output.mp3']), verifyOutput(extracted, 'mp3')])
-    const roots = ['sources', 'source-doc', 'source-docx', 'document', 'documentx', 'spreadsheet', 'jpeg', 'image-pdf', 'ico', 'icns', 'pdf-png', 'pdf-jpeg', 'audio', 'video', 'extract']
+    await Promise.all([probeMedia(audio, 'mp3', 'audio'), probeMedia(video, 'webm', 'video'), probeMedia(extracted, 'mp3', 'audio')])
+    const roots = ['sources', 'source-doc', 'source-docx', 'document', 'documentx', 'spreadsheet', 'xlsx-roundtrip', 'jpeg', 'image-pdf', 'ico', 'icns', 'pdf-png', 'pdf-jpeg', 'pdf-probe', 'audio', 'video', 'extract']
     const entries = await readdir(workRoot, { withFileTypes: true })
     if (entries.length !== roots.length || entries.some((entry) => !entry.isDirectory() || entry.isSymbolicLink() || !roots.includes(entry.name))) fail()
   } catch {
     fail()
   } finally {
-    await rm(workRoot, { recursive: true, force: true })
+    await rm(canonicalWorkRoot, { recursive: true, force: true })
   }
 }
 
