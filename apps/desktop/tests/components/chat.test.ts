@@ -1807,67 +1807,24 @@ describe('chat interactions', () => {
     ])
   })
 
-  it('renders one system provenance entry as a compact operation card', async () => {
-    const { api } = createEventApi()
-    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+  it('renders no DOM wrapper for a historical workflow provenance block', () => {
     const wrapper = mount(MessageBlock, {
       props: { block: workflowProvenanceBlock([{
         executionId: 'execution_1',
         workflowId: 'workflow.beijing',
         workflowName: '北京工作居住证',
         workflowVersion: '1.0.0',
-        source: 'development',
-        buildHash,
+        source: 'installed',
         city: '北京',
         status: 'completed',
       }]) },
       global: { plugins: [ElementPlus] },
     })
 
-    const card = wrapper.get('[data-testid="workflow-provenance"]')
-    expect(card.classes()).toContain('af-operation-card')
-    expect(card.classes()).toContain('tone-success')
-    expect(card.classes()).toContain('is-collapsed')
-    expect(card.get('.af-operation-eyebrow').text()).toBe('已使用工作流 · 北京')
-    expect(card.get('.af-operation-title strong').text()).toBe('北京工作居住证')
-    expect(card.get('[data-testid="workflow-provenance-badge"]').text()).toBe('已完成')
-    expect(card.find('[data-testid="workflow-provenance-content"]').exists()).toBe(false)
-
-    await card.get('[data-testid="toggle-workflow-provenance"]').trigger('click')
-
-    expect(card.get('[data-testid="workflow-provenance-content"]').isVisible()).toBe(true)
-    await wrapper.get('[data-testid="open-provenance-execution-execution_1"]').trigger('click')
-    expect(useExecutionStore().selectedId).toBe('execution_1')
-  })
-
-  it('summarizes multiple provenance entries and uses the most severe status tone', async () => {
-    const wrapper = mount(MessageBlock, {
-      props: { block: workflowProvenanceBlock([
-        {
-          executionId: 'execution_1', workflowId: 'workflow.beijing',
-          workflowName: '北京工作居住证', workflowVersion: '1.0.0',
-          source: 'development', buildHash, city: '北京', status: 'completed',
-        },
-        {
-          executionId: 'execution_2', workflowId: 'workflow.national',
-          workflowName: '全国政策查询', workflowVersion: '2.0.0',
-          source: 'installed', status: 'failed',
-        },
-      ]) },
-      global: { plugins: [ElementPlus] },
-    })
-
-    const card = wrapper.get('[data-testid="workflow-provenance"]')
-    expect(card.attributes('data-entry-count')).toBe('2')
-    expect(card.classes()).toContain('tone-danger')
-    expect(card.get('.af-operation-eyebrow').text()).toBe('已使用 2 个工作流')
-    expect(card.get('.af-operation-title strong').text()).toContain('北京工作居住证')
-    expect(card.get('[data-testid="workflow-provenance-badge"]').text()).toBe('含未完成项')
-
-    await card.get('[data-testid="toggle-workflow-provenance"]').trigger('click')
-
-    expect(card.text()).toContain('全国政策查询')
-    expect(card.text()).toContain('不限城市')
+    expect(wrapper.find('.message-block').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="workflow-provenance"]').exists()).toBe(false)
+    expect(wrapper.text()).toBe('')
+    expect(wrapper.text()).not.toContain('已使用工作流')
   })
 
   it('does not treat model text as authoritative workflow provenance', () => {

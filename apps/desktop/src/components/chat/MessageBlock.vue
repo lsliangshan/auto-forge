@@ -1,5 +1,8 @@
 <template>
-  <div class="message-block">
+  <div
+    v-if="block.type !== 'workflow_provenance'"
+    class="message-block"
+  >
     <!-- eslint-disable vue/no-v-html -->
     <div
       v-if="block.type === 'text'"
@@ -39,10 +42,6 @@
     />
     <KnowledgeCitation
       v-else-if="block.type === 'knowledge_citation'"
-      :block="block"
-    />
-    <WorkflowProvenance
-      v-else-if="block.type === 'workflow_provenance'"
       :block="block"
     />
     <ExecutionCard
@@ -96,7 +95,6 @@ import ExecutionCard from './ExecutionCard.vue'
 import { renderMarkdown } from './markdown'
 import MediaBlock from './MediaBlock.vue'
 import MediaGenerationBlock from './MediaGenerationBlock.vue'
-import WorkflowProvenance from './WorkflowProvenance.vue'
 import WorkflowStatusCard from './WorkflowStatusCard.vue'
 
 const props = defineProps<{ block: UiChatBlock }>()
