@@ -6,6 +6,7 @@ import { afterEach, expect, it } from 'vitest'
 import {
   developmentFingerprintInputs,
   prepareLocalDevelopmentRelease,
+  runLocalDevelopmentReleasePreparation,
 } from '../../scripts/converter-packs/prepare-local-development-release.mjs'
 
 const roots: string[] = []
@@ -273,4 +274,31 @@ it('passes callbacks only absolute paths inside the cache workspace or release r
   expect(paths.length).toBeGreaterThan(0)
   expect(paths.every((path) => path === cacheRoot || path.startsWith(`${cacheRoot}/`))).toBe(true)
   expect(paths.every((path) => !path.includes('/../'))).toBe(true)
+})
+
+it('runs local preparation with the desktop cache and reports only its status and fingerprint', async () => {
+  const desktopRoot = temporaryRoot()
+  const cacheRoot = join(desktopRoot, 'node_modules', '.cache', 'autoforge-converter-packs')
+  const lines: string[] = []
+  const prepare = async (value: Record<string, unknown>) => {
+    expect(value).toEqual({
+      desktopRoot,
+      cacheRoot,
+      platform: 'darwin',
+      arch: 'arm64',
+      compiler: '/usr/bin/clang',
+    })
+    expect(existsSync(cacheRoot)).toBe(true)
+    return { fingerprint: 'c'.repeat(64), releaseRoot: '/sensitive/release/root', reused: false }
+  }
+
+  await runLocalDevelopmentReleasePreparation({
+    desktopRoot,
+    platform: 'darwin',
+    arch: 'arm64',
+    write: (line: string) => { lines.push(line) },
+    prepare,
+  })
+
+  expect(lines).toEqual([`prepared ${'c'.repeat(64)}\n`])
 })

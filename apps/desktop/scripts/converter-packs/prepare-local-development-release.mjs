@@ -1,7 +1,8 @@
 import { Buffer } from 'node:buffer'
 import { createPrivateKey, createPublicKey } from 'node:crypto'
 import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   activateDevelopmentRelease,
   developmentReleasePaths,
@@ -184,5 +185,35 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     return { fingerprint, releaseRoot: paths.release, reused: false }
   } finally {
     await rm(privateRoot, { recursive: true, force: true })
+  }
+}
+
+export async function runLocalDevelopmentReleasePreparation({
+  desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..'),
+  platform = process.platform,
+  arch = process.arch,
+  prepare = prepareLocalDevelopmentRelease,
+  write = (line) => process.stdout.write(line),
+} = {}) {
+  const cacheRoot = join(desktopRoot, 'node_modules', '.cache', 'autoforge-converter-packs')
+  await mkdir(cacheRoot, { recursive: true, mode: 0o700 })
+  const result = await prepare({
+    desktopRoot,
+    cacheRoot,
+    platform,
+    arch,
+    compiler: '/usr/bin/clang',
+  })
+  write(`${result.reused ? 'reused' : 'prepared'} ${result.fingerprint}\n`)
+  return result
+}
+
+const entry = process.argv[1]
+if (entry && import.meta.url === pathToFileURL(resolve(entry)).href) {
+  try {
+    await runLocalDevelopmentReleasePreparation()
+  } catch (error) {
+    process.stderr.write(`Local development release preparation failed: ${error instanceof Error ? error.message : 'unknown error'}\n`)
+    process.exitCode = 1
   }
 }

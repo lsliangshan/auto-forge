@@ -1,12 +1,14 @@
 import { EventEmitter } from 'node:events'
 import { spawnSync } from 'node:child_process'
-import { rm, writeFile } from 'node:fs/promises'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 interface SupervisorModule {
   buildWorkflowRunner(options: Record<string, unknown>): number
-  localDevelopmentConverterReleaseRoot(cwd: string): string
+  resolveLocalDevelopmentConverterReleaseRoot(cwd: string): string
   resolvePinnedElectronViteCli(): string
   resolvePinnedTsupCli(): string
   runElectronViteDev(options: Record<string, unknown>): Promise<number>
@@ -20,20 +22,38 @@ async function loadSupervisor(): Promise<SupervisorModule> {
   return import('../../scripts/dev.mjs') as Promise<SupervisorModule>
 }
 
+const roots: string[] = []
+
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
+
 function createHarness(platform: NodeJS.Platform = 'darwin') {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'autoforge-dev-supervisor-')))
+  roots.push(root)
+  const cwd = join(root, 'desktop')
+  const fingerprint = 'a'.repeat(64)
+  const cacheRoot = join(cwd, 'node_modules', '.cache', 'autoforge-converter-packs')
+  const releaseRoot = join(cacheRoot, 'releases', fingerprint)
+  mkdirSync(releaseRoot, { recursive: true })
+  writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`)
   const child = new FakeChild()
   const signals = new EventEmitter()
   const buildWorkflowRunner = vi.fn(() => 0)
   const spawn = vi.fn(() => child)
   return {
     buildWorkflowRunner,
+    cacheRoot,
     child,
+    cwd,
+    fingerprint,
+    releaseRoot,
     signals,
     spawn,
     options: {
       cli: '/workspace/electron-vite.js',
       executable: '/runtime/node',
-      cwd: '/workspace/apps/desktop',
+      cwd,
       environment: { EXISTING: 'preserved' },
       platform,
       buildWorkflowRunner,
@@ -44,11 +64,49 @@ function createHarness(platform: NodeJS.Platform = 'darwin') {
 }
 
 describe('development supervisor', () => {
-  it('pins the signed local converter release under the ignored dependency cache', async () => {
+  it('resolves the canonical active local converter release under the ignored dependency cache', async () => {
     const supervisor = await loadSupervisor()
-    expect(supervisor.localDevelopmentConverterReleaseRoot('/workspace/apps/desktop')).toBe(
-      '/workspace/apps/desktop/node_modules/.cache/autoforge-converter-packs/release',
-    )
+    const harness = createHarness()
+
+    expect(supervisor.resolveLocalDevelopmentConverterReleaseRoot(harness.cwd)).toBe(harness.releaseRoot)
+  })
+
+  it.each([
+    ['missing marker', (harness: ReturnType<typeof createHarness>) => {
+      rmSync(join(harness.cacheRoot, 'active-release.json'))
+    }],
+    ['malformed marker', (harness: ReturnType<typeof createHarness>) => {
+      writeFileSync(join(harness.cacheRoot, 'active-release.json'), '{not json}\n')
+    }],
+    ['marker with unknown keys', (harness: ReturnType<typeof createHarness>) => {
+      writeFileSync(join(harness.cacheRoot, 'active-release.json'), `{"fingerprint":"${harness.fingerprint}","schemaVersion":1,"extra":true}\n`)
+    }],
+    ['path escape marker', (harness: ReturnType<typeof createHarness>) => {
+      writeFileSync(join(harness.cacheRoot, 'active-release.json'), '{"fingerprint":"../../escape","schemaVersion":1}\n')
+    }],
+    ['missing release', (harness: ReturnType<typeof createHarness>) => {
+      rmSync(harness.releaseRoot, { recursive: true })
+    }],
+    ['symlinked release', (harness: ReturnType<typeof createHarness>) => {
+      const external = join(harness.cwd, 'external-release')
+      mkdirSync(external)
+      rmSync(harness.releaseRoot, { recursive: true })
+      symlinkSync(external, harness.releaseRoot)
+    }],
+    ['noncanonical release', (harness: ReturnType<typeof createHarness>) => {
+      const releases = join(harness.cacheRoot, 'releases')
+      const external = join(harness.cwd, 'external-releases')
+      rmSync(releases, { recursive: true })
+      mkdirSync(join(external, harness.fingerprint), { recursive: true })
+      symlinkSync(external, releases)
+    }],
+  ])('fails closed for a %s', async (_name, mutate) => {
+    const supervisor = await loadSupervisor()
+    const harness = createHarness()
+
+    mutate(harness)
+
+    expect(() => supervisor.resolveLocalDevelopmentConverterReleaseRoot(harness.cwd)).toThrow()
   })
 
   it('resolves the pinned electron-vite CLI', async () => {
@@ -88,6 +146,7 @@ describe('development supervisor', () => {
     const supervisor = await loadSupervisor()
     const desktopRoot = resolve(import.meta.dirname, '../..')
     const workflowEntry = join(desktopRoot, 'node_modules', '.cache', 'autoforge-dev-worker-protocol.mjs')
+    await mkdir(join(desktopRoot, 'node_modules', '.cache'), { recursive: true })
     await writeFile(workflowEntry, 'export default { async run() { return null } }\n')
 
     try {
@@ -167,9 +226,9 @@ describe('development supervisor', () => {
       '/runtime/node',
       ['/workspace/electron-vite.js', 'dev'],
       {
-        cwd: '/workspace/apps/desktop',
+        cwd: harness.cwd,
         env: {
-          AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT: '/workspace/apps/desktop/node_modules/.cache/autoforge-converter-packs/release',
+          AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT: harness.releaseRoot,
           EXISTING: 'preserved',
         },
         stdio: 'inherit',

@@ -37,6 +37,15 @@ describe('main process build', () => {
     expect(existsSync(stageScriptPath)).toBe(false)
   })
 
+  it('prepares the full local converter release before development starts', () => {
+    const packageJsonPath = fileURLToPath(new URL('../../package.json', import.meta.url))
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> }
+    const removedImageOnlyScript = ['create', 'local', 'development', 'image', 'release'].join('-') + '.mjs'
+
+    expect(packageJson.scripts?.predev).toContain('prepare-local-development-release.mjs')
+    expect(packageJson.scripts?.predev).not.toContain(removedImageOnlyScript)
+  })
+
   it('packages only fail-closed converter bootstrap trust metadata, never keys or engines', () => {
     const packageJsonPath = fileURLToPath(new URL('../../package.json', import.meta.url))
     const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { scripts?: Record<string, string> }

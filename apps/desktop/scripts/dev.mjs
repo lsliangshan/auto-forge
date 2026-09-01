@@ -1,6 +1,7 @@
 import { spawn as spawnChild, spawnSync as spawnChildSync } from 'node:child_process'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL, URL } from 'node:url'
 
@@ -39,8 +40,42 @@ export function buildWorkflowRunner({
   return result.status ?? 1
 }
 
-export function localDevelopmentConverterReleaseRoot(cwd) {
-  return resolve(cwd, 'node_modules', '.cache', 'autoforge-converter-packs', 'release')
+export function resolveLocalDevelopmentConverterReleaseRoot(cwd) {
+  const cacheRoot = resolve(cwd, 'node_modules', '.cache', 'autoforge-converter-packs')
+  const releasesRoot = join(cacheRoot, 'releases')
+  const markerPath = join(cacheRoot, 'active-release.json')
+  const markerDetails = lstatSync(markerPath)
+  if (!markerDetails.isFile() || markerDetails.isSymbolicLink()) {
+    throw new Error('Development release marker must be a regular file')
+  }
+
+  const markerBytes = readFileSync(markerPath, 'utf8')
+  let marker
+  try {
+    marker = JSON.parse(markerBytes)
+  } catch {
+    throw new Error('Development release marker is invalid')
+  }
+  if (Object.getPrototypeOf(marker) !== Object.prototype || Object.keys(marker).length !== 2
+    || marker.schemaVersion !== 1 || typeof marker.fingerprint !== 'string'
+    || !/^[a-f0-9]{64}$/.test(marker.fingerprint)
+    || markerBytes !== `{"fingerprint":"${marker.fingerprint}","schemaVersion":1}\n`) {
+    throw new Error('Development release marker schema is invalid')
+  }
+
+  const releaseRoot = join(releasesRoot, marker.fingerprint)
+  if (relative(releasesRoot, releaseRoot) !== marker.fingerprint) {
+    throw new Error('Development release is outside releases')
+  }
+  const releaseDetails = lstatSync(releaseRoot)
+  if (!releaseDetails.isDirectory() || releaseDetails.isSymbolicLink()) {
+    throw new Error('Development release must be a non-symbolic directory')
+  }
+  const canonicalRelease = realpathSync(releaseRoot)
+  if (canonicalRelease !== releaseRoot || relative(releasesRoot, canonicalRelease) !== marker.fingerprint) {
+    throw new Error('Development release must be canonical and remain inside releases')
+  }
+  return releaseRoot
 }
 
 export async function runElectronViteDev({
@@ -53,12 +88,13 @@ export async function runElectronViteDev({
   spawn = spawnChild,
   signals = process,
 } = {}) {
+  const developmentReleaseRoot = resolveLocalDevelopmentConverterReleaseRoot(cwd)
   const buildStatus = buildRunner({ cwd, environment })
   if (buildStatus !== 0) return Promise.resolve(buildStatus)
   return new Promise((resolveStatus, reject) => {
     const childEnvironment = {
       ...environment,
-      AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT: localDevelopmentConverterReleaseRoot(cwd),
+      AUTOFORGE_DEV_CONVERTER_RELEASE_ROOT: developmentReleaseRoot,
     }
     const child = spawn(executable, [cli, 'dev'], {
       cwd,
