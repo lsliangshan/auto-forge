@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import type { FileHandle } from 'node:fs/promises'
-import { lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path'
 import { toSafeAppError, type ConversionTargetFormat } from '@autoforge/shared'
 import { sanitizeDisplayName } from '../chat/local-conversion-intent.js'
@@ -11,6 +11,7 @@ import { imageIconAdapter } from './adapters/image-icon.js'
 import { documentAdapter } from './adapters/document.js'
 import { mediaAdapter } from './adapters/media.js'
 import { pdfAdapter } from './adapters/pdf.js'
+import { CONVERSION_LIMITS } from './conversion-catalog.js'
 import type {
   ConversionArtifactService,
   ConversionArtifactServiceDatabase,
@@ -39,6 +40,7 @@ import {
   createConversionProcessRunner,
   createNodeConversionProcessTreePort,
 } from './conversion-process-runner.js'
+import { renderMarkdownConversionDocument } from './markdown-conversion-source.js'
 
 const adapters = [
   { adapter: imageIconAdapter, pack: 'image-icon' },
@@ -80,6 +82,27 @@ function selectedAdapter(
   targetFormat: ConversionTargetFormat,
 ) {
   return available.find(({ adapter }) => adapter.supports(input.probe, targetFormat))
+}
+
+async function renderedInputPath(
+  source: ResolvedOwnedInput,
+  privateInputPath: string,
+  workRoot: string,
+  signal: AbortSignal,
+): Promise<string> {
+  if (source.probe.format !== 'markdown') return privateInputPath
+  let markdown: string
+  try {
+    markdown = new TextDecoder('utf-8', { fatal: true }).decode(await readFile(privateInputPath))
+  } catch {
+    throw failure('CONVERSION_INPUT_INVALID')
+  }
+  if (signal.aborted) throw failure('CONVERSION_CANCELLED')
+  const html = renderMarkdownConversionDocument(markdown)
+  if (Buffer.byteLength(html) > CONVERSION_LIMITS.outputBytes) throw failure('CONVERSION_INPUT_INVALID')
+  const path = join(workRoot, 'input.html')
+  await writeFile(path, html, { flag: 'wx', mode: 0o600 })
+  return path
 }
 
 function concurrencyClass(job: ConversionJob): ConversionConcurrencyClass {
@@ -326,8 +349,9 @@ export function createProductionConversionJobRuntime(
         if (workMetadata.isSymbolicLink() || !workMetadata.isDirectory()) throw failure('CONVERSION_INPUT_INVALID')
         const privateInputPath = join(workRoot, `input.${source.input.probe.format}`)
         await copyPrivateInput(source.input, privateInputPath, source.byteSize, source.sha256)
+        const converterInputPath = await renderedInputPath(source.input, privateInputPath, workRoot, signal)
         const plan = selected.adapter.plan(source.input.probe, {
-          inputPath: privateInputPath,
+          inputPath: converterInputPath,
           targetFormat: job.targetFormat,
           ...(job.preset === undefined ? {} : { preset: job.preset }),
         }, lease, workRoot)

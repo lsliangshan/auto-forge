@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { createPrivateKey, createPublicKey, sign } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { chmod, lstat, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import process from 'node:process'
@@ -12,6 +13,8 @@ import {
 } from './pack-tooling-lib.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
+const require = createRequire(import.meta.url)
+const electronPath = require('electron')
 const privatePkcs8Prefix = Buffer.from('302e020100300506032b657004220420', 'hex')
 const developmentSeed = Buffer.from(
   '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60',
@@ -55,16 +58,105 @@ fi
 exit 64
 `, 'utf8')
 
-const license = Buffer.from(
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
+const documentRenderer = Buffer.from(`'use strict'
+const { app, BrowserWindow } = require('electron')
+const { writeFile } = require('node:fs/promises')
+const { pathToFileURL } = require('node:url')
+
+const [inputPath, outputPath, profilePath] = process.argv.slice(2)
+if (!inputPath || !outputPath || !profilePath) process.exit(64)
+app.setPath('userData', profilePath)
+app.commandLine.appendSwitch('disable-gpu')
+
+app.whenReady().then(async () => {
+  const window = new BrowserWindow({
+    show: false,
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true },
+  })
+  const inputUrl = pathToFileURL(inputPath).href
+  window.webContents.session.webRequest.onBeforeRequest((details, callback) => {
+    callback({ cancel: details.url !== inputUrl && !details.url.startsWith('data:') })
+  })
+  await window.loadURL(inputUrl)
+  await window.webContents.executeJavaScript('document.fonts.ready.then(() => true)', true)
+  const pdf = await window.webContents.printToPDF({
+    printBackground: true,
+    pageSize: 'A4',
+    margins: { top: 0, bottom: 0, left: 0, right: 0 },
+  })
+  await writeFile(outputPath, pdf, { flag: 'wx', mode: 0o600 })
+  window.destroy()
+  app.quit()
+}).catch((error) => {
+  process.stderr.write(String(error?.message ?? error) + '\\n')
+  app.exit(1)
+})
+`, 'utf8')
+
+const documentConverter = Buffer.from(`#!/bin/sh
+set -eu
+electron_path=${shellQuote(electronPath)}
+output_format=
+output_dir=
+input_path=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -env:UserInstallation=*|--headless|--invisible|--nologo|--nodefault|--nolockcheck|--norestore) shift ;;
+    --convert-to) [ "$#" -ge 2 ] || exit 64; output_format=$2; shift 2 ;;
+    --outdir) [ "$#" -ge 2 ] || exit 64; output_dir=$2; shift 2 ;;
+    --) shift; [ "$#" -eq 1 ] || exit 64; input_path=$1; shift ;;
+    *) exit 64 ;;
+  esac
+done
+[ "$output_format" = "pdf" ] && [ -n "$output_dir" ] && [ -n "$input_path" ] || exit 64
+input_name=\${input_path##*/}
+case "$input_name" in
+  *.html) input_kind=html ;;
+  *.txt) input_kind=text ;;
+  *) exit 65 ;;
+esac
+output_name=\${input_name%.*}.pdf
+umask 077
+if [ "$input_kind" = html ]; then
+  script_dir=\${0%/*}
+  "$electron_path" "$script_dir/render-html-to-pdf.cjs" "$input_path" "$output_dir/$output_name" "$output_dir/electron-profile"
+else
+  /usr/sbin/cupsfilter -i text/plain -m application/pdf "$input_path" > "$output_dir/$output_name"
+fi
+`, 'utf8')
+
+const imageLicense = Buffer.from(
   'Development-only adapter invoking /usr/bin/sips, a component of macOS. Not for production distribution.\n',
   'utf8',
 )
 
-function localEntries() {
+const documentLicense = Buffer.from(
+  'Development-only adapter invoking bundled Electron or /usr/sbin/cupsfilter. Not for production distribution.\n',
+  'utf8',
+)
+
+function localPacks() {
   return [
-    { path: 'bin/autoforge-image-converter', bytes: converter, executable: true, role: 'executable' },
-    { path: 'bin/vips', bytes: vipsProbe, executable: true, role: 'executable' },
-    { path: 'LICENSES/local-development.txt', bytes: license, executable: false, role: 'license' },
+    {
+      name: 'image-icon',
+      entries: [
+        { path: 'bin/autoforge-image-converter', bytes: converter, executable: true, role: 'executable' },
+        { path: 'bin/vips', bytes: vipsProbe, executable: true, role: 'executable' },
+        { path: 'LICENSES/local-development.txt', bytes: imageLicense, executable: false, role: 'license' },
+      ],
+    },
+    {
+      name: 'document',
+      entries: [
+        { path: 'program/soffice', bytes: documentConverter, executable: true, role: 'executable' },
+        { path: 'program/render-html-to-pdf.cjs', bytes: documentRenderer, executable: false, role: 'code' },
+        { path: 'LICENSES/local-development.txt', bytes: documentLicense, executable: false, role: 'license' },
+      ],
+    },
   ]
 }
 
@@ -86,36 +178,40 @@ export async function createLocalDevelopmentImageRelease({ output, platform, arc
   }
   const temporary = await realpath(await mkdtemp(join(parent, '.local-converter-release-')))
   try {
-    const entries = localEntries()
-    const archive = createRestrictedUstar(entries)
     const version = '0.0.0-dev'
-    const descriptor = {
-      name: 'image-icon',
-      version,
-      platform,
-      arch,
-      archiveUrl: `https://local-development.invalid/image-icon-${version}-${platform}-${arch}.tar`,
-      archiveSha256: sha256(archive),
-      archiveBytes: archive.byteLength,
-      entries: entries.map((entry) => ({
-        path: entry.path,
-        sha256: sha256(entry.bytes),
-        bytes: entry.bytes.byteLength,
-        executable: entry.executable,
-        role: entry.role,
-      })),
-    }
+    const packs = localPacks()
+    const descriptors = packs.map(({ name, entries }) => {
+      const archive = createRestrictedUstar(entries)
+      return {
+        name,
+        version,
+        platform,
+        arch,
+        archiveUrl: `https://local-development.invalid/${name}-${version}-${platform}-${arch}.tar`,
+        archiveSha256: sha256(archive),
+        archiveBytes: archive.byteLength,
+        entries: entries.map((entry) => ({
+          path: entry.path,
+          sha256: sha256(entry.bytes),
+          bytes: entry.bytes.byteLength,
+          executable: entry.executable,
+          role: entry.role,
+        })),
+      }
+    })
     const index = validateIndex({
       schemaVersion: 1,
       generatedAt: '2026-08-31T00:00:00.000Z',
       sequence: 1,
-      packs: [descriptor],
+      packs: descriptors,
     }, 'test')
     const indexBytes = canonicalBytes(index)
     const signature = sign(null, indexBytes, developmentPrivateKey).toString('base64')
     const publicKey = createPublicKey(developmentPrivateKey).export({ format: 'pem', type: 'spki' })
-    const installedRoot = join(temporary, 'installed', 'image-icon', version, `${platform}-${arch}`)
-    await Promise.all(entries.map((entry) => writeInstalledEntry(installedRoot, entry)))
+    await Promise.all(packs.flatMap(({ name, entries }) => {
+      const installedRoot = join(temporary, 'installed', name, version, `${platform}-${arch}`)
+      return entries.map((entry) => writeInstalledEntry(installedRoot, entry))
+    }))
     await Promise.all([
       writeFile(join(temporary, 'index.json'), indexBytes, { flag: 'wx', mode: 0o600 }),
       writeFile(join(temporary, 'index.sig'), `${signature}\n`, { flag: 'wx', mode: 0o600 }),

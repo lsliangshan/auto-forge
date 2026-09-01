@@ -10,6 +10,7 @@ import {
   loadLocalDevelopmentConverterRelease,
   selectConversionRuntimeFactory,
 } from '../../electron/main/conversion/local-development-conversion-runtime.js'
+import { renderMarkdownConversionDocument } from '../../electron/main/conversion/markdown-conversion-source.js'
 import {
   createLocalDevelopmentImageRelease,
   replaceLocalDevelopmentImageRelease,
@@ -156,6 +157,37 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     lease.release()
   })
 
+  it('converts rendered Markdown HTML to PDF through the signed document pack executable', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-markdown-pdf-pack-')))
+    roots.push(root)
+    const releaseRoot = join(root, 'release')
+    await createLocalDevelopmentImageRelease({ output: releaseRoot, platform: 'darwin', arch: process.arch })
+    const release = await loadLocalDevelopmentConverterRelease(releaseRoot)
+    const manager = new ConverterPackManager({
+      packsRoot: release.packsRoot,
+      rootPublicKeyPem: release.rootPublicKeyPem,
+      platform: 'darwin',
+      arch: process.arch,
+    })
+    const lease = await manager.acquire({ signedIndex: release.signedIndex, name: 'document' })
+    const executable = lease.executables['program/soffice']!
+    const source = join(root, 'source.html')
+    const output = join(root, 'source.pdf')
+    await writeFile(source, renderMarkdownConversionDocument('# AutoForge\n\n- Markdown to PDF\n- 中文内容\n'))
+    const environment = { ...process.env }
+    delete environment.ELECTRON_RUN_AS_NODE
+
+    const converted = spawnSync(executable, [
+      `-env:UserInstallation=file://${join(root, 'profile')}`,
+      '--headless', '--invisible', '--nologo', '--nodefault', '--nolockcheck', '--norestore',
+      '--convert-to', 'pdf', '--outdir', root, '--', source,
+    ], { env: environment })
+
+    expect(converted.status, converted.stderr.toString()).toBe(0)
+    expect((await readFile(output)).subarray(0, 5).toString('ascii')).toBe('%PDF-')
+    lease.release()
+  })
+
   it('binds the workflow runtime to the signed local release', async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-runtime-')))
     roots.push(root)
@@ -163,6 +195,7 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     await createLocalDevelopmentImageRelease({ output: releaseRoot, platform: 'darwin', arch: process.arch })
     const sourcePng = join(root, 'source.png')
     const source = join(root, 'source.jpg')
+    const sourceMarkdown = join(root, 'source.markdown')
     await writeFile(sourcePng, Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
       'base64',
@@ -170,8 +203,12 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     expect(spawnSync('/usr/bin/sips', ['-s', 'format', 'jpeg', sourcePng, '--out', source]).status).toBe(0)
     const sourcePngBytes = await readFile(sourcePng)
     const sourceBytes = await readFile(source)
+    await writeFile(sourceMarkdown, '# AutoForge\n\nMarkdown to PDF\n')
+    const sourceMarkdownBytes = await readFile(sourceMarkdown)
     const batchOutput = join(root, 'batch-output.png')
+    const batchPdfOutput = join(root, 'batch-output.pdf')
     await writeFile(batchOutput, Buffer.alloc(0), { mode: 0o600 })
+    await writeFile(batchPdfOutput, Buffer.alloc(0), { mode: 0o600 })
     const factory = createLocalDevelopmentConversionRuntimeFactory({
       releaseRoot,
       platform: 'darwin',
@@ -187,14 +224,16 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
         conversionArtifacts: {
           getOwned: (id) => {
             const png = id === 'source-png'
-            const bytes = png ? sourcePngBytes : sourceBytes
+            const markdown = id === 'source-markdown'
+            const bytes = markdown ? sourceMarkdownBytes : png ? sourcePngBytes : sourceBytes
             return {
               id, ownerUserId: 'alice', executionId: 'execution', conversionJobId: null,
-              role: 'input' as const, displayName: png ? 'source.png' : 'source.jpg',
-              detectedFormat: png ? 'png' as const : 'jpeg' as const,
-              mimeType: png ? 'image/png' : 'image/jpeg', byteSize: bytes.byteLength,
-              sha256: createHash('sha256').update(bytes).digest('hex'),
-              relativePath: png ? 'source.png' : 'source.jpg', status: 'ready' as const,
+              role: 'input' as const, displayName: markdown ? 'source.md' : png ? 'source.png' : 'source.jpg',
+              detectedFormat: markdown ? 'markdown' as const : png ? 'png' as const : 'jpeg' as const,
+              mimeType: markdown ? 'text/markdown' : png ? 'image/png' : 'image/jpeg', byteSize: bytes.byteLength,
+              sha256: createHash('sha256').update(bytes).digest('hex'), relativePath: markdown
+                ? 'source.markdown'
+                : png ? 'source.png' : 'source.jpg', status: 'ready' as const,
               metadata: null, createdAt: 0,
             }
           },
@@ -205,19 +244,22 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
       artifacts: {
         resolveOwnedInput: async (input) => {
           const png = input.displayName === 'source.png'
-          const selectedSource = png ? sourcePng : source
+          const markdown = input.displayName === 'source.md'
+          const selectedSource = markdown ? sourceMarkdown : png ? sourcePng : source
           const sourceHandle = await open(selectedSource, 'r')
           return {
             handle: sourceHandle,
             mainPath: selectedSource,
-            probe: { kind: 'image' as const, format: png ? 'png' as const : 'jpeg' as const, width: 1, height: 1, frameCount: 1 },
+            probe: markdown
+              ? { kind: 'file' as const, format: 'markdown' as const, frameCount: 1 }
+              : { kind: 'image' as const, format: png ? 'png' as const : 'jpeg' as const, width: 1, height: 1, frameCount: 1 },
             close: async () => { await sourceHandle.close() },
           }
         },
         createOutputWriter: async () => { throw new Error('unexpected createOutputWriter') },
-        createOutputBatch: async () => ({
+        createOutputBatch: async (outputs) => ({
           atomicJobCompletion: true,
-          outputs: [{ tempPath: batchOutput }],
+          outputs: [{ tempPath: outputs[0]?.targetFormat === 'pdf' ? batchPdfOutput : batchOutput }],
           commit: async () => [],
           abort: async () => undefined,
         }),
@@ -238,6 +280,16 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     expect((await readFile(batchOutput)).subarray(0, 8)).toEqual(Buffer.from('89504e470d0a1a0a', 'hex'))
     await attempt.abort()
     lease.release()
+    const markdownJob = {
+      ...job, id: 'markdown-to-pdf-job', sourceId: 'source-markdown', targetFormat: 'pdf',
+    } as const
+    const documentLease = await binding.runtime.acquirePack(markdownJob, controller.signal)
+    const documentAttempt = await binding.runtime.prepare(markdownJob, documentLease, controller.signal)
+    await documentAttempt.execute({ signal: controller.signal, onProgress: () => true })
+    expect(documentLease.name).toBe('document')
+    expect((await readFile(batchPdfOutput)).subarray(0, 5).toString('ascii')).toBe('%PDF-')
+    await documentAttempt.abort()
+    documentLease.release()
     const pdfLease = await binding.runtime.acquirePack(
       { ...job, id: 'png-to-pdf-job', sourceId: 'source-png', targetFormat: 'pdf' },
       controller.signal,

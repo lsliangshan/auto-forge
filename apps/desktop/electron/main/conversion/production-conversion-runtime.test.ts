@@ -122,7 +122,7 @@ function deferred<T>() {
 async function fixture(input: {
   name: string
   mimeType: string
-  format: 'pdf' | 'icns' | 'ico'
+  format: 'pdf' | 'icns' | 'ico' | 'markdown'
   bytes: Buffer
   invalidOutputIndex?: number
   processGate?: { started: { resolve(value: void): void }; release: Promise<void> }
@@ -154,10 +154,14 @@ async function fixture(input: {
     },
   })
   const packRoot = join(dataRoot, 'signed-pack')
-  await mkdir(join(packRoot, 'bin'), { recursive: true })
+  await Promise.all([
+    mkdir(join(packRoot, 'bin'), { recursive: true }),
+    mkdir(join(packRoot, 'program'), { recursive: true }),
+  ])
   const executables = {
     pdf: join(packRoot, 'bin/autoforge-pdf-raster'),
     'image-icon': join(packRoot, 'bin/autoforge-image-converter'),
+    document: join(packRoot, 'program/soffice'),
   } as const
   const observedProcessInputs: Buffer[] = []
   await Promise.all(Object.values(executables).map((path) => writeFile(path, 'signed executable')))
@@ -166,6 +170,8 @@ async function fixture(input: {
       let leaseExecutables: Readonly<Record<string, string>>
       if (name === 'pdf') {
         leaseExecutables = Object.freeze({ 'bin/autoforge-pdf-raster': executables.pdf })
+      } else if (name === 'document') {
+        leaseExecutables = Object.freeze({ 'program/soffice': executables.document })
       } else {
         leaseExecutables = Object.freeze({ 'bin/autoforge-image-converter': executables['image-icon'] })
       }
@@ -181,15 +187,17 @@ async function fixture(input: {
       if (input.replaceInputBeforeProcess) {
         await rename(join(ownerRoot, relativePath), join(ownerRoot, `${relativePath}.validated`))
         await writeFile(join(ownerRoot, relativePath), input.replaceInputBeforeProcess)
-        observedProcessInputs.push(await readFile(plan.args.at(-1)!))
       }
+      observedProcessInputs.push(await readFile(plan.args.at(-1)!))
       for (const [index, output] of plan.outputs.entries()) {
         const representation = output.metadata?.iconRepresentation
         await writeFile(
           output.path,
           index === input.invalidOutputIndex
             ? Buffer.from('not a valid conversion output')
-            : png(representation?.pixelWidth ?? index + 1, representation?.pixelHeight ?? index + 1),
+            : output.format === 'pdf'
+              ? pdf(1)
+              : png(representation?.pixelWidth ?? index + 1, representation?.pixelHeight ?? index + 1),
         )
       }
       if (input.processGate) {
@@ -216,6 +224,26 @@ async function fixture(input: {
 }
 
 describe('production conversion runtime', () => {
+  it('renders Markdown to HTML before handing it to the document converter', async () => {
+    const source = Buffer.from('# AutoForge\n\n- First item\n- Second item\n')
+    const { database, observedProcessInputs, runner } = await fixture({
+      name: 'guide.md', mimeType: 'text/markdown', format: 'markdown', bytes: source,
+    })
+    runner.start()
+    const submitted = runner.submit({
+      executionId: 'execution', sourceKind: 'artifact', sourceId: 'source', targetFormat: 'pdf',
+    })
+    await runner.idle()
+
+    expect(database.conversionJobs.getOwned(submitted.jobId, 'alice')).toMatchObject({ status: 'completed' })
+    expect(observedProcessInputs).toHaveLength(1)
+    const rendered = observedProcessInputs[0]!.toString('utf8')
+    expect(rendered).toContain('<h1>AutoForge</h1>')
+    expect(rendered).toContain('<li>First item</li>')
+    expect(rendered).not.toContain('# AutoForge')
+    database.close()
+  })
+
   it('persists all three PDF pages in deterministic order through the real job runner', async () => {
     const { database, runner, dataRoot } = await fixture({
       name: 'annual-report.pdf', mimeType: 'application/pdf', format: 'pdf', bytes: pdf(3),

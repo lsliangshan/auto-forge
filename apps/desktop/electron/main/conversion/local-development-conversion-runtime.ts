@@ -2,6 +2,7 @@ import { constants } from 'node:fs'
 import type { FileHandle } from 'node:fs/promises'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
+import { documentAdapter } from './adapters/document.js'
 import { imageIconAdapter } from './adapters/image-icon.js'
 import { ConverterPackManager } from './converter-pack-manager.js'
 import type { SignedConverterPackIndex } from './converter-pack-types.js'
@@ -28,6 +29,15 @@ const localDevelopmentImageAdapter: ConverterAdapter = {
       || (['png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif'].includes(input.format) && target === 'pdf')
     return supported
       && imageIconAdapter.supports(input, target)
+  },
+}
+
+const localDevelopmentDocumentAdapter: ConverterAdapter = {
+  ...documentAdapter,
+  supports(input, target) {
+    return (input.format === 'markdown' || input.format === 'txt')
+      && target === 'pdf'
+      && documentAdapter.supports(input, target)
   },
 }
 
@@ -143,7 +153,10 @@ export function createLocalDevelopmentConversionRuntimeFactory(options: {
         packManager,
         signedIndex: async () => release.signedIndex,
         processRunner,
-        adapters: [{ adapter: localDevelopmentImageAdapter, pack: 'image-icon' }],
+        adapters: [
+          { adapter: localDevelopmentImageAdapter, pack: 'image-icon' },
+          { adapter: localDevelopmentDocumentAdapter, pack: 'document' },
+        ],
       }),
     }
   }

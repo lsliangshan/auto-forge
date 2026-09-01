@@ -154,6 +154,7 @@ describe('MediaAssetService imports', () => {
   })
 
   it.each([
+    ['notes.md', Buffer.from('# hello\n\n世界'), 'text/markdown'],
     ['notes.weird', Buffer.from('hello\n世界'), 'text/plain'],
     ['README', Buffer.from('extensionless text'), 'text/plain'],
     ['payload.bin', Buffer.from([0x00, 0xff, 0x00, 0x01]), 'application/octet-stream'],

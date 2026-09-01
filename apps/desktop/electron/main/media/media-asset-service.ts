@@ -138,6 +138,7 @@ export interface MediaAssetFileSystem {
 
 type FileMimeType =
   | 'text/plain'
+  | 'text/markdown'
   | 'application/pdf'
   | 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
   | 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -225,6 +226,12 @@ function hasSignature(bytes: Uint8Array, signature: readonly number[]): boolean 
 
 function detectedFile(mimeType: FileMimeType): DetectedAsset {
   return { kind: 'file', mimeType, extension: 'bin', inlineSafe: false }
+}
+
+function detectedUnknownFile(name: string, validUtf8: boolean): DetectedAsset {
+  if (!validUtf8) return detectedFile('application/octet-stream')
+  const suffix = /\.([^.]+)$/u.exec(name)?.[1]?.toLowerCase()
+  return detectedFile(suffix === 'md' || suffix === 'markdown' ? 'text/markdown' : 'text/plain')
 }
 
 function detectKnownAsset(bytes: Uint8Array, name: string): DetectedAsset | undefined {
@@ -814,7 +821,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
           validUtf8 = false
         }
       }
-      const detected = knownDetected ?? detectedFile(validUtf8 ? 'text/plain' : 'application/octet-stream')
+      const detected = knownDetected ?? detectedUnknownFile(basename(sourcePath), validUtf8)
       if (byteSize !== opened.size) throw failure('MEDIA_IMPORT_FAILED')
       const afterHandle = snapshot(await sourceHandle.stat())
       const afterPath = await filesystem.lstat(sourcePath)
@@ -927,7 +934,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
           validUtf8 = false
         }
       }
-      const detected = knownDetected ?? detectedFile(validUtf8 ? 'text/plain' : 'application/octet-stream')
+      const detected = knownDetected ?? detectedUnknownFile(record.originalName, validUtf8)
       const after = snapshot(await handle.stat())
       const afterPath = await filesystem.lstat(absolutePath)
       if (
