@@ -40,12 +40,12 @@ import {
   createNodeConversionProcessTreePort,
 } from './conversion-process-runner.js'
 
-const adapters = [
+export const CONVERSION_ADAPTERS = Object.freeze([
   { adapter: imageIconAdapter, pack: 'image-icon' },
   { adapter: documentAdapter, pack: 'document' },
   { adapter: pdfAdapter, pack: 'pdf' },
   { adapter: mediaAdapter, pack: 'media' },
-] as const satisfies readonly { adapter: ConverterAdapter; pack: ConverterPackName }[]
+] as const satisfies readonly { adapter: ConverterAdapter; pack: ConverterPackName }[])
 
 interface ProductionConversionJobRuntimeOptions {
   ownerUserId: string
@@ -291,7 +291,7 @@ async function ownedInput(
 export function createProductionConversionJobRuntime(
   options: ProductionConversionJobRuntimeOptions,
 ): ConversionJobRuntime {
-  const available = options.adapters ?? adapters
+  const available = options.adapters ?? CONVERSION_ADAPTERS
   return {
     concurrencyClass,
     async acquirePack(job, signal) {
