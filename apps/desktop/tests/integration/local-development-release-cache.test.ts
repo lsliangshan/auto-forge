@@ -50,6 +50,16 @@ describe('local development release cache', () => {
     expect(fingerprintDevelopmentRelease({ target: 'darwin-arm64', inputs: [{ path: 'a', bytes: Buffer.from('ONE') }, inputs[1]] })).not.toBe(fingerprint)
   })
 
+  it('uses a strict bytewise order for distinct Unicode paths', () => {
+    const inputs = [
+      { path: 'e\u0301', bytes: Buffer.from('one') },
+      { path: 'é', bytes: Buffer.from('two') },
+    ]
+
+    expect(fingerprintDevelopmentRelease({ target: 'darwin-arm64', inputs: [...inputs].reverse() }))
+      .toBe(fingerprintDevelopmentRelease({ target: 'darwin-arm64', inputs }))
+  })
+
   it('rejects unsafe or duplicate fingerprint input paths', () => {
     for (const inputs of [
       [{ path: '../escape', bytes: Buffer.alloc(0) }],

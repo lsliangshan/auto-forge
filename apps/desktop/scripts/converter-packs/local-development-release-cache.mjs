@@ -86,7 +86,7 @@ export function fingerprintDevelopmentRelease({ target, inputs }) {
     if (!input || !Buffer.isBuffer(input.bytes)) throw new Error('Development release input bytes must be a Buffer')
     assertInputPath(input.path)
     return input
-  }).sort((left, right) => left.path.localeCompare(right.path))
+  }).sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)))
   for (let index = 1; index < sortedInputs.length; index += 1) {
     if (sortedInputs[index - 1].path === sortedInputs[index].path) throw new Error('Development release input paths must be unique')
   }
