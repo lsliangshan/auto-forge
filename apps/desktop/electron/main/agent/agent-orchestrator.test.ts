@@ -2083,11 +2083,10 @@ describe('AgentOrchestrator', () => {
       })]),
     })
     expect(JSON.stringify(dependencies.records.events)).not.toContain('汉汉汉汉汉汉汉汉')
-    const provenance = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks.at(-1)
-    expect(provenance).toMatchObject({
+    const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
+    expect(finalBlocks).not.toContainEqual(expect.objectContaining({
       type: 'workflow_provenance',
-      entries: [expect.objectContaining({ status: 'completed' })],
-    })
+    }))
   })
 
   it('keeps invalid output failed while RESULT_TOO_LARGE leaves a completed execution', async () => {
@@ -2125,10 +2124,9 @@ describe('AgentOrchestrator', () => {
       errorCode: 'INVALID_OUTPUT', errorSummary: 'The workflow produced an invalid result.',
     }))
     expect(JSON.stringify(finalBlocks)).not.toContain('RESULT_TOO_LARGE')
-    expect(finalBlocks.at(-1)).toMatchObject({
+    expect(finalBlocks).not.toContainEqual(expect.objectContaining({
       type: 'workflow_provenance',
-      entries: [expect.objectContaining({ status: 'failed' })],
-    })
+    }))
   })
 
   it('keeps the reservation-only status unavailable when start rejects safely before creating a record', async () => {
@@ -2813,7 +2811,7 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.terminal).toHaveLength(1)
   })
 
-  it('buffers tool-call preamble, preserves the original call id, and appends authoritative status and provenance', async () => {
+  it('buffers tool-call preamble and preserves the original call id with an authoritative status', async () => {
     let finishExecution!: (value: { id: string; status: string; result: unknown }) => void
     let markStarted!: () => void
     const started = new Promise<void>((resolve) => { markStarted = resolve })
@@ -2865,12 +2863,13 @@ describe('AgentOrchestrator', () => {
     expect(finalBlocks.find((block) => (
       typeof block === 'object' && block !== null && 'type' in block && block.type === 'workflow_status'
     ))).not.toHaveProperty('errorCode')
-    expect(finalBlocks.at(-1)).toMatchObject({
+    expect(finalBlocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status', executionId: 'reserved_1', workflowName: '百度搜索',
+      status: 'completed',
+    }))
+    expect(finalBlocks).not.toContainEqual(expect.objectContaining({
       type: 'workflow_provenance',
-      entries: [expect.objectContaining({
-        executionId: 'reserved_1', workflowName: '百度搜索', status: 'completed',
-      })],
-    })
+    }))
   })
 
   it('repairs one multi-call response without executing and rejects a repeated parallel call', async () => {
@@ -5722,7 +5721,10 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
     expect(browser.executor.execute).not.toHaveBeenCalled()
     expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain(finalText)
-    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('workflow_provenance')
+    const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
+    expect(finalBlocks).not.toContainEqual(expect.objectContaining({
+      type: 'workflow_provenance',
+    }))
   })
 
   it('still honors an explicit browser inspect emitted after a workflow execution', async () => {

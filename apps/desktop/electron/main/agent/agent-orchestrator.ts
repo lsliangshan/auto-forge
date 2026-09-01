@@ -1604,7 +1604,6 @@ export class AgentOrchestrator {
           this.appendText(active, consent === 'denied'
             ? '你已拒绝向当前模型供应商发送知识库依据，因此本次不生成知识库答案。'
             : '需要你先授权向当前模型供应商发送最小知识库依据，然后重新发送问题。')
-          this.appendWorkflowProvenance(active)
           return this.terminalize(active, 'completed')
         }
       }
@@ -1728,7 +1727,6 @@ export class AgentOrchestrator {
         )
         if (grounding.kind === 'repair') continue
         this.appendText(active, grounding.text)
-        this.appendWorkflowProvenance(active)
         return this.terminalize(active, 'completed')
       }
       if (!active.browserRead) for (const text of bufferedText) this.appendText(active, text)
@@ -2306,7 +2304,6 @@ export class AgentOrchestrator {
       const grounding = await this.groundKnowledgeAnswer(active, earlyBrowserAnswer)
       if (grounding.kind === 'repair') return this.drive(active)
       this.appendText(active, grounding.text)
-      this.appendWorkflowProvenance(active)
       return this.terminalize(active, 'completed')
     }
     return this.drive(active)
@@ -2464,7 +2461,6 @@ export class AgentOrchestrator {
     this.enableKnowledgeAfterWorkflow(active)
     if (terminalStatus === 'completed') await this.refreshBrowserCatalog(active)
     if (terminalStatus === 'completed' && hasAuthoritativeConversionBlock) {
-      this.appendWorkflowProvenance(active)
       return this.terminalize(active, 'completed')
     }
     return this.drive(active)
@@ -3228,15 +3224,6 @@ export class AgentOrchestrator {
     })
   }
 
-  private appendWorkflowProvenance(active: ActiveAgentRun): void {
-    if (active.actualExecutions.length === 0) return
-    this.appendBlock(active, {
-      type: 'workflow_provenance',
-      blockId: this.id(),
-      entries: active.actualExecutions.map((entry) => structuredClone(entry)),
-    })
-  }
-
   private armApprovalExpiry(active: ActiveAgentRun): void {
     if (active.approvalTimer !== undefined) return
     active.approvalTimer = this.setTimer(() => {
@@ -3498,7 +3485,6 @@ export class AgentOrchestrator {
     active.knowledgeConsentBlocked = 'consent_required'
     this.setKnowledgeStatus(active, 'consent_required', active.knowledgeEvidence.snapshot().length)
     this.appendText(active, '需要你先授权向当前模型供应商发送最小知识库依据，然后重新发送问题。')
-    this.appendWorkflowProvenance(active)
     return this.terminalize(active, 'completed')
   }
 
