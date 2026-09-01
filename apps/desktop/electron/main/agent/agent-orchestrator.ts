@@ -2452,17 +2452,11 @@ export class AgentOrchestrator {
       && (terminalStatus === 'failed' || modelResult.code === 'RESULT_TOO_LARGE')
       ? modelResult
       : undefined
-    const hasAuthoritativeConversionBlock = active.blocks.some((block) => (
-      block.type === 'conversion' && block.executionId === tool.executionId
-    ))
     this.updateWorkflowStatus(active, pending, terminalStatus, statusError)
     this.appendToolExchange(active, pending, modelResult)
     this.clearPending(active)
     this.enableKnowledgeAfterWorkflow(active)
     if (terminalStatus === 'completed') await this.refreshBrowserCatalog(active)
-    if (terminalStatus === 'completed' && hasAuthoritativeConversionBlock) {
-      return this.terminalize(active, 'completed')
-    }
     return this.drive(active)
   }
 

@@ -314,8 +314,14 @@ function protectedAttachmentRunInput(
   const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
   const plan = authority.createPlan({
     requestId,
-    text: decision === 'ordinary' ? input.content : 'convert this attachment to PDF',
-    context: { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['image'] },
+    text: decision === 'ordinary'
+      ? input.content
+      : input.assetIds.length === 1 ? 'convert this attachment to PDF' : 'convert these attachments to PDF',
+    context: {
+      hasAttachments: true,
+      requestedOutput: 'text',
+      attachmentKinds: input.assetIds.map(() => 'image'),
+    },
     attachments: input.assetIds.map((id, index) => ({
       index, id, name: `private-${index}.png`, mimeType: 'image/png', byteSize: 12,
       fingerprint: assetFingerprints[index]!,
@@ -3150,37 +3156,42 @@ describe('AgentOrchestrator', () => {
     expect(providerPayload).not.toMatch(/media_private_0|b{32}|sourceFingerprint|attachmentBindings/)
   })
 
-  it('does not append a stale queued summary after creating the authoritative conversion card', async () => {
+  it('waits for a conversion terminal result and asks the model for one closing response', async () => {
     const dependencies = harness([[
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_convert_status', name: 'workflow_1',
-        arguments: { input: { files: [0], targetFormat: 'pdf' } },
+        arguments: { input: { files: [0, 1], targetFormat: 'pdf' } },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
-      {
-        type: 'text_delta', choiceIndex: 0,
-        text: '当前状态：任务已受理并排队中（queued）',
-      },
+      { type: 'text_delta', choiceIndex: 0, text: '两个附件均已转换完成。' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = async () => [conversionWorkflow]
-    let finishExecution!: (execution: Execution) => void
+    const terminal = deferred<Execution>()
     dependencies.executions.startReserved = async (reservation, input) => {
       dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
-      return {
-        id: reservation.executionId,
-        finished: new Promise<Execution>((resolve) => { finishExecution = resolve }),
-      }
+      return { id: reservation.executionId, finished: terminal.promise }
     }
     const orchestrator = new AgentOrchestrator(dependencies)
+    const firstAttachment = currentConversionAttachments()[0]!
+    const attachments = [
+      firstAttachment,
+      {
+        ...firstAttachment,
+        attachmentIndex: 1,
+        displayName: 'second.png',
+        source: { kind: 'media' as const, mediaAssetId: 'media_private_1' },
+        sourceFingerprint: 'c'.repeat(64),
+      },
+    ]
     const pending = await orchestrator.run(protectedAttachmentRunInput({
       ...textRunInput({
         conversationId: 'conversion_conversation', content: '将附件转换成 PDF',
         provider: 'openrouter', model: 'model',
       }),
-      assetIds: ['media_private_0'],
-      attachmentBindings: currentConversionAttachments(),
+      assetIds: ['media_private_0', 'media_private_1'],
+      attachmentBindings: attachments,
     }))
 
     const resultPromise = orchestrator.resumeApproval({
@@ -3191,23 +3202,116 @@ describe('AgentOrchestrator', () => {
     })
     await vi.waitFor(() => expect(dependencies.records.starts).toHaveLength(1))
     expect(orchestrator.onConversionJobSubmitted(pending.executionId!)).toBe(true)
-    finishExecution({
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(1)
+
+    terminal.resolve({
       id: pending.executionId!,
       workflowId: conversionWorkflow.id,
       workflowVersion: conversionWorkflow.version,
       status: 'completed',
-      input: { files: [0], targetFormat: 'pdf' },
-      result: { accepted: true, status: 'queued', outputs: [] },
+      input: { files: [0, 1], targetFormat: 'pdf' },
+      result: {
+        workflow: '万象转换',
+        results: [
+          { accepted: true, status: 'completed', outputs: [{ name: 'converted-1-1.pdf', format: 'pdf', byteSize: 100 }] },
+          { accepted: true, status: 'completed', outputs: [{ name: 'converted-2-1.pdf', format: 'pdf', byteSize: 200 }] },
+        ],
+      },
       createdAt: 1,
     })
 
     await expect(resultPromise).resolves.toMatchObject({ status: 'completed' })
-    const terminal = dependencies.records.terminal.at(-1) as { blocks?: unknown[] } | undefined
-    expect(terminal?.blocks).toContainEqual(expect.objectContaining({
-      type: 'conversion', executionId: pending.executionId!, state: 'active',
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    const closingRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    expect(closingRequest.messages).toContainEqual(expect.objectContaining({
+      role: 'tool',
+      content: expect.stringContaining('"status":"completed"'),
     }))
-    expect(JSON.stringify(terminal?.blocks)).not.toMatch(/queued|排队/u)
-    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(closingRequest)).not.toMatch(/"status":"queued"|排队/u)
+    const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
+    expect(finalBlocks).toContainEqual(expect.objectContaining({
+      type: 'text', text: '两个附件均已转换完成。',
+    }))
+    expect(finalBlocks).not.toContainEqual(expect.objectContaining({ type: 'workflow_provenance' }))
+  })
+
+  it('asks the model for one closing response after mixed conversion results settle', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_convert_mixed', name: 'workflow_1',
+        arguments: { input: { files: [0, 1], targetFormat: 'pdf' } },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已完成 1 个附件，另有 1 个转换失败。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [conversionWorkflow]
+    const terminal = deferred<Execution>()
+    dependencies.executions.startReserved = async (reservation, input) => {
+      dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
+      return { id: reservation.executionId, finished: terminal.promise }
+    }
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const firstAttachment = currentConversionAttachments()[0]!
+    const attachments = [
+      { ...firstAttachment, conversationId: 'mixed_conversion_conversation' },
+      {
+        ...firstAttachment,
+        attachmentIndex: 1,
+        conversationId: 'mixed_conversion_conversation',
+        displayName: 'second.png',
+        source: { kind: 'media' as const, mediaAssetId: 'media_private_1' },
+        sourceFingerprint: 'c'.repeat(64),
+      },
+    ]
+    const pending = await orchestrator.run(protectedAttachmentRunInput({
+      ...textRunInput({
+        conversationId: 'mixed_conversion_conversation', content: '将附件转换成 PDF',
+        provider: 'openrouter', model: 'model',
+      }),
+      assetIds: ['media_private_0', 'media_private_1'],
+      attachmentBindings: attachments,
+    }))
+
+    const resultPromise = orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      permissionIndex: 0,
+      scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
+      decision: 'once',
+    })
+    await vi.waitFor(() => expect(dependencies.records.starts).toHaveLength(1))
+    expect(orchestrator.onConversionJobSubmitted(pending.executionId!)).toBe(true)
+
+    terminal.resolve({
+      id: pending.executionId!,
+      workflowId: conversionWorkflow.id,
+      workflowVersion: conversionWorkflow.version,
+      status: 'completed',
+      input: { files: [0, 1], targetFormat: 'pdf' },
+      result: {
+        workflow: '万象转换',
+        results: [
+          { accepted: true, status: 'completed', outputs: [{ name: 'converted-1-1.pdf', format: 'pdf', byteSize: 100 }] },
+          { accepted: false, status: 'failed', error: { code: 'CONVERSION_FAILED', message: 'File conversion failed.' } },
+        ],
+      },
+      createdAt: 1,
+    })
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'completed' })
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    const closingRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    expect(closingRequest.messages).toContainEqual(expect.objectContaining({
+      role: 'tool', content: expect.stringContaining('"status":"completed"'),
+    }))
+    expect(closingRequest.messages).toContainEqual(expect.objectContaining({
+      role: 'tool', content: expect.stringContaining('"status":"failed"'),
+    }))
+    const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
+    expect(finalBlocks.filter((block) => (
+      typeof block === 'object' && block !== null && 'type' in block && block.type === 'text'
+    ))).toHaveLength(1)
   })
 
   it('rejects a Provider tool call that changes the Main-bound conversion target before approval', async () => {
