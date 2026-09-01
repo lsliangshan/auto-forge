@@ -219,6 +219,7 @@ async function runtime(options: {
     resolveCurrentWorkflow: async (selector, id, version) => (
       (await liveSourceResolver.resolve(id, version, selector))?.workflow
     ),
+    inspectWorkflowConfig: async () => ({ implemented: false }),
     checkRemainingBudgets: () => undefined,
     providerUsage: database.providerUsage,
     emit: () => undefined,
@@ -314,7 +315,7 @@ describe('agent workflow integration', () => {
     expect(app.workers.workers).toEqual([])
   })
 
-  it('semantically selects a restricted workflow by its opaque provider tool name and persists exact provenance', async () => {
+  it('semantically selects a restricted workflow by its opaque provider tool name and persists terminal status', async () => {
     const requests: RequestInit[] = []
     let turn = 0
     const app = await runtime({
@@ -416,18 +417,28 @@ describe('agent workflow integration', () => {
     })
     expect(execution!.endedAt!).toBeGreaterThanOrEqual(execution!.startedAt!)
     const assistant = messages.find((message) => message.role === 'assistant')!
-    expect(assistant.blocks.at(-1)).toMatchObject({
+    expect(assistant.blocks).toContainEqual(expect.objectContaining({
+      type: 'text',
+      text: expect.any(String),
+    }))
+    expect(assistant.blocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status',
+      executionId,
+      workflowId: app.workflow.id,
+      workflowName: app.workflow.name,
+      workflowVersion: app.workflow.version,
+      source: 'installed',
+      city: '北京',
+      status: 'completed',
+    }))
+    expect(assistant.blocks).not.toContainEqual(expect.objectContaining({
       type: 'workflow_provenance',
-      entries: [{
-        executionId,
-        workflowId: app.workflow.id,
-        workflowName: app.workflow.name,
-        workflowVersion: app.workflow.version,
-        source: 'installed',
-        city: '北京',
-        status: 'completed',
-      }],
-    })
+    }))
+    expect(assistant.blocks.findIndex((block) => (
+      block.type === 'workflow_status' && block.status === 'completed'
+    ))).toBeLessThan(assistant.blocks.findIndex((block) => (
+      block.type === 'text' && block.text === '真实执行完成'
+    )))
     expect(app.database.chatRuns.get(execution!.chatRunId!)).toMatchObject({
       status: 'completed', generationId: 'generation_final', inputTokens: 4, outputTokens: 2, costUsd: '0.01',
     })
@@ -572,41 +583,40 @@ describe('agent workflow integration', () => {
     expect(secondExecution).toBeDefined()
     expect(firstExecution!.status).toBe('completed')
     expect(secondExecution!.status).toBe('completed')
-    const expectedEntries = [
-      {
-        executionId: firstExecution!.id,
-        workflowId: firstExecution!.workflowId,
-        workflowName: app.workflow.name,
-        workflowVersion: firstExecution!.workflowVersion,
-        source: app.workflow.runtimeIdentity.source,
-        city: '北京',
-        status: firstExecution!.status,
-      },
-      {
-        executionId: secondExecution!.id,
-        workflowId: secondExecution!.workflowId,
-        workflowName: second.name,
-        workflowVersion: secondExecution!.workflowVersion,
-        source: second.runtimeIdentity.source,
-        status: secondExecution!.status,
-      },
-    ]
-    const provenance = assistant.blocks.at(-1)
-    expect(provenance).toStrictEqual({
+    expect(firstExecution!.endedAt).toBeLessThanOrEqual(secondExecution!.startedAt!)
+    expect(persistedExecutions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: firstExecution!.id,
+        workflowId: app.workflow.id,
+        workflowVersion: app.workflow.version,
+        status: 'completed',
+      }),
+      expect.objectContaining({
+        id: secondExecution!.id,
+        workflowId: second.id,
+        workflowVersion: second.version,
+        status: 'completed',
+      }),
+    ]))
+    expect(firstExecution!.id).not.toBe(secondExecution!.id)
+    expect(assistant.blocks).toContainEqual(expect.objectContaining({
+      type: 'text',
+      text: expect.any(String),
+    }))
+    expect(assistant.blocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status',
+      status: 'completed',
+    }))
+    expect(assistant.blocks).not.toContainEqual(expect.objectContaining({
       type: 'workflow_provenance',
-      blockId: expect.any(String),
-      entries: expectedEntries,
-    })
-    const swappedExecutionIds = [
-      { ...expectedEntries[0], executionId: secondExecution!.id },
-      { ...expectedEntries[1], executionId: firstExecution!.id },
-    ]
-    expect(() => expect(provenance).toStrictEqual({
-      type: 'workflow_provenance',
-      blockId: expect.any(String),
-      entries: swappedExecutionIds,
-    })).toThrow()
-    expect(expectedEntries[1]).not.toHaveProperty('city')
+    }))
+    expect(assistant.blocks.every((block, index) => (
+      block.type !== 'workflow_status'
+        || block.status !== 'completed'
+        || index < assistant.blocks.findIndex((candidate) => (
+          candidate.type === 'text' && candidate.text === '两个工作流均已完成'
+        ))
+    ))).toBe(true)
   })
 
   it('runs one exact multi-attachment conversion while the Provider sees canonical fields only', async () => {
@@ -643,9 +653,16 @@ describe('agent workflow integration', () => {
         },
       },
       workerOutput: (request) => ({
-        accepted: true,
-        files: (request.input as { files: number[] }).files,
-        targetFormat: (request.input as { targetFormat: string }).targetFormat,
+        workflow: '万象转换',
+        results: (request.input as { files: number[] }).files.map((attachmentIndex) => ({
+          accepted: true,
+          status: 'completed',
+          outputs: [{
+            name: `converted-${attachmentIndex + 1}-1.pdf`,
+            format: 'pdf',
+            byteSize: attachmentIndex === 0 ? 67 : 4_096,
+          }],
+        })),
       }),
       fetch: async (_input, init) => {
         const liveApp = appRef.current!
@@ -677,12 +694,15 @@ describe('agent workflow integration', () => {
           expect.objectContaining({
             role: 'tool',
             tool_call_id: 'tool_convert_pdf',
-            content: expect.stringContaining('"targetFormat":"pdf"'),
+            content: expect.stringContaining('"status":"completed"'),
           }),
         ]))
+        expect(JSON.stringify(body.messages)).toContain('converted-1-1.pdf')
+        expect(JSON.stringify(body.messages)).toContain('converted-2-1.pdf')
+        expect(JSON.stringify(body.messages)).not.toContain('"status":"queued"')
         return response([
           { id: 'generation_conversion_final', choices: [{
-            index: 0, delta: { content: '本地转换已提交' }, finish_reason: 'stop',
+            index: 0, delta: { content: '两个附件转换处理完毕。' }, finish_reason: 'stop',
           }] },
           '[DONE]',
         ])
@@ -787,6 +807,23 @@ describe('agent workflow integration', () => {
     )
     expect(providerPayload).not.toContain(app.directory)
     expect(providerPayload).not.toMatch(/\/Users\/|[A-Za-z]:\\Users\\|iVBORw0|UEsDB|dataBase64|base64/i)
+    const assistant = app.database.messages.listForConversation('conversation_1')
+      .find((message) => message.role === 'assistant')!
+    expect(assistant.blocks.filter((block) => block.type === 'text')).toEqual([
+      expect.objectContaining({ type: 'text', text: '两个附件转换处理完毕。' }),
+    ])
+    expect(assistant.blocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status',
+      status: 'completed',
+    }))
+    expect(assistant.blocks).not.toContainEqual(expect.objectContaining({
+      type: 'workflow_provenance',
+    }))
+    expect(assistant.blocks.findIndex((block) => (
+      block.type === 'workflow_status' && block.status === 'completed'
+    ))).toBeLessThan(assistant.blocks.findIndex((block) => (
+      block.type === 'text' && block.text === '两个附件转换处理完毕。'
+    )))
   })
 
   it.each([
@@ -873,10 +910,22 @@ describe('agent workflow integration', () => {
     ])
     const assistant = app.database.messages.listForConversation('conversation_1')
       .find((message) => message.role === 'assistant')!
-    expect(assistant.blocks.at(-1)).toMatchObject({
+    expect(assistant.blocks).toContainEqual(expect.objectContaining({
+      type: 'text',
+      text: expect.any(String),
+    }))
+    expect(assistant.blocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status',
+      status: 'completed',
+    }))
+    expect(assistant.blocks).not.toContainEqual(expect.objectContaining({
       type: 'workflow_provenance',
-      entries: [expect.not.objectContaining({ city: expect.anything() })],
-    })
+    }))
+    expect(assistant.blocks.findIndex((block) => (
+      block.type === 'workflow_status' && block.status === 'completed'
+    ))).toBeLessThan(assistant.blocks.findIndex((block) => (
+      block.type === 'text' && block.text === '全国通用查询完成'
+    )))
   })
 
   it.each(['disabled', 'renamed', 'output schema', 'timeout'] as const)(

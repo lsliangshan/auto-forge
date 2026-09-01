@@ -822,6 +822,8 @@ async function applicationHarness(input: {
   const executionStarts: Array<{ executionId: string; input: unknown }> = []
   const runningCompletion = deferred<Execution>()
   let inspectedAgent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'> | undefined
+  vi.spyOn(ExecutionService.prototype, 'inspectWorkflowConfig')
+    .mockResolvedValue({ implemented: false })
   const startReserved = vi.spyOn(ExecutionService.prototype, 'startReserved')
     .mockImplementation(async (reservation, startInput) => {
       executionStarts.push({ executionId: reservation.executionId, input: startInput })
@@ -4346,15 +4348,21 @@ describe('createApplicationRuntime', () => {
       await vi.waitFor(() => expect(app.chatEvents).toContainEqual(expect.objectContaining({
         type: 'block',
         block: expect.objectContaining({
-          type: 'workflow_provenance',
-          entries: [expect.objectContaining({
-            executionId: pending.approval.executionId,
-            source: 'installed',
-            city: '北京',
-            status: 'completed',
-          })],
+          type: 'workflow_status',
+          executionId: pending.approval.executionId,
+          workflowId: 'local.autoforge.approval-workflow',
+          workflowName: '北京工作居住证',
+          workflowVersion: '1.0.0',
+          source: 'installed',
+          city: '北京',
+          status: 'completed',
         }),
       })))
+      await vi.waitFor(() => expect(JSON.stringify(app.chatEvents)).toContain('工作流处理完成'))
+      expect(app.chatEvents).not.toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({ type: 'workflow_provenance' }),
+      }))
       expect(app.chatEvents).not.toContainEqual(expect.objectContaining({
         type: 'block',
         block: expect.objectContaining({
@@ -4367,7 +4375,7 @@ describe('createApplicationRuntime', () => {
     }
   })
 
-  it('binds a completed development run to the exact version, build, city, and final provenance', async () => {
+  it('binds a completed development run to the exact version, build, city, status, and closing text', async () => {
     const app = await applicationHarness({ developerMode: true })
     try {
       expect(app.authoritativeWorkflow).toMatchObject({
@@ -4425,22 +4433,18 @@ describe('createApplicationRuntime', () => {
       await expect(decision).resolves.toBeUndefined()
       await vi.waitFor(() => expect(app.chatEvents).toContainEqual(expect.objectContaining({
         type: 'block',
-        block: expect.objectContaining({ type: 'workflow_provenance' }),
-      })))
-      const provenance = [...app.chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
-        event.type === 'block'
-        && event.block.type === 'workflow_provenance'
-      ))!.block
-      expect(provenance).toStrictEqual({
-        type: 'workflow_provenance',
-        blockId: expect.any(String),
-        entries: [{
+        block: expect.objectContaining({
+          type: 'workflow_status',
           executionId: pending.approval.executionId,
           ...expectedWorkflowContext,
           status: 'completed',
-        }],
-      })
-      expect(JSON.stringify(app.chatEvents)).toContain('工作流处理完成')
+        }),
+      })))
+      await vi.waitFor(() => expect(JSON.stringify(app.chatEvents)).toContain('工作流处理完成'))
+      expect(app.chatEvents).not.toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({ type: 'workflow_provenance' }),
+      }))
     } finally {
       await app.runtime.close()
     }
@@ -13119,6 +13123,8 @@ describe('createApplicationRuntime', () => {
     await writeFile(source, 'local conversion source')
     const chatEvents: ChatEvent[] = []
     const completion = deferred<Execution>()
+    vi.spyOn(ExecutionService.prototype, 'inspectWorkflowConfig')
+      .mockResolvedValue({ implemented: false })
     const startReserved = vi.spyOn(ExecutionService.prototype, 'startReserved')
       .mockImplementation(async function (this: unknown, reservation, input) {
         const database = openAppDatabase(join(root, 'autoforge.sqlite'))
@@ -13160,35 +13166,36 @@ describe('createApplicationRuntime', () => {
         }
         return { id: reservation.executionId, finished: completion.promise }
       })
+    const providerStream = vi.fn(async function* (request: ModelStreamRequest) {
+      if (isConversationTitleRequest(request)) {
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '文件转换' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        return
+      }
+      if (request.messages.some((message) => message.role === 'tool')) {
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '转换任务已完成' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        return
+      }
+      const toolName = request.tools?.[0]?.function.name
+      if (!toolName) throw new Error('Expected the conversion workflow tool')
+      yield {
+        type: 'tool_call' as const,
+        choiceIndex: 0,
+        index: 0,
+        id: 'call_conversion_block_fast',
+        name: toolName,
+        arguments: { input: { files: [0], targetFormat: 'pdf' } },
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+    })
     const provider = snapshotProvider('openrouter', {
       listModels: vi.fn(async () => [{
         ...modelInfo('openrouter/conversion-block-fast', 'Conversion block fast'),
         supportsTools: true,
       }]),
       validateCredential: vi.fn(async () => ({ valid: true })),
-      stream: vi.fn(async function* (request: ModelStreamRequest) {
-        if (isConversationTitleRequest(request)) {
-          yield { type: 'text_delta' as const, choiceIndex: 0, text: '文件转换' }
-          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
-          return
-        }
-        if (request.messages.some((message) => message.role === 'tool')) {
-          yield { type: 'text_delta' as const, choiceIndex: 0, text: '转换任务已完成' }
-          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
-          return
-        }
-        const toolName = request.tools?.[0]?.function.name
-        if (!toolName) throw new Error('Expected the conversion workflow tool')
-        yield {
-          type: 'tool_call' as const,
-          choiceIndex: 0,
-          index: 0,
-          id: 'call_conversion_block_fast',
-          name: toolName,
-          arguments: { input: { files: [0], targetFormat: 'pdf' } },
-        }
-        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
-      }),
+      stream: providerStream,
     })
     const runtime = createApplicationRuntime(options(root, {
       chooseMediaFiles: async () => [source],
@@ -13277,6 +13284,22 @@ describe('createApplicationRuntime', () => {
           type: 'conversion', executionId: approval.executionId, state: 'terminal',
         }),
       })))
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: { type: 'text', text: '转换任务已完成' },
+      })))
+      expect(chatEvents).not.toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({ type: 'workflow_provenance' }),
+      }))
+      const conversionAgentRequests = providerStream.mock.calls
+        .map(([request]) => request)
+        .filter((request) => !isConversationTitleRequest(request))
+      expect(conversionAgentRequests).toHaveLength(2)
+      expect(conversionAgentRequests[1]!.messages).toContainEqual(expect.objectContaining({
+        role: 'tool',
+        content: expect.not.stringContaining('"status":"queued"'),
+      }))
       expect(withUserData(root, session.user.id, (store) => (
         store.conversionBlockBindings.get(session.user.id, approval.executionId)
       ))).toMatchObject({ finalizedAt: expect.any(Number), consumedAt: expect.any(Number) })
