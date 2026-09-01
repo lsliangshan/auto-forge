@@ -2366,6 +2366,7 @@ export class AgentOrchestrator {
           workflowId: tool.candidate.workflow.id,
           workflowName: tool.candidate.workflow.name,
           workflowVersion: tool.candidate.workflow.version,
+          ...(tool.candidate.workflow.logo ? { logo: tool.candidate.workflow.logo } : {}),
           source: source.source,
           ...(source.source === 'development' ? { buildHash: source.buildHash } : {}),
           ...(tool.city === undefined ? {} : { city: tool.city }),
@@ -2454,11 +2455,18 @@ export class AgentOrchestrator {
       && (terminalStatus === 'failed' || modelResult.code === 'RESULT_TOO_LARGE')
       ? modelResult
       : undefined
+    const hasAuthoritativeConversionBlock = active.blocks.some((block) => (
+      block.type === 'conversion' && block.executionId === tool.executionId
+    ))
     this.updateWorkflowStatus(active, pending, terminalStatus, statusError)
     this.appendToolExchange(active, pending, modelResult)
     this.clearPending(active)
     this.enableKnowledgeAfterWorkflow(active)
     if (terminalStatus === 'completed') await this.refreshBrowserCatalog(active)
+    if (terminalStatus === 'completed' && hasAuthoritativeConversionBlock) {
+      this.appendWorkflowProvenance(active)
+      return this.terminalize(active, 'completed')
+    }
     return this.drive(active)
   }
 
@@ -3109,13 +3117,14 @@ export class AgentOrchestrator {
 
   private workflowStatusContext(tool: PendingWorkflowTool): Pick<
     WorkflowStatusBlock,
-    'workflowId' | 'workflowName' | 'workflowVersion' | 'source' | 'buildHash' | 'city'
+    'workflowId' | 'workflowName' | 'workflowVersion' | 'logo' | 'source' | 'buildHash' | 'city'
   > {
     const workflow = tool.candidate.workflow
     return {
       workflowId: workflow.id,
       workflowName: workflow.name,
       workflowVersion: workflow.version,
+      ...(workflow.logo ? { logo: workflow.logo } : {}),
       source: tool.source.source,
       ...(tool.source.source === 'development' ? { buildHash: tool.source.buildHash } : {}),
       ...(tool.city === undefined ? {} : { city: tool.city }),

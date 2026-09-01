@@ -54,8 +54,10 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+const workflowLogo = 'https://img.liangqy.com/autoforge/workflows/baidu.png'
 const workflow: WorkflowDetail = {
   id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索',
+  logo: workflowLogo,
   author: 'AutoForge', category: 'search', enabled: true, source: 'installed', integrity: 'valid',
   updatedAt: '2026-07-19T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
   runtimeIdentity: { id: 'browser.search.baidu', version: '1.0.0', source: 'installed' }, timeoutMs: 30_000,
@@ -1876,14 +1878,15 @@ describe('AgentOrchestrator', () => {
       expect.objectContaining({
         type: 'block',
         block: expect.objectContaining({
-          type: 'workflow_status', workflowId: workflow.id, status: 'awaiting_approval', executionAvailable: false,
+          type: 'workflow_status', workflowId: workflow.id, logo: workflowLogo,
+          status: 'awaiting_approval', executionAvailable: false,
         }),
       }),
       expect.objectContaining({
         type: 'block',
         block: expect.objectContaining({
           type: 'approval', blockId: expect.any(String), state: 'pending',
-          workflowId: workflow.id, workflowVersion: workflow.version,
+          workflowId: workflow.id, workflowVersion: workflow.version, logo: workflowLogo,
         }),
       }),
     ]))
@@ -3146,6 +3149,66 @@ describe('AgentOrchestrator', () => {
     expect(JSON.stringify(conversion)).not.toMatch(/bytes|path|sha256|artifactId|jobId|metadata/i)
     const providerPayload = JSON.stringify(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls)
     expect(providerPayload).not.toMatch(/media_private_0|b{32}|sourceFingerprint|attachmentBindings/)
+  })
+
+  it('does not append a stale queued summary after creating the authoritative conversion card', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_convert_status', name: 'workflow_1',
+        arguments: { input: { files: [0], targetFormat: 'pdf' } },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'text_delta', choiceIndex: 0,
+        text: '当前状态：任务已受理并排队中（queued）',
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [conversionWorkflow]
+    let finishExecution!: (execution: Execution) => void
+    dependencies.executions.startReserved = async (reservation, input) => {
+      dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
+      return {
+        id: reservation.executionId,
+        finished: new Promise<Execution>((resolve) => { finishExecution = resolve }),
+      }
+    }
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const pending = await orchestrator.run(protectedAttachmentRunInput({
+      ...textRunInput({
+        conversationId: 'conversion_conversation', content: '将附件转换成 PDF',
+        provider: 'openrouter', model: 'model',
+      }),
+      assetIds: ['media_private_0'],
+      attachmentBindings: currentConversionAttachments(),
+    }))
+
+    const resultPromise = orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      permissionIndex: 0,
+      scopeHash: scopeHash(conversionWorkflow.permissions[0]!.scope),
+      decision: 'once',
+    })
+    await vi.waitFor(() => expect(dependencies.records.starts).toHaveLength(1))
+    expect(orchestrator.onConversionJobSubmitted(pending.executionId!)).toBe(true)
+    finishExecution({
+      id: pending.executionId!,
+      workflowId: conversionWorkflow.id,
+      workflowVersion: conversionWorkflow.version,
+      status: 'completed',
+      input: { files: [0], targetFormat: 'pdf' },
+      result: { accepted: true, status: 'queued', outputs: [] },
+      createdAt: 1,
+    })
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'completed' })
+    const terminal = dependencies.records.terminal.at(-1) as { blocks?: unknown[] } | undefined
+    expect(terminal?.blocks).toContainEqual(expect.objectContaining({
+      type: 'conversion', executionId: pending.executionId!, state: 'active',
+    }))
+    expect(JSON.stringify(terminal?.blocks)).not.toMatch(/queued|排队/u)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(1)
   })
 
   it('rejects a Provider tool call that changes the Main-bound conversion target before approval', async () => {
