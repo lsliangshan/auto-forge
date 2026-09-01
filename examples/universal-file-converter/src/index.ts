@@ -1,4 +1,4 @@
-import { defineWorkflow, type ConverterSubmitResult } from '@autoforge/workflow-sdk'
+import { defineWorkflow, type ConversionErrorCode, type ConverterSubmitResult } from '@autoforge/workflow-sdk'
 import type { ConversionPreset, ConversionTargetFormat } from '@autoforge/shared'
 
 const targetFormats = new Set<ConversionTargetFormat>([
@@ -7,6 +7,15 @@ const targetFormats = new Set<ConversionTargetFormat>([
   'mp4', 'webm', 'mov',
 ])
 const presets = new Set<ConversionPreset>(['default', 'favicon', 'app-icon'])
+const safeConversionErrors: Readonly<Record<ConversionErrorCode, string>> = Object.freeze({
+  CONVERSION_FORMAT_UNSUPPORTED: 'The requested output format is not supported.',
+  CONVERSION_COMPONENT_UNAVAILABLE: 'The required conversion component is unavailable.',
+  CONVERSION_INPUT_INVALID: 'The input file cannot be converted.',
+  CONVERSION_OUTPUT_TOO_LARGE: 'The converted output is too large.',
+  CONVERSION_TIMEOUT: 'The conversion timed out.',
+  CONVERSION_CANCELLED: 'The conversion was cancelled.',
+  CONVERSION_INTERRUPTED: 'The conversion was interrupted.',
+})
 
 interface Input {
   files: number[]
@@ -32,15 +41,30 @@ function validateInput(input: Input): void {
   if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('background must be a boolean')
 }
 
-function unavailableResult(): ConverterSubmitResult {
+function errorResult(code: ConversionErrorCode): ConverterSubmitResult {
   return {
     accepted: false,
     status: 'failed',
     error: {
-      code: 'CONVERSION_COMPONENT_UNAVAILABLE',
-      message: 'The conversion component is unavailable.',
+      code,
+      message: safeConversionErrors[code],
     },
   }
+}
+
+function failedResult(error: unknown): ConverterSubmitResult {
+  if (typeof error !== 'object' || error === null) return errorResult('CONVERSION_COMPONENT_UNAVAILABLE')
+
+  try {
+    const code = Object.getOwnPropertyDescriptor(error, 'code')?.value
+    if (typeof code === 'string' && Object.hasOwn(safeConversionErrors, code)) {
+      return errorResult(code as ConversionErrorCode)
+    }
+  } catch {
+    // An untrusted rejected value must not prevent later files from submitting.
+  }
+
+  return errorResult('CONVERSION_COMPONENT_UNAVAILABLE')
 }
 
 export default defineWorkflow<Input, Output>({
@@ -56,8 +80,8 @@ export default defineWorkflow<Input, Output>({
           preset: input.preset,
           background: input.background,
         }))
-      } catch {
-        results.push(unavailableResult())
+      } catch (error) {
+        results.push(failedResult(error))
       }
     }
     return { workflow: '万象转换', results }

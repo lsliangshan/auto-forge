@@ -9,6 +9,16 @@ const ajv = new Ajv({ allErrors: true, strict: false })
 const validateInput = ajv.compile(manifest.inputSchema)
 
 describe('万象转换 workflow', () => {
+  const safeConversionErrors = [
+    ['CONVERSION_FORMAT_UNSUPPORTED', 'The requested output format is not supported.'],
+    ['CONVERSION_COMPONENT_UNAVAILABLE', 'The required conversion component is unavailable.'],
+    ['CONVERSION_INPUT_INVALID', 'The input file cannot be converted.'],
+    ['CONVERSION_OUTPUT_TOO_LARGE', 'The converted output is too large.'],
+    ['CONVERSION_TIMEOUT', 'The conversion timed out.'],
+    ['CONVERSION_CANCELLED', 'The conversion was cancelled.'],
+    ['CONVERSION_INTERRUPTED', 'The conversion was interrupted.'],
+  ] as const
+
   it.each([
     { files: [], targetFormat: 'png' },
     { files: [0, 0], targetFormat: 'png' },
@@ -149,7 +159,64 @@ describe('万象转换 workflow', () => {
         status: 'failed',
         error: {
           code: 'CONVERSION_COMPONENT_UNAVAILABLE',
-          message: 'The conversion component is unavailable.',
+          message: 'The required conversion component is unavailable.',
+        },
+      },
+      { accepted: true, status: 'queued', outputs: [] },
+    ])
+  })
+
+  it.each(safeConversionErrors)('preserves the safe %s code without copying a rejected message', async (code, message) => {
+    const submissions: number[] = []
+    const context = {
+      converter: {
+        submit: async ({ attachmentIndex }: { attachmentIndex: number }) => {
+          submissions.push(attachmentIndex)
+          if (attachmentIndex === 1) throw { code, message: 'sensitive implementation detail', stack: 'sensitive stack', path: '/secret/path' }
+          return { accepted: true as const, status: 'queued' as const, outputs: [] }
+        },
+      },
+    } as WorkflowContext
+
+    const result = await workflow.run(context, { files: [0, 1, 2], targetFormat: 'pdf' })
+
+    expect(submissions).toEqual([0, 1, 2])
+    expect(result.results).toEqual([
+      { accepted: true, status: 'queued', outputs: [] },
+      { accepted: false, status: 'failed', error: { code, message } },
+      { accepted: true, status: 'queued', outputs: [] },
+    ])
+  })
+
+  it.each([
+    ['an Error', new Error('sensitive implementation detail')],
+    ['a string', 'sensitive implementation detail'],
+    ['null', null],
+    ['a spoofed code', { code: 'CONVERSION_SECRET_LEAK', message: 'sensitive implementation detail' }],
+    ['an inherited code', Object.create({ code: 'CONVERSION_TIMEOUT', message: 'sensitive implementation detail' })],
+  ])('converts %s rejections to component-unavailable results without skipping later files', async (_name, rejection) => {
+    const submissions: number[] = []
+    const context = {
+      converter: {
+        submit: async ({ attachmentIndex }: { attachmentIndex: number }) => {
+          submissions.push(attachmentIndex)
+          if (attachmentIndex === 1) throw rejection
+          return { accepted: true as const, status: 'queued' as const, outputs: [] }
+        },
+      },
+    } as WorkflowContext
+
+    const result = await workflow.run(context, { files: [0, 1, 2], targetFormat: 'pdf' })
+
+    expect(submissions).toEqual([0, 1, 2])
+    expect(result.results).toEqual([
+      { accepted: true, status: 'queued', outputs: [] },
+      {
+        accepted: false,
+        status: 'failed',
+        error: {
+          code: 'CONVERSION_COMPONENT_UNAVAILABLE',
+          message: 'The required conversion component is unavailable.',
         },
       },
       { accepted: true, status: 'queued', outputs: [] },
