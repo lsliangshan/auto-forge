@@ -6,6 +6,7 @@ import { afterEach, expect, it } from 'vitest'
 import {
   developmentFingerprintInputs,
   prepareLocalDevelopmentRelease,
+  runLocalDevelopmentReleasePreparationCli,
   runLocalDevelopmentReleasePreparation,
 } from '../../scripts/converter-packs/prepare-local-development-release.mjs'
 
@@ -301,4 +302,19 @@ it('runs local preparation with the desktop cache and reports only its status an
   })
 
   expect(lines).toEqual([`prepared ${'c'.repeat(64)}\n`])
+})
+
+it('reports CLI preparation failures without leaking an error path or message', async () => {
+  const errors: string[] = []
+  const sensitiveMessage = 'unable to use /private/workspace/cache/signing-key/private.pem token=not-for-output'
+
+  const status = await runLocalDevelopmentReleasePreparationCli({
+    prepare: async () => { throw new Error(sensitiveMessage) },
+    writeError: (line: string) => { errors.push(line) },
+  })
+
+  expect(status).toBe(1)
+  expect(errors).toEqual(['converter release preparation failed\n'])
+  expect(errors.join('')).not.toContain('/private/workspace')
+  expect(errors.join('')).not.toContain('token=not-for-output')
 })

@@ -208,12 +208,17 @@ export async function runLocalDevelopmentReleasePreparation({
   return result
 }
 
+export async function runLocalDevelopmentReleasePreparationCli({ writeError = (line) => process.stderr.write(line), ...options } = {}) {
+  try {
+    await runLocalDevelopmentReleasePreparation(options)
+    return 0
+  } catch {
+    writeError('converter release preparation failed\n')
+    return 1
+  }
+}
+
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(resolve(entry)).href) {
-  try {
-    await runLocalDevelopmentReleasePreparation()
-  } catch (error) {
-    process.stderr.write(`Local development release preparation failed: ${error instanceof Error ? error.message : 'unknown error'}\n`)
-    process.exitCode = 1
-  }
+  process.exitCode = await runLocalDevelopmentReleasePreparationCli()
 }
