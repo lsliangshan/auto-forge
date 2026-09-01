@@ -65,7 +65,7 @@ function png(size = 1) {
   const scanlines = Buffer.alloc(size * (1 + size * 4)); for (let row = 0; row < size; row += 1) scanlines[row * (1 + size * 4)] = 0
   return Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', header), chunk('IDAT', deflateSync(scanlines)), chunk('IEND', Buffer.alloc(0))])
 }
-function jpeg() { return Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0, 11, 8, 0, 1, 0, 1, 1, 1, 0x11, 0, 0xff, 0xda, 0, 8, 1, 1, 0, 0, 63, 0, 0, 0xff, 0xd9]) }
+function jpeg() { return Buffer.from([0xff, 0xd8, 0xff, 0xdb, 0, 3, 0, 0xff, 0xc4, 0, 3, 0, 0xff, 0xc0, 0, 11, 8, 0, 1, 0, 1, 1, 1, 0x11, 0, 0xff, 0xda, 0, 8, 1, 1, 0, 0, 63, 0, 1, 0xff, 0xd9]) }
 
 function ico(sizes = [16, 24, 32, 48, 64, 128, 256]) {
   const payloads = sizes.map((size) => png(size))

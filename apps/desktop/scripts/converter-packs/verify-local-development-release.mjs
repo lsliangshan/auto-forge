@@ -77,6 +77,7 @@ function validPng(bytes, expectedSize) {
   let offset = 8
   let width
   let height
+  let channels
   let idat = false
   const payloads = []
   let ended = false
@@ -88,7 +89,9 @@ function validPng(bytes, expectedSize) {
     if (type.toString('ascii') === 'IHDR') {
       if (length !== 13 || width !== undefined) return false
       width = bytes.readUInt32BE(offset + 8); height = bytes.readUInt32BE(offset + 12)
-      if (!width || !height) return false
+      const bitDepth = bytes[offset + 16]; const colorType = bytes[offset + 17]; const interlace = bytes[offset + 20]
+      channels = colorType === 2 ? 3 : colorType === 6 ? 4 : undefined
+      if (!width || !height || bitDepth !== 8 || channels === undefined || interlace !== 0) return false
     } else if (type.toString('ascii') === 'IDAT') { idat ||= length > 0; payloads.push(bytes.subarray(offset + 8, offset + 8 + length)) }
     else if (type.toString('ascii') === 'IEND') { ended = length === 0 && end === bytes.length; break }
     offset = end
@@ -96,8 +99,8 @@ function validPng(bytes, expectedSize) {
   if (!width || !height || !idat || !ended || (expectedSize !== undefined && (width !== expectedSize || height !== expectedSize))) return false
   try {
     const decoded = inflateSync(Buffer.concat(payloads))
-    if (decoded.length !== height * (1 + width * 4)) return false
-    for (let offset = 0; offset < decoded.length; offset += 1 + width * 4) if (decoded[offset] > 4) return false
+    if (decoded.length !== height * (1 + width * channels)) return false
+    for (let offset = 0; offset < decoded.length; offset += 1 + width * channels) if (decoded[offset] > 4) return false
     return true
   } catch { return false }
 }
@@ -107,16 +110,20 @@ function validJpeg(bytes) {
   let offset = 2
   let frame = false
   let scan = false
+  let dqt = false
+  let dht = false
   while (offset + 4 <= bytes.length - 2) {
     if (bytes[offset] !== 0xff) return false
     const marker = bytes[offset + 1]
-    if (marker === 0xda) { scan = true; break }
+    if (marker === 0xda) { scan = offset + 2 + bytes.readUInt16BE(offset + 2) < bytes.length - 2; break }
     const length = bytes.readUInt16BE(offset + 2)
     if (length < 2 || offset + 2 + length > bytes.length) return false
     if (marker >= 0xc0 && marker <= 0xc3 && length >= 8 && bytes.readUInt16BE(offset + 5) > 0 && bytes.readUInt16BE(offset + 7) > 0) frame = true
+    if (marker === 0xdb) dqt = true
+    if (marker === 0xc4) dht = true
     offset += 2 + length
   }
-  return frame && scan
+  return frame && scan && dqt && dht
 }
 
 async function verifyOutput(path, expectedFormat) {
@@ -138,13 +145,14 @@ async function verifyOutputDirectory(root, expectedNames, allowedDirectories = [
   for (const name of names) await regularFile(join(root, name))
 }
 
-async function auditTree(root) {
-  let files = 0
+async function auditTree(root, prefix = '') {
+  const files = []
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const path = join(root, entry.name)
+    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name
     if (entry.isSymbolicLink()) fail()
-    if (entry.isDirectory()) files += await auditTree(path)
-    else { await regularFile(path); files += 1 }
+    if (entry.isDirectory()) files.push(...await auditTree(path, relativePath))
+    else { await regularFile(path); files.push(relativePath) }
   }
   return files
 }
@@ -358,7 +366,14 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     const roots = ['sources', 'source-doc', 'source-docx', 'document', 'documentx', 'spreadsheet', 'xlsx-roundtrip', 'jpeg', 'image-pdf', 'ico', 'icns', 'pdf-png', 'pdf-jpeg', 'pdf-probe', 'audio', 'video', 'extract']
     const entries = await readdir(workRoot, { withFileTypes: true })
     if (entries.length !== roots.length || entries.some((entry) => !entry.isDirectory() || entry.isSymbolicLink() || !roots.includes(entry.name))) fail()
-    if (await auditTree(workRoot) > maximumOutputs) fail()
+    const files = await auditTree(workRoot)
+    const expectedFiles = [
+      'sources/source.txt', 'sources/source.csv', 'sources/source.png', 'sources/source.wav', 'sources/source.mp4',
+      'source-doc/source.doc', 'source-docx/source.docx', 'document/source.pdf', 'documentx/source.pdf', 'spreadsheet/source.xlsx', 'xlsx-roundtrip/source.csv',
+      'jpeg/output.jpeg', 'image-pdf/output.pdf', 'ico/output.ico', 'icns/output.icns', 'pdf-png/page-001.png', 'pdf-jpeg/page-001.jpeg', 'pdf-probe/generated.png', 'pdf-probe/generated.jpeg',
+      'audio/output.mp3', 'video/output.webm', 'extract/output.mp3',
+    ].sort()
+    if (files.length > maximumOutputs || files.sort().join('\0') !== expectedFiles.join('\0')) fail()
   } catch {
     fail()
   } finally {
