@@ -62,6 +62,11 @@ function uniqueSuffix(files, suffix, label) {
 }
 
 export async function selectVerifiedSourceLicense(root, names, label) {
+  const rootMetadata = await lstat(root).catch(() => undefined)
+  const canonicalRoot = await realpath(root).catch(() => undefined)
+  if (!rootMetadata?.isDirectory() || rootMetadata.isSymbolicLink() || canonicalRoot !== root) {
+    fail(`${label} source root must be a canonical directory and symbolic links are forbidden.`)
+  }
   const acceptedNames = new Set(names)
   const candidates = []
   const byUtf8Name = (left, right) => Buffer.from(left.name).compare(Buffer.from(right.name))
@@ -82,13 +87,23 @@ export async function selectVerifiedSourceLicense(root, names, label) {
 
   const rootEntries = (await readdir(root, { withFileTypes: true })).sort(byUtf8Name)
   await inspectEntries(root, rootEntries)
+  if (rootEntries.some((entry) => entry.isSymbolicLink())) {
+    fail(`${label} source wrappers must not use symbolic links.`)
+  }
   const wrappers = rootEntries.filter((entry) => entry.isDirectory())
   if (wrappers.length > maximumSourceLicenseWrappers) {
     fail(`${label} license search has too many directories in the verified source archive.`)
   }
   for (const wrapper of wrappers) {
     const directory = join(root, wrapper.name)
-    if (!(await lstat(directory)).isDirectory()) {
+    const metadata = await lstat(directory).catch(() => undefined)
+    const resolved = await realpath(directory).catch(() => undefined)
+    if (
+      !metadata?.isDirectory()
+      || metadata.isSymbolicLink()
+      || resolved !== directory
+      || !isPathInsideRoot(canonicalRoot, resolved)
+    ) {
       fail(`${label} license search encountered an unsupported source wrapper.`)
     }
     const entries = (await readdir(directory, { withFileTypes: true })).sort(byUtf8Name)
@@ -99,7 +114,18 @@ export async function selectVerifiedSourceLicense(root, names, label) {
     const matches = candidates.filter((candidate) => candidate.name === name)
     if (matches.length === 0) continue
     matches.sort((left, right) => left.path.length - right.path.length || Buffer.from(left.path).compare(Buffer.from(right.path)))
-    return matches[0].path
+    const selected = matches[0].path
+    const metadata = await lstat(selected).catch(() => undefined)
+    const resolved = await realpath(selected).catch(() => undefined)
+    if (
+      !metadata?.isFile()
+      || metadata.isSymbolicLink()
+      || resolved !== selected
+      || !isPathInsideRoot(canonicalRoot, resolved)
+    ) {
+      fail(`${label} license must resolve to a canonical regular file inside the verified source root.`)
+    }
+    return resolved
   }
   fail(`${label} license is missing from the verified source archive.`)
 }

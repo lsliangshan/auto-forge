@@ -1,6 +1,6 @@
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   adhocSignMachOClosure,
@@ -37,20 +37,15 @@ describe('verified converter source license selection', () => {
   it('searches only the source root and its first wrapper level', async () => {
     const root = temporaryRoot()
     const wrapper = join(root, 'libreoffice-26.8.0.3')
-    const expected = fixtureFile(wrapper, 'COPYING')
+    const expected = fixtureFile(wrapper, 'LICENSE')
     const deep = join(wrapper, 'vendor', 'large-source-tree')
     mkdirSync(deep, { recursive: true })
     for (let index = 0; index < 512; index += 1) {
       writeFileSync(join(deep, `unrelated-${index.toString().padStart(4, '0')}`), 'fixture')
     }
     fixtureFile(deep, 'COPYING')
-    chmodSync(deep, 0o000)
 
-    try {
-      await expect(selectVerifiedSourceLicense(root, ['COPYING', 'LICENSE'], 'libreoffice')).resolves.toBe(expected)
-    } finally {
-      chmodSync(deep, 0o700)
-    }
+    await expect(selectVerifiedSourceLicense(root, ['COPYING', 'LICENSE'], 'libreoffice')).resolves.toBe(expected)
   })
 
   it('uses license-name priority, shortest path, and UTF-8 byte order deterministically', async () => {
@@ -67,15 +62,41 @@ describe('verified converter source license selection', () => {
 
   it('fails closed when an exact license-name match is symbolic or non-regular', async () => {
     const symbolicRoot = temporaryRoot()
-    const valid = fixtureFile(symbolicRoot, 'COPYING')
-    mkdirSync(join(symbolicRoot, 'wrapper'))
-    symlinkSync(valid, join(symbolicRoot, 'wrapper', 'COPYING'))
+    const outsideRoot = temporaryRoot()
+    const outside = fixtureFile(outsideRoot, 'COPYING')
+    symlinkSync(outside, join(symbolicRoot, 'COPYING'))
     await expect(selectVerifiedSourceLicense(symbolicRoot, ['COPYING', 'LICENSE'], 'libreoffice')).rejects.toThrow(/unsupported/iu)
 
     const nonRegularRoot = temporaryRoot()
     fixtureFile(nonRegularRoot, 'COPYING')
     mkdirSync(join(nonRegularRoot, 'wrapper', 'LICENSE'), { recursive: true })
     await expect(selectVerifiedSourceLicense(nonRegularRoot, ['COPYING', 'LICENSE'], 'libreoffice')).rejects.toThrow(/unsupported/iu)
+  })
+
+  it('requires a canonical non-symbolic root and wrapper hierarchy', async () => {
+    const sourceRoot = temporaryRoot()
+    fixtureFile(sourceRoot, 'COPYING')
+    const aliasParent = temporaryRoot()
+    const rootAlias = join(aliasParent, 'source-alias')
+    symlinkSync(sourceRoot, rootAlias)
+    await expect(selectVerifiedSourceLicense(rootAlias, ['COPYING'], 'libreoffice')).rejects.toThrow(/canonical|symbolic/iu)
+    await expect(selectVerifiedSourceLicense(`${sourceRoot}/.`, ['COPYING'], 'libreoffice')).rejects.toThrow(/canonical/iu)
+
+    const wrapperRoot = temporaryRoot()
+    const outsideRoot = temporaryRoot()
+    fixtureFile(outsideRoot, 'COPYING')
+    symlinkSync(outsideRoot, join(wrapperRoot, 'source-wrapper'))
+    await expect(selectVerifiedSourceLicense(wrapperRoot, ['COPYING'], 'libreoffice')).rejects.toThrow(/symbolic|wrapper/iu)
+  })
+
+  it('returns a resolved canonical regular path contained by the canonical root', async () => {
+    const root = temporaryRoot()
+    const expected = fixtureFile(root, 'wrapper/COPYING')
+
+    const selected = await selectVerifiedSourceLicense(root, ['COPYING'], 'libreoffice')
+
+    expect(selected).toBe(realpathSync(expected))
+    expect(relative(root, selected)).toBe('wrapper/COPYING')
   })
 
   it('fails closed for missing, excessive-wrapper, and excessive-candidate inventories', async () => {
