@@ -27,12 +27,12 @@ function temporaryRoot() {
   return root
 }
 
-async function releaseFixture(root: string) {
+async function releaseFixture(root: string, arch: 'arm64' | 'x64' = 'arm64') {
   const stagingRoot = join(root, 'staging')
   await mkdir(join(stagingRoot, 'packs'), { recursive: true })
   writeFileSync(join(stagingRoot, 'release.json'), '{"schemaVersion":1,"generatedAt":"2026-09-01T00:00:00.000Z","sequence":1}')
   for (const [family, paths] of Object.entries(executablePaths)) {
-    const pack = join(stagingRoot, 'packs', `${family}-darwin-arm64`)
+    const pack = join(stagingRoot, 'packs', `${family}-darwin-${arch}`)
     const payload = join(pack, 'payload')
     for (const path of paths) {
       const executable = join(payload, ...path.split('/'))
@@ -43,7 +43,7 @@ async function releaseFixture(root: string) {
     await mkdir(join(payload, 'LICENSES'), { recursive: true })
     writeFileSync(join(payload, 'LICENSES', `${family}.txt`), `${family} license\n`)
     writeFileSync(join(pack, 'pack.json'), JSON.stringify({
-      schemaVersion: 1, name: family, version: '1.0.0', platform: 'darwin', arch: 'arm64',
+      schemaVersion: 1, name: family, version: '1.0.0', platform: 'darwin', arch,
       archiveUrl: `https://packs.example.test/${family}.tar`,
       files: [...paths.map((path) => ({ path, role: 'executable' })), { path: `LICENSES/${family}.txt`, role: 'license' }],
     }))
@@ -55,7 +55,7 @@ async function releaseFixture(root: string) {
   writeFileSync(publicKeyPath, pair.publicKey.export({ format: 'pem', type: 'spki' }))
   chmodSync(privateKeyPath, 0o600)
   const releaseRoot = join(root, 'release')
-  await buildLocalDevelopmentRelease({ stagingRoot, outputRoot: releaseRoot, privateKeyPath, publicKeyPath, platform: 'darwin', arch: 'arm64' })
+  await buildLocalDevelopmentRelease({ stagingRoot, outputRoot: releaseRoot, privateKeyPath, publicKeyPath, platform: 'darwin', arch })
   return releaseRoot
 }
 
@@ -292,6 +292,49 @@ it('runs the bounded four-family smoke contracts using only descriptor-declared 
   const isContained = (path: string) => { const value = relative(workRoot, path); return value !== '..' && !value.startsWith('../') && !isAbsolute(value) }
   expect(calls.every(({ cwd }) => isContained(cwd))).toBe(true)
   expect(pathArguments.every(isContained)).toBe(true)
+  expect(existsSync(workRoot)).toBe(false)
+})
+
+it('uses the signed darwin-x64 release coordinate instead of the host architecture', async () => {
+  const root = temporaryRoot()
+  const calls: RunRequest[] = []
+  const releaseRoot = await releaseFixture(root, 'x64')
+  const workRoot = join(root, 'work-x64')
+  await mkdir(workRoot)
+
+  let smokeError: unknown
+  try {
+    await smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, run: recordingRunner(calls) })
+  } catch (error) {
+    smokeError = error
+  }
+
+  expect(calls).toHaveLength(27)
+  if (smokeError) throw smokeError
+  expect(calls.every(({ executable }) => executable.includes('/darwin-x64/'))).toBe(true)
+  expect(existsSync(workRoot)).toBe(false)
+})
+
+it.each([
+  ['malformed', (index: Record<string, unknown>) => { index.packs = 'not-an-array' }],
+  ['mixed-target', (index: { packs?: Array<{ name?: string, arch?: string }> }) => {
+    const media = index.packs?.find((descriptor) => descriptor.name === 'media')
+    if (media) media.arch = 'x64'
+  }],
+])('fails closed for a %s release index before invoking a runner', async (_name, mutate) => {
+  const root = temporaryRoot()
+  const calls: RunRequest[] = []
+  const releaseRoot = await releaseFixture(root)
+  const indexPath = join(releaseRoot, 'index.json')
+  const index = JSON.parse(await readFile(indexPath, 'utf8')) as Record<string, unknown> & { packs?: Array<{ name?: string, arch?: string }> }
+  mutate(index)
+  await writeFile(indexPath, JSON.stringify(index))
+  const workRoot = join(root, `work-${_name}`)
+  await mkdir(workRoot)
+
+  await expect(smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, run: recordingRunner(calls) })).rejects.toThrow()
+
+  expect(calls).toHaveLength(0)
   expect(existsSync(workRoot)).toBe(false)
 })
 

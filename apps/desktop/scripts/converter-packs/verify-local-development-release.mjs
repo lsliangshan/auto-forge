@@ -431,13 +431,36 @@ function documentArguments(input, target, outputRoot) {
   ]
 }
 
-async function resolveExecutables(releaseRoot) {
+async function readReleaseCoordinate(releaseRoot) {
+  const indexPath = join(releaseRoot, 'index.json')
+  const before = await regularFile(indexPath)
+  const bytes = await readFile(indexPath)
+  const after = await regularFile(indexPath)
+  if (bytes.byteLength !== before.size || bytes.byteLength !== after.size || before.dev !== after.dev || before.ino !== after.ino
+    || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) fail()
+  let index
+  try { index = JSON.parse(bytes.toString('utf8')) } catch { fail() }
+  const families = new Set(Object.keys(executableEntries))
+  if (!Array.isArray(index?.packs) || index.packs.length !== families.size) fail()
+  let coordinate
+  for (const descriptor of index.packs) {
+    if (!descriptor || !families.delete(descriptor.name) || descriptor.platform !== 'darwin' || (descriptor.arch !== 'arm64' && descriptor.arch !== 'x64')) fail()
+    const candidate = `${descriptor.platform}-${descriptor.arch}`
+    if (coordinate !== undefined && coordinate !== candidate) fail()
+    coordinate = candidate
+  }
+  if (families.size !== 0 || coordinate === undefined) fail()
+  const [platform, arch] = coordinate.split('-')
+  return Object.freeze({ platform, arch })
+}
+
+async function resolveExecutables(releaseRoot, target) {
   const index = JSON.parse((await readFile(join(releaseRoot, 'index.json'))).toString('utf8'))
   if (!Array.isArray(index?.packs)) fail()
   const result = Object.create(null)
   for (const [name, entry] of Object.entries(executableEntries)) {
     const descriptor = index.packs.find((candidate) => candidate?.name === name)
-    if (!descriptor || descriptor.platform !== 'darwin' || (descriptor.arch !== 'arm64' && descriptor.arch !== 'x64')
+    if (!descriptor || descriptor.platform !== target.platform || descriptor.arch !== target.arch
       || !Array.isArray(descriptor.entries) || !descriptor.entries.some((candidate) => candidate?.path === entry && candidate.executable === true)) fail()
     const executable = join(releaseRoot, 'installed', name, descriptor.version, `${descriptor.platform}-${descriptor.arch}`, ...entry.split('/'))
     if (!inside(releaseRoot, executable)) fail()
@@ -446,7 +469,8 @@ async function resolveExecutables(releaseRoot) {
   }
   for (const [name, { family, entry }] of Object.entries(supportingEntries)) {
     const descriptor = index.packs.find((candidate) => candidate?.name === family)
-    if (!descriptor?.entries.some((candidate) => candidate?.path === entry && candidate.executable === true)) fail()
+    if (descriptor?.platform !== target.platform || descriptor?.arch !== target.arch
+      || !descriptor?.entries.some((candidate) => candidate?.path === entry && candidate.executable === true)) fail()
     const executable = join(releaseRoot, 'installed', family, descriptor.version, `${descriptor.platform}-${descriptor.arch}`, ...entry.split('/'))
     if (!inside(releaseRoot, executable)) fail()
     await regularFile(executable)
@@ -461,8 +485,9 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     await canonicalDirectory(releaseRoot, 'Release root')
     if (typeof run !== 'function' || (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1))) fail()
     if ((await readdir(workRoot)).length !== 0) fail()
-    await verifyLocalDevelopmentReleaseIntegrity({ releaseRoot, platform: 'darwin', arch: process.arch === 'x64' ? 'x64' : 'arm64' })
-    const executables = await resolveExecutables(releaseRoot)
+    const target = await readReleaseCoordinate(releaseRoot)
+    await verifyLocalDevelopmentReleaseIntegrity({ releaseRoot, platform: target.platform, arch: target.arch })
+    const executables = await resolveExecutables(releaseRoot, target)
     const sources = join(workRoot, 'sources')
     await mkdir(sources)
     const text = join(sources, 'source.txt')
