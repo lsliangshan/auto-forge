@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, readdir, realpath, rm } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm } from 'node:fs/promises'
 import { dirname, join, posix, win32 } from 'node:path'
 import process from 'node:process'
 import { URL } from 'node:url'
@@ -557,22 +557,26 @@ async function createRestrictedDestinationDirectory(root, path) {
   if (!isPathInsideRoot(root, await realpath(path))) fail('Archive destination escapes its root.')
 }
 
-export async function writeRestrictedUstarEntries({ archive, descriptor, destination }) {
+export async function writeRestrictedUstarEntries({ archive, descriptor, destination, beforeWriteForTest }) {
   requireAbsolutePath(destination, 'Archive destination')
-  await requireDirectory(dirname(destination), 'Archive destination parent')
+  const destinationParent = dirname(destination)
+  await requireDirectory(destinationParent, 'Archive destination parent')
   if (await lstat(destination).catch(() => undefined)) fail('Archive destination must not already exist.')
   const entries = restrictedUstarEntries(archive, descriptor)
-  let created = false
+  const privateRoot = await realpath(await mkdtemp(join(destinationParent, '.restricted-ustar-')))
   try {
-    await mkdir(destination, { mode: 0o700 })
-    created = true
-    const root = await realpath(destination)
     for (const entry of entries) {
       const segments = entry.path.split('/')
-      let directory = root
+      let directory = privateRoot
       for (const segment of segments.slice(0, -1)) {
         directory = join(directory, segment)
-        await createRestrictedDestinationDirectory(root, directory)
+        await createRestrictedDestinationDirectory(privateRoot, directory)
+      }
+      await beforeWriteForTest?.({ root: privateRoot, entry: entry.path })
+      directory = privateRoot
+      for (const segment of segments.slice(0, -1)) {
+        directory = join(directory, segment)
+        await createRestrictedDestinationDirectory(privateRoot, directory)
       }
       const output = join(directory, segments.at(-1))
       const handle = await open(output, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), entry.executable ? 0o755 : 0o644)
@@ -584,8 +588,10 @@ export async function writeRestrictedUstarEntries({ archive, descriptor, destina
         await handle.close()
       }
     }
+    if (await lstat(destination).catch(() => undefined)) fail('Archive destination must not already exist.')
+    await rename(privateRoot, destination)
   } catch (error) {
-    if (created) await rm(destination, { recursive: true, force: true })
+    await rm(privateRoot, { recursive: true, force: true })
     throw error
   }
 }

@@ -315,6 +315,30 @@ describe('converter pack release tooling', () => {
     expect(existsSync(partial)).toBe(false)
   })
 
+  it('does not publish or write outside the private extraction root when a checked ancestor is replaced', async () => {
+    const root = temporaryRoot()
+    const external = join(root, 'external')
+    mkdirSync(external)
+    const entries = [
+      { path: 'bin/converter', bytes: Buffer.from('#!/bin/sh\n'), executable: true, role: 'executable' },
+      { path: 'LICENSES/notice.txt', bytes: Buffer.from('license\n'), executable: false, role: 'license' },
+    ]
+    const archive = createRestrictedUstar(entries)
+    const destination = join(root, 'installed')
+
+    await expect(writeRestrictedUstarEntries({
+      archive,
+      descriptor: restrictedDescriptor(entries, archive),
+      destination,
+      beforeWriteForTest: ({ root: extractionRoot }: { root: string }) => {
+        rmSync(join(extractionRoot, 'bin'), { recursive: true, force: true })
+        symlinkSync(external, join(extractionRoot, 'bin'))
+      },
+    })).rejects.toThrow()
+    expect(existsSync(join(external, 'converter'))).toBe(false)
+    expect(existsSync(destination)).toBe(false)
+  })
+
   it.skipIf(!existsSync(actualDarwinApp))('accepts the actual large electron-builder ASAR with canonical Pickle sizing', () => {
     const appAsar = join(actualDarwinApp, 'Contents', 'Resources', 'app.asar')
     const previousNoAsar = process.noAsar

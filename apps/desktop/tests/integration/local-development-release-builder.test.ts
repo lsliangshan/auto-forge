@@ -1,5 +1,5 @@
 import { generateKeyPairSync, verify } from 'node:crypto'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -71,6 +71,13 @@ function keyPair(root: string) {
   return { privateKeyPath, publicKeyPath, publicKey: pair.publicKey }
 }
 
+function replaceDirectoryWithSymlink(path: string, root: string) {
+  const target = join(root, `outside-${path.split('/').at(-1)}`)
+  mkdirSync(target)
+  rmSync(path, { recursive: true, force: true })
+  symlinkSync(target, path)
+}
+
 it('builds and verifies a signed four-family darwin-arm64 installed development release', async () => {
   const root = temporaryRoot()
   const stagingRoot = await stagingFixture(root)
@@ -88,4 +95,25 @@ it('builds and verifies a signed four-family darwin-arm64 installed development 
   expect((await readdir(outputRoot)).sort()).toEqual(['index.json', 'index.sig', 'installed', 'root-public-key.pem'])
   expect(statSync(join(outputRoot, 'installed', 'media', '1.0.0', 'darwin-arm64', 'bin', 'ffmpeg')).mode & 0o777).toBe(0o755)
   await expect(verifyLocalDevelopmentReleaseIntegrity({ releaseRoot: outputRoot, platform: 'darwin', arch: 'arm64' })).resolves.toBeUndefined()
+})
+
+it.each([
+  ['an extra top-level file', (release: string) => writeFileSync(join(release, 'extra.txt'), 'extra'), { platform: 'darwin', arch: 'arm64' }],
+  ['an extra installed file', (release: string) => writeFileSync(join(release, 'installed', 'media', '1.0.0', 'darwin-arm64', 'extra.txt'), 'extra'), { platform: 'darwin', arch: 'arm64' }],
+  ['an installed-root symlink', (release: string, root: string) => replaceDirectoryWithSymlink(join(release, 'installed'), root), { platform: 'darwin', arch: 'arm64' }],
+  ['an installed-family symlink', (release: string, root: string) => replaceDirectoryWithSymlink(join(release, 'installed', 'media'), root), { platform: 'darwin', arch: 'arm64' }],
+  ['an installed-version symlink', (release: string, root: string) => replaceDirectoryWithSymlink(join(release, 'installed', 'media', '1.0.0'), root), { platform: 'darwin', arch: 'arm64' }],
+  ['an installed-coordinate symlink', (release: string, root: string) => replaceDirectoryWithSymlink(join(release, 'installed', 'media', '1.0.0', 'darwin-arm64'), root), { platform: 'darwin', arch: 'arm64' }],
+  ['a wrong target', () => undefined, { platform: 'darwin', arch: 'x64' }],
+  ['a mismatched signature', (release: string) => writeFileSync(join(release, 'index.sig'), 'AAAA\n'), { platform: 'darwin', arch: 'arm64' }],
+  ['a mismatched public key', (release: string, root: string) => writeFileSync(join(release, 'root-public-key.pem'), keyPair(root).publicKey.export({ format: 'pem', type: 'spki' })), { platform: 'darwin', arch: 'arm64' }],
+  ['a tampered entry hash', (release: string) => writeFileSync(join(release, 'installed', 'media', '1.0.0', 'darwin-arm64', 'bin', 'ffmpeg'), 'tampered'), { platform: 'darwin', arch: 'arm64' }],
+  ['a tampered entry mode', (release: string) => chmodSync(join(release, 'installed', 'media', '1.0.0', 'darwin-arm64', 'bin', 'ffmpeg'), 0o644), { platform: 'darwin', arch: 'arm64' }],
+])('fails closed for %s', async (_name, mutate, target) => {
+  const root = temporaryRoot()
+  const keys = keyPair(root)
+  const release = join(root, 'release')
+  await buildLocalDevelopmentRelease({ stagingRoot: await stagingFixture(root), outputRoot: release, ...keys })
+  mutate(release, root)
+  await expect(verifyLocalDevelopmentReleaseIntegrity({ releaseRoot: release, ...target })).rejects.toThrow()
 })
