@@ -15,6 +15,7 @@ import {
   buildLocalDevelopmentRelease,
   verifyLocalDevelopmentReleaseIntegrity,
 } from './build-local-development-release.mjs'
+import { smokeTestLocalDevelopmentRelease } from './verify-local-development-release.mjs'
 
 const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/source-lock.mjs',
@@ -40,6 +41,7 @@ const productionDependencies = Object.freeze({
   stagePacks: ({ plan }) => stageProductionPacks(plan),
   buildRelease: (request) => buildLocalDevelopmentRelease(request),
   verifyRelease: (request) => verifyLocalDevelopmentReleaseIntegrity(request),
+  smokeRelease: (request) => smokeTestLocalDevelopmentRelease(request),
   activateRelease: ({ cacheRoot, fingerprint }) => activateDevelopmentRelease({ cacheRoot, fingerprint }),
 })
 
@@ -181,6 +183,11 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
       stagingRoot, outputRoot: paths.release, privateKeyPath, publicKeyPath, platform: request.platform, arch: request.arch,
     })
     await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
+    if (typeof dependencies.smokeRelease === 'function') {
+      const smokeWorkRoot = join(privateRoot, 'smoke')
+      await mkdir(smokeWorkRoot, { mode: 0o700 })
+      await dependencies.smokeRelease({ releaseRoot: paths.release, workRoot: smokeWorkRoot })
+    }
     await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
     return { fingerprint, releaseRoot: paths.release, reused: false }
   } finally {

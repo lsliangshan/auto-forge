@@ -25,6 +25,7 @@
     "converter-packs:stage": "node scripts/converter-packs/stage-production-packs.mjs",
     "converter-packs:verify-evidence": "node scripts/converter-packs/verify-release-evidence.mjs",
     "converter-packs:verify-sources": "node scripts/converter-packs/source-lock.mjs",
+    "converter-packs:verify-development": "node scripts/converter-packs/verify-local-development-release.mjs",
     "converter-packs:verify-workflows": "node scripts/converter-packs/validate-workflows.mjs",
     "verify:converter-packs": "node scripts/verify-converter-packs.mjs",
     "verify:packaged-native": "node scripts/verify-packaged-native.mjs",
