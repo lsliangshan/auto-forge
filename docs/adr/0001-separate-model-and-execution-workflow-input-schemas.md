@@ -1,0 +1,5 @@
+# Separate model and execution workflow input schemas
+
+AutoForge uses a permissive model-facing projection of each workflow input Schema so the model can submit only values explicitly supplied by the user, while the original strict Schema remains authoritative for execution. This avoids extra parameter-planning model requests and enables deterministic cross-turn input collection without weakening the workflow contract; defaults and runtime bindings are applied by Main before strict validation, and incomplete model output can never reach execution.
+
+The rejected alternatives were to keep one strict Schema and rely on free-form model clarification, which cannot persist or deterministically classify missing input, or to add a separate model planning request before every workflow call, which duplicates tool calling and increases latency and cost. The consequence is that schema projection becomes a security-sensitive Main responsibility and must be covered independently from final input validation.
