@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { constants } from 'node:fs'
-import { lstat, open, readdir, realpath } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, realpath, rm } from 'node:fs/promises'
 import { dirname, join, posix, win32 } from 'node:path'
 import process from 'node:process'
 import { URL } from 'node:url'
@@ -501,10 +501,11 @@ function verifyTarHeader(header) {
   ) fail('Archive header is unsafe or non-deterministic.')
 }
 
-export function verifyRestrictedUstar(archive, descriptor) {
+function restrictedUstarEntries(archive, descriptor) {
   if (archive.byteLength !== descriptor.archiveBytes || archive.byteLength % 512 !== 0) fail('Archive size mismatch.')
   const expected = new Map(descriptor.entries.map((entry) => [entry.path, entry]))
   const seen = new Set()
+  const entries = []
   let offset = 0
   let zeroBlocks = 0
   while (offset < archive.byteLength) {
@@ -535,8 +536,58 @@ export function verifyRestrictedUstar(archive, descriptor) {
     if (!archive.subarray(offset, offset + padding).every((value) => value === 0)) fail('Archive padding is unsafe.')
     offset += padding
     seen.add(path.toLowerCase())
+    entries.push({ path, bytes, executable: entry.executable })
   }
   if (zeroBlocks < 2 || seen.size !== expected.size) fail('Archive entry set mismatch.')
+  return entries
+}
+
+export function verifyRestrictedUstar(archive, descriptor) {
+  restrictedUstarEntries(archive, descriptor)
+}
+
+async function createRestrictedDestinationDirectory(root, path) {
+  const metadata = await lstat(path).catch(() => undefined)
+  if (metadata) {
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) fail('Archive destination contains an unsafe path component.')
+  } else {
+    await mkdir(path, { mode: 0o755 })
+  }
+  await requireDirectory(path, 'Archive destination directory')
+  if (!isPathInsideRoot(root, await realpath(path))) fail('Archive destination escapes its root.')
+}
+
+export async function writeRestrictedUstarEntries({ archive, descriptor, destination }) {
+  requireAbsolutePath(destination, 'Archive destination')
+  await requireDirectory(dirname(destination), 'Archive destination parent')
+  if (await lstat(destination).catch(() => undefined)) fail('Archive destination must not already exist.')
+  const entries = restrictedUstarEntries(archive, descriptor)
+  let created = false
+  try {
+    await mkdir(destination, { mode: 0o700 })
+    created = true
+    const root = await realpath(destination)
+    for (const entry of entries) {
+      const segments = entry.path.split('/')
+      let directory = root
+      for (const segment of segments.slice(0, -1)) {
+        directory = join(directory, segment)
+        await createRestrictedDestinationDirectory(root, directory)
+      }
+      const output = join(directory, segments.at(-1))
+      const handle = await open(output, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), entry.executable ? 0o755 : 0o644)
+      try {
+        await handle.writeFile(entry.bytes)
+        await handle.chmod(entry.executable ? 0o755 : 0o644)
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+    }
+  } catch (error) {
+    if (created) await rm(destination, { recursive: true, force: true })
+    throw error
+  }
 }
 
 export function archiveFilename(descriptor) {

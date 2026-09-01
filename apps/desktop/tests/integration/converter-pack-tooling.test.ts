@@ -8,9 +8,11 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -20,6 +22,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createProductionBootstrap } from '../../scripts/converter-packs/create-production-bootstrap.mjs'
+import { createRestrictedUstar, sha256, writeRestrictedUstarEntries } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const buildScript = join(desktopRoot, 'scripts/converter-packs/build-index.mjs')
@@ -235,8 +238,82 @@ function keyPair(root: string) {
   return { privateKey, publicKey }
 }
 
+function restrictedDescriptor(entries: Array<{ path: string; bytes: Buffer; executable: boolean; role: string }>, archive: Buffer) {
+  return {
+    archiveBytes: archive.byteLength,
+    entries: entries.map((entry) => ({
+      path: entry.path,
+      sha256: sha256(entry.bytes),
+      bytes: entry.bytes.byteLength,
+      executable: entry.executable,
+      role: entry.role,
+    })),
+  }
+}
+
 describe('converter pack release tooling', () => {
   const actualDarwinApp = join(desktopRoot, 'dist', 'mac-arm64', 'AutoForge.app')
+
+  it('materializes only descriptor-authenticated USTAR entries beneath a new destination', async () => {
+    const root = temporaryRoot()
+    const entries = [
+      { path: 'bin/converter', bytes: Buffer.from('#!/bin/sh\necho fixture\n'), executable: true, role: 'executable' },
+      { path: 'LICENSES/notice.txt', bytes: Buffer.from('Fixture license\n'), executable: false, role: 'license' },
+    ]
+    const archive = createRestrictedUstar(entries)
+    const descriptor = restrictedDescriptor(entries, archive)
+    const destination = join(root, 'installed')
+
+    await writeRestrictedUstarEntries({ archive, descriptor, destination })
+
+    expect(readFileSync(join(destination, 'bin', 'converter'))).toEqual(entries[0]!.bytes)
+    expect(readFileSync(join(destination, 'LICENSES', 'notice.txt'))).toEqual(entries[1]!.bytes)
+    expect(statSync(join(destination, 'bin', 'converter')).mode & 0o777).toBe(0o755)
+    expect(statSync(join(destination, 'LICENSES', 'notice.txt')).mode & 0o777).toBe(0o644)
+  })
+
+  it.each([
+    ['traversal', (archive: Buffer) => { Buffer.from('../escape\0').copy(archive, 0) }],
+    ['duplicate portable names', (archive: Buffer) => { Buffer.from('BIN/converter\0').copy(archive, 1024) }],
+    ['symlink', (archive: Buffer) => { archive[156] = '2'.charCodeAt(0) }],
+    ['undeclared entries', (archive: Buffer) => { Buffer.from('bin/other\0').copy(archive, 0) }],
+  ])('rejects a %s archive entry without preserving output', async (_name, mutate) => {
+    const root = temporaryRoot()
+    const entries = [
+      { path: 'bin/converter', bytes: Buffer.from('#!/bin/sh\n'), executable: true, role: 'executable' },
+      { path: 'LICENSES/notice.txt', bytes: Buffer.from('license\n'), executable: false, role: 'license' },
+    ]
+    const archive = createRestrictedUstar(entries)
+    mutate(archive)
+    const destination = join(root, 'installed')
+
+    await expect(writeRestrictedUstarEntries({ archive, descriptor: restrictedDescriptor(entries, archive), destination })).rejects.toThrow()
+    expect(existsSync(destination)).toBe(false)
+  })
+
+  it('rejects hash mismatches, non-empty destinations, and malformed second entries without partial output', async () => {
+    const root = temporaryRoot()
+    const entries = [
+      { path: 'bin/converter', bytes: Buffer.from('#!/bin/sh\n'), executable: true, role: 'executable' },
+      { path: 'LICENSES/notice.txt', bytes: Buffer.from('license\n'), executable: false, role: 'license' },
+    ]
+    const archive = createRestrictedUstar(entries)
+    const descriptor = restrictedDescriptor(entries, archive)
+    const hashMismatch = { ...descriptor, entries: descriptor.entries.map((entry, index) => index === 0 ? { ...entry, sha256: '0'.repeat(64) } : entry) }
+    await expect(writeRestrictedUstarEntries({ archive, descriptor: hashMismatch, destination: join(root, 'hash-mismatch') })).rejects.toThrow()
+
+    const occupied = join(root, 'occupied')
+    mkdirSync(occupied)
+    writeFileSync(join(occupied, 'keep.txt'), 'keep')
+    await expect(writeRestrictedUstarEntries({ archive, descriptor, destination: occupied })).rejects.toThrow()
+    expect(readdirSync(occupied)).toEqual(['keep.txt'])
+
+    const malformed = Buffer.from(archive)
+    malformed[1024 + 156] = '2'.charCodeAt(0)
+    const partial = join(root, 'partial')
+    await expect(writeRestrictedUstarEntries({ archive: malformed, descriptor: restrictedDescriptor(entries, malformed), destination: partial })).rejects.toThrow()
+    expect(existsSync(partial)).toBe(false)
+  })
 
   it.skipIf(!existsSync(actualDarwinApp))('accepts the actual large electron-builder ASAR with canonical Pickle sizing', () => {
     const appAsar = join(actualDarwinApp, 'Contents', 'Resources', 'app.asar')
