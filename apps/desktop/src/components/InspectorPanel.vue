@@ -119,7 +119,23 @@
           正在加载工作流详情…
         </div>
         <template v-else-if="workflow.selectedDetail">
-          <section><span class="af-panel-heading">工作流</span><p>{{ workflow.selectedDetail.name }} · {{ workflow.selectedDetail.version }}</p></section>
+          <section>
+            <span class="af-panel-heading">工作流</span>
+            <div class="workflow-inspector-identity">
+              <span
+                v-if="workflow.selectedDetail.logo"
+                class="workflow-inspector-logo"
+              >
+                <WorkflowLogo
+                  :logo="workflow.selectedDetail.logo"
+                  test-id="inspector-workflow-logo"
+                >
+                  <el-icon><Operation /></el-icon>
+                </WorkflowLogo>
+              </span>
+              <p>{{ workflow.selectedDetail.name }} · {{ workflow.selectedDetail.version }}</p>
+            </div>
+          </section>
           <section><span class="af-panel-heading">Manifest</span><p class="breakable">{{ workflow.selectedDetail.id }}<br>{{ workflow.selectedDetail.author }} · {{ workflow.selectedDetail.category }} · {{ workflow.selectedDetail.source === 'installed' ? '已安装' : '开发中' }}</p></section>
           <section><span class="af-panel-heading">代码 Hash</span><p class="breakable hash">{{ workflow.selectedDetail.codeSha256 ?? '未提供' }}</p></section>
           <section>
@@ -167,7 +183,7 @@
 </template>
 
 <script setup lang="ts">
-import { Close } from '@element-plus/icons-vue'
+import { Close, Operation } from '@element-plus/icons-vue'
 import type { WorkflowDetail } from '@autoforge/shared'
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
@@ -175,6 +191,7 @@ import { useChatStore } from '../stores/chat'
 import { useExecutionStore } from '../stores/execution'
 import { useWorkflowStore } from '../stores/workflow'
 import DebugPanel from './developer/DebugPanel.vue'
+import WorkflowLogo from './WorkflowLogo.vue'
 
 defineProps<{ open: boolean }>()
 defineEmits<{ close: [] }>()
@@ -212,6 +229,7 @@ const formatData = (value: unknown) => {
 .data-preview { max-height: 220px; margin: 8px 0 0; padding: 8px; overflow: auto; color: var(--af-text); background: var(--af-surface-muted); font-family: ui-monospace, monospace; font-size: 0.6875rem; white-space: pre-wrap; overflow-wrap: anywhere; }.execution-error, .inspector-error { color: var(--af-danger); }.inspector-error { padding: 18px 10px; font-size: 0.75rem; }
 .permission-list { display: grid; gap: 8px; margin: 9px 0 0; padding: 0; list-style: none; }.permission-list li { font-family: ui-monospace, monospace; font-size: 0.6875rem; overflow-wrap: anywhere; }.permission-list small { display: block; margin-top: 2px; color: var(--af-text-muted); font-family: inherit; }
 .hash { font-family: ui-monospace, monospace; font-size: 0.625rem !important; }.recent-list { display: grid; gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }.recent-list li { display: flex; justify-content: space-between; gap: 8px; font-size: 0.6875rem; }.recent-list small { color: var(--af-text-muted); }
+.workflow-inspector-identity { display: flex; align-items: center; gap: 9px; margin-top: 7px; }.workflow-inspector-identity p { margin: 0; }.workflow-inspector-logo { display: block; width: 34px; height: 34px; flex: none; overflow: hidden; border: 1px solid var(--af-border); border-radius: 9px; }
 .inspector-state { padding: 36px 10px; color: var(--af-text-muted); font-size: 0.8125rem; line-height: 1.6; text-align: center; }
 @media (max-width: 1179px) {
   .inspector { position: fixed; z-index: 25; top: 0; right: 0; box-shadow: -12px 0 28px rgb(25 32 44 / 16%); }

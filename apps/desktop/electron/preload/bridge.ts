@@ -244,6 +244,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       cancel: (input) => invoke(ipcRenderer, ipcChannels.conversionCancel, input),
       retry: (input) => invoke(ipcRenderer, ipcChannels.conversionRetry, input),
       saveCopy: (input) => invoke(ipcRenderer, ipcChannels.conversionSaveCopy, input),
+      preview: (input) => invoke(ipcRenderer, ipcChannels.conversionPreview, input),
       reveal: (input) => invoke(ipcRenderer, ipcChannels.conversionReveal, input),
       deleteArtifact: (input) => invoke(ipcRenderer, ipcChannels.conversionDeleteArtifact, input),
       onEvent: subscribeToConversionEvents,

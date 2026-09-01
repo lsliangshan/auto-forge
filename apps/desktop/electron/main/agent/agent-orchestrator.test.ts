@@ -54,8 +54,10 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+const workflowLogo = 'https://img.liangqy.com/autoforge/workflows/baidu.png'
 const workflow: WorkflowDetail = {
   id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索',
+  logo: workflowLogo,
   author: 'AutoForge', category: 'search', enabled: true, source: 'installed', integrity: 'valid',
   updatedAt: '2026-07-19T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
   runtimeIdentity: { id: 'browser.search.baidu', version: '1.0.0', source: 'installed' }, timeoutMs: 30_000,
@@ -1882,14 +1884,15 @@ describe('AgentOrchestrator', () => {
       expect.objectContaining({
         type: 'block',
         block: expect.objectContaining({
-          type: 'workflow_status', workflowId: workflow.id, status: 'awaiting_approval', executionAvailable: false,
+          type: 'workflow_status', workflowId: workflow.id, logo: workflowLogo,
+          status: 'awaiting_approval', executionAvailable: false,
         }),
       }),
       expect.objectContaining({
         type: 'block',
         block: expect.objectContaining({
           type: 'approval', blockId: expect.any(String), state: 'pending',
-          workflowId: workflow.id, workflowVersion: workflow.version,
+          workflowId: workflow.id, workflowVersion: workflow.version, logo: workflowLogo,
         }),
       }),
     ]))

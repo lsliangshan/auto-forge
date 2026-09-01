@@ -1136,6 +1136,7 @@ export function probeConversionInput(input: {
 
 const staticImages = new Set<ConversionInputFormat>(['png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp'])
 const staticTargets = new Set<ConversionTargetFormat>(['png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp'])
+const pdfImageSources = new Set<ConversionInputFormat>([...staticImages, 'gif'])
 const iconSources = new Set<ConversionInputFormat>(['png', 'jpeg', 'webp', 'avif', 'svg'])
 const documents = new Set<ConversionInputFormat>(['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'rtf', 'csv', 'html', 'markdown', 'txt'])
 const audioTargets = new Set<ConversionTargetFormat>(['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'])
@@ -1147,6 +1148,7 @@ export function resolveConversionRoute(input: ProbedConversionInput, targetForma
     (staticImages.has(sourceFormat) && staticTargets.has(targetFormat))
     || ((sourceFormat === 'gif' || (sourceFormat === 'webp' && input.frameCount > 1))
       && (targetFormat === 'gif' || targetFormat === 'mp4' || staticTargets.has(targetFormat)))
+    || (pdfImageSources.has(sourceFormat) && targetFormat === 'pdf')
     || (sourceFormat === 'svg' && ['png', 'jpeg', 'webp', 'pdf'].includes(targetFormat))
     || ((sourceFormat === 'ico' || sourceFormat === 'icns') && staticTargets.has(targetFormat))
     || (iconSources.has(sourceFormat) && (targetFormat === 'ico' || targetFormat === 'icns'))
@@ -1157,7 +1159,7 @@ export function resolveConversionRoute(input: ProbedConversionInput, targetForma
     || (videoFormats.has(sourceFormat) && (videoTargets.has(targetFormat) || audioTargets.has(targetFormat)))
   )
   if (!allowed) throw failure('CONVERSION_FORMAT_UNSUPPORTED')
-  const animatedToStatic = input.frameCount > 1 && staticTargets.has(targetFormat)
+  const animatedToStatic = input.frameCount > 1 && (staticTargets.has(targetFormat) || targetFormat === 'pdf')
   const iconGeometry = (targetFormat === 'ico' || targetFormat === 'icns')
     && input.width !== undefined && input.height !== undefined && input.width !== input.height
     ? { fit: 'contain' as const, canvas: 'square' as const, crop: false as const, transparentPadding: true as const }

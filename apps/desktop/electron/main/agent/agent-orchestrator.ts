@@ -2363,6 +2363,7 @@ export class AgentOrchestrator {
           workflowId: tool.candidate.workflow.id,
           workflowName: tool.candidate.workflow.name,
           workflowVersion: tool.candidate.workflow.version,
+          ...(tool.candidate.workflow.logo ? { logo: tool.candidate.workflow.logo } : {}),
           source: source.source,
           ...(source.source === 'development' ? { buildHash: source.buildHash } : {}),
           ...(tool.city === undefined ? {} : { city: tool.city }),
@@ -3106,13 +3107,14 @@ export class AgentOrchestrator {
 
   private workflowStatusContext(tool: PendingWorkflowTool): Pick<
     WorkflowStatusBlock,
-    'workflowId' | 'workflowName' | 'workflowVersion' | 'source' | 'buildHash' | 'city'
+    'workflowId' | 'workflowName' | 'workflowVersion' | 'logo' | 'source' | 'buildHash' | 'city'
   > {
     const workflow = tool.candidate.workflow
     return {
       workflowId: workflow.id,
       workflowName: workflow.name,
       workflowVersion: workflow.version,
+      ...(workflow.logo ? { logo: workflow.logo } : {}),
       source: tool.source.source,
       ...(tool.source.source === 'development' ? { buildHash: tool.source.buildHash } : {}),
       ...(tool.city === undefined ? {} : { city: tool.city }),

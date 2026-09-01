@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "name": "万象转换",
   "description": "将附件转换为明确指定的图片、图标、文档、音频或视频格式。",
+  "logo": "https://img.liangqy.com/autoforge/workflows/manifold.png",
   "author": "AutoForge",
   "category": "file",
   "cities": [],

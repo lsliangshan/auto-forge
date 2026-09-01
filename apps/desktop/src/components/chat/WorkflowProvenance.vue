@@ -9,7 +9,9 @@
         class="af-operation-marker"
         aria-hidden="true"
       >
-        <el-icon><component :is="statusIcon" /></el-icon>
+        <WorkflowLogo :logo="first.logo">
+          <el-icon><component :is="statusIcon" /></el-icon>
+        </WorkflowLogo>
       </span>
       <div class="af-operation-title">
         <span class="af-operation-eyebrow">{{ eyebrowLabel }}</span>
@@ -50,7 +52,17 @@
           aria-hidden="true"
         />
         <div class="provenance-entry-copy">
-          <strong>{{ entry.workflowName }}</strong>
+          <div class="provenance-entry-title">
+            <span
+              v-if="entry.logo"
+              class="provenance-entry-logo"
+            >
+              <WorkflowLogo :logo="entry.logo">
+                <el-icon><Operation /></el-icon>
+              </WorkflowLogo>
+            </span>
+            <strong>{{ entry.workflowName }}</strong>
+          </div>
           <span>{{ entry.city ?? '不限城市' }} · {{ statusLabel(entry.status) }}</span>
         </div>
         <button
@@ -67,10 +79,11 @@
 </template>
 
 <script setup lang="ts">
-import { ArrowDown, Check, CloseBold, Loading, Remove, Warning } from '@element-plus/icons-vue'
+import { ArrowDown, Check, CloseBold, Loading, Operation, Remove, Warning } from '@element-plus/icons-vue'
 import type { ChatBlock, ExecutionStatus } from '@autoforge/shared'
 import { computed, ref } from 'vue'
 import { useExecutionStore } from '../../stores/execution'
+import WorkflowLogo from '../WorkflowLogo.vue'
 
 type WorkflowProvenanceBlock = Extract<ChatBlock, { type: 'workflow_provenance' }>
 const props = defineProps<{ block: WorkflowProvenanceBlock }>()
@@ -130,6 +143,7 @@ function entryTone(status: ExecutionStatus): string {
 .provenance-entry-marker.tone-success { background: var(--af-success); }
 .provenance-entry-marker.tone-danger { background: var(--af-danger); }
 .provenance-entry-copy { display: grid; min-width: 0; gap: 2px; }
+.provenance-entry-title { display: flex; min-width: 0; align-items: center; gap: 6px; }.provenance-entry-logo { display: block; width: 18px; height: 18px; flex: none; overflow: hidden; border: 1px solid var(--af-border); border-radius: 5px; }
 .provenance-entry-copy strong { overflow-wrap: anywhere; color: var(--af-text); font-size: 0.6875rem; font-weight: 650; }
 .provenance-entry-copy span { color: var(--af-text-muted); font-size: 0.625rem; }
 </style>

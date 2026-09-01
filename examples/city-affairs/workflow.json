@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "name": "城事通",
   "description": "根据个人政务业务打开对应的官方查询或办理页面。",
+  "logo": "https://img.liangqy.com/autoforge/workflows/nexora/nexora.png",
   "author": "AutoForge",
   "category": "政务",
   "cities": [],
@@ -13,8 +14,7 @@
       "capability": "browser.open",
       "scope": {
         "origins": [
-          "https://fw.bjrcgz.gov.cn",
-          "https://fuwu.rsj.beijing.gov.cn"
+          "https://*.gov.cn"
         ]
       }
     }

@@ -321,6 +321,7 @@ export interface ApplicationRuntimeOptions {
   readClipboardImage(): { bytes: Uint8Array; mimeType: 'image/png'; name: string } | undefined
   chooseMediaSavePath(defaultName: string): Promise<string | undefined>
   revealPath(path: string): void
+  openPath?(path: string): Promise<string>
   openExternal(url: string): Promise<void>
   emitChat(event: ChatEvent): void
   emitExecution(event: ExecutionEvent): void
@@ -659,6 +660,7 @@ function summary(workflow: WorkflowDetail): WorkflowSummary {
     version: workflow.version,
     name: workflow.name,
     description: workflow.description,
+    ...(workflow.logo ? { logo: workflow.logo } : {}),
     author: workflow.author,
     category: workflow.category,
     cities: workflow.cities,
@@ -787,6 +789,7 @@ function newManifest(name: string): WorkflowManifest {
     version: '0.1.0',
     name,
     description: '',
+    logo: '',
     author: 'Local developer',
     category: 'local',
     cities: [],
@@ -4280,6 +4283,24 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
         try {
           options.revealPath(verified.path)
+        } finally {
+          await verified.handle.close().catch(() => undefined)
+        }
+      },
+      preview: async ({ artifactId }) => {
+        const session = await requireAuthenticatedSession()
+        const artifact = database.conversionArtifacts.getOwned(artifactId, session.user.id)
+        if (!artifact || artifact.status !== 'ready') throw failure('NOT_FOUND')
+        requireCompletedConversionArtifactParent(database, artifact, session.user.id)
+        const verified = await openVerifiedConversionArtifact(
+          options.paths.data,
+          session.user.id,
+          artifact,
+        )
+        try {
+          if (!options.openPath) throw failure('SERVICE_UNAVAILABLE')
+          const openError = await options.openPath(verified.path)
+          if (openError) throw failure('SERVICE_UNAVAILABLE')
         } finally {
           await verified.handle.close().catch(() => undefined)
         }

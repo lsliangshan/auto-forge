@@ -116,6 +116,7 @@ function services(): DesktopIpcServices {
       cancel: vi.fn().mockResolvedValue(undefined),
       retry: vi.fn().mockResolvedValue(undefined),
       saveCopy: vi.fn().mockResolvedValue({ saved: true }),
+      preview: vi.fn().mockResolvedValue(undefined),
       reveal: vi.fn().mockResolvedValue(undefined),
       deleteArtifact: vi.fn().mockResolvedValue(undefined),
       onEvent: vi.fn(() => () => undefined),
@@ -351,16 +352,19 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.conversionRetry, { jobId: 'job_2' })).resolves.toBeUndefined()
     await expect(app.invoke(ipcChannels.conversionSaveCopy, { artifactId: 'artifact_1' }))
       .resolves.toEqual({ saved: true })
+    await expect(app.invoke(ipcChannels.conversionPreview, { artifactId: 'artifact_2' })).resolves.toBeUndefined()
     await expect(app.invoke(ipcChannels.conversionReveal, { artifactId: 'artifact_2' })).resolves.toBeUndefined()
     await expect(app.invoke(ipcChannels.conversionDeleteArtifact, { artifactId: 'artifact_3' }))
       .resolves.toBeUndefined()
 
     expect(app.dependencies.conversion.listForExecution).toHaveBeenCalledWith({ executionId: 'execution_1' })
     expect(app.dependencies.conversion.saveCopy).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
+    expect(app.dependencies.conversion.preview).toHaveBeenCalledWith({ artifactId: 'artifact_2' })
     for (const [channel, input] of [
       [ipcChannels.conversionListForExecution, { executionId: 'execution_1', path: '/private/source.png' }],
       [ipcChannels.conversionCancel, { jobId: '../job_1' }],
       [ipcChannels.conversionSaveCopy, { artifactId: 'artifact_1', destination: '/tmp/result.png' }],
+      [ipcChannels.conversionPreview, { artifactId: '/private/result.png' }],
       [ipcChannels.conversionReveal, { artifactId: '/private/result.png' }],
       [ipcChannels.conversionDeleteArtifact, { artifactId: 'artifact_3', ownerUserId: 'forged' }],
     ] as const) {

@@ -219,7 +219,7 @@ export const useConversionStore = defineStore('conversion', {
         delete this.pendingJobIds[job.jobId]
       }
     },
-    async actOnArtifact(action: 'saveCopy' | 'reveal' | 'deleteArtifact', artifact: ConversionArtifactView) {
+    async actOnArtifact(action: 'saveCopy' | 'preview' | 'reveal' | 'deleteArtifact', artifact: ConversionArtifactView) {
       if (artifact.status !== 'ready' || this.pendingArtifactIds[artifact.artifactId]) return
       this.pendingArtifactIds[artifact.artifactId] = true
       delete this.actionErrorsByArtifact[artifact.artifactId]

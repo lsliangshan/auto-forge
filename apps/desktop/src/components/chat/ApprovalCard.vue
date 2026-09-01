@@ -9,7 +9,9 @@
         class="af-operation-marker"
         aria-hidden="true"
       >
-        <el-icon><component :is="statusIcon" /></el-icon>
+        <WorkflowLogo :logo="approval.logo">
+          <el-icon><component :is="statusIcon" /></el-icon>
+        </WorkflowLogo>
       </span>
       <div class="af-operation-title">
         <span class="af-operation-eyebrow">权限请求</span>
@@ -112,6 +114,7 @@ import { ArrowDown, Check, CloseBold, Lock, Remove, Warning } from '@element-plu
 import type { ApprovalDecision, ChatBlock } from '@autoforge/shared'
 import { computed, ref, watch } from 'vue'
 import { displayError, getDesktopApi } from '../../services/desktop-api'
+import WorkflowLogo from '../WorkflowLogo.vue'
 
 type ApprovalBlock = Extract<ChatBlock, { type: 'approval' }>
 const props = defineProps<{ approval: ApprovalBlock }>()

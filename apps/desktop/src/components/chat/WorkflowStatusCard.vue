@@ -9,9 +9,11 @@
         :class="['af-operation-marker', `tone-${statusTone}`]"
         aria-hidden="true"
       >
-        <el-icon :class="{ 'is-loading': block.status === 'running' }">
-          <component :is="statusIcon" />
-        </el-icon>
+        <WorkflowLogo :logo="block.logo">
+          <el-icon :class="{ 'is-loading': block.status === 'running' }">
+            <component :is="statusIcon" />
+          </el-icon>
+        </WorkflowLogo>
       </span>
       <div class="af-operation-title">
         <span class="af-operation-eyebrow">工作流 · 第 {{ block.executionIndex }} 次调用 · 上限 {{ block.executionLimit }} 次</span>
@@ -92,6 +94,7 @@ import type { ChatBlock } from '@autoforge/shared'
 import { computed, ref, watch } from 'vue'
 import { displayError } from '../../services/desktop-api'
 import { useExecutionStore } from '../../stores/execution'
+import WorkflowLogo from '../WorkflowLogo.vue'
 
 type WorkflowStatusBlock = Extract<ChatBlock, { type: 'workflow_status' }>
 const props = defineProps<{ block: WorkflowStatusBlock }>()

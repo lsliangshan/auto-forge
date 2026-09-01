@@ -109,6 +109,33 @@ describe('local conversion intent', () => {
   })
 
   it.each([
+    ['转换为 PDF', 1, 'pdf'],
+    ['转换为 PDF', 3, 'pdf'],
+    ['转成 WebP', 2, 'webp'],
+    ['Convert to PDF', 2, 'pdf'],
+  ] as const)(
+    'binds a source-omitted conversion command to every attachment in the current message: %s',
+    (text, count, targetFormat) => {
+      const projected = Array.from({ length: count }, (_, index) => ({
+        ...attachments[0]!, index, name: `current-${index + 1}.png`,
+      }))
+      expect(classifyAttachmentConversionRequest(text, projected)).toEqual({
+        decision: 'local',
+        targetFormat,
+        selectedAttachmentIndexes: Array.from({ length: count }, (_, index) => index),
+      })
+    },
+  )
+
+  it.each([
+    '不要转换为 PDF',
+    '转换为 PDF 或 WEBP',
+    '如何转换为 PDF？',
+  ])('does not infer current attachments from unsafe source-omitted text: %s', (text) => {
+    expect(classifyAttachmentConversionRequest(text, attachments)).toEqual({ decision: 'ambiguous' })
+  })
+
+  it.each([
     ['Convert report.pdf to .PDF', 'pdf'],
     ['Convert report.pdf to .ico', 'ico'],
     ['Convert report.pdf to .icns', 'icns'],

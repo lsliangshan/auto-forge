@@ -816,6 +816,43 @@ describe('workbench', () => {
     expect(selectButton.attributes('aria-pressed')).toBe('true')
   })
 
+  it('renders non-empty workflow logos and keeps the default icon for empty logos', async () => {
+    const api = createApi()
+    const logo = 'https://img.liangqy.com/autoforge/workflows/example.png'
+    const branded = {
+      id: 'local.logo.branded', version: '1.0.0', name: '品牌工作流', description: '包含 Logo', logo,
+      author: 'AutoForge', category: '工具', cities: [], enabled: true,
+      source: 'installed' as const, integrity: 'valid' as const, updatedAt: '2026-08-31T00:00:00.000Z',
+    }
+    const unbranded = {
+      ...branded, id: 'local.logo.unbranded', name: '默认工作流', description: '不包含 Logo', logo: undefined,
+    }
+    vi.mocked(api.workflows.list).mockResolvedValue([branded, unbranded])
+    vi.mocked(api.workflows.get).mockResolvedValue({
+      ...branded,
+      runtimeIdentity: { id: branded.id, version: branded.version, source: 'installed' },
+      permissions: [], activationExamples: ['运行品牌工作流'], activationNegativeExamples: [],
+      timeoutMs: 30_000, inputSchema: { type: 'object' }, outputSchema: { type: 'object' },
+    })
+
+    const { wrapper } = await mountApp('/workflows', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('品牌工作流'))
+
+    expect(wrapper.get('[data-testid="workflow-logo-local.logo.branded"]').attributes('src')).toBe(logo)
+    expect(wrapper.find('[data-testid="workflow-logo-local.logo.unbranded"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="workflow-icon-local.logo.unbranded"] .el-icon').exists()).toBe(true)
+
+    await wrapper.get('button[aria-label="查看品牌工作流详情"]').trigger('click')
+    await vi.waitFor(() => expect(api.workflows.get).toHaveBeenCalledWith(branded.id, branded.version))
+    const inspectorLogo = wrapper.get('[data-testid="inspector-workflow-logo"]')
+    expect(inspectorLogo.attributes('src')).toBe(logo)
+
+    await inspectorLogo.trigger('error')
+
+    expect(wrapper.find('[data-testid="inspector-workflow-logo"]').exists()).toBe(false)
+    expect(wrapper.get('.workflow-inspector-logo .el-icon').exists()).toBe(true)
+  })
+
   it('builds the city filter from every unique workflow city after unrestricted', async () => {
     const api = createApi()
     const shanghaiAndBeijing = {

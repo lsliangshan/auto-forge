@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "name": "百度搜索",
   "description": "在可见的受控浏览器中打开百度并搜索关键词。",
+  "logo": "",
   "author": "AutoForge",
   "category": "browser",
   "entryPath": "dist/index.js",

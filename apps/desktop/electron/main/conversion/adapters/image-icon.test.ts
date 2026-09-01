@@ -228,6 +228,30 @@ describe('image/icon conversion adapter', () => {
     expect(plan.outputs).toEqual([{ path: '/work/output.png', format: 'png', metadata: { frameSelection: 'first' } }])
   })
 
+  it('plans a static PNG as a single-page PDF', () => {
+    const plan = imageIconAdapter.plan(image(), request('pdf'), lease, '/work')
+
+    expect(plan.args).toEqual([
+      'convert', '--input-format', 'png', '--output-format', 'pdf',
+      '--output', '/work/output.pdf', '--', specialInput,
+    ])
+    expect(plan.outputs).toEqual([{ path: '/work/output.pdf', format: 'pdf' }])
+  })
+
+  it.each(['gif', 'webp'] as const)('selects only the first frame when animated %s becomes PDF', (format) => {
+    const plan = imageIconAdapter.plan(image({
+      format, mimeType: `image/${format}`, frameCount: 4,
+    }), request('pdf'), lease, '/work')
+
+    expect(plan.args).toEqual([
+      'convert', '--input-format', format, '--output-format', 'pdf', '--frame', 'first',
+      '--output', '/work/output.pdf', '--', specialInput,
+    ])
+    expect(plan.outputs).toEqual([{
+      path: '/work/output.pdf', format: 'pdf', metadata: { frameSelection: 'first' },
+    }])
+  })
+
   it('selects and records the first frame when an animated WebP becomes a static icon', () => {
     const plan = imageIconAdapter.plan(image({ format: 'webp', mimeType: 'image/webp', frameCount: 4 }), request('ico'), lease, '/work')
     expect(plan.args).toContain('first')

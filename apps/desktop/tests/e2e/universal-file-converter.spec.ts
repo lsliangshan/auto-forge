@@ -43,6 +43,7 @@ interface HarnessSnapshot {
   nativePickerNames: string[][]
   saveDialogDefaults: string[]
   revealedCount: number
+  previewedCount: number
   heldJobIds: string[]
   processEvidence: Array<{
     jobId: string
@@ -244,8 +245,8 @@ test.describe.serial('universal file conversion through Electron', () => {
       .toHaveLength(2)
     expectIco(await readFile(icoCopy))
     expectPdf(await readFile(pdfCopy))
-    await blocks.filter({ hasText: 'ICO' }).getByTestId('conversion-reveal').click()
-    await expect.poll(async () => (await command<HarnessSnapshot>(profile.app, 'snapshot')).revealedCount)
+    await blocks.filter({ hasText: 'ICO' }).getByTestId('conversion-preview').click()
+    await expect.poll(async () => (await command<HarnessSnapshot>(profile.app, 'snapshot')).previewedCount)
       .toBe(1)
 
     const snapshot = await command<HarnessSnapshot>(profile.app, 'snapshot')
@@ -496,7 +497,7 @@ test.describe.serial('universal file conversion through Electron', () => {
     await firstArtifact.getByTestId('conversion-delete').click()
     await expect(firstArtifact.getByText('已删除')).toBeVisible()
     await expect(firstArtifact.getByTestId('conversion-save-copy')).toBeDisabled()
-    await expect(firstArtifact.getByTestId('conversion-reveal')).toBeDisabled()
+    await expect(firstArtifact.getByTestId('conversion-preview')).toBeDisabled()
     await expect(firstArtifact.getByTestId('conversion-delete')).toBeDisabled()
     await screenshot(profile.page, 'visual-artifact-deleted')
 

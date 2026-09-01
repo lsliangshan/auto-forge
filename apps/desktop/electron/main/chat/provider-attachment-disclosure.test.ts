@@ -305,6 +305,30 @@ describe('provider attachment disclosure', () => {
     )
   })
 
+  it('binds a source-omitted command only to attachments supplied by the current request', () => {
+    const authority = createProviderAttachmentDisclosureAuthority({ currentCredentialEpoch: () => 0 })
+    const plan = authority.createPlan({
+      requestId: 'request_implicit_current_attachments',
+      text: '转换为 PDF',
+      context: { hasAttachments: true, requestedOutput: 'text', attachmentKinds: ['image', 'image'] },
+      attachments: [
+        {
+          index: 0, id: 'asset_current_a', name: 'current-a.png', mimeType: 'image/png',
+          byteSize: bytesA.length, fingerprint: fingerprintA,
+        },
+        {
+          index: 1, id: 'asset_current_b', name: 'current-b.png', mimeType: 'image/png',
+          byteSize: bytesB.length, fingerprint: fingerprintB,
+        },
+      ],
+    })
+
+    expect(plan.access.decision).toBe('local')
+    expect(plan.targetFormat).toBe('pdf')
+    expect(plan.selectedAttachmentIndexes).toEqual([0, 1])
+    expect(plan.mainText).toContain('附件索引：0, 1')
+  })
+
   it.each([
     'convert this attachment to PDF, then save it as WebP',
     'convert this attachment not to PDF',

@@ -481,6 +481,12 @@ function modelSupportsRequest(model: ModelInfo, output: ConcreteOutput): boolean
   })
 }
 
+function modelCanSubmitRequest(model: ModelInfo, output: ConcreteOutput): boolean {
+  return output === 'text'
+    ? modelSupportsOutput(model, output)
+    : modelSupportsRequest(model, output)
+}
+
 function modelsForOutput(output: OutputType, models = props.models): ModelInfo[] {
   if (output === 'auto') {
     return models.filter((model) =>
@@ -491,8 +497,8 @@ function modelsForOutput(output: OutputType, models = props.models): ModelInfo[]
 
 function outputSupported(output: OutputType): boolean {
   return modelsForOutput(output).some((model) => output === 'auto'
-    ? model.outputModalities.some((candidate) => modelSupportsRequest(model, candidate))
-    : modelSupportsRequest(model, output))
+    ? model.outputModalities.some((candidate) => modelCanSubmitRequest(model, candidate))
+    : modelCanSubmitRequest(model, output))
 }
 
 const compatibleModels = computed(() => modelsForOutput(chat.preferences.outputType))
@@ -517,21 +523,27 @@ const selectedModel = computed(() => compatibleModels.value
 const selectedModelSupportsRequest = computed(() => {
   if (!selectedModel.value) return false
   const output = chat.preferences.outputType
-  if (output !== 'auto') return modelSupportsRequest(selectedModel.value, output)
+  if (output !== 'auto') return modelCanSubmitRequest(selectedModel.value, output)
   return selectedModel.value.outputModalities
-    .some((candidate) => modelSupportsRequest(selectedModel.value!, candidate))
+    .some((candidate) => modelCanSubmitRequest(selectedModel.value!, candidate))
 })
 
 const hasFileDraft = computed(() => chat.drafts.some(({ kind }) => kind === 'file'))
 
 function modelOptionSupportsRequest(model: ModelInfo): boolean {
   const output = chat.preferences.outputType
-  if (output !== 'auto') return modelSupportsRequest(model, output)
-  return model.outputModalities.some((candidate) => modelSupportsRequest(model, candidate))
+  if (output !== 'auto') return modelCanSubmitRequest(model, output)
+  return model.outputModalities.some((candidate) => modelCanSubmitRequest(model, candidate))
 }
 
 function modelOptionLabel(model: ModelInfo): string {
-  if (chat.drafts.length === 0 || modelOptionSupportsRequest(model)) return model.name
+  if (chat.drafts.length === 0) return model.name
+  const output = chat.preferences.outputType
+  const directlySupported = output === 'auto'
+    ? model.outputModalities.some((candidate) => modelSupportsRequest(model, candidate))
+    : modelSupportsRequest(model, output)
+  if (directlySupported) return model.name
+  if (modelOptionSupportsRequest(model)) return `${model.name}（附件仅供工作流使用）`
   return `${model.name}（不支持当前附件）`
 }
 
@@ -541,15 +553,6 @@ const attachmentCompatibilityMessage = computed(() => {
   if (!model) return '当前模型不支持已添加的附件。'
   if (hasFileDraft.value) {
     return '当前模型无法读取该附件格式。请更换模型、供应商或移除附件。'
-  }
-  if (output === 'text') {
-    const unsupported = [...new Set(chat.drafts
-      .filter(({ kind }) => kind !== 'file' && !model.inputModalities.includes(kind))
-      .map(({ kind }) => kindLabel(kind)))]
-    if (unsupported.length > 0) {
-      const kinds = unsupported.join('、')
-      return `文本输出仍需要模型支持${kinds}输入。当前模型无法读取已添加的${kinds}；请切换模型或移除附件。`
-    }
   }
   if ((output === 'image' || output === 'video')
     && chat.drafts.some(({ kind }) => kind !== 'image')) {
@@ -571,7 +574,7 @@ const attachmentCompatibilityMessage = computed(() => {
 const autoChoiceRequired = computed(() => {
   if (chat.preferences.outputType !== 'auto' || !selectedModel.value) return false
   const supported = selectedModel.value.outputModalities
-    .filter((output) => modelSupportsRequest(selectedModel.value!, output))
+    .filter((output) => modelCanSubmitRequest(selectedModel.value!, output))
   return new Set(supported).size > 1
 })
 

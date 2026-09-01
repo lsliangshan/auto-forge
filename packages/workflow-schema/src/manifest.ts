@@ -17,6 +17,7 @@ export interface WorkflowManifest {
   version: string
   name: string
   description: string
+  logo?: string
   author: string
   category: string
   cities?: string[]

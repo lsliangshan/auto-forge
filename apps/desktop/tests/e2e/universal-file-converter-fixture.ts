@@ -498,6 +498,7 @@ const nativePickerResults: string[][] = []
 const saveDialogDefaults: string[] = []
 const developerRuns: unknown[] = []
 const revealedPaths: string[] = []
+const previewedPaths: string[] = []
 
 function emit(channel: string, value: unknown): void {
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
@@ -713,6 +714,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
       nativePickerNames: nativePickerResults.map((paths) => paths.map((path) => basename(path))),
       saveDialogDefaults: [...saveDialogDefaults],
       revealedCount: revealedPaths.length,
+      previewedCount: previewedPaths.length,
       heldJobIds: [...heldConversions.keys()],
       processEvidence: structuredClone(processEvidence),
       jobs: await allJobViews(),
@@ -792,6 +794,7 @@ async function initialize(): Promise<void> {
       return savePathQueue.shift()
     },
     revealPath: (path) => { revealedPaths.push(path) },
+    openPath: async (path) => { previewedPaths.push(path); return '' },
     openExternal: async () => undefined,
     emitChat: (event) => {
       const parsed = chatEventSchema.safeParse(event)

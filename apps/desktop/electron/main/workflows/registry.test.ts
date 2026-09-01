@@ -158,6 +158,34 @@ afterEach(() => {
 })
 
 describe('WorkflowRegistry', () => {
+  it('propagates non-empty logos and omits empty logos from workflow details', async () => {
+    const branded = readyProject()
+    branded.manifest.logo = 'https://img.liangqy.com/autoforge/workflows/example.png'
+    branded.project.buildHash = buildFingerprint([
+      { path: 'src/index.ts', contents: Buffer.from(branded.source) },
+    ], branded.manifest)
+    const brandedHarness = registryHarness({
+      installed: [installedWorkflow({ manifest: branded.manifest })],
+      projects: [branded],
+    })
+
+    expect((await brandedHarness.registry.list({ developerMode: false }))[0]?.logo)
+      .toBe(branded.manifest.logo)
+    expect((await brandedHarness.registry.getDevelopmentProject(branded.project.id))?.logo)
+      .toBe(branded.manifest.logo)
+
+    const unbranded = readyProject({ id: 'project_unbranded' })
+    unbranded.manifest.id = 'workflow.unbranded'
+    unbranded.manifest.logo = ''
+    unbranded.project.buildHash = buildFingerprint([
+      { path: 'src/index.ts', contents: Buffer.from(unbranded.source) },
+    ], unbranded.manifest)
+    const unbrandedHarness = registryHarness({ installed: [], projects: [unbranded] })
+
+    expect(await unbrandedHarness.registry.getDevelopmentProject(unbranded.project.id))
+      .not.toHaveProperty('logo')
+  })
+
   it('propagates browser continuation metadata from installed and development manifests', async () => {
     const development = readyProject()
     const browserContinuation = {

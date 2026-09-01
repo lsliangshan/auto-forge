@@ -41,7 +41,7 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$output_format" ] && [ -n "$output_path" ] && [ -n "$input_path" ] || exit 64
 case "$output_format" in
-  png|jpeg|tiff|bmp|gif) ;;
+  png|jpeg|tiff|bmp|gif|pdf) ;;
   *) exit 65 ;;
 esac
 /usr/bin/sips -s format "$output_format" "$input_path" --out "$output_path" >/dev/null

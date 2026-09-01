@@ -521,6 +521,7 @@ function options(
     readClipboardImage: () => undefined,
     chooseMediaSavePath: async () => undefined,
     revealPath: () => undefined,
+    openPath: async () => '',
     openExternal: async () => undefined,
     emitChat: vi.fn(),
     emitExecution: vi.fn(),
@@ -6697,6 +6698,7 @@ describe('createApplicationRuntime', () => {
     ['Convert 文件-999 to PDF', 'ambiguous', 'text'],
     ['Convert \uE000AF-1\uE001 to PDF', 'ambiguous', 'text'],
     ['Convert these attachments to PDF', 'local', 'text', 2, [0, 1]],
+    ['转换为 PDF', 'local', 'text', 2, [0, 1]],
     ['Convert all files to WEBP', 'local', 'text', 2, [0, 1]],
     ['Convert both attachments to JPG', 'local', 'text', 2, [0, 1]],
     ['Convert this attachment to .PDF', 'local', 'text'],
@@ -9173,6 +9175,26 @@ describe('createApplicationRuntime', () => {
     ) as Record<string, unknown>
 
     expect(manifest.cities).toEqual([])
+    expect(manifest.logo).toBe('')
+
+    await runtime.close()
+  })
+
+  it('returns workflow logos in detail and list contracts', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-logo-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+    const project = await runtime.services.developer.createProject('Branded Workflow')
+    const manifest = JSON.parse(
+      await runtime.services.developer.readFile(project.id, 'workflow.json'),
+    ) as Record<string, unknown>
+    const logo = 'https://img.liangqy.com/autoforge/workflows/example.png'
+    manifest.logo = logo
+    await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+    await runtime.services.developer.build(project.id)
+
+    expect((await runtime.services.workflows.installProject(project.id)).logo).toBe(logo)
+    expect((await runtime.services.workflows.list()).find(({ id }) => id === manifest.id)?.logo).toBe(logo)
 
     await runtime.close()
   })
@@ -11996,12 +12018,14 @@ describe('createApplicationRuntime', () => {
     })
     const destination = join(root, 'saved-copy.png')
     const revealPath = vi.fn()
+    const openPath = vi.fn().mockResolvedValue('')
     const chooseMediaSavePath = vi.fn()
       .mockResolvedValueOnce(undefined)
       .mockResolvedValue(destination)
     const runtime = createApplicationRuntime(options(root, {
       chooseMediaSavePath,
       revealPath,
+      openPath,
     }))
     await authenticate(runtime, 'ConversionAlice', false)
     const events: unknown[] = []
@@ -12030,6 +12054,14 @@ describe('createApplicationRuntime', () => {
     expect(revealPath).toHaveBeenCalledWith(join(
       resolveUserConversionRoot(root, aliceId), 'results', 'artifact_alice_conversion.png',
     ))
+    await expect(runtime.services.conversion.preview({ artifactId: 'artifact_alice_conversion' }))
+      .resolves.toBeUndefined()
+    expect(openPath).toHaveBeenCalledWith(join(
+      resolveUserConversionRoot(root, aliceId), 'results', 'artifact_alice_conversion.png',
+    ))
+    openPath.mockResolvedValueOnce('No application is associated with this file type')
+    await expect(runtime.services.conversion.preview({ artifactId: 'artifact_alice_conversion' }))
+      .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
 
     await expect(runtime.services.conversion.cancel({ jobId: alice.jobId }))
       .rejects.toMatchObject({ code: 'CONFLICT' })
@@ -12045,6 +12077,7 @@ describe('createApplicationRuntime', () => {
       .resolves.toEqual({ availability: 'unavailable', jobs: [] })
     for (const action of [
       () => runtime.services.conversion.saveCopy({ artifactId: 'artifact_alice_missing' }),
+      () => runtime.services.conversion.preview({ artifactId: 'artifact_alice_missing' }),
       () => runtime.services.conversion.reveal({ artifactId: 'artifact_alice_missing' }),
       () => runtime.services.conversion.deleteArtifact({ artifactId: 'artifact_alice_missing' }),
     ]) {

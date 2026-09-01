@@ -699,6 +699,28 @@ describe('conversion catalog input probing', () => {
 
 describe('conversion catalog routes', () => {
   it.each([
+    'png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp',
+  ] as const)('allows static %s images to become a single-page PDF', (sourceFormat) => {
+    expect(resolveConversionRoute({
+      format: sourceFormat,
+      mimeType: 'application/octet-stream',
+      kind: 'image',
+      byteSize: 1,
+      frameCount: 1,
+    }, 'pdf')).toEqual({ sourceFormat, targetFormat: 'pdf' })
+  })
+
+  it.each(['gif', 'webp'] as const)('selects the first frame when animated %s becomes PDF', (sourceFormat) => {
+    expect(resolveConversionRoute({
+      format: sourceFormat,
+      mimeType: 'application/octet-stream',
+      kind: 'image',
+      byteSize: 1,
+      frameCount: 4,
+    }, 'pdf')).toEqual({ sourceFormat, targetFormat: 'pdf', frameSelection: 'first' })
+  })
+
+  it.each([
     ['png', 'jpeg'],
     ['gif', 'mp4'],
     ['svg', 'pdf'],

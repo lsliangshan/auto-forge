@@ -76,8 +76,16 @@
           unavailable: item.integrity === 'failed',
         }"
       >
-        <div class="workflow-icon">
-          <el-icon><Operation /></el-icon>
+        <div
+          class="workflow-icon"
+          :data-testid="`workflow-icon-${item.id}`"
+        >
+          <WorkflowLogo
+            :logo="item.logo"
+            :test-id="`workflow-logo-${item.id}`"
+          >
+            <el-icon><Operation /></el-icon>
+          </WorkflowLogo>
         </div>
         <button
           class="workflow-main"
@@ -131,6 +139,7 @@ import { LocationInformation, Operation, Refresh, Upload } from '@element-plus/i
 import { ElMessageBox } from 'element-plus'
 import type { WorkflowSummary } from '@autoforge/shared'
 import { computed, onMounted } from 'vue'
+import WorkflowLogo from '../components/WorkflowLogo.vue'
 import { useWorkflowStore } from '../stores/workflow'
 
 const workflow = useWorkflowStore()

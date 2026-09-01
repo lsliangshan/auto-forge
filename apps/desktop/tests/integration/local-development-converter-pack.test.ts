@@ -125,6 +125,37 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     lease.release()
   })
 
+  it('converts PNG input to a single-page PDF through the pack executable', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-image-pdf-pack-')))
+    roots.push(root)
+    const releaseRoot = join(root, 'release')
+    await createLocalDevelopmentImageRelease({ output: releaseRoot, platform: 'darwin', arch: process.arch })
+    const release = await loadLocalDevelopmentConverterRelease(releaseRoot)
+    const manager = new ConverterPackManager({
+      packsRoot: release.packsRoot,
+      rootPublicKeyPem: release.rootPublicKeyPem,
+      platform: 'darwin',
+      arch: process.arch,
+    })
+    const lease = await manager.acquire({ signedIndex: release.signedIndex, name: 'image-icon' })
+    const executable = lease.executables['bin/autoforge-image-converter']!
+    const source = join(root, 'source.png')
+    const output = join(root, 'output.pdf')
+    await writeFile(source, Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    ))
+
+    const converted = spawnSync(executable, [
+      'convert', '--input-format', 'png', '--output-format', 'pdf',
+      '--output', output, '--', source,
+    ])
+
+    expect(converted.status, converted.stderr.toString()).toBe(0)
+    expect((await readFile(output)).subarray(0, 5).toString('ascii')).toBe('%PDF-')
+    lease.release()
+  })
+
   it('binds the workflow runtime to the signed local release', async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'autoforge-local-runtime-')))
     roots.push(root)
@@ -137,6 +168,7 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
       'base64',
     ))
     expect(spawnSync('/usr/bin/sips', ['-s', 'format', 'jpeg', sourcePng, '--out', source]).status).toBe(0)
+    const sourcePngBytes = await readFile(sourcePng)
     const sourceBytes = await readFile(source)
     const batchOutput = join(root, 'batch-output.png')
     await writeFile(batchOutput, Buffer.alloc(0), { mode: 0o600 })
@@ -153,24 +185,32 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
         conversations: { get: () => undefined },
         mediaAssets: { get: () => undefined },
         conversionArtifacts: {
-          getOwned: () => ({
-            id: 'source', ownerUserId: 'alice', executionId: 'execution', conversionJobId: null,
-            role: 'input', displayName: 'source.jpg', detectedFormat: 'jpeg', mimeType: 'image/jpeg',
-            byteSize: sourceBytes.byteLength, sha256: createHash('sha256').update(sourceBytes).digest('hex'),
-            relativePath: 'source.jpg', status: 'ready',
-            metadata: null, createdAt: 0,
-          }),
+          getOwned: (id) => {
+            const png = id === 'source-png'
+            const bytes = png ? sourcePngBytes : sourceBytes
+            return {
+              id, ownerUserId: 'alice', executionId: 'execution', conversionJobId: null,
+              role: 'input' as const, displayName: png ? 'source.png' : 'source.jpg',
+              detectedFormat: png ? 'png' as const : 'jpeg' as const,
+              mimeType: png ? 'image/png' : 'image/jpeg', byteSize: bytes.byteLength,
+              sha256: createHash('sha256').update(bytes).digest('hex'),
+              relativePath: png ? 'source.png' : 'source.jpg', status: 'ready' as const,
+              metadata: null, createdAt: 0,
+            }
+          },
           create: () => { throw new Error('unexpected create') },
           createBatch: () => { throw new Error('unexpected createBatch') },
         },
       },
       artifacts: {
-        resolveOwnedInput: async () => {
-          const sourceHandle = await open(source, 'r')
+        resolveOwnedInput: async (input) => {
+          const png = input.displayName === 'source.png'
+          const selectedSource = png ? sourcePng : source
+          const sourceHandle = await open(selectedSource, 'r')
           return {
             handle: sourceHandle,
-            mainPath: source,
-            probe: { kind: 'image', format: 'jpeg', width: 1, height: 1, frameCount: 1 },
+            mainPath: selectedSource,
+            probe: { kind: 'image' as const, format: png ? 'png' as const : 'jpeg' as const, width: 1, height: 1, frameCount: 1 },
             close: async () => { await sourceHandle.close() },
           }
         },
@@ -198,6 +238,12 @@ describe.skipIf(process.platform !== 'darwin')('local development image converte
     expect((await readFile(batchOutput)).subarray(0, 8)).toEqual(Buffer.from('89504e470d0a1a0a', 'hex'))
     await attempt.abort()
     lease.release()
+    const pdfLease = await binding.runtime.acquirePack(
+      { ...job, id: 'png-to-pdf-job', sourceId: 'source-png', targetFormat: 'pdf' },
+      controller.signal,
+    )
+    expect(pdfLease.name).toBe('image-icon')
+    pdfLease.release()
     await expect(binding.runtime.acquirePack(
       { ...job, id: 'unsupported-job', targetFormat: 'webp' },
       controller.signal,

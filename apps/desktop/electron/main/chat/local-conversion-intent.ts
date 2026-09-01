@@ -766,6 +766,37 @@ function authorityTargetFromSegment(
   return undefined
 }
 
+function sourceOmittedTargetFromSegment(
+  segment: string,
+  attachmentCount: number,
+): { targetFormat: ConversionTargetFormat; selectedAttachmentIndexes: readonly number[] } | undefined {
+  const commands = [
+    new RegExp(
+      `^${AUTHORITY_ENGLISH_POLITE}(?:(?:convert|transcode|reformat|encode|render|transform)\\s+(?:to|into|as)|(?:save|export)\\s+as)\\s+(?:an?\\s+)?${AUTHORITY_TARGET}${AUTHORITY_TERMINAL}$`,
+      'iu',
+    ),
+    new RegExp(
+      `^(?:请\\s*)?(?:直接\\s*)?(?:转换成|转换为|转成|转为|另存为|保存为|保存成|导出为|输出为)\\s*(?:一(?:个|份|张)\\s*)?${AUTHORITY_TARGET}${AUTHORITY_CHINESE_TERMINAL}$`,
+      'iu',
+    ),
+  ]
+  for (const command of commands) {
+    const token = command.exec(segment.trim())?.groups?.target
+      ?.replace(/^\./u, '')
+      .toLocaleLowerCase('und')
+    const targetFormat = token === undefined ? undefined : TRUSTED_TARGET_ALIASES.get(token)
+    if (targetFormat !== undefined) {
+      return {
+        targetFormat,
+        selectedAttachmentIndexes: Object.freeze(
+          Array.from({ length: attachmentCount }, (_, index) => index),
+        ),
+      }
+    }
+  }
+  return undefined
+}
+
 function inheritedChineseTargetFromSegment(
   segment: string,
   prefix: string,
@@ -919,6 +950,7 @@ function trustedUniqueTargetFormat(
   for (const { prefix, segment } of authoritySegments(normalized)) {
     const directAuthority = authorityTargetFromSegment(segment, attachments.length)
     const authority = directAuthority
+      ?? sourceOmittedTargetFromSegment(segment, attachments.length)
       ?? inheritedChineseTargetFromSegment(
         segment,
         prefix,

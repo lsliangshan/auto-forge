@@ -30,6 +30,7 @@ import ChatView from '../../src/views/ChatView.vue'
 
 const scopeHash = 'a'.repeat(64)
 const buildHash = 'b'.repeat(64)
+const workflowLogo = 'https://img.liangqy.com/autoforge/workflows/example.png'
 
 function bindSettingsOwner(ownerId: string) {
   const settings = useSettingsStore()
@@ -1256,6 +1257,24 @@ describe('chat interactions', () => {
     expect(card.text()).toContain('第 1 次调用 · 上限 5 次')
   })
 
+  it('renders a workflow status logo and restores the status icon if the image fails', async () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('running', { logo: workflowLogo }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const marker = wrapper.get('.af-operation-marker')
+    const logo = marker.get('img.workflow-logo-image')
+    expect(logo.attributes('src')).toBe(workflowLogo)
+    expect(logo.attributes('alt')).toBe('')
+    expect(marker.find('.el-icon').exists()).toBe(false)
+
+    await logo.trigger('error')
+
+    expect(marker.find('img.workflow-logo-image').exists()).toBe(false)
+    expect(marker.get('.el-icon').exists()).toBe(true)
+  })
+
   it('collapses completed workflow details until the user expands them', async () => {
     const wrapper = mount(MessageBlock, {
       props: { block: workflowStatusBlock('completed') },
@@ -2291,6 +2310,15 @@ describe('chat interactions', () => {
     expect(wrapper.find('[data-testid="approve-always"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="deny-approval"]').exists()).toBe(true)
     expect(wrapper.find('[data-testid="approve-once"]').exists()).toBe(true)
+  })
+
+  it('renders the requesting workflow logo in approval cards', () => {
+    const wrapper = mount(ApprovalCard, {
+      props: { approval: approvalBlock({ logo: workflowLogo }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('.af-operation-marker img.workflow-logo-image').attributes('src')).toBe(workflowLogo)
   })
 
   it('collapses an authoritative resolved approval into a status summary', async () => {
@@ -3821,7 +3849,7 @@ describe('chat interactions', () => {
     expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
   })
 
-  it('blocks unsupported generic files with a file-specific explanation', () => {
+  it('allows unsupported generic files for workflow-only use', () => {
     const store = useChatStore()
     store.selectedConversationId = 'conversation_1'
     store.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'text' })
@@ -3837,9 +3865,10 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
-      .toContain('当前模型无法读取该附件格式')
-    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('[data-testid="model-attachment-incompatible"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="model-select"] option[value="text/model"]').text())
+      .toContain('附件仅供工作流使用')
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
   })
 
   it('keeps OpenRouter document attachments sendable as text output', () => {
@@ -3862,7 +3891,7 @@ describe('chat interactions', () => {
     expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
   })
 
-  it('blocks an authoritative document MIME when its mapped filename suffix conflicts', () => {
+  it('allows a mismatched document name and MIME for workflow validation', () => {
     const store = useChatStore()
     store.selectedConversationId = 'conversation_1'
     store.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'text' })
@@ -3878,9 +3907,10 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
-      .toContain('当前模型无法读取该附件格式')
-    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('[data-testid="model-attachment-incompatible"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="model-select"] option[value="text/model"]').text())
+      .toContain('附件仅供工作流使用')
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
   })
 
   it('removes drafts through Main and allows the fifth attachment while blocking a sixth', async () => {
@@ -4468,7 +4498,7 @@ describe('chat interactions', () => {
     expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
   })
 
-  it('explains that text output still requires a model that can read the attachment', () => {
+  it('allows a text-only model to send attachments for workflow-only use', async () => {
     const store = useChatStore()
     store.selectedConversationId = 'conversation_1'
     store.draftsByConversation.conversation_1 = [mediaAsset('image_input')]
@@ -4490,16 +4520,25 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
-      .toContain('文本输出仍需要模型支持图片输入')
-    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
-      .toContain('切换模型或移除附件')
+    await wrapper.get('textarea').setValue('把这个附件转换成 PDF')
+
+    expect(wrapper.find('[data-testid="model-attachment-incompatible"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="model-select"] option[value="text-only/model"]').attributes('disabled'))
-      .toBeDefined()
+      .toBeUndefined()
     expect(wrapper.get('[data-testid="model-select"] option[value="text-only/model"]').text())
-      .toContain('不支持当前附件')
+      .toContain('附件仅供工作流使用')
     expect(wrapper.get('[data-testid="model-select"] option[value="vision/model"]').attributes('disabled'))
       .toBeUndefined()
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
+
+    await wrapper.get('form').trigger('submit')
+
+    expect(wrapper.emitted('submit')?.[0]?.[0]).toMatchObject({
+      content: '把这个附件转换成 PDF',
+      assetIds: ['image_input'],
+      model: 'text-only/model',
+      outputType: 'text',
+    })
   })
 
   it('disables unsupported outputs and cannot send without a compatible model', async () => {

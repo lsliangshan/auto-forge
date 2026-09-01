@@ -31,7 +31,8 @@ function apiFor(jobs: ConversionJobView[] = []) {
     conversion: {
       listForExecution: vi.fn().mockResolvedValue({ availability: 'local', jobs }),
       cancel: vi.fn().mockResolvedValue(undefined), retry: vi.fn().mockResolvedValue(undefined),
-      saveCopy: vi.fn().mockResolvedValue({ saved: true }), reveal: vi.fn().mockResolvedValue(undefined),
+      saveCopy: vi.fn().mockResolvedValue({ saved: true }), preview: vi.fn().mockResolvedValue(undefined),
+      reveal: vi.fn().mockResolvedValue(undefined),
       deleteArtifact: vi.fn().mockResolvedValue(undefined),
       onEvent: vi.fn((next) => { listener = next; return unsubscribe }),
     },
@@ -73,7 +74,7 @@ describe('conversion chat block', () => {
     if (status === 'failed') expect(wrapper.text()).toContain('请稍后重试')
   })
 
-  it('renders only local snapshot results and performs opaque artifact actions', async () => {
+  it('offers download and system preview without exposing a reveal action or local path', async () => {
     const { api } = apiFor([job('completed')])
     const wrapper = mountBlock(api)
     await flushPromises()
@@ -81,11 +82,15 @@ describe('conversion chat block', () => {
     expect(wrapper.text()).toContain('result.png')
     expect(wrapper.text()).toContain('第 2 页')
     expect(wrapper.text()).not.toMatch(/\/Users\/|sha256|bytes|managedPath/i)
+    expect(wrapper.get('[data-testid="conversion-save-copy"]').text()).toBe('下载')
+    expect(wrapper.get('[data-testid="conversion-preview"]').text()).toBe('预览')
+    expect(wrapper.find('[data-testid="conversion-reveal"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('显示位置')
     await wrapper.get('[data-testid="conversion-save-copy"]').trigger('click')
-    await wrapper.get('[data-testid="conversion-reveal"]').trigger('click')
+    await wrapper.get('[data-testid="conversion-preview"]').trigger('click')
     await wrapper.get('[data-testid="conversion-delete"]').trigger('click')
     expect(api.conversion.saveCopy).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
-    expect(api.conversion.reveal).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
+    expect(api.conversion.preview).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
     expect(api.conversion.deleteArtifact).toHaveBeenCalledWith({ artifactId: 'artifact_1' })
   })
 
@@ -97,7 +102,7 @@ describe('conversion chat block', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('已删除')
     expect(wrapper.get('[data-testid="conversion-save-copy"]').attributes('disabled')).toBeDefined()
-    expect(wrapper.get('[data-testid="conversion-reveal"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="conversion-preview"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="conversion-delete"]').attributes('disabled')).toBeDefined()
   })
 

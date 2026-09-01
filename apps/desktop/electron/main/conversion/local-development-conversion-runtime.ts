@@ -24,8 +24,9 @@ export interface LocalDevelopmentConverterRelease {
 const localDevelopmentImageAdapter: ConverterAdapter = {
   ...imageIconAdapter,
   supports(input, target) {
-    return input.format === 'jpeg'
-      && target === 'png'
+    const supported = (input.format === 'jpeg' && target === 'png')
+      || (['png', 'jpeg', 'webp', 'avif', 'tiff', 'bmp', 'gif'].includes(input.format) && target === 'pdf')
+    return supported
       && imageIconAdapter.supports(input, target)
   },
 }

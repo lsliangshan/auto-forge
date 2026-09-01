@@ -129,6 +129,28 @@ describe('validateManifest', () => {
     expect(validateManifest({ ...validManifest(), cities: ['上海', '杭州'] }).valid).toBe(true)
   })
 
+  it('accepts omitted, empty, and HTTPS workflow logos', () => {
+    expect(validateManifest(validManifest()).valid).toBe(true)
+    expect(validateManifest({ ...validManifest(), logo: '' }).valid).toBe(true)
+    expect(validateManifest({
+      ...validManifest(), logo: 'https://img.liangqy.com/autoforge/workflows/manifold.png',
+    }).valid).toBe(true)
+  })
+
+  it('rejects unsafe or blank workflow logos', () => {
+    for (const logo of [
+      ' ',
+      'http://img.liangqy.com/logo.png',
+      'https://example.com/logo.png',
+      'HTTPS://img.liangqy.com/logo.png',
+      'https://user:password@img.liangqy.com/logo.png',
+      'https://img.liangqy.com:443/logo.png',
+      'data:image/png;base64,AA==',
+    ]) {
+      expect(validateManifest({ ...validManifest(), logo }).valid).toBe(false)
+    }
+  })
+
   it('rejects malformed or duplicate workflow cities', () => {
     for (const cities of [
       [''],

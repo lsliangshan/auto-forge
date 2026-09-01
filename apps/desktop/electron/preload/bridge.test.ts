@@ -415,14 +415,16 @@ describe('preload desktop bridge', () => {
     await app.api.conversion.cancel({ jobId: 'job_1' })
     await app.api.conversion.retry({ jobId: 'job_2' })
     await app.api.conversion.saveCopy({ artifactId: 'artifact_1' })
+    await app.api.conversion.preview({ artifactId: 'artifact_2' })
     await app.api.conversion.reveal({ artifactId: 'artifact_2' })
     await app.api.conversion.deleteArtifact({ artifactId: 'artifact_3' })
 
-    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-6)).toEqual([
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-7)).toEqual([
       [ipcChannels.conversionListForExecution, { executionId: 'execution_1' }],
       [ipcChannels.conversionCancel, { jobId: 'job_1' }],
       [ipcChannels.conversionRetry, { jobId: 'job_2' }],
       [ipcChannels.conversionSaveCopy, { artifactId: 'artifact_1' }],
+      [ipcChannels.conversionPreview, { artifactId: 'artifact_2' }],
       [ipcChannels.conversionReveal, { artifactId: 'artifact_2' }],
       [ipcChannels.conversionDeleteArtifact, { artifactId: 'artifact_3' }],
     ])

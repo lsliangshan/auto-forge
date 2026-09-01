@@ -6,6 +6,7 @@ import {
   runtimeCapabilityPermissionSchema,
   runtimeCapabilityScopeSchema,
 } from './worker-protocol.js'
+import { workflowLogoSchema } from './workflow-logo.js'
 
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
@@ -127,6 +128,7 @@ const workflowBlockContextSchema = z.object({
   workflowId: identifierSchema,
   workflowName: nonEmptyStringSchema,
   workflowVersion: nonEmptyStringSchema,
+  logo: workflowLogoSchema.optional(),
   source: workflowSourceSchema,
   buildHash: buildHashSchema.optional(),
   city: nonEmptyStringSchema.optional(),
@@ -272,6 +274,7 @@ const currentChatBlockSchema = z.discriminatedUnion('type', [
     workflowId: identifierSchema,
     workflowName: nonEmptyStringSchema,
     workflowVersion: nonEmptyStringSchema,
+    logo: workflowLogoSchema.optional(),
     source: workflowSourceSchema,
     buildHash: buildHashSchema.optional(),
     city: nonEmptyStringSchema.optional(),

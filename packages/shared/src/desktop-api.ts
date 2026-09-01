@@ -28,6 +28,7 @@ import {
   type Capability,
   type CapabilityScope,
 } from './worker-protocol.js'
+import { workflowLogoSchema } from './workflow-logo.js'
 
 const identifierSchema = z.string().trim().min(1).max(128)
 const timestampSchema = z.string().datetime()
@@ -1073,6 +1074,7 @@ export const workflowSummarySchema = z.object({
   version: nonEmptyStringSchema,
   name: nonEmptyStringSchema,
   description: z.string(),
+  logo: workflowLogoSchema.optional(),
   author: nonEmptyStringSchema,
   category: nonEmptyStringSchema,
   cities: z.array(citySchema).default([]),
@@ -2046,6 +2048,7 @@ export const ipcChannels = {
   conversionCancel: 'conversion:cancel',
   conversionRetry: 'conversion:retry',
   conversionSaveCopy: 'conversion:save-copy',
+  conversionPreview: 'conversion:preview',
   conversionReveal: 'conversion:reveal',
   conversionDeleteArtifact: 'conversion:delete-artifact',
   conversionSubscribe: 'conversion:subscribe',
@@ -2304,6 +2307,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.conversionCancel]: conversionJobRequestSchema,
   [ipcChannels.conversionRetry]: conversionJobRequestSchema,
   [ipcChannels.conversionSaveCopy]: conversionArtifactRequestSchema,
+  [ipcChannels.conversionPreview]: conversionArtifactRequestSchema,
   [ipcChannels.conversionReveal]: conversionArtifactRequestSchema,
   [ipcChannels.conversionDeleteArtifact]: conversionArtifactRequestSchema,
   [ipcChannels.conversionSubscribe]: z.undefined(),
@@ -2424,6 +2428,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.conversionCancel]: voidResponseSchema,
   [ipcChannels.conversionRetry]: voidResponseSchema,
   [ipcChannels.conversionSaveCopy]: z.object({ saved: z.boolean() }).strict(),
+  [ipcChannels.conversionPreview]: voidResponseSchema,
   [ipcChannels.conversionReveal]: voidResponseSchema,
   [ipcChannels.conversionDeleteArtifact]: voidResponseSchema,
   [ipcChannels.conversionSubscribe]: voidResponseSchema,
@@ -2565,6 +2570,7 @@ export interface DesktopAPI {
     cancel(input: { jobId: string }): Promise<void>
     retry(input: { jobId: string }): Promise<void>
     saveCopy(input: { artifactId: string }): Promise<{ saved: boolean }>
+    preview(input: { artifactId: string }): Promise<void>
     reveal(input: { artifactId: string }): Promise<void>
     deleteArtifact(input: { artifactId: string }): Promise<void>
     onEvent(listener: (event: ConversionJobEvent) => void): () => void

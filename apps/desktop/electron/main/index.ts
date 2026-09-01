@@ -256,6 +256,7 @@ async function initialize(): Promise<ApplicationRuntime> {
       return result.canceled ? undefined : result.filePath
     },
     revealPath: (path) => { shell.showItemInFolder(path) },
+    openPath: (path) => shell.openPath(path),
     openExternal: (url) => shell.openExternal(url),
     emitChat: (event) => {
       const parsed = chatEventSchema.safeParse(event)

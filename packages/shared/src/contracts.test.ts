@@ -1398,6 +1398,24 @@ describe('cross-process contracts', () => {
     expect(workflowQuerySchema.parse({ city: ' 北京 ' })).toEqual({ city: '北京' })
   })
 
+  it('preserves only non-empty HTTPS workflow logos in public workflow contracts', () => {
+    const summary = {
+      id: 'workflow.example', version: '1.0.0', name: '示例工作流', description: '示例',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'installed' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', cities: [],
+    }
+    const logo = 'https://img.liangqy.com/autoforge/workflows/example.png'
+
+    expect(workflowSummarySchema.parse({ ...summary, logo }).logo).toBe(logo)
+    expect(workflowSummarySchema.parse(summary)).not.toHaveProperty('logo')
+    expect(workflowSummarySchema.safeParse({ ...summary, logo: '' }).success).toBe(false)
+    expect(workflowSummarySchema.safeParse({ ...summary, logo: 'http://example.com/logo.png' }).success).toBe(false)
+    expect(workflowSummarySchema.safeParse({ ...summary, logo: 'https://example.com/logo.png' }).success).toBe(false)
+    expect(workflowSummarySchema.safeParse({ ...summary, logo: 'HTTPS://img.liangqy.com/logo.png' }).success).toBe(false)
+    expect(workflowSummarySchema.safeParse({ ...summary, logo: 'https://user:password@img.liangqy.com/logo.png' }).success).toBe(false)
+    expect(workflowSummarySchema.safeParse({ ...summary, logo: 'https://img.liangqy.com:443/logo.png' }).success).toBe(false)
+  })
+
   it('preserves optional browser continuation metadata without synthesizing it for legacy workflows', () => {
     const legacyWorkflow = {
       id: 'workflow.example', version: '1.0.0', name: '示例工作流', description: '示例',
@@ -1532,18 +1550,19 @@ describe('cross-process contracts', () => {
   })
 
   it('accepts strict system-owned workflow status and provenance blocks', () => {
+    const logo = 'https://img.liangqy.com/autoforge/workflows/example.png'
     expect(chatBlockSchema.parse({
       type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
       workflowId: 'workflow.beijing', workflowName: '北京工作居住证',
       workflowVersion: '1.0.0', source: 'development', buildHash: 'a'.repeat(64),
-      city: '北京', status: 'running', executionAvailable: true, executionIndex: 1, executionLimit: 5,
-    }).type).toBe('workflow_status')
+      logo, city: '北京', status: 'running', executionAvailable: true, executionIndex: 1, executionLimit: 5,
+    })).toMatchObject({ type: 'workflow_status', logo })
     expect(chatBlockSchema.parse({
       type: 'workflow_provenance', blockId: 'provenance_1',
       entries: [{ executionId: 'exec_1', workflowId: 'workflow.beijing',
         workflowName: '北京工作居住证', workflowVersion: '1.0.0',
-        source: 'development', buildHash: 'a'.repeat(64), city: '北京', status: 'completed' }],
-    }).type).toBe('workflow_provenance')
+        source: 'development', buildHash: 'a'.repeat(64), logo, city: '北京', status: 'completed' }],
+    })).toMatchObject({ type: 'workflow_provenance', entries: [{ logo }] })
     expect(() => chatBlockSchema.parse({
       type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
       workflowId: 'workflow.beijing', workflowName: '北京工作居住证', workflowVersion: '1.0.0',
@@ -1558,18 +1577,19 @@ describe('cross-process contracts', () => {
   })
 
   it('requires a stable Main-owned approval identity and authoritative state', () => {
+    const logo = 'https://img.liangqy.com/autoforge/workflows/example.png'
     const approval = {
       type: 'approval' as const,
       blockId: 'approval_1',
       state: 'pending' as const,
       executionId: 'execution_1',
       workflowId: 'workflow.beijing', workflowName: '北京工作居住证', workflowVersion: '1.0.0',
-      source: 'installed' as const, actionSummary: '填写并点击提交', permissionIndex: 0,
+      source: 'installed' as const, logo, actionSummary: '填写并点击提交', permissionIndex: 0,
       capability: 'browser.click' as const, scope: { origins: ['https://example.com'] },
       scopeHash: 'a'.repeat(64),
     }
 
-    expect(chatBlockSchema.parse(approval)).toMatchObject({ blockId: 'approval_1', state: 'pending' })
+    expect(chatBlockSchema.parse(approval)).toMatchObject({ blockId: 'approval_1', state: 'pending', logo })
     for (const state of ['approved', 'denied', 'expired', 'cancelled', 'invalidated'] as const) {
       expect(chatBlockSchema.parse({ ...approval, state })).toMatchObject({ state })
     }

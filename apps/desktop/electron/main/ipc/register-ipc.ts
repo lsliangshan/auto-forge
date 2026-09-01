@@ -304,6 +304,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.conversionCancel, (input) => options.services.conversion.cancel(input))
   register(ipcChannels.conversionRetry, (input) => options.services.conversion.retry(input))
   register(ipcChannels.conversionSaveCopy, (input) => options.services.conversion.saveCopy(input))
+  register(ipcChannels.conversionPreview, (input) => options.services.conversion.preview(input))
   register(ipcChannels.conversionReveal, (input) => options.services.conversion.reveal(input))
   register(ipcChannels.conversionDeleteArtifact, (input) => options.services.conversion.deleteArtifact(input))
   register(ipcChannels.conversionSubscribe, (_input, event) => {
