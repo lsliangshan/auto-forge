@@ -215,6 +215,21 @@ it('removes a smoke-failed cold release, preserves the prior marker, and rebuild
   expect(secondEvents).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
 })
 
+it('keeps a release when activation writes its marker and then throws', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  let releaseRoot = ''
+  const injected = dependencies([], {
+    buildRelease: async ({ outputRoot }: { outputRoot: string }) => { releaseRoot = outputRoot; await releaseBuilder({ outputRoot }) },
+    activateRelease: async ({ fingerprint }: { fingerprint: string }) => {
+      await writeFile(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`)
+      throw new Error('activation after marker write')
+    },
+  })
+
+  await expect(prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)).rejects.toThrow('activation after marker write')
+  expect(existsSync(releaseRoot)).toBe(true)
+})
+
 it('removes only a corrupted derived release before rebuilding and activation', async () => {
   const { desktopRoot, cacheRoot } = fixture()
   const inputs = await developmentFingerprintInputs(desktopRoot)

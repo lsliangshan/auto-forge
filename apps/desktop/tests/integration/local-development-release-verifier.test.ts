@@ -1,4 +1,5 @@
 import { generateKeyPairSync } from 'node:crypto'
+import { deflateSync } from 'node:zlib'
 import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -58,40 +59,42 @@ async function releaseFixture(root: string) {
 }
 
 function crc32(bytes: Buffer) { let value = 0xffffffff; for (const byte of bytes) { value ^= byte; for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? (value >>> 1) ^ 0xedb88320 : value >>> 1 } return (value ^ 0xffffffff) >>> 0 }
-function png() {
+function png(size = 1) {
   const chunk = (type: string, bytes: Buffer) => { const value = Buffer.alloc(12 + bytes.length); value.writeUInt32BE(bytes.length); value.write(type, 4); bytes.copy(value, 8); value.writeUInt32BE(crc32(value.subarray(4, 8 + bytes.length)), 8 + bytes.length); return value }
-  const header = Buffer.alloc(13); header.writeUInt32BE(1); header.writeUInt32BE(1, 4); header[8] = 8; header[9] = 6
-  return Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', header), chunk('IDAT', Buffer.from([0])), chunk('IEND', Buffer.alloc(0))])
+  const header = Buffer.alloc(13); header.writeUInt32BE(size); header.writeUInt32BE(size, 4); header[8] = 8; header[9] = 6
+  const scanlines = Buffer.alloc(size * (1 + size * 4)); for (let row = 0; row < size; row += 1) scanlines[row * (1 + size * 4)] = 0
+  return Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', header), chunk('IDAT', deflateSync(scanlines)), chunk('IEND', Buffer.alloc(0))])
 }
 function jpeg() { return Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0, 11, 8, 0, 1, 0, 1, 1, 1, 0x11, 0, 0xff, 0xda, 0, 8, 1, 1, 0, 0, 63, 0, 0, 0xff, 0xd9]) }
 
 function ico(sizes = [16, 24, 32, 48, 64, 128, 256]) {
-  const payload = png()
-  const bytes = Buffer.alloc(6 + sizes.length * 16 + sizes.length * payload.length)
+  const payloads = sizes.map((size) => png(size))
+  const bytes = Buffer.alloc(6 + sizes.length * 16 + payloads.reduce((total, payload) => total + payload.length, 0))
   bytes.writeUInt16LE(1, 2)
   bytes.writeUInt16LE(sizes.length, 4)
   for (const [index, size] of sizes.entries()) {
     const entry = 6 + index * 16
     bytes[entry] = size === 256 ? 0 : size
     bytes[entry + 1] = size === 256 ? 0 : size
-    const offset = 6 + sizes.length * 16 + index * payload.length
-    bytes.writeUInt32LE(payload.length, entry + 8)
+    const offset = index === 0 ? 6 + sizes.length * 16 : bytes.readUInt32LE(entry - 4) + bytes.readUInt32LE(entry - 8)
+    bytes.writeUInt32LE(payloads[index]!.length, entry + 8)
     bytes.writeUInt32LE(offset, entry + 12)
-    payload.copy(bytes, offset)
+    payloads[index]!.copy(bytes, offset)
   }
   return bytes
 }
 
 function icns(types = ['icp4', 'ic11', 'icp5', 'ic12', 'ic07', 'ic13', 'ic08', 'ic14', 'ic09', 'ic10']) {
-  const payload = png()
-  const bytes = Buffer.alloc(8 + types.length * (8 + payload.length))
+  const sizes = [16, 32, 32, 64, 128, 256, 256, 512, 512, 1024]
+  const payloads = types.map((_type, index) => png(sizes[index]!))
+  const bytes = Buffer.alloc(8 + payloads.reduce((total, payload) => total + 8 + payload.length, 0))
   bytes.write('icns', 0)
   bytes.writeUInt32BE(bytes.length, 4)
   for (const [index, type] of types.entries()) {
-    const offset = 8 + index * (8 + payload.length)
+    const offset = index === 0 ? 8 : 8 + payloads.slice(0, index).reduce((total, value) => total + 8 + value.length, 0)
     bytes.write(type, offset)
-    bytes.writeUInt32BE(8 + payload.length, offset + 4)
-    payload.copy(bytes, offset + 8)
+    bytes.writeUInt32BE(8 + payloads[index]!.length, offset + 4)
+    payloads[index]!.copy(bytes, offset + 8)
   }
   return bytes
 }

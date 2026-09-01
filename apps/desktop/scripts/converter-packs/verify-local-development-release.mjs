@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { inflateSync } from 'node:zlib'
 import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -77,6 +78,7 @@ function validPng(bytes, expectedSize) {
   let width
   let height
   let idat = false
+  const payloads = []
   let ended = false
   while (offset + 12 <= bytes.length) {
     const length = bytes.readUInt32BE(offset)
@@ -87,11 +89,17 @@ function validPng(bytes, expectedSize) {
       if (length !== 13 || width !== undefined) return false
       width = bytes.readUInt32BE(offset + 8); height = bytes.readUInt32BE(offset + 12)
       if (!width || !height) return false
-    } else if (type.toString('ascii') === 'IDAT') idat ||= length > 0
+    } else if (type.toString('ascii') === 'IDAT') { idat ||= length > 0; payloads.push(bytes.subarray(offset + 8, offset + 8 + length)) }
     else if (type.toString('ascii') === 'IEND') { ended = length === 0 && end === bytes.length; break }
     offset = end
   }
-  return Boolean(width && height && idat && ended && (expectedSize === undefined || (width === expectedSize && height === expectedSize)))
+  if (!width || !height || !idat || !ended || (expectedSize !== undefined && (width !== expectedSize || height !== expectedSize))) return false
+  try {
+    const decoded = inflateSync(Buffer.concat(payloads))
+    if (decoded.length !== height * (1 + width * 4)) return false
+    for (let offset = 0; offset < decoded.length; offset += 1 + width * 4) if (decoded[offset] > 4) return false
+    return true
+  } catch { return false }
 }
 
 function validJpeg(bytes) {
@@ -130,6 +138,17 @@ async function verifyOutputDirectory(root, expectedNames, allowedDirectories = [
   for (const name of names) await regularFile(join(root, name))
 }
 
+async function auditTree(root) {
+  let files = 0
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name)
+    if (entry.isSymbolicLink()) fail()
+    if (entry.isDirectory()) files += await auditTree(path)
+    else { await regularFile(path); files += 1 }
+  }
+  return files
+}
+
 function verifyIco(bytes) {
   if (bytes.length < 6 || bytes.readUInt16LE(4) !== icoSizes.length) fail()
   const sizes = []
@@ -139,7 +158,7 @@ function verifyIco(bytes) {
     const size = bytes[offset] || 256
     const payloadLength = bytes.readUInt32LE(offset + 8)
     const payloadOffset = bytes.readUInt32LE(offset + 12)
-    if (!payloadLength || payloadOffset + payloadLength > bytes.length || !validPng(bytes.subarray(payloadOffset, payloadOffset + payloadLength))) fail()
+    if (!payloadLength || payloadOffset + payloadLength > bytes.length || !validPng(bytes.subarray(payloadOffset, payloadOffset + payloadLength), size)) fail()
     sizes.push(size)
   }
   if (sizes.some((size, index) => size !== icoSizes[index])) fail()
@@ -148,13 +167,14 @@ function verifyIco(bytes) {
 function verifyIcns(bytes) {
   if (bytes.length < 8 || bytes.readUInt32BE(4) !== bytes.length) fail()
   const types = []
+  const sizes = [16, 32, 32, 64, 128, 256, 256, 512, 512, 1024]
   for (let offset = 8; offset < bytes.length;) {
     if (offset + 8 > bytes.length) fail()
     const length = bytes.readUInt32BE(offset + 4)
     if (length < 8 || offset + length > bytes.length) fail()
     const index = types.length
     types.push(bytes.subarray(offset, offset + 4).toString('ascii'))
-    if (!validPng(bytes.subarray(offset + 8, offset + length))) fail()
+    if (!validPng(bytes.subarray(offset + 8, offset + length), sizes[index])) fail()
     offset += length
   }
   if (types.length !== icnsTypes.length || types.some((type, index) => type !== icnsTypes[index])) fail()
@@ -235,6 +255,10 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     await Promise.all([writeFile(text, 'AutoForge smoke fixture\n'), writeFile(csv, 'name,value\nauto-forge,1\n'), writeFile(image, pngFixture)])
     await Promise.all([regularFile(text), regularFile(csv), regularFile(image)])
     const invoke = (executable, args, cwd, kind) => runCommand(run, { executable, args, cwd, env: commandEnvironment(executable, workRoot) }, timeoutMs ?? timeouts[kind])
+    const invokeDocument = async (input, target, root) => {
+      await invoke(executables.document, documentArguments(input, target, root), root, 'document')
+      await rm(join(root, 'libreoffice-profile'), { recursive: true, force: true })
+    }
     const probePdf = async (path) => {
       const result = await invoke(executables.pdfinfo, ['-f', '1', '-l', '1', path], workRoot, 'pdf')
       if (!/^Pages:\s+1$/mu.test(result.stdout ?? '')) fail()
@@ -250,8 +274,8 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     const docSourceRoot = join(workRoot, 'source-doc')
     const docxSourceRoot = join(workRoot, 'source-docx')
     await Promise.all([mkdir(docSourceRoot), mkdir(docxSourceRoot)])
-    await invoke(executables.document, documentArguments(text, 'doc', docSourceRoot), docSourceRoot, 'document')
-    await invoke(executables.document, documentArguments(text, 'docx', docxSourceRoot), docxSourceRoot, 'document')
+    await invokeDocument(text, 'doc', docSourceRoot)
+    await invokeDocument(text, 'docx', docxSourceRoot)
     const doc = join(docSourceRoot, 'source.doc')
     const docx = join(docxSourceRoot, 'source.docx')
     await Promise.all([verifyOutput(doc, 'doc'), verifyOutput(docx, 'zip')])
@@ -260,19 +284,19 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     const documentXRoot = join(workRoot, 'documentx')
     const spreadsheetRoot = join(workRoot, 'spreadsheet')
     await Promise.all([mkdir(documentRoot), mkdir(documentXRoot), mkdir(spreadsheetRoot)])
-    await invoke(executables.document, documentArguments(doc, 'pdf', documentRoot), documentRoot, 'document')
-    await invoke(executables.document, documentArguments(docx, 'pdf', documentXRoot), documentXRoot, 'document')
-    await invoke(executables.document, documentArguments(csv, 'xlsx', spreadsheetRoot), spreadsheetRoot, 'document')
+    await invokeDocument(doc, 'pdf', documentRoot)
+    await invokeDocument(docx, 'pdf', documentXRoot)
+    await invokeDocument(csv, 'xlsx', spreadsheetRoot)
     await Promise.all([
-      verifyOutputDirectory(documentRoot, ['source.pdf'], ['libreoffice-profile']), verifyOutput(join(documentRoot, 'source.pdf'), 'pdf'),
-      verifyOutputDirectory(documentXRoot, ['source.pdf'], ['libreoffice-profile']), verifyOutput(join(documentXRoot, 'source.pdf'), 'pdf'),
-      verifyOutputDirectory(spreadsheetRoot, ['source.xlsx'], ['libreoffice-profile']), verifyOutput(join(spreadsheetRoot, 'source.xlsx'), 'zip'),
+      verifyOutputDirectory(documentRoot, ['source.pdf']), verifyOutput(join(documentRoot, 'source.pdf'), 'pdf'),
+      verifyOutputDirectory(documentXRoot, ['source.pdf']), verifyOutput(join(documentXRoot, 'source.pdf'), 'pdf'),
+      verifyOutputDirectory(spreadsheetRoot, ['source.xlsx']), verifyOutput(join(spreadsheetRoot, 'source.xlsx'), 'zip'),
     ])
     await Promise.all([probePdf(join(documentRoot, 'source.pdf')), probePdf(join(documentXRoot, 'source.pdf'))])
     const roundtripRoot = join(workRoot, 'xlsx-roundtrip')
     await mkdir(roundtripRoot)
     const spreadsheet = join(spreadsheetRoot, 'source.xlsx')
-    await invoke(executables.document, documentArguments(spreadsheet, 'csv', roundtripRoot), roundtripRoot, 'document')
+    await invokeDocument(spreadsheet, 'csv', roundtripRoot)
     const roundtrip = join(roundtripRoot, 'source.csv')
     await regularFile(roundtrip)
     if ((await readFile(roundtrip, 'utf8')).replace(/^\ufeff/u, '').trim() !== 'name,value\nauto-forge,1') fail()
@@ -334,6 +358,7 @@ export async function smokeTestLocalDevelopmentRelease({ releaseRoot, workRoot, 
     const roots = ['sources', 'source-doc', 'source-docx', 'document', 'documentx', 'spreadsheet', 'xlsx-roundtrip', 'jpeg', 'image-pdf', 'ico', 'icns', 'pdf-png', 'pdf-jpeg', 'pdf-probe', 'audio', 'video', 'extract']
     const entries = await readdir(workRoot, { withFileTypes: true })
     if (entries.length !== roots.length || entries.some((entry) => !entry.isDirectory() || entry.isSymbolicLink() || !roots.includes(entry.name))) fail()
+    if (await auditTree(workRoot) > maximumOutputs) fail()
   } catch {
     fail()
   } finally {

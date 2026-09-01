@@ -187,12 +187,12 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
       const smokeWorkRoot = join(privateRoot, 'smoke')
       await mkdir(smokeWorkRoot, { mode: 0o700 })
       await dependencies.smokeRelease({ releaseRoot: paths.release, workRoot: smokeWorkRoot })
-      await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
-      return { fingerprint, releaseRoot: paths.release, reused: false }
     } catch (error) {
       await rm(paths.release, { recursive: true, force: true })
       throw error
     }
+    await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
+    return { fingerprint, releaseRoot: paths.release, reused: false }
   } finally {
     await rm(privateRoot, { recursive: true, force: true })
   }
