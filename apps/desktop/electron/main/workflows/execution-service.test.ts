@@ -28,6 +28,7 @@ import {
   type ExecutionAttachmentBinding,
   type ExecutionRepositories,
   type FileConversionPort,
+  type FileConversionTerminalResult,
   type WorkflowExecutionSourceResolver,
   type WorkflowWorker,
   type WorkflowWorkerFactory,
@@ -322,6 +323,7 @@ function conversionStartInput(
   bindings: readonly ExecutionAttachmentBinding[] = [attachmentBinding()],
   options: {
     authorize?: boolean
+    agentAuthorized?: boolean
     formats?: readonly ConversionTargetFormat[]
     authorizationFingerprint?: string
   } = {},
@@ -334,6 +336,17 @@ function conversionStartInput(
     input: { files: [0], targetFormat: 'png' },
     sourceSelector,
     attachmentBindings: bindings,
+    ...(options.agentAuthorized ? {
+      agentAuthorization: {
+        workflowFingerprint: workflowSecurityFingerprint(conversionWorkflow),
+        permissions: conversionWorkflow.permissions.map((permission, permissionIndex) => ({
+          permissionIndex,
+          capability: permission.capability,
+          scope: permission.scope,
+          scopeHash: scopeHash(permission.scope),
+        })),
+      },
+    } : {}),
     ...(options.authorize === false ? {} : {
       fileConvertAuthorization: {
         executionId,
@@ -1195,6 +1208,29 @@ describe('ExecutionService', () => {
     worker.respond({ type: 'result', output: { converted: true } })
     await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
   })
+
+  it.each([undefined, true])(
+    'waits for an Agent-authorized conversion terminal result when background is %s',
+    async (background) => {
+      let releaseTerminal!: (value: FileConversionTerminalResult) => void
+      const terminal = new Promise<FileConversionTerminalResult>((resolve) => {
+        releaseTerminal = resolve
+      })
+      const conversion = createFileConversionPort({ waitForTerminal: async () => terminal })
+      const harness = createHarness({ conversion, source: { workflow: conversionWorkflow, rootPath: trustedRootPath, entryPath: 'workers/workflow-runner.ts', integrity: 'valid' } })
+      const reservation = harness.service.reserve()
+      const execution = await harness.service.startReserved(reservation, conversionStartInput(reservation.executionId, harness.sourceSelector, [attachmentBinding()], { agentAuthorized: true }))
+      const worker = harness.workerFactory.workers.get(execution.id)!
+      worker.respond({ type: 'ready', executionId: execution.id })
+      worker.respond({ type: 'capability_request', requestId: 'convert_agent_terminal', request: conversionRequest({ ...(background === undefined ? {} : { background }) }) })
+      await vi.waitFor(() => expect(conversion.waitForTerminal).toHaveBeenCalledOnce())
+      expect(worker.requests).not.toContainEqual(expect.objectContaining({ type: 'capability_result', requestId: 'convert_agent_terminal' }))
+      releaseTerminal({ status: 'completed', outputs: [{ displayName: 'result.png', detectedFormat: 'png', byteSize: 64 }] })
+      await vi.waitFor(() => expect(worker.requests).toContainEqual({ type: 'capability_result', requestId: 'convert_agent_terminal', result: { accepted: true, status: 'completed', outputs: [{ name: 'converted-1-1.png', format: 'png', byteSize: 64 }] } }))
+      worker.respond({ type: 'result', output: { converted: true } })
+      await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+    },
+  )
 
   it.each([undefined, true])(
     'returns a queued receipt without waiting when background is %s',

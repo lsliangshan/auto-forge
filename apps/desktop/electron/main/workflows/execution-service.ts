@@ -1429,7 +1429,8 @@ export class ExecutionService {
     if (!receipt.accepted || receipt.status !== 'queued' || receipt.epoch !== 0 || !receipt.jobId.trim()) {
       throw failure('INTERNAL_ERROR')
     }
-    if (background !== false) {
+    const mustWaitForTerminal = active.agentAuthorization !== undefined || background === false
+    if (!mustWaitForTerminal) {
       return { accepted: true, status: 'queued', outputs: [] }
     }
 
