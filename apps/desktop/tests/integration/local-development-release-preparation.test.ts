@@ -136,6 +136,26 @@ it('includes the requested target in the fingerprint', async () => {
   expect(x64.fingerprint).not.toBe(arm64.fingerprint)
 })
 
+it('passes the requested x64 target to the release builder', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const events: string[] = []
+  const injected = dependencies(events, {
+    buildRelease: async (value: Record<string, unknown>) => {
+      events.push('build')
+      expect(value.platform).toBe('darwin')
+      expect(value.arch).toBe('x64')
+      await releaseBuilder({ outputRoot: value.outputRoot as string })
+    },
+  })
+
+  await prepareLocalDevelopmentRelease(
+    { ...request({ desktopRoot, cacheRoot }), arch: 'x64' },
+    injected,
+  )
+
+  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'activate'])
+})
+
 it('rejects symbolic fingerprint inputs instead of following them outside the desktop root', async () => {
   const { root, desktopRoot } = fixture()
   const outside = join(root, 'outside.c')

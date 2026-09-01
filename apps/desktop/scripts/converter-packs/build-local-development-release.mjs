@@ -1,7 +1,6 @@
 import { createPrivateKey, createPublicKey, verify } from 'node:crypto'
 import { lstat, mkdir, mkdtemp, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import process from 'node:process'
 import {
   archiveFilename,
   canonicalBytes,
@@ -18,7 +17,7 @@ import { signConverterPackIndex } from './sign-index.mjs'
 
 const families = Object.freeze(['image-icon', 'document', 'pdf', 'media'])
 
-function releaseTarget(platform = process.platform, arch = process.arch) {
+function releaseTarget(platform, arch) {
   if (platform !== 'darwin' || (arch !== 'arm64' && arch !== 'x64')) {
     fail('Local development converter releases support only current darwin-arm64 or darwin-x64 targets.')
   }
@@ -94,8 +93,8 @@ async function readVerifiedIndex(releaseRoot, platform, arch) {
   return { index, indexBytes }
 }
 
-export async function buildLocalDevelopmentRelease({ stagingRoot, outputRoot, privateKeyPath, publicKeyPath }) {
-  const { platform, arch } = releaseTarget()
+export async function buildLocalDevelopmentRelease({ stagingRoot, outputRoot, privateKeyPath, publicKeyPath, platform, arch }) {
+  const target = releaseTarget(platform, arch)
   requireAbsolutePath(stagingRoot, 'Staging root')
   requireAbsolutePath(outputRoot, 'Output root')
   requireAbsolutePath(privateKeyPath, 'Private key path')
@@ -122,13 +121,13 @@ export async function buildLocalDevelopmentRelease({ stagingRoot, outputRoot, pr
     const built = join(temporary, '.packs')
     await buildConverterPackIndex({ input: stagingRoot, output: built, mode: 'test' })
     await signConverterPackIndex({ indexPath: join(built, 'index.json'), privateKeyPath, mode: 'test' })
-    const { index, indexBytes } = await readVerifiedIndex(built, platform, arch)
+    const { index, indexBytes } = await readVerifiedIndex(built, target.platform, target.arch)
     const signature = await readStableRegularFile(join(built, 'index.sig'), 'Development release signature')
     if (!verify(null, indexBytes, publicKey, Buffer.from(signature.toString('utf8').trim(), 'base64'))) fail('Development release index signature is invalid.')
     for (const descriptor of index.packs) {
       const archive = await readStableRegularFile(join(built, archiveFilename(descriptor)), 'Development release archive', descriptor.archiveBytes)
       if (archive.byteLength !== descriptor.archiveBytes || sha256(archive) !== descriptor.archiveSha256) fail('Development release archive hash mismatch.')
-      const destination = join(temporary, 'installed', descriptor.name, descriptor.version, `${platform}-${arch}`)
+      const destination = join(temporary, 'installed', descriptor.name, descriptor.version, `${target.platform}-${target.arch}`)
       await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
       await writeRestrictedUstarEntries({
         archive,

@@ -1,4 +1,5 @@
-import { createPublicKey } from 'node:crypto'
+import { Buffer } from 'node:buffer'
+import { createPrivateKey, createPublicKey } from 'node:crypto'
 import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import {
@@ -26,10 +27,10 @@ const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/pack-tooling-lib.mjs',
   'scripts/converter-packs/build-local-development-release.mjs',
 ])
-const developmentPrivateKey = `-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIBsz/pecJJKmQJhW2OtzrZp4RxTUGy1ZfGhRXkUhUHm8
------END PRIVATE KEY-----
-`
+const developmentPrivateKeyDer = Buffer.from(
+  '302e020100300506032b6570042204209d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60',
+  'hex',
+)
 const requestKeys = Object.freeze(['desktopRoot', 'cacheRoot', 'platform', 'arch', 'compiler'])
 
 const productionDependencies = Object.freeze({
@@ -162,7 +163,8 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     await mkdir(join(cacheRoot, 'sources'), { recursive: true, mode: 0o700 })
     await mkdir(join(cacheRoot, 'releases'), { recursive: true, mode: 0o700 })
     await mkdir(signingRoot, { mode: 0o700 })
-    await writeFile(privateKeyPath, developmentPrivateKey, { flag: 'wx', mode: 0o600 })
+    const developmentPrivateKey = createPrivateKey({ key: developmentPrivateKeyDer, format: 'der', type: 'pkcs8' })
+    await writeFile(privateKeyPath, developmentPrivateKey.export({ format: 'pem', type: 'pkcs8' }), { flag: 'wx', mode: 0o600 })
     await writeFile(publicKeyPath, createPublicKey(developmentPrivateKey).export({ format: 'pem', type: 'spki' }), { flag: 'wx', mode: 0o600 })
     const version = `0.0.0-dev+${fingerprint.slice(0, 12)}`
     const archiveBaseUrl = `https://local-development.invalid/converter-packs/${fingerprint}`
@@ -174,7 +176,9 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     })
     const plan = JSON.parse(await readFile(planPath, 'utf8'))
     await dependencies.stagePacks({ plan, output: stagingRoot })
-    await dependencies.buildRelease({ stagingRoot, outputRoot: paths.release, privateKeyPath, publicKeyPath })
+    await dependencies.buildRelease({
+      stagingRoot, outputRoot: paths.release, privateKeyPath, publicKeyPath, platform: request.platform, arch: request.arch,
+    })
     await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
     await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
     return { fingerprint, releaseRoot: paths.release, reused: false }

@@ -28,7 +28,7 @@ const executables = {
   media: ['bin/ffmpeg', 'bin/ffprobe'],
 } as const
 
-async function stagingFixture(root: string) {
+async function stagingFixture(root: string, arch: 'arm64' | 'x64' = 'arm64') {
   const stagingRoot = join(root, 'staging')
   await mkdir(join(stagingRoot, 'packs'), { recursive: true })
   writeFileSync(join(stagingRoot, 'release.json'), JSON.stringify({
@@ -37,7 +37,7 @@ async function stagingFixture(root: string) {
     sequence: 1,
   }))
   for (const [family, paths] of Object.entries(executables)) {
-    const pack = join(stagingRoot, 'packs', `${family}-darwin-arm64`)
+    const pack = join(stagingRoot, 'packs', `${family}-darwin-${arch}`)
     const payload = join(pack, 'payload')
     const licensePath = `LICENSES/${family}.txt`
     for (const path of paths) {
@@ -53,8 +53,8 @@ async function stagingFixture(root: string) {
       name: family,
       version: '1.0.0',
       platform: 'darwin',
-      arch: 'arm64',
-      archiveUrl: `https://packs.example.test/${family}-1.0.0-darwin-arm64.tar`,
+      arch,
+      archiveUrl: `https://packs.example.test/${family}-1.0.0-darwin-${arch}.tar`,
       files: [...paths.map((path) => ({ path, role: 'executable' })), { path: licensePath, role: 'license' }],
     }))
   }
@@ -84,7 +84,7 @@ it('builds and verifies a signed four-family darwin-arm64 installed development 
   const outputRoot = join(root, 'release')
   const keys = keyPair(root)
 
-  await buildLocalDevelopmentRelease({ stagingRoot, outputRoot, ...keys })
+  await buildLocalDevelopmentRelease({ stagingRoot, outputRoot, platform: 'darwin', arch: 'arm64', ...keys })
 
   const index = JSON.parse(readFileSync(join(outputRoot, 'index.json'), 'utf8')) as { packs: Array<{ name: string; version: string }> }
   expect(index.packs).toHaveLength(4)
@@ -95,6 +95,19 @@ it('builds and verifies a signed four-family darwin-arm64 installed development 
   expect((await readdir(outputRoot)).sort()).toEqual(['index.json', 'index.sig', 'installed', 'root-public-key.pem'])
   expect(statSync(join(outputRoot, 'installed', 'media', '1.0.0', 'darwin-arm64', 'bin', 'ffmpeg')).mode & 0o777).toBe(0o755)
   await expect(verifyLocalDevelopmentReleaseIntegrity({ releaseRoot: outputRoot, platform: 'darwin', arch: 'arm64' })).resolves.toBeUndefined()
+})
+
+it('builds and verifies a signed four-family darwin-x64 installed development release', async () => {
+  const root = temporaryRoot()
+  const outputRoot = join(root, 'release')
+  const keys = keyPair(root)
+
+  await buildLocalDevelopmentRelease({
+    stagingRoot: await stagingFixture(root, 'x64'), outputRoot, platform: 'darwin', arch: 'x64', ...keys,
+  })
+
+  expect(existsSync(join(outputRoot, 'installed', 'media', '1.0.0', 'darwin-x64'))).toBe(true)
+  await expect(verifyLocalDevelopmentReleaseIntegrity({ releaseRoot: outputRoot, platform: 'darwin', arch: 'x64' })).resolves.toBeUndefined()
 })
 
 it.each([
@@ -113,7 +126,7 @@ it.each([
   const root = temporaryRoot()
   const keys = keyPair(root)
   const release = join(root, 'release')
-  await buildLocalDevelopmentRelease({ stagingRoot: await stagingFixture(root), outputRoot: release, ...keys })
+  await buildLocalDevelopmentRelease({ stagingRoot: await stagingFixture(root), outputRoot: release, platform: 'darwin', arch: 'arm64', ...keys })
   mutate(release, root)
   await expect(verifyLocalDevelopmentReleaseIntegrity({ releaseRoot: release, ...target })).rejects.toThrow()
 })
