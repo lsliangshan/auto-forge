@@ -453,6 +453,7 @@ export async function extractVerifiedBottleForDiscovery({
   expectedSha256,
   formula,
   version,
+  archiveVersion = version,
   outputRoot,
 }) {
   requireAbsolutePath(outputRoot, 'Bottle discovery output root')
@@ -461,6 +462,8 @@ export async function extractVerifiedBottleForDiscovery({
     || !/^[a-z0-9][a-z0-9+_.@-]*$/u.test(formula)
     || typeof version !== 'string'
     || !/^[A-Za-z0-9._+-]+$/u.test(version)
+    || typeof archiveVersion !== 'string'
+    || !/^[A-Za-z0-9._+-]+$/u.test(archiveVersion)
   ) invalid()
   const rootMetadata = await lstat(outputRoot).catch(() => undefined)
   if (
@@ -470,7 +473,7 @@ export async function extractVerifiedBottleForDiscovery({
     || await realpath(outputRoot).catch(() => undefined) !== outputRoot
   ) invalid()
 
-  const rootPrefix = `${formula}/${version}/`
+  const rootPrefix = `${formula}/${archiveVersion}/`
   let privateRoot
   let primaryError
   const openHandles = new Set()

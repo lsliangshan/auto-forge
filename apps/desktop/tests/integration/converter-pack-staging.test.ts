@@ -253,8 +253,8 @@ describe('converter pack Mach-O closure', () => {
       { destination: 'bin/vips', dependency: prefixDependency, replacement: '@loader_path/../lib/glib/libglib-2.0.0.dylib' },
     ])
     expect(discovered.licenses).toEqual([
-      { ...glibLicense, destination: 'licenses/glib/LICENSE' },
-      { ...vipsLicense, destination: 'licenses/vips/COPYING' },
+      { ...glibLicense, destination: 'LICENSES/glib.LICENSE' },
+      { ...vipsLicense, destination: 'LICENSES/vips.COPYING' },
     ])
     expect(discovered.files.some((file: { sourcePath: string }) => file.sourcePath === ignoredData.sourcePath)).toBe(false)
 

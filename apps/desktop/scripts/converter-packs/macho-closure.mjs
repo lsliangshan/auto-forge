@@ -338,7 +338,7 @@ export async function discoverMachOClosure({ family, architecture, files, inspec
     const license = candidates[0]
     if (!license) fail(`Contributing formula is missing a bottle license: ${formula}`)
     await verifyDiscoveryFile(license)
-    licenses.push({ ...license, destination: `licenses/${formula}/${posix.basename(license.sourcePath)}` })
+    licenses.push({ ...license, destination: `LICENSES/${formula}.${posix.basename(license.sourcePath)}` })
   }
 
   const discoveredFiles = [...selected.values()].map((node) => ({

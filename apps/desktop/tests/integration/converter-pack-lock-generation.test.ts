@@ -89,10 +89,10 @@ function bottleArchive(formula: string, version: string, entries: Array<{ path: 
 
 function captureFixture(target = targetForHost()) {
   const formulae = [
-    { name: 'vips', version: '8.18.6', revision: 0, license: 'LGPL-2.1-or-later', dependencies: ['glib'] },
-    { name: 'poppler', version: '26.8.0', revision: 0, license: 'GPL-3.0-only', dependencies: ['glib'] },
-    { name: 'glib', version: '2.86.0', revision: 0, license: 'LGPL-2.1-or-later', dependencies: [] },
-    { name: 'ffmpeg', version: '9.0.1+1', revision: 1, license: 'GPL-3.0-or-later', dependencies: ['glib'] },
+    { name: 'vips', version: '8.18.6', stableVersion: '8.18.6', revision: 0, license: 'LGPL-2.1-or-later', dependencies: ['glib'] },
+    { name: 'poppler', version: '26.8.0', stableVersion: '26.8.0', revision: 0, license: 'GPL-3.0-only', dependencies: ['glib'] },
+    { name: 'glib', version: '2.86.0', stableVersion: '2.86.0', revision: 0, license: 'LGPL-2.1-or-later', dependencies: [] },
+    { name: 'ffmpeg', version: '9.0.1_1', stableVersion: '9.0.1', revision: 1, license: 'GPL-3.0-or-later', dependencies: ['glib'] },
   ]
   const fileBytes = (formula: string, sourcePath: string) => Buffer.from(`${formula}-${sourcePath}`)
   const licenseBytes = (formula: string) => Buffer.from(`${formula}-license`)
@@ -120,7 +120,7 @@ function captureFixture(target = targetForHost()) {
         files: [
           file('vips', 'bin/vips', 'bin/vips'),
           file('glib', 'lib/libglib.dylib', 'lib/glib/libglib.dylib', false, 'code'),
-          file('vips', 'share/vips/runtime.conf', 'share/vips/runtime.conf', false, 'data'),
+          file('glib', 'share/glib-2.0/schemas/gschemas.compiled', 'share/runtime/glib/share/glib-2.0/schemas/gschemas.compiled', false, 'data'),
         ],
         rewrites: [{
           destination: 'bin/vips',
@@ -168,11 +168,11 @@ function captureFixture(target = targetForHost()) {
     ffmpeg: ['bin/ffmpeg', 'bin/ffprobe'].map((path) => ({ path, bytes: fileBytes('ffmpeg', path), mode: 0o555 })),
     glib: [
       { path: 'lib/libglib.dylib', bytes: fileBytes('glib', 'lib/libglib.dylib'), mode: 0o444 },
+      { path: 'share/glib-2.0/schemas/gschemas.compiled', bytes: fileBytes('glib', 'share/glib-2.0/schemas/gschemas.compiled'), mode: 0o444 },
     ],
     poppler: ['bin/pdfinfo', 'bin/pdftocairo'].map((path) => ({ path, bytes: fileBytes('poppler', path), mode: 0o555 })),
     vips: [
       { path: 'bin/vips', bytes: fileBytes('vips', 'bin/vips'), mode: 0o555 },
-      { path: 'share/vips/runtime.conf', bytes: fileBytes('vips', 'share/vips/runtime.conf'), mode: 0o444 },
     ],
   }
   for (const formula of formulae) bottleEntries[formula.name].push({ path: 'LICENSE', bytes: licenseBytes(formula.name), mode: 0o644 })
@@ -190,28 +190,36 @@ function captureFixture(target = targetForHost()) {
   closure.measurements.downloadBytes = Object.values(coordinates).reduce((sum, coordinate) => sum + coordinate.bytes, 0)
     + libreOfficeBytes.byteLength + libreOfficeLicenseBytes.byteLength
   const roots = {
-    formulae: ['ffmpeg', 'poppler', 'vips'],
-    homebrewCaskRevision: '2'.repeat(40),
+    schemaVersion: 1,
+    formulaRoots: ['ffmpeg', 'poppler', 'vips'],
     engines: [
-      { name: 'ffmpeg', version: '9.0.1+1', license: 'GPL-3.0-or-later', rootFormula: 'ffmpeg', acquisition: coordinates.ffmpeg, licenses: [] },
+      { name: 'ffmpeg', formula: 'ffmpeg', expectedLicense: 'GPL-3.0-or-later' },
       {
-        name: 'libreoffice', version: '26.8.0', license: 'MPL-2.0', rootFormula: null,
-        acquisition: {
-          kind: 'dmg', url: `https://downloads.example.test/libreoffice-${target}.dmg`,
-          sha256: sha256(libreOfficeBytes), bytes: libreOfficeBytes.byteLength, cellar: null,
-        },
-        licenses: [{
-          kind: 'download', url: 'https://downloads.example.test/libreoffice-LICENSE',
+        name: 'libreoffice', cask: 'libreoffice', expectedLicense: 'MPL-2.0',
+        directLicenses: [{
+          url: 'https://downloads.example.test/libreoffice-LICENSE',
           sha256: sha256(libreOfficeLicenseBytes), bytes: libreOfficeLicenseBytes.byteLength,
           destination: 'LICENSES/libreoffice.LICENSE',
         }],
       },
-      { name: 'libvips', version: '8.18.6', license: 'LGPL-2.1-or-later', rootFormula: 'vips', acquisition: coordinates.vips, licenses: [] },
-      { name: 'poppler', version: '26.8.0', license: 'GPL-3.0-only', rootFormula: 'poppler', acquisition: coordinates.poppler, licenses: [] },
+      { name: 'libvips', formula: 'vips', expectedLicense: 'LGPL-2.1-or-later' },
+      { name: 'poppler', formula: 'poppler', expectedLicense: 'GPL-3.0-only' },
     ],
-    closure,
   }
   return { bottleBytes, formulae, coordinates, libreOfficeBytes, libreOfficeLicenseBytes, roots, closure }
+}
+
+function brewCaskJson(fixture: ReturnType<typeof captureFixture>, target = targetForHost()) {
+  return {
+    formulae: [],
+    casks: [{
+      token: 'libreoffice',
+      version: '26.8.0',
+      url: `https://downloads.example.test/libreoffice-${target}.dmg`,
+      sha256: sha256(fixture.libreOfficeBytes),
+      artifacts: [{ app: ['LibreOffice.app'] }],
+    }],
+  }
 }
 
 function brewFormulaJson(fixture: ReturnType<typeof captureFixture>, target = targetForHost()) {
@@ -220,7 +228,7 @@ function brewFormulaJson(fixture: ReturnType<typeof captureFixture>, target = ta
       name: formula.name,
       full_name: formula.name,
       tap: 'homebrew/core',
-      versions: { stable: formula.version },
+      versions: { stable: formula.stableVersion },
       revision: formula.revision,
       license: formula.license,
       dependencies: formula.dependencies,
@@ -246,14 +254,17 @@ function syntheticRun(fixture: ReturnType<typeof captureFixture>, calls: Capture
   return async (executable: string, args: string[], options: RunOptions) => {
     calls.push({ executable, args: [...args], options })
     if (args[0] === 'tap-info') {
-      return { status: 0, stdout: canonicalBytes([{ name: 'homebrew/core', installed: true, HEAD: '1'.repeat(40) }]), stderr: Buffer.alloc(0) }
+      const tap = args.at(-1)
+      const revision = tap === 'homebrew/core' ? '1'.repeat(40) : '2'.repeat(40)
+      return { status: 0, stdout: canonicalBytes([{ name: tap, installed: true, HEAD: revision }]), stderr: Buffer.alloc(0) }
     }
     if (args[0] === 'deps') {
-      const roots = new Set(fixture.roots.formulae)
+      const roots = new Set(fixture.roots.formulaRoots)
       const dependencies = fixture.formulae.map(({ name }) => name).filter((name) => !roots.has(name)).sort()
       return { status: 0, stdout: Buffer.from(`${dependencies.join('\n')}\n`), stderr: Buffer.alloc(0) }
     }
     if (args[0] === 'info') {
+      if (args.includes('--cask')) return { status: 0, stdout: canonicalBytes(brewCaskJson(fixture)), stderr: Buffer.alloc(0) }
       return { status: 0, stdout: canonicalBytes(brewFormulaJson(fixture)), stderr: Buffer.alloc(0) }
     }
     if (executable === '/usr/bin/curl') {
@@ -302,7 +313,7 @@ async function captureWithFixture(
   overrides: Record<string, unknown> = {},
 ) {
   return captureHomebrewTarget({
-    target: targetForHost(), brew: '/opt/test/bin/brew', coreRevision: '1'.repeat(40),
+    target: targetForHost(), brew: '/opt/test/bin/brew', coreRevision: '1'.repeat(40), caskRevision: '2'.repeat(40),
     roots: fixture.roots, output: join(root, 'capture.json'), run,
     ...overrides,
   })
@@ -334,8 +345,24 @@ function captureDocument(target: 'darwin-arm64' | 'darwin-x64') {
     target,
     homebrewCoreRevision: '1'.repeat(40),
     homebrewCaskRevision: '2'.repeat(40),
-    roots: [...fixture.roots.formulae],
-    engines: structuredClone(fixture.roots.engines),
+    roots: [...fixture.roots.formulaRoots],
+    engines: [
+      { name: 'ffmpeg', version: '9.0.1_1', license: 'GPL-3.0-or-later', rootFormula: 'ffmpeg', acquisition: fixture.coordinates.ffmpeg, licenses: [] },
+      {
+        name: 'libreoffice', version: '26.8.0', license: 'MPL-2.0', rootFormula: null,
+        acquisition: {
+          kind: 'dmg', url: `https://downloads.example.test/libreoffice-${target}.dmg`,
+          sha256: sha256(fixture.libreOfficeBytes), bytes: fixture.libreOfficeBytes.byteLength, cellar: null,
+        },
+        licenses: [{
+          kind: 'download', url: 'https://downloads.example.test/libreoffice-LICENSE',
+          sha256: sha256(fixture.libreOfficeLicenseBytes), bytes: fixture.libreOfficeLicenseBytes.byteLength,
+          destination: 'LICENSES/libreoffice.LICENSE',
+        }],
+      },
+      { name: 'libvips', version: '8.18.6', license: 'LGPL-2.1-or-later', rootFormula: 'vips', acquisition: fixture.coordinates.vips, licenses: [] },
+      { name: 'poppler', version: '26.8.0', license: 'GPL-3.0-only', rootFormula: 'poppler', acquisition: fixture.coordinates.poppler, licenses: [] },
+    ],
     formulae,
     probes: {
       'image-icon': sha256('image-icon-probe'),
@@ -366,6 +393,16 @@ describe('converter pack lock generation', () => {
     expect(packageJson.scripts['converter-packs:generate-lock']).toBe('node scripts/converter-packs/generate-transitive-source-lock.mjs')
     expect(packageJson.scripts.predev).not.toContain('capture-lock-target')
     expect(packageJson.scripts.predev).not.toContain('generate-lock')
+  })
+
+  it('keeps one portable repository candidate set free of dependency closure coordinates', () => {
+    const path = join(process.cwd(), 'converter-packs', 'lock-candidates.json')
+    const bytes = readFileSync(path)
+    const candidates = JSON.parse(bytes.toString('utf8'))
+    expect(bytes).toEqual(Buffer.concat([canonicalBytes(candidates), Buffer.from('\n')]))
+    expect(candidates.formulaRoots).toEqual(['ffmpeg', 'poppler', 'vips'])
+    expect(candidates.engines.map(({ name }: { name: string }) => name)).toEqual(['ffmpeg', 'libreoffice', 'libvips', 'poppler'])
+    expect(JSON.stringify(candidates)).not.toMatch(/homebrewCaskRevision|closure|dependencies|acquisition|runtimeRoot|sourcePath/iu)
   })
 
   it('defines isolated dual-target capture jobs and a review-only merge workflow', () => {
@@ -404,6 +441,7 @@ describe('converter pack lock generation', () => {
       target: targetForHost(),
       brew: '/opt/test/bin/brew',
       coreRevision: '1'.repeat(40),
+      caskRevision: '2'.repeat(40),
       roots: fixture.roots,
       output,
       run: syntheticRun(fixture, calls),
@@ -426,8 +464,10 @@ describe('converter pack lock generation', () => {
         installedReleaseBytes: expect.any(Number),
       },
     })
-    expect(calls.slice(0, 3).map(({ executable, args }) => ({ executable, args }))).toEqual([
+    expect(calls.slice(0, 5).map(({ executable, args }) => ({ executable, args }))).toEqual([
       { executable: '/opt/test/bin/brew', args: ['tap-info', '--json=v1', 'homebrew/core'] },
+      { executable: '/opt/test/bin/brew', args: ['tap-info', '--json=v1', 'homebrew/cask'] },
+      { executable: '/opt/test/bin/brew', args: ['info', '--json=v2', '--cask', 'libreoffice'] },
       { executable: '/opt/test/bin/brew', args: ['deps', '--union', '--formula', 'ffmpeg', 'poppler', 'vips'] },
       { executable: '/opt/test/bin/brew', args: ['info', '--json=v2', '--formula', 'ffmpeg', 'glib', 'poppler', 'vips'] },
     ])
@@ -451,6 +491,7 @@ describe('converter pack lock generation', () => {
     let calls = 0
     const neverRun = async () => { calls += 1; throw new Error('must not run') }
     await expect(captureWithFixture(root, fixture, neverRun, { coreRevision: 'A'.repeat(40) })).rejects.toThrow(/40-hex|revision/iu)
+    await expect(captureWithFixture(root, fixture, neverRun, { caskRevision: 'A'.repeat(40) })).rejects.toThrow(/40-hex|revision/iu)
     await expect(captureWithFixture(root, fixture, neverRun, { brew: 'brew' })).rejects.toThrow(/absolute/iu)
     const otherTarget = targetForHost() === 'darwin-arm64' ? 'darwin-x64' : 'darwin-arm64'
     await expect(captureWithFixture(root, fixture, neverRun, { target: otherTarget })).rejects.toThrow(/host|target/iu)
@@ -463,6 +504,17 @@ describe('converter pack lock generation', () => {
         ? { status: 0, stdout: canonicalBytes([{ name: 'homebrew/core', installed: true, HEAD: '3'.repeat(40) }]), stderr: Buffer.alloc(0) }
         : base(executable, args, options)
     )],
+    ['cask tap revision mismatch', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => async (executable: string, args: string[], options: RunOptions) => (
+      args[0] === 'tap-info' && args.at(-1) === 'homebrew/cask'
+        ? { status: 0, stdout: canonicalBytes([{ name: 'homebrew/cask', installed: true, HEAD: '3'.repeat(40) }]), stderr: Buffer.alloc(0) }
+        : base(executable, args, options)
+    )],
+    ['LibreOffice cask without the fixed app artifact', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => async (executable: string, args: string[], options: RunOptions) => {
+      if (args[0] !== 'info' || !args.includes('--cask')) return base(executable, args, options)
+      const cask = brewCaskJson(fixture)
+      cask.casks[0]!.artifacts = [{ app: ['Other.app'] }]
+      return { status: 0, stdout: canonicalBytes(cask), stderr: Buffer.alloc(0) }
+    }],
     ['non-HTTPS bottle URL', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => {
       fixture.coordinates.glib.url = 'http://downloads.example.test/glib.tar.gz'
       return base
@@ -476,7 +528,7 @@ describe('converter pack lock generation', () => {
       return { status: 0, stdout: canonicalBytes(json), stderr: Buffer.alloc(0) }
     }],
     ['inconsistent formula version', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => {
-      fixture.formulae.find((formula) => formula.name === 'vips')!.version = '8.18.7'
+      fixture.formulae.find((formula) => formula.name === 'vips')!.stableVersion = '8.18.7'
       return base
     }],
     ['duplicate formula metadata', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => async (executable: string, args: string[], options: RunOptions) => {
@@ -525,7 +577,7 @@ describe('converter pack lock generation', () => {
     const fixture = captureFixture()
     const bytes = bottleArchive('unused', '1.0.0', [{ path: 'LICENSE', bytes: Buffer.from('unused-license'), mode: 0o644 }])
     fixture.formulae.find(({ name }) => name === 'glib')!.dependencies.push('unused')
-    fixture.formulae.push({ name: 'unused', version: '1.0.0', revision: 0, license: 'MIT', dependencies: [] })
+    fixture.formulae.push({ name: 'unused', version: '1.0.0', stableVersion: '1.0.0', revision: 0, license: 'MIT', dependencies: [] })
     fixture.bottleBytes.set('unused', bytes)
     fixture.coordinates.unused = {
       kind: 'homebrew-bottle', url: `https://downloads.example.test/unused-${targetForHost()}.tar.gz`,

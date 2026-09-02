@@ -6,7 +6,8 @@ import process from 'node:process'
 import { pathToFileURL, URL } from 'node:url'
 import { validateTargetClosureLock } from './closure-lock.mjs'
 import { materializeBottleUniverse } from './bottle-universe.mjs'
-import { adhocSignMachOClosure, inspectMachO, planMachOClosure, relocateMachOClosure } from './macho-closure.mjs'
+import { extractVerifiedBottleForDiscovery } from './bottle-archive.mjs'
+import { adhocSignMachOClosure, discoverMachOClosure, inspectMachO, planMachOClosure, relocateMachOClosure } from './macho-closure.mjs'
 import { probeConverterFamily, stageProductionPacks } from './stage-production-packs.mjs'
 import { buildConverterPackIndex } from './build-index.mjs'
 import { buildNativeHelpers } from './build-native-helpers.mjs'
@@ -17,6 +18,7 @@ import {
   fail,
   parseArguments,
   readCanonicalJson,
+  readStableRegularFile,
   requireAbsolutePath,
   sha256,
 } from './pack-tooling-lib.mjs'
@@ -110,27 +112,78 @@ function expectedHostTarget() {
   invalid('Homebrew capture host architecture is unsupported.')
 }
 
-function validateRoots(roots, target) {
+function validateRoots(roots) {
+  const formulaEngines = new Map([
+    ['ffmpeg', 'ffmpeg'],
+    ['libvips', 'vips'],
+    ['poppler', 'poppler'],
+  ])
   if (
-    !exactKeys(roots, ['formulae', 'homebrewCaskRevision', 'engines', 'closure'])
-    || !Array.isArray(roots.formulae)
-    || roots.formulae.length === 0
-    || roots.formulae.some((name) => typeof name !== 'string' || !formulaPattern.test(name))
-    || new Set(roots.formulae).size !== roots.formulae.length
-    || roots.formulae.some((name, index) => index > 0 && compareUtf8(roots.formulae[index - 1], name) >= 0)
-    || !revisionPattern.test(roots.homebrewCaskRevision)
+    !exactKeys(roots, ['schemaVersion', 'formulaRoots', 'engines'])
+    || roots.schemaVersion !== 1
+    || !Array.isArray(roots.formulaRoots)
+    || roots.formulaRoots.length === 0
+    || roots.formulaRoots.some((name) => typeof name !== 'string' || !formulaPattern.test(name))
+    || new Set(roots.formulaRoots).size !== roots.formulaRoots.length
+    || roots.formulaRoots.some((name, index) => index > 0 && compareUtf8(roots.formulaRoots[index - 1], name) >= 0)
     || !Array.isArray(roots.engines)
     || roots.engines.length !== engineNames.length
     || roots.engines.some((engine, index) => !plainRecord(engine) || engine.name !== engineNames[index])
   ) invalid('Capture roots are invalid.')
-  return validateTargetClosureLock(roots.closure, target)
+  for (const engine of roots.engines) {
+    if (engine.name === 'libreoffice') {
+      if (
+        !exactKeys(engine, ['name', 'cask', 'expectedLicense', 'directLicenses'])
+        || engine.cask !== 'libreoffice'
+        || typeof engine.expectedLicense !== 'string'
+        || engine.expectedLicense.length === 0
+        || !Array.isArray(engine.directLicenses)
+        || engine.directLicenses.length !== 1
+        || engine.directLicenses.some((license) => (
+          !exactKeys(license, ['url', 'sha256', 'bytes', 'destination'])
+          || !validHttpsUrl(license.url)
+          || !sha256Pattern.test(license.sha256)
+          || !Number.isSafeInteger(license.bytes)
+          || license.bytes <= 0
+          || license.destination !== 'LICENSES/libreoffice.LICENSE'
+        ))
+      ) invalid('Capture LibreOffice candidate is invalid.')
+      continue
+    }
+    if (
+      !exactKeys(engine, ['name', 'formula', 'expectedLicense'])
+      || engine.formula !== formulaEngines.get(engine.name)
+      || typeof engine.expectedLicense !== 'string'
+      || engine.expectedLicense.length === 0
+      || !roots.formulaRoots.includes(engine.formula)
+    ) invalid('Capture formula engine candidate is invalid.')
+  }
+  return cloneJson(roots)
 }
 
-function parseTapInfo(value, revision) {
+function parseTapInfo(value, tap, revision) {
   if (!Array.isArray(value) || value.length !== 1 || !plainRecord(value[0])) invalid('Homebrew tap metadata is invalid.')
-  if (value[0].name !== 'homebrew/core' || value[0].installed !== true || value[0].HEAD !== revision) {
-    invalid('Homebrew core revision does not match the pinned revision.')
+  if (value[0].name !== tap || value[0].installed !== true || value[0].HEAD !== revision) {
+    invalid(`Homebrew ${tap} revision does not match the pinned revision.`)
   }
+}
+
+function parseCask(value, candidate) {
+  if (!plainRecord(value) || !Array.isArray(value.formulae) || value.formulae.length !== 0 || !Array.isArray(value.casks) || value.casks.length !== 1) {
+    invalid('Homebrew cask metadata is invalid.')
+  }
+  const cask = value.casks[0]
+  if (
+    !plainRecord(cask)
+    || cask.token !== candidate.cask
+    || typeof cask.version !== 'string'
+    || cask.version.length === 0
+    || !validHttpsUrl(cask.url)
+    || !sha256Pattern.test(cask.sha256)
+    || !Array.isArray(cask.artifacts)
+    || !cask.artifacts.some((artifact) => plainRecord(artifact) && Array.isArray(artifact.app) && artifact.app.length === 1 && artifact.app[0] === 'LibreOffice.app')
+  ) invalid('Homebrew LibreOffice cask metadata is invalid.')
+  return { version: cask.version, url: cask.url, sha256: cask.sha256 }
 }
 
 function dependencyNames(bytes) {
@@ -168,8 +221,9 @@ function parseFormulae(value, names, target) {
     if (!plainRecord(bottle) || bottle.cellar !== expectedCellar(target) || !validHttpsUrl(bottle.url) || !sha256Pattern.test(bottle.sha256)) {
       invalid('Homebrew formula bottle metadata is invalid for the selected target.')
     }
+    const version = formula.revision === 0 ? formula.versions.stable : `${formula.versions.stable}_${formula.revision}`
     byName.set(formula.name, {
-      name: formula.name, version: formula.versions.stable, revision: formula.revision, license: formula.license,
+      name: formula.name, version, revision: formula.revision, license: formula.license,
       dependencies: [...formula.dependencies].sort(compareUtf8), bottle: { url: bottle.url, sha256: bottle.sha256 },
     })
   }
@@ -194,53 +248,6 @@ function requireReachable(formulae, roots) {
   if (reached.size !== formulae.size) invalid('Homebrew formula is not reachable from a root.')
 }
 
-function licenseAssets(closure, formula, target) {
-  const values = []
-  const seen = new Set()
-  for (const family of familyNames) {
-    for (const license of closure.families[family].licenses) {
-      if (license.formula !== formula) continue
-      const asset = license.source.startsWith('https://')
-        ? { kind: 'download', url: license.source, sha256: license.sha256, bytes: license.bytes, destination: license.destination }
-        : { kind: 'bottle-entry', target, path: license.source, sha256: license.sha256, bytes: license.bytes, destination: license.destination }
-      const key = canonicalBytes(asset).toString('utf8')
-      if (!seen.has(key)) {
-        seen.add(key)
-        values.push(asset)
-      }
-    }
-  }
-  values.sort((left, right) => compareUtf8(
-    left.kind === 'download' ? `download\0${left.destination}\0${left.url}` : `bottle-entry\0${left.target}\0${left.destination}\0${left.path}`,
-    right.kind === 'download' ? `download\0${right.destination}\0${right.url}` : `bottle-entry\0${right.target}\0${right.destination}\0${right.path}`,
-  ))
-  if (values.length === 0 && familyNames.some((family) => closure.families[family].files.some((file) => file.formula === formula))) {
-    invalid('Contributing formula is missing a captured license.')
-  }
-  return values
-}
-
-function validateClosureFormulae(closure, formulae, roots) {
-  const selectedNames = new Set(closure.formulae.map(({ name }) => name))
-  const contributingFormulae = new Set(familyNames.flatMap((family) => (
-    closure.families[family].files.map(({ formula }) => formula)
-  )))
-  if (roots.some((name) => !selectedNames.has(name))) invalid('Captured closure omits a root formula.')
-  for (const selected of closure.formulae) {
-    const formula = formulae.get(selected.name)
-    const selectedDependencies = formula?.dependencies.filter((dependency) => selectedNames.has(dependency))
-    if (
-      !formula
-      || formula.version !== selected.version
-      || !contributingFormulae.has(selected.name)
-      || canonicalBytes(selectedDependencies).compare(canonicalBytes(selected.dependencies)) !== 0
-    ) {
-      invalid('Captured closure formula identity differs from Homebrew metadata.')
-    }
-  }
-  return selectedNames
-}
-
 async function verifyDownload({ run, workspace, artifact, verified }) {
   const previous = verified.get(artifact.sha256)
   if (previous) {
@@ -255,14 +262,13 @@ async function verifyDownload({ run, workspace, artifact, verified }) {
     '--fail', '--location', '--proto', '=https', '--proto-redir', '=https',
     '--silent', '--show-error', '--output', path, artifact.url,
   ], { cwd: workspace, env: maintainerEnv }, 'Capture artifact download')
-  const metadata = await stat(path).catch(() => undefined)
-  if (!metadata?.isFile() || metadata.size <= 0 || (artifact.bytes !== undefined && metadata.size !== artifact.bytes)) {
+  const bytes = await readStableRegularFile(path, 'Downloaded capture artifact')
+  if (bytes.byteLength <= 0 || (artifact.bytes !== undefined && bytes.byteLength !== artifact.bytes)) {
     invalid('Downloaded capture artifact byte length differs from metadata.')
   }
-  const bytes = await readFile(path)
   if (sha256(bytes) !== artifact.sha256) invalid('Downloaded capture artifact hash differs from metadata.')
-  verified.set(artifact.sha256, { url: artifact.url, bytes: metadata.size, path })
-  return metadata.size
+  verified.set(artifact.sha256, { url: artifact.url, bytes: bytes.byteLength, path })
+  return bytes.byteLength
 }
 
 function asText(value) {
@@ -282,6 +288,154 @@ function targetToolRunner(run, workspace) {
     }
     return { status: result?.status, stdout: stdout.toString('utf8'), stderr: stderr.toString('utf8') }
   }
+}
+
+function lockedDiscoveryFile(file) {
+  return {
+    formula: file.formula,
+    sourcePath: file.sourcePath,
+    destination: file.destination,
+    sha256: file.sha256,
+    bytes: file.bytes,
+    executable: file.executable,
+    role: file.role,
+    runtimeRoot: file.runtimeRoot,
+  }
+}
+
+function lockedDiscoveryLicense(license) {
+  return {
+    formula: license.formula,
+    source: license.sourcePath,
+    destination: license.destination,
+    sha256: license.sha256,
+    bytes: license.bytes,
+  }
+}
+
+function emptyFamily() {
+  return { files: [], rewrites: [], licenses: [], nativeHelpers: [], engineAssets: [], engineLicenses: [] }
+}
+
+function deriveEngines(roots, cask, formulae, target, libreOfficeBytes) {
+  return roots.engines.map((candidate) => {
+    if (candidate.name === 'libreoffice') {
+      return {
+        name: 'libreoffice',
+        version: cask.version,
+        license: candidate.expectedLicense,
+        rootFormula: null,
+        acquisition: {
+          kind: 'dmg', url: cask.url, sha256: cask.sha256, bytes: libreOfficeBytes, cellar: null,
+        },
+        licenses: candidate.directLicenses.map((license) => ({ kind: 'download', ...cloneJson(license) })),
+      }
+    }
+    const formula = formulae.get(candidate.formula)
+    if (!formula || formula.license !== candidate.expectedLicense || !Number.isSafeInteger(formula.bytes)) {
+      invalid('Formula-backed engine identity differs from Homebrew metadata.')
+    }
+    return {
+      name: candidate.name,
+      version: formula.version,
+      license: formula.license,
+      rootFormula: formula.name,
+      acquisition: {
+        kind: 'homebrew-bottle', url: formula.bottle.url, sha256: formula.bottle.sha256,
+        bytes: formula.bytes, cellar: expectedCellar(target),
+      },
+      licenses: [],
+    }
+  })
+}
+
+async function discoverTargetClosure({ target, formulae, engines, verified, workspace, run, roots }) {
+  const candidates = []
+  for (const formula of [...formulae.values()].sort((left, right) => compareUtf8(left.name, right.name))) {
+    const artifact = verified.get(formula.bottle.sha256)
+    if (!artifact) invalid('Formula bottle was not verified before closure discovery.')
+    candidates.push(...await extractVerifiedBottleForDiscovery({
+      archive: artifact.path,
+      expectedBytes: artifact.bytes,
+      expectedSha256: formula.bottle.sha256,
+      formula: formula.name,
+      version: formula.version,
+      outputRoot: workspace,
+    }))
+  }
+  const architecture = target === 'darwin-arm64' ? 'arm64' : 'x86_64'
+  const toolRun = targetToolRunner(run, workspace)
+  const inspect = (path) => inspectMachO(path, { run: toolRun })
+  const image = await discoverMachOClosure({ family: 'image-icon', architecture, files: candidates, inspect })
+  const pdf = await discoverMachOClosure({ family: 'pdf', architecture, files: candidates, inspect })
+  const media = await discoverMachOClosure({ family: 'media', architecture, files: candidates, inspect })
+  const libreOffice = engines.find((engine) => engine.name === 'libreoffice')
+  if (!libreOffice) invalid('LibreOffice engine identity is missing.')
+  const family = (discovered) => ({
+    ...emptyFamily(),
+    files: discovered.files.map(lockedDiscoveryFile),
+    rewrites: cloneJson(discovered.rewrites),
+    licenses: discovered.licenses.map(lockedDiscoveryLicense),
+  })
+  const families = {
+    'image-icon': {
+      ...family(image),
+      nativeHelpers: [{ helper: 'autoforge-image-converter', destination: 'bin/autoforge-image-converter' }],
+    },
+    document: {
+      ...emptyFamily(),
+      nativeHelpers: [{ helper: 'autoforge-soffice-launcher', destination: 'program/soffice' }],
+      engineAssets: [{
+        engine: 'libreoffice', source: 'acquisition', destination: 'share/LibreOffice.dmg',
+        sha256: libreOffice.acquisition.sha256, bytes: libreOffice.acquisition.bytes, executable: false, role: 'data',
+      }],
+      engineLicenses: libreOffice.licenses.map((license) => ({
+        engine: 'libreoffice', source: license.url, destination: license.destination,
+        sha256: license.sha256, bytes: license.bytes,
+      })),
+    },
+    pdf: {
+      ...family(pdf),
+      nativeHelpers: [{ helper: 'autoforge-pdf-raster', destination: 'bin/autoforge-pdf-raster' }],
+    },
+    media: family(media),
+  }
+  const selectedNames = new Set(Object.values(families).flatMap((value) => value.files.map((file) => file.formula)))
+  if (roots.formulaRoots.some((name) => !selectedNames.has(name))) invalid('Discovered closure omits a root formula.')
+  const selectedFormulae = [...selectedNames].sort(compareUtf8).map((name) => {
+    const formula = formulae.get(name)
+    return {
+      name,
+      version: formula.version,
+      dependencies: formula.dependencies.filter((dependency) => selectedNames.has(dependency)),
+    }
+  })
+  const closure = {
+    schemaVersion: 1,
+    target,
+    formulae: selectedFormulae,
+    families,
+    measurements: {
+      downloadBytes: 1,
+      compressedPackBytes: { 'image-icon': 1, document: 1, pdf: 1, media: 1 },
+      installedReleaseBytes: 1,
+    },
+  }
+  return validateTargetClosureLock(closure, target)
+}
+
+function capturedFormulaLicenseAssets(closure, formula, target) {
+  const values = Object.values(closure.families).flatMap((family) => family.licenses)
+    .filter((license) => license.formula === formula)
+    .map((license) => ({
+      kind: 'bottle-entry', target, path: license.source, sha256: license.sha256,
+      bytes: license.bytes, destination: license.destination,
+    }))
+  return [...new Map(values.map((value) => [canonicalBytes(value).toString('utf8'), value])).values()]
+    .sort((left, right) => compareUtf8(
+      `${left.target}\0${left.destination}\0${left.path}`,
+      `${right.target}\0${right.destination}\0${right.path}`,
+    ))
 }
 
 async function sumRegularBytes(root) {
@@ -381,7 +535,14 @@ async function authenticateAndMeasureClosure({ target, closure, engines, formula
   const compressedPackBytes = Object.fromEntries(index.packs.map((pack) => [pack.name, pack.archiveBytes]))
   if (!exactKeys(compressedPackBytes, familyNames)) invalid('Measured capture packs are incomplete.')
   const installedReleaseBytes = await sumRegularBytes(release)
-  const downloadBytes = [...verified.values()].reduce((sum, artifact) => sum + artifact.bytes, 0)
+  const downloadable = new Map()
+  for (const value of [
+    ...formulae.map((formula) => formula.acquisition),
+    ...formulae.flatMap((formula) => formula.licenses.filter((license) => license.kind === 'download')),
+    ...engines.map((engine) => engine.acquisition),
+    ...engines.flatMap((engine) => engine.licenses),
+  ]) downloadable.set(value.sha256, value)
+  const downloadBytes = [...downloadable.values()].reduce((sum, artifact) => sum + artifact.bytes, 0)
   if (!Number.isSafeInteger(downloadBytes) || downloadBytes <= 0 || installedReleaseBytes <= 0) invalid('Capture measurement is invalid.')
   return {
     probes: probeDigests,
@@ -389,54 +550,11 @@ async function authenticateAndMeasureClosure({ target, closure, engines, formula
   }
 }
 
-function validEngineLicense(license) {
-  return exactKeys(license, ['kind', 'url', 'sha256', 'bytes', 'destination'])
-    && license.kind === 'download'
-    && validHttpsUrl(license.url)
-    && sha256Pattern.test(license.sha256)
-    && Number.isSafeInteger(license.bytes)
-    && license.bytes > 0
-    && typeof license.destination === 'string'
-}
-
-function validateEngine(engine, formulae, target) {
-  if (
-    !exactKeys(engine, ['name', 'version', 'license', 'rootFormula', 'acquisition', 'licenses'])
-    || typeof engine.version !== 'string'
-    || typeof engine.license !== 'string'
-    || !Array.isArray(engine.licenses)
-    || engine.licenses.some((license) => !validEngineLicense(license))
-  ) {
-    invalid('Captured engine identity is invalid.')
-  }
-  if (engine.name === 'libreoffice') {
-    if (
-      engine.rootFormula !== null || !exactKeys(engine.acquisition, ['kind', 'url', 'sha256', 'bytes', 'cellar'])
-      || engine.acquisition.kind !== 'dmg' || !validHttpsUrl(engine.acquisition.url)
-      || !sha256Pattern.test(engine.acquisition.sha256) || !Number.isSafeInteger(engine.acquisition.bytes)
-      || engine.acquisition.bytes <= 0 || engine.acquisition.cellar !== null
-    ) invalid('Captured LibreOffice identity is invalid.')
-    if (engine.licenses.length === 0) invalid('Captured LibreOffice license is invalid.')
-    return cloneJson(engine)
-  }
-  if (engine.licenses.length !== 0) invalid('Formula-backed engine licenses must be empty.')
-  const formula = formulae.get(engine.rootFormula)
-  if (!formula || formula.version !== engine.version || formula.license !== engine.license) invalid('Captured engine differs from its root formula.')
-  const acquisition = {
-    kind: 'homebrew-bottle', url: formula.bottle.url, sha256: formula.bottle.sha256,
-    bytes: formula.bytes, cellar: expectedCellar(target),
-  }
-  if (!canonicalBytes(engine.acquisition).equals(canonicalBytes(acquisition))) invalid('Captured engine acquisition differs from its root formula.')
-  return {
-    name: engine.name, version: engine.version, license: engine.license,
-    rootFormula: engine.rootFormula, acquisition, licenses: [],
-  }
-}
-
-export async function captureHomebrewTarget({ target, brew, coreRevision, roots, output, run = defaultRun }) {
+export async function captureHomebrewTarget({ target, brew, coreRevision, caskRevision, roots, output, run = defaultRun }) {
   if (!targets.has(target) || target !== expectedHostTarget()) invalid('Capture target does not match the maintainer host.')
   if (typeof brew !== 'string' || !isAbsolute(brew)) invalid('Homebrew executable must be an absolute path.')
   if (!revisionPattern.test(coreRevision)) invalid('Homebrew core revision must be an exact lowercase 40-hex commit.')
+  if (!revisionPattern.test(caskRevision)) invalid('Homebrew cask revision must be an exact lowercase 40-hex commit.')
   requireAbsolutePath(output, 'Capture output')
   if (typeof run !== 'function') invalid('Maintainer command runner is invalid.')
   const parent = dirname(output)
@@ -444,28 +562,38 @@ export async function captureHomebrewTarget({ target, brew, coreRevision, roots,
   if (!parentMetadata?.isDirectory() || parentMetadata.isSymbolicLink() || await realpath(parent).catch(() => undefined) !== parent) {
     invalid('Capture output parent must be canonical and non-symbolic.')
   }
-  const closure = validateRoots(roots, target)
+  roots = validateRoots(roots)
   const workspace = await mkdtemp(join(parent, '.converter-lock-capture-'))
   try {
     parseTapInfo(parseJson(await runChecked(
       run, brew, ['tap-info', '--json=v1', 'homebrew/core'], { cwd: workspace, env: maintainerEnv }, 'Homebrew tap inspection',
-    ), 'Homebrew tap metadata'), coreRevision)
+    ), 'Homebrew tap metadata'), 'homebrew/core', coreRevision)
+    parseTapInfo(parseJson(await runChecked(
+      run, brew, ['tap-info', '--json=v1', 'homebrew/cask'], { cwd: workspace, env: maintainerEnv }, 'Homebrew tap inspection',
+    ), 'Homebrew tap metadata'), 'homebrew/cask', caskRevision)
+    const libreOfficeCandidate = roots.engines.find((engine) => engine.name === 'libreoffice')
+    const cask = parseCask(parseJson(await runChecked(
+      run, brew, ['info', '--json=v2', '--cask', libreOfficeCandidate.cask], { cwd: workspace, env: maintainerEnv }, 'Homebrew cask inspection',
+    ), 'Homebrew cask metadata'), libreOfficeCandidate)
     const dependencies = dependencyNames(await runChecked(
-      run, brew, ['deps', '--union', '--formula', ...roots.formulae], { cwd: workspace, env: maintainerEnv }, 'Homebrew dependency discovery',
+      run, brew, ['deps', '--union', '--formula', ...roots.formulaRoots], { cwd: workspace, env: maintainerEnv }, 'Homebrew dependency discovery',
     ))
-    const names = [...new Set([...roots.formulae, ...dependencies])].sort(compareUtf8)
+    const names = [...new Set([...roots.formulaRoots, ...dependencies])].sort(compareUtf8)
     const formulae = parseFormulae(parseJson(await runChecked(
       run, brew, ['info', '--json=v2', '--formula', ...names], { cwd: workspace, env: maintainerEnv }, 'Homebrew formula inspection',
     ), 'Homebrew formula metadata'), names, target)
-    requireReachable(formulae, roots.formulae)
-    const selectedNames = validateClosureFormulae(closure, formulae, roots.formulae)
+    requireReachable(formulae, roots.formulaRoots)
 
     const verified = new Map()
     for (const formula of formulae.values()) {
-      if (!selectedNames.has(formula.name)) continue
       formula.bytes = await verifyDownload({ run, workspace, artifact: formula.bottle, verified })
     }
-    const engines = roots.engines.map((engine) => validateEngine(engine, formulae, target))
+    const libreOfficeBytes = await verifyDownload({ run, workspace, artifact: cask, verified })
+    for (const license of libreOfficeCandidate.directLicenses) {
+      await verifyDownload({ run, workspace, artifact: license, verified })
+    }
+    const engines = deriveEngines(roots, cask, formulae, target, libreOfficeBytes)
+    const closure = await discoverTargetClosure({ target, formulae, engines, verified, workspace, run, roots })
     const capturedFormulae = closure.formulae.map((selected) => {
       const formula = formulae.get(selected.name)
       return {
@@ -475,19 +603,9 @@ export async function captureHomebrewTarget({ target, brew, coreRevision, roots,
           kind: 'homebrew-bottle', url: formula.bottle.url, sha256: formula.bottle.sha256,
           bytes: formula.bytes, cellar: expectedCellar(target),
         },
-        licenses: licenseAssets(closure, formula.name, target),
+        licenses: capturedFormulaLicenseAssets(closure, formula.name, target),
       }
     })
-    const extras = [
-      ...engines.filter((engine) => engine.rootFormula === null).map((engine) => engine.acquisition),
-      ...engines.flatMap((engine) => engine.licenses.map((license) => ({
-        url: license.url, sha256: license.sha256, bytes: license.bytes,
-      }))),
-      ...capturedFormulae.flatMap((formula) => formula.licenses.filter((license) => license.kind === 'download').map((license) => ({
-        url: license.url, sha256: license.sha256, bytes: license.bytes,
-      }))),
-    ]
-    for (const artifact of extras) await verifyDownload({ run, workspace, artifact, verified })
     const measured = await authenticateAndMeasureClosure({
       target,
       closure,
@@ -501,7 +619,7 @@ export async function captureHomebrewTarget({ target, brew, coreRevision, roots,
 
     const payload = {
       schemaVersion: 1, target, homebrewCoreRevision: coreRevision,
-      homebrewCaskRevision: roots.homebrewCaskRevision, roots: [...roots.formulae], engines,
+      homebrewCaskRevision: caskRevision, roots: [...roots.formulaRoots], engines,
       formulae: capturedFormulae, probes: measured.probes, closure: measuredClosure,
     }
     await writeFile(output, canonicalBytes({ payloadSha256: sha256(canonicalBytes(payload)), payload }), { flag: 'wx', mode: 0o600 })
@@ -512,10 +630,10 @@ export async function captureHomebrewTarget({ target, brew, coreRevision, roots,
 
 export async function captureHomebrewTargetMain(argv) {
   try {
-    const args = parseArguments(argv, ['--target', '--brew', '--core-revision', '--roots', '--output'])
+    const args = parseArguments(argv, ['--target', '--brew', '--core-revision', '--cask-revision', '--roots', '--output'])
     const roots = (await readCanonicalJson(args['--roots'], 'Capture roots')).value
     await captureHomebrewTarget({
-      target: args['--target'], brew: args['--brew'], coreRevision: args['--core-revision'], roots, output: args['--output'],
+      target: args['--target'], brew: args['--brew'], coreRevision: args['--core-revision'], caskRevision: args['--cask-revision'], roots, output: args['--output'],
     })
     process.stdout.write('captured verified Homebrew converter target\n')
     return 0
