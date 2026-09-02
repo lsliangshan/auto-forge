@@ -33,6 +33,12 @@ function writeOctal(header: Buffer, offset: number, length: number, value: numbe
   writeString(header, offset, length, `${value.toString(8).padStart(length - 1, '0')}\0`)
 }
 
+function recomputeChecksum(header: Buffer): void {
+  header.fill(0x20, 148, 156)
+  const checksum = header.reduce((sum, value) => sum + value, 0)
+  writeString(header, 148, 8, `${checksum.toString(8).padStart(6, '0')}\0 `)
+}
+
 type TarFixtureEntry = {
   path: string
   type?: '0' | '2' | '5' | 'x' | 'g' | '1' | '3'
@@ -57,8 +63,7 @@ function tarEntry(entry: TarFixtureEntry): Buffer[] {
   writeString(header, 157, 100, entry.linkpath ?? '')
   writeString(header, 257, 6, 'ustar\0')
   writeString(header, 263, 2, '00')
-  const checksum = header.reduce((sum, value) => sum + value, 0)
-  writeString(header, 148, 8, `${checksum.toString(8).padStart(6, '0')}\0 `)
+  recomputeChecksum(header)
   entry.mutateHeader?.(header)
   return [header, bytes, Buffer.alloc((512 - (bytes.byteLength % 512)) % 512)]
 }
@@ -91,6 +96,8 @@ describe('converter bottle universe', () => {
     const executable = Buffer.from('#!/bin/sh\necho vips\n')
     const library = Buffer.from('fixture dylib bytes')
     const license = Buffer.from('fixture license\n')
+    const data = Buffer.from('fixture runtime data')
+    const readOnlyData = Buffer.from('fixture read-only runtime data')
     const compressed = gzipTar([
       { path: 'vips/', type: '5' },
       { path: 'vips/8.18.6/', type: '5' },
@@ -98,8 +105,10 @@ describe('converter bottle universe', () => {
       { path: 'vips/8.18.6/bin/vips', bytes: executable, mode: 0o555 },
       { path: 'vips/8.18.6/lib/', type: '5' },
       { path: 'vips/8.18.6/lib/libvips.dylib', bytes: library },
-      { path: 'vips/8.18.6/LICENSE', bytes: license },
+      { path: 'vips/8.18.6/LICENSE', bytes: license, mode: 0o644 },
       { path: 'vips/8.18.6/share/', type: '5' },
+      { path: 'vips/8.18.6/share/runtime.dat', bytes: data, mode: 0o644 },
+      { path: 'vips/8.18.6/share/runtime-readonly.dat', bytes: readOnlyData, mode: 0o444 },
       { path: 'vips/8.18.6/share/not-selected.dat', bytes: Buffer.from('must not be materialized') },
     ])
     const archive = join(root, 'vips.tar.gz')
@@ -110,11 +119,13 @@ describe('converter bottle universe', () => {
     }
     const vipsExecutable = file('vips', 'bin/vips', 'bin/vips', executable, true, 'executable')
     const vipsLibrary = file('vips', 'lib/libvips.dylib', 'lib/libvips.dylib', library, false, 'code')
+    const vipsData = file('vips', 'share/runtime.dat', 'share/runtime.dat', data, false, 'data')
+    const vipsReadOnlyData = file('vips', 'share/runtime-readonly.dat', 'share/runtime-readonly.dat', readOnlyData, false, 'data')
     const closureLock = {
       target: 'darwin-arm64', formulae: [{ name: 'vips', version: '8.18.6', dependencies: [] }],
       families: {
         'image-icon': {
-          files: [vipsExecutable, vipsLibrary], rewrites: [],
+          files: [vipsExecutable, vipsLibrary, vipsData, vipsReadOnlyData], rewrites: [],
           licenses: [{ formula: 'vips', source: 'LICENSE', destination: 'licenses/vips.txt', sha256: sha256(license), bytes: license.byteLength }],
         },
         document: { files: [], rewrites: [], licenses: [] },
@@ -144,7 +155,13 @@ describe('converter bottle universe', () => {
     expect(universe.cellar('vips', '8.18.6')).toBe(versionRoot)
     expect(universe.opt('vips')).toBe(versionRoot)
     expect(universe.resolveLockedFile('vips', 'bin/vips')).toBe(join(versionRoot, 'bin', 'vips'))
+    expect(universe.contains(outputRoot)).toBe(true)
+    expect(universe.contains(join(outputRoot, 'Cellar'))).toBe(true)
+    expect(universe.contains(versionRoot)).toBe(true)
+    expect(universe.contains(join(versionRoot, 'bin'))).toBe(true)
     expect(universe.contains(join(versionRoot, 'lib', 'libvips.dylib'))).toBe(true)
+    expect(universe.contains(join(versionRoot, 'share'))).toBe(true)
+    expect(universe.contains(join(versionRoot, 'share', 'runtime.dat'))).toBe(true)
     expect(universe.contains(join(versionRoot, 'share', 'not-selected.dat'))).toBe(false)
     expect(universe.contains(join(root, 'outside'))).toBe(false)
     expect(() => universe.cellar('vips', 'wrong-version')).toThrow('not locked')
@@ -153,11 +170,29 @@ describe('converter bottle universe', () => {
     expect(Object.isFrozen(universe)).toBe(true)
     expect(readFileSync(join(versionRoot, 'bin', 'vips'))).toEqual(executable)
     expect(readFileSync(join(versionRoot, 'lib', 'libvips.dylib'))).toEqual(library)
+    expect(readFileSync(join(versionRoot, 'share', 'runtime.dat'))).toEqual(data)
+    expect(readFileSync(join(versionRoot, 'share', 'runtime-readonly.dat'))).toEqual(readOnlyData)
     expect(readFileSync(join(versionRoot, 'LICENSE'))).toEqual(license)
     expect(existsSync(join(versionRoot, 'share', 'not-selected.dat'))).toBe(false)
     expect(statSync(join(versionRoot, 'bin', 'vips')).mode & 0o777).toBe(0o755)
     expect(statSync(join(versionRoot, 'lib', 'libvips.dylib')).mode & 0o777).toBe(0o644)
     expect(existsSync(join(outputRoot, 'opt'))).toBe(false)
+
+    const externalFile = join(root, 'external-vips')
+    writeFileSync(externalFile, 'outside')
+    const lockedExecutable = join(versionRoot, 'bin', 'vips')
+    rmSync(lockedExecutable)
+    symlinkSync(externalFile, lockedExecutable)
+    expect(universe.contains(lockedExecutable)).toBe(false)
+    expect(() => universe.resolveLockedFile('vips', 'bin/vips')).toThrow('no longer safe')
+
+    const externalRoot = join(root, 'external-root')
+    mkdirSync(externalRoot)
+    rmSync(versionRoot, { recursive: true })
+    symlinkSync(externalRoot, versionRoot)
+    expect(universe.contains(versionRoot)).toBe(false)
+    expect(() => universe.cellar('vips', '8.18.6')).toThrow('no longer safe')
+    expect(() => universe.opt('vips')).toThrow('no longer safe')
   })
 
   it('applies bounded local PAX records and copies a selected internal symlink as verified regular bytes', async () => {
@@ -219,6 +254,26 @@ describe('converter bottle universe', () => {
     ['bad header checksum', [{
       path: 'vips/8.18.6/bin/tool', bytes: Buffer.from('a'), mutateHeader: (header: Buffer) => { header[0] ^= 1 },
     }]],
+    ['high-bit byte in an octal field', [{
+      path: 'vips/8.18.6/bin/tool',
+      bytes: Buffer.from('a'),
+      mutateHeader: (header: Buffer) => {
+        header[100] = 0xb0
+        recomputeChecksum(header)
+      },
+    }]],
+    ['high-bit byte in a PAX key', [
+      {
+        path: 'PaxHeaders/high-key',
+        type: 'x' as const,
+        bytes: (() => {
+          const bytes = paxRecord('path', 'vips/8.18.6/bin/tool')
+          bytes[bytes.indexOf(0x20) + 1] = 0xf0
+          return bytes
+        })(),
+      },
+      { path: 'placeholder', bytes: Buffer.from('a') },
+    ]],
     ['expanded size beyond four GiB', [
       { path: 'PaxHeaders/huge', type: 'x' as const, bytes: paxRecord('size', String(4 * 1024 * 1024 * 1024 + 1)) },
       { path: 'vips/8.18.6/huge', bytes: Buffer.alloc(0) },
@@ -305,6 +360,48 @@ describe('converter bottle universe', () => {
       return {
         entries: [{ path: 'vips/8.18.6/lib/library', bytes, mode: 0o755 }],
         selected: [{ sourcePath: 'lib/library', sha256: sha256(bytes), bytes: bytes.byteLength, executable: false, role: 'code' }],
+      }
+    }],
+    ['writable code mode', () => {
+      const bytes = Buffer.from('library')
+      return {
+        entries: [{ path: 'vips/8.18.6/lib/library', bytes, mode: 0o644 }],
+        selected: [{ sourcePath: 'lib/library', sha256: sha256(bytes), bytes: bytes.byteLength, executable: false, role: 'code' }],
+      }
+    }],
+    ['writable executable mode', () => {
+      const bytes = Buffer.from('tool')
+      return {
+        entries: [{ path: 'vips/8.18.6/bin/tool', bytes, mode: 0o755 }],
+        selected: [{ sourcePath: 'bin/tool', sha256: sha256(bytes), bytes: bytes.byteLength, executable: true, role: 'executable' }],
+      }
+    }],
+    ['read-only license mode instead of locked writable license mode', () => {
+      const bytes = Buffer.from('license')
+      return {
+        entries: [{ path: 'vips/8.18.6/LICENSE', bytes, mode: 0o444 }],
+        selected: [{ sourcePath: 'LICENSE', sha256: sha256(bytes), bytes: bytes.byteLength, executable: false, role: 'license' }],
+      }
+    }],
+    ['executable license mode', () => {
+      const bytes = Buffer.from('license')
+      return {
+        entries: [{ path: 'vips/8.18.6/LICENSE', bytes, mode: 0o755 }],
+        selected: [{ sourcePath: 'LICENSE', sha256: sha256(bytes), bytes: bytes.byteLength, executable: false, role: 'license' }],
+      }
+    }],
+    ['executable data mode', () => {
+      const bytes = Buffer.from('runtime data')
+      return {
+        entries: [{ path: 'vips/8.18.6/share/runtime.dat', bytes, mode: 0o555 }],
+        selected: [{ sourcePath: 'share/runtime.dat', sha256: sha256(bytes), bytes: bytes.byteLength, executable: false, role: 'data' }],
+      }
+    }],
+    ['unlisted non-executable data mode', () => {
+      const bytes = Buffer.from('runtime data')
+      return {
+        entries: [{ path: 'vips/8.18.6/share/runtime.dat', bytes, mode: 0o600 }],
+        selected: [{ sourcePath: 'share/runtime.dat', sha256: sha256(bytes), bytes: bytes.byteLength, executable: false, role: 'data' }],
       }
     }],
     ['extra selected file', () => {

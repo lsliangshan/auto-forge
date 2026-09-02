@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
-import { constants } from 'node:fs'
+import { constants, lstatSync, realpathSync } from 'node:fs'
 import { lstat, mkdir, mkdtemp, open, realpath, rename, rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
@@ -40,8 +40,11 @@ function regularMode(entry) {
   return entry.executable ? 0o755 : 0o644
 }
 
-function lockedBottleMode(entry) {
-  return entry.executable ? 0o555 : 0o444
+function validLockedBottleMode(entry, mode) {
+  if (entry.role === 'executable') return mode === 0o555
+  if (entry.role === 'code') return mode === 0o444
+  if (entry.role === 'license') return mode === 0o644
+  return entry.role === 'data' && (mode === 0o444 || mode === 0o644) && (mode & 0o111) === 0
 }
 
 function validSelectedEntry(entry) {
@@ -133,7 +136,7 @@ function verifyArchiveLinks(entries, rootPrefix) {
 
 function verifiedBytes(entry, selected, selectedByArchivePath, archiveByPath) {
   if (entry.type === 'file') {
-    if (entry.mode !== lockedBottleMode(selected)) invalid()
+    if (!validLockedBottleMode(selected, entry.mode)) invalid()
     if (entry.bytes.byteLength !== selected.bytes) invalid()
     if (createHash('sha256').update(entry.bytes).digest('hex') !== selected.sha256) invalid()
     return entry.bytes
@@ -146,6 +149,8 @@ function verifiedBytes(entry, selected, selectedByArchivePath, archiveByPath) {
   if (
     targetSelected.sha256 !== selected.sha256
     || targetSelected.bytes !== selected.bytes
+    || targetSelected.executable !== selected.executable
+    || targetSelected.role !== selected.role
     || bytes.byteLength !== selected.bytes
     || createHash('sha256').update(bytes).digest('hex') !== selected.sha256
   ) invalid()
@@ -276,30 +281,58 @@ function selectedInventory(closureLock) {
 
 function createUniverse({ target, outputRoot, records, lockedPaths }) {
   const formulae = new Map(records.map((record) => [record.name, record]))
-  const roots = new Set([outputRoot, join(outputRoot, 'Cellar'), ...records.map((record) => record.root)])
-  const allPaths = new Set([...roots, ...lockedPaths])
+  const pathTypes = new Map([
+    [outputRoot, 'directory'],
+    [join(outputRoot, 'Cellar'), 'directory'],
+    ...records.map((record) => [record.root, 'directory']),
+    ...lockedPaths.map((path) => [path, 'file']),
+  ])
+  for (const record of records) {
+    for (const path of record.files.values()) {
+      let directory = dirname(path)
+      while (isPathInsideRoot(record.root, directory) && directory !== record.root) {
+        pathTypes.set(directory, 'directory')
+        directory = dirname(directory)
+      }
+    }
+  }
+  function currentPathIsSafe(path, expectedType) {
+    try {
+      const metadata = lstatSync(path)
+      if (metadata.isSymbolicLink()) return false
+      if (expectedType === 'file' ? !metadata.isFile() : !metadata.isDirectory()) return false
+      if (expectedType === 'file' && metadata.nlink !== 1) return false
+      const resolved = realpathSync(path)
+      return resolved === path && isPathInsideRoot(outputRoot, resolved)
+    } catch {
+      return false
+    }
+  }
+  function requireCurrentPath(path, expectedType) {
+    if (!currentPathIsSafe(path, expectedType)) fail('Bottle universe path is no longer safe.')
+    return path
+  }
   return Object.freeze({
     target,
     cellar(formula, version) {
       const record = formulae.get(formula)
       if (!record || record.version !== version) fail('Bottle universe formula is not locked.')
-      return record.root
+      return requireCurrentPath(record.root, 'directory')
     },
     opt(formula) {
       const record = formulae.get(formula)
       if (!record) fail('Bottle universe formula is not locked.')
-      return record.root
+      return requireCurrentPath(record.root, 'directory')
     },
     resolveLockedFile(formula, sourcePath) {
       const record = formulae.get(formula)
       const path = record?.files.get(sourcePath)
       if (!path) fail('Bottle universe file is not locked.')
-      return path
+      return requireCurrentPath(path, 'file')
     },
     contains(path) {
-      return typeof path === 'string'
-        && isPathInsideRoot(outputRoot, path)
-        && allPaths.has(path)
+      const expectedType = typeof path === 'string' ? pathTypes.get(path) : undefined
+      return expectedType !== undefined && currentPathIsSafe(path, expectedType)
     },
   })
 }

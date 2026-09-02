@@ -33,7 +33,9 @@ function tarString(header, offset, length) {
 }
 
 function tarNumber(header, offset, length) {
-  const value = header.subarray(offset, offset + length).toString('ascii')
+  const field = header.subarray(offset, offset + length)
+  if (!field.every((byte) => byte === 0 || byte === 0x20 || (byte >= 0x30 && byte <= 0x37))) invalid()
+  const value = field.toString('ascii')
   const match = /^[ \0]*([0-7]+)[ \0]*$/u.exec(value)
   if (!match) invalid()
   const number = Number.parseInt(match[1], 8)
@@ -113,7 +115,9 @@ function parsePax(bytes) {
     if (record.at(-1) !== 0x0a) invalid()
     const separator = record.indexOf(0x3d)
     if (separator <= 0) invalid()
-    const key = record.subarray(0, separator).toString('ascii')
+    const keyBytes = record.subarray(0, separator)
+    if (!keyBytes.every((byte) => byte >= 0x61 && byte <= 0x7a)) invalid()
+    const key = keyBytes.toString('ascii')
     if (!['path', 'linkpath', 'size'].includes(key) || values[key] !== undefined) invalid()
     const value = decodeUtf8(record.subarray(separator + 1, -1))
     if (value.length === 0 || value.includes('\0')) invalid()
