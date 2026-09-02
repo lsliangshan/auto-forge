@@ -112,10 +112,11 @@ describe('development converter cache budget', () => {
     expect(existsSync(join(cacheRoot, 'sources', `${newerExtraBlob}.archive`))).toBe(true)
   })
 
-  it('migrates only inactive legacy releases under the prune claim when explicitly enabled', async () => {
+  it('transactionally removes unauthenticated inactive legacy releases without retaining or inventing metadata', async () => {
     const cacheRoot = createCache()
     const legacy = fingerprint('0')
     mkdirSync(join(cacheRoot, 'releases', legacy))
+    const previous = await createVerifiedRelease(cacheRoot, '2', [], 200)
     const active = await createVerifiedRelease(cacheRoot, '1', [], 300)
     writeActiveMarker(cacheRoot, active)
 
@@ -126,10 +127,14 @@ describe('development converter cache budget', () => {
     await expect(pruneDevelopmentCache({
       cacheRoot,
       activeFingerprint: active,
-      keepPrevious: 0,
+      keepPrevious: 1,
       migrateLegacyReleases: true,
+      beforeMutationForTest: async () => {
+        expect(existsSync(join(cacheRoot, 'release-metadata', `${legacy}.json`))).toBe(false)
+      },
     })).resolves.toEqual({ removedReleases: [legacy], removedBlobs: [] })
     expect(existsSync(join(cacheRoot, 'releases', legacy))).toBe(false)
+    expect(existsSync(join(cacheRoot, 'releases', previous))).toBe(true)
     expect(existsSync(join(cacheRoot, 'release-metadata', `${legacy}.json`))).toBe(false)
   })
 

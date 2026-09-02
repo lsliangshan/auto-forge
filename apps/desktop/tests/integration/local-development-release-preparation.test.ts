@@ -290,6 +290,9 @@ it('prepares a cold development cache in order and activates only after verifica
 
 it('runs the public cold entry through real lock, acquisition, universe, metadata, activation, and prune modules', async () => {
   const { root, desktopRoot, cacheRoot } = fixture()
+  const legacyActive = 'e'.repeat(64)
+  mkdirSync(join(cacheRoot, 'releases', legacyActive), { recursive: true })
+  writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${legacyActive}","schemaVersion":1}\n`)
   const fetchImpl = writeSyntheticBottleLocks(desktopRoot)
   const compiler = join(root, 'synthetic-compiler')
   writeFileSync(compiler, '#!/bin/sh\nfor output do :; done\nprintf "#!/bin/sh\\nexit 0\\n" > "$output"\nchmod 755 "$output"\n')
@@ -338,6 +341,8 @@ it('runs the public cold entry through real lock, acquisition, universe, metadat
   await expect(readFile(join(cacheRoot, 'active-release.json'), 'utf8'))
     .resolves.toBe(`{"fingerprint":"${result.fingerprint}","schemaVersion":1}\n`)
   expect(existsSync(join(cacheRoot, 'release-metadata', `${result.fingerprint}.json`))).toBe(true)
+  expect(existsSync(join(cacheRoot, 'releases', legacyActive))).toBe(false)
+  expect(existsSync(join(cacheRoot, 'release-metadata', `${legacyActive}.json`))).toBe(false)
   expect(readdirSync(join(result.releaseRoot, 'installed')).sort()).toEqual(['document', 'image-icon', 'media', 'pdf'])
 })
 
