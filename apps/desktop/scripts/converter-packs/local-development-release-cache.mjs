@@ -588,7 +588,11 @@ export async function replaceActiveDevelopmentRelease({
       }
       try { await Promise.all([syncDirectory(dirname(paths.release)), syncDirectory(dirname(candidateRelease))]) } catch (error) { cleanup.push(error) }
       if (cleanup.length > 0) {
-        throw new AggregateError([primary, ...cleanup], primary instanceof Error ? primary.message : 'Development active release replacement failed')
+        throw new AggregateError(
+          [primary, ...cleanup],
+          primary instanceof Error ? primary.message : 'Development active release replacement failed',
+          { cause: primary },
+        )
       }
       throw primary
     }
