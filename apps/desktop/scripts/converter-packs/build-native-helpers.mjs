@@ -41,6 +41,21 @@ const helpers = Object.freeze([
   }),
 ])
 const helperByName = new Map(helpers.map((helper) => [helper.name, helper]))
+const nativeHelperSources = Object.freeze([
+  'common/arguments.c',
+  'common/arguments.h',
+  'common/process.c',
+  'common/process.h',
+  'image-converter/icon-container.c',
+  'image-converter/icon-container.h',
+  'image-converter/main.c',
+  'pdf-raster/main.c',
+  'soffice-launcher/main.c',
+])
+
+export function nativeHelperSourceInventory() {
+  return nativeHelperSources
+}
 
 function invalid() {
   throw new Error('Native helper set is invalid.')

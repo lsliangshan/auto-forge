@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { createPrivateKey, createPublicKey } from 'node:crypto'
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import process from 'node:process'
@@ -14,7 +14,7 @@ import {
   writeDevelopmentReleaseMetadata,
 } from './local-development-release-cache.mjs'
 import { pruneDevelopmentCache } from './development-cache-budget.mjs'
-import { buildNativeHelpers } from './build-native-helpers.mjs'
+import { buildNativeHelpers, nativeHelperSourceInventory } from './build-native-helpers.mjs'
 import { prepareProductionStagingPlan } from './prepare-production-staging.mjs'
 import { stageProductionPacks } from './stage-production-packs.mjs'
 import {
@@ -51,6 +51,8 @@ const developmentPrivateKeyDer = Buffer.from(
   'hex',
 )
 const requestKeys = Object.freeze(['desktopRoot', 'cacheRoot', 'platform', 'arch', 'compiler'])
+const maximumNativeHelperSourceBytes = 1024 * 1024
+const maximumNativeHelperInventoryBytes = 4 * 1024 * 1024
 
 const productionDependencies = Object.freeze({
   buildHelpers: (request) => buildNativeHelpers(request),
@@ -111,17 +113,18 @@ async function nativeInputs(desktopRoot) {
     throw new Error('Development native helper tree must be a canonical non-symbolic directory')
   }
   const files = []
-  async function visit(directory) {
-    const entries = await readdir(directory, { withFileTypes: true })
-    for (const entry of entries) {
-      const child = join(directory, entry.name)
-      if (entry.isSymbolicLink()) throw new Error('Development native helper tree must not contain symbolic links')
-      if (entry.isDirectory()) await visit(child)
-      else if (entry.isFile()) files.push(await regularFileUnderRoot(desktopRoot, child))
-      else throw new Error('Development native helper tree contains an unsupported entry')
+  let totalBytes = 0
+  for (const relativePath of nativeHelperSourceInventory()) {
+    const input = await regularFileUnderRoot(desktopRoot, join(nativeRoot, ...relativePath.split('/')))
+    if (input.bytes.byteLength > maximumNativeHelperSourceBytes) {
+      throw new Error('Development native helper source exceeds its byte limit')
     }
+    totalBytes += input.bytes.byteLength
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > maximumNativeHelperInventoryBytes) {
+      throw new Error('Development native helper inventory exceeds its byte limit')
+    }
+    files.push(input)
   }
-  await visit(nativeRoot)
   return files
 }
 

@@ -12,6 +12,7 @@ import {
 } from '../../scripts/converter-packs/prepare-local-development-release.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 import { writeDevelopmentReleaseMetadata } from '../../scripts/converter-packs/local-development-release-cache.mjs'
+import { nativeHelperSourceInventory } from '../../scripts/converter-packs/build-native-helpers.mjs'
 
 const roots: string[] = []
 const fingerprintFiles = [
@@ -60,7 +61,10 @@ function writeFixtureDesktop(root: string) {
   writeFileSync(join(root, 'converter-packs', 'sources.lock.json'), JSON.stringify(lock), { flag: 'w' })
   writeFileSync(join(root, 'converter-packs', 'closures', 'darwin-arm64.lock.json'), '{"target":"darwin-arm64"}', { flag: 'w' })
   writeFileSync(join(root, 'converter-packs', 'closures', 'darwin-x64.lock.json'), '{"target":"darwin-x64"}', { flag: 'w' })
-  writeFileSync(join(root, 'converter-packs', 'native', 'common', 'helper.c'), 'int helper(void) { return 1; }\n', { flag: 'w' })
+  for (const relative of nativeHelperSourceInventory()) {
+    mkdirSync(join(root, 'converter-packs', 'native', ...relative.split('/').slice(0, -1)), { recursive: true })
+    writeFileSync(join(root, 'converter-packs', 'native', ...relative.split('/')), `/* ${relative} */\n`, { flag: 'w' })
+  }
   for (const relative of fingerprintFiles) {
     writeFileSync(join(root, relative), `// ${relative}\n`, { flag: 'w' })
   }
@@ -288,7 +292,7 @@ it('reuses only the verified active fingerprint with integrity and safe pruning 
 it.each([
   ['converter-packs/closures/darwin-arm64.lock.json'],
   ['converter-packs/closures/darwin-x64.lock.json'],
-  ['converter-packs/native/common/helper.c'],
+  ['converter-packs/native/common/arguments.c'],
   ['scripts/converter-packs/private-directory-publication.mjs'],
   ['scripts/converter-packs/prepare-production-staging.mjs'],
   ['scripts/converter-packs/development-cache-budget.mjs'],
@@ -380,6 +384,16 @@ it('includes the requested target in the fingerprint', async () => {
   expect(x64.fingerprint).not.toBe(arm64.fingerprint)
 })
 
+it('ignores unlisted native files and bounds every inventoried helper source', async () => {
+  const { desktopRoot } = fixture()
+  const first = await developmentFingerprintInputs(desktopRoot)
+  await writeFile(join(desktopRoot, 'converter-packs', 'native', 'unlisted.c'), 'ignored\n')
+  expect(await developmentFingerprintInputs(desktopRoot)).toEqual(first)
+
+  await writeFile(join(desktopRoot, 'converter-packs', 'native', 'common', 'arguments.c'), Buffer.alloc(1024 * 1024 + 1))
+  await expect(developmentFingerprintInputs(desktopRoot)).rejects.toThrow(/native helper.*limit/iu)
+})
+
 it('passes the requested x64 target to the release builder', async () => {
   const { desktopRoot, cacheRoot } = fixture()
   const events: string[] = []
@@ -404,8 +418,8 @@ it('rejects symbolic fingerprint inputs instead of following them outside the de
   const { root, desktopRoot } = fixture()
   const outside = join(root, 'outside.c')
   writeFileSync(outside, 'outside helper source\n')
-  rmSync(join(desktopRoot, 'converter-packs', 'native', 'common', 'helper.c'))
-  symlinkSync(outside, join(desktopRoot, 'converter-packs', 'native', 'common', 'helper.c'))
+  rmSync(join(desktopRoot, 'converter-packs', 'native', 'common', 'arguments.c'))
+  symlinkSync(outside, join(desktopRoot, 'converter-packs', 'native', 'common', 'arguments.c'))
 
   await expect(developmentFingerprintInputs(desktopRoot)).rejects.toThrow(/symbolic/i)
 })
