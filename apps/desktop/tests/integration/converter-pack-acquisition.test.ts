@@ -45,6 +45,25 @@ function acquisition(bytes: Buffer, name: string) {
   }
 }
 
+function lockedSelection({
+  engines,
+  formulae = [],
+  closureFormulae = formulae.map((formula) => formula.name),
+}: {
+  engines: Array<Record<string, unknown>>
+  formulae?: Array<{ name: string; acquisition?: unknown; licenses?: unknown[] }>
+  closureFormulae?: string[]
+}) {
+  return {
+    target: 'darwin-arm64',
+    sourceLock: { target: 'darwin-arm64', engines, formulae },
+    closureLock: {
+      target: 'darwin-arm64',
+      formulae: closureFormulae.map((name) => ({ name })),
+    },
+  }
+}
+
 function writePartial(cacheRoot: string, archive: { url: string; sha256: string; bytes: number }, bytes: Buffer, partialBytes = bytes.byteLength) {
   writeFileSync(join(cacheRoot, `.${archive.sha256}.partial`), bytes, { mode: 0o600 })
   writeFileSync(join(cacheRoot, `.${archive.sha256}.partial.json`), canonicalBytes({
@@ -447,7 +466,7 @@ describe('converter pack source acquisition', () => {
     const cacheRoot = join(root, 'cache')
     mkdirSync(cacheRoot)
     const bytes = Buffer.from('homebrew bottle bytes')
-    const archiveUrl = `https://ghcr.io/v2/homebrew/core/ffmpeg/blobs/sha256:${sha256(bytes)}`
+    const archiveUrl = `https://ghcr.io/v2/homebrew/core/openssl/3/blobs/sha256:${sha256(bytes)}`
     const archive = { url: archiveUrl, sha256: sha256(bytes), bytes: bytes.byteLength }
     writePartial(cacheRoot, archive, bytes.subarray(0, 4))
     const requests: Array<{ url: string; range: string | null; authorization: string | null; signal: AbortSignal | null }> = []
@@ -460,11 +479,11 @@ describe('converter pack source acquisition', () => {
         return new Response('{}', {
           status: 401,
           headers: {
-            'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/ffmpeg:pull"',
+            'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/openssl/3:pull"',
           },
         })
       }
-      if (url === 'https://ghcr.io/token?service=ghcr.io&scope=repository%3Ahomebrew%2Fcore%2Fffmpeg%3Apull') {
+      if (url === 'https://ghcr.io/token?service=ghcr.io&scope=repository%3Ahomebrew%2Fcore%2Fopenssl%2F3%3Apull') {
         return Response.json({ token: 'fixture-token' })
       }
       if (url === archiveUrl && authorization === 'Bearer fixture-token') {
@@ -491,6 +510,148 @@ describe('converter pack source acquisition', () => {
     expect(requests.map(({ signal }) => signal)).toEqual([requests[0]!.signal, requests[0]!.signal, requests[0]!.signal])
   })
 
+  it('rejects a GHCR bearer scope that does not match the locked blob repository', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('versioned bottle bytes')
+    const archive = {
+      url: `https://ghcr.io/v2/homebrew/core/openssl/3/blobs/sha256:${sha256(bytes)}`,
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    let requests = 0
+
+    await expect(acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async () => {
+        requests += 1
+        return new Response('unauthorized', {
+          status: 401,
+          headers: {
+            'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/openssl:pull"',
+          },
+        })
+      },
+    })).rejects.toThrow('Converter source authentication failed.')
+    expect(requests).toBe(1)
+  })
+
+  it('cancels the challenge body before rejecting an unsafe locked GHCR repository path', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('unsafe repository bottle')
+    const archive = {
+      url: `https://ghcr.io/v2/another/project/blobs/sha256:${sha256(bytes)}`,
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    let cancelled = false
+
+    await expect(acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async () => new Response(new ReadableStream<Uint8Array>({
+        pull() {},
+        cancel() { cancelled = true },
+      }), {
+        status: 401,
+        headers: {
+          'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:another/project:pull"',
+        },
+      }),
+    })).rejects.toThrow('Converter source authentication failed.')
+    expect(cancelled).toBe(true)
+  })
+
+  it('cancels an unconsumed GHCR token error body', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('token failure bottle')
+    const archive = {
+      url: `https://ghcr.io/v2/homebrew/core/openssl/3/blobs/sha256:${sha256(bytes)}`,
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    let cancelled = false
+
+    await expect(acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async (input) => {
+        if (String(input).startsWith('https://ghcr.io/token?')) {
+          return new Response(new ReadableStream<Uint8Array>({
+            pull() {},
+            cancel() { cancelled = true },
+          }), { status: 503 })
+        }
+        return new Response('unauthorized', {
+          status: 401,
+          headers: {
+            'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/openssl/3:pull"',
+          },
+        })
+      },
+    })).rejects.toThrow('Converter source authentication failed.')
+    expect(cancelled).toBe(true)
+  })
+
+  it('cancels the archive reader when a local metadata checkpoint fails', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('metadata failure')
+    const archive = {
+      url: 'https://downloads.example.test/metadata-failure.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    const metadataPath = join(cacheRoot, `.${archive.sha256}.partial.json`)
+    let pulled = false
+    let cancelled = false
+
+    await expect(acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async () => new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pulled) return
+          pulled = true
+          rmSync(metadataPath)
+          mkdirSync(metadataPath)
+          controller.enqueue(bytes)
+        },
+        cancel() { cancelled = true },
+      }), { status: 200 }),
+    })).rejects.toThrow('Converter source download failed.')
+    expect(cancelled).toBe(true)
+  })
+
+  it('cancels the archive reader after an empty response chunk', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('nonempty archive')
+    let cancelled = false
+
+    await expect(acquireVerifiedArchive({
+      archive: {
+        url: 'https://downloads.example.test/empty-chunk.tar.gz',
+        sha256: sha256(bytes),
+        bytes: bytes.byteLength,
+      },
+      cacheRoot,
+      fetchImpl: async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new Uint8Array()) },
+        cancel() { cancelled = true },
+      }), { status: 200 }),
+    })).rejects.toThrow('Converter source download failed.')
+    expect(cancelled).toBe(true)
+  })
+
   it('runs exactly three unique locked artifacts concurrently and queues the fourth', async () => {
     const root = temporaryRoot()
     const cacheRoot = join(root, 'cache')
@@ -499,10 +660,9 @@ describe('converter pack source acquisition', () => {
       const bytes = Buffer.from(value)
       return { bytes, acquisition: acquisition(bytes, value) }
     })
-    const selected = {
+    const selected = lockedSelection({
       engines: artifacts.map(({ acquisition: coordinate }, index) => ({ name: `engine-${index}`, acquisition: coordinate })),
-      formulae: [],
-    }
+    })
     const pendingResponses = new Map<string, ReturnType<typeof deferred<Response>>>()
     const thirdStarted = deferred<void>()
     const fourthStarted = deferred<void>()
@@ -560,7 +720,7 @@ describe('converter pack source acquisition', () => {
       bytes: licenseBytes.byteLength,
     }
     let requests = 0
-    const selected = {
+    const selected = lockedSelection({
       engines: [{ name: 'ffmpeg', acquisition: coordinate }],
       formulae: [{
         name: 'ffmpeg',
@@ -571,7 +731,7 @@ describe('converter pack source acquisition', () => {
           destination: 'licenses/ffmpeg.txt',
         }],
       }],
-    }
+    })
     const result = await acquireLockedArtifacts({
       selected,
       cacheRoot,
@@ -584,8 +744,8 @@ describe('converter pack source acquisition', () => {
     expect(result.blobs.size).toBe(2)
 
     const conflict = structuredClone(selected)
-    conflict.engines[0]!.acquisition = {
-      ...conflict.engines[0]!.acquisition,
+    conflict.sourceLock.engines[0]!.acquisition = {
+      ...conflict.sourceLock.engines[0]!.acquisition,
       url: 'https://downloads.example.test/conflict.tar.gz',
     }
     await expect(acquireLockedArtifacts({ selected: conflict, cacheRoot, fetchImpl: async () => {
@@ -593,6 +753,88 @@ describe('converter pack source acquisition', () => {
       return new Response(bytes, { status: 200 })
     } })).rejects.toThrow('Converter source artifact identities conflict.')
     expect(requests).toBe(2)
+  })
+
+  it('acquires formula bottles and direct licenses only from the authenticated target closure', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const engineBytes = Buffer.from('engine')
+    const selectedBytes = Buffer.from('selected formula')
+    const selectedLicenseBytes = Buffer.from('selected license')
+    const unusedBytes = Buffer.from('unused formula')
+    const unusedLicenseBytes = Buffer.from('unused license')
+    const engine = acquisition(engineBytes, 'engine')
+    const selectedFormula = acquisition(selectedBytes, 'selected')
+    const unusedFormula = acquisition(unusedBytes, 'unused')
+    const selectedLicense = {
+      kind: 'download',
+      url: 'https://downloads.example.test/selected-license.txt',
+      sha256: sha256(selectedLicenseBytes),
+      bytes: selectedLicenseBytes.byteLength,
+      destination: 'licenses/selected.txt',
+    }
+    const unusedLicense = {
+      kind: 'download',
+      url: 'https://downloads.example.test/unused-license.txt',
+      sha256: sha256(unusedLicenseBytes),
+      bytes: unusedLicenseBytes.byteLength,
+      destination: 'licenses/unused.txt',
+    }
+    const selected = lockedSelection({
+      engines: [{ name: 'engine', acquisition: engine }],
+      formulae: [
+        { name: 'selected', acquisition: selectedFormula, licenses: [selectedLicense] },
+        { name: 'unused', acquisition: unusedFormula, licenses: [unusedLicense] },
+      ],
+      closureFormulae: ['selected'],
+    })
+    const bodies = new Map([
+      [engine.url, engineBytes],
+      [selectedFormula.url, selectedBytes],
+      [selectedLicense.url, selectedLicenseBytes],
+      [unusedFormula.url, unusedBytes],
+      [unusedLicense.url, unusedLicenseBytes],
+    ])
+    const requests: string[] = []
+
+    const result = await acquireLockedArtifacts({
+      selected,
+      cacheRoot,
+      fetchImpl: async (input) => {
+        const url = String(input)
+        requests.push(url)
+        return new Response(bodies.get(url), { status: 200 })
+      },
+    })
+
+    expect(requests.sort()).toEqual([engine.url, selectedFormula.url, selectedLicense.url].sort())
+    expect(result.networkBytes).toBe(engineBytes.byteLength + selectedBytes.byteLength + selectedLicenseBytes.byteLength)
+    expect(result.blobs.has(unusedFormula.sha256)).toBe(false)
+    expect(result.blobs.has(unusedLicense.sha256)).toBe(false)
+  })
+
+  it('rejects an unknown target-closure formula before making requests', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('engine')
+    const selected = lockedSelection({
+      engines: [{ name: 'engine', acquisition: acquisition(bytes, 'engine') }],
+      formulae: [],
+      closureFormulae: ['missing'],
+    })
+    let requests = 0
+
+    await expect(acquireLockedArtifacts({
+      selected,
+      cacheRoot,
+      fetchImpl: async () => {
+        requests += 1
+        return new Response(bytes, { status: 200 })
+      },
+    })).rejects.toThrow('Converter source closure references an unknown formula.')
+    expect(requests).toBe(0)
   })
 
   it('aborts active siblings on the first failure, waits for settlement, and never starts queued work', async () => {
@@ -603,10 +845,9 @@ describe('converter pack source acquisition', () => {
       const bytes = Buffer.from(value)
       return { bytes, acquisition: acquisition(bytes, value) }
     })
-    const selected = {
+    const selected = lockedSelection({
       engines: artifacts.map(({ acquisition: coordinate }, index) => ({ name: `engine-${index}`, acquisition: coordinate })),
-      formulae: [],
-    }
+    })
     const pendingResponses = new Map<string, ReturnType<typeof deferred<Response>>>()
     const thirdStarted = deferred<void>()
     const starts: string[] = []

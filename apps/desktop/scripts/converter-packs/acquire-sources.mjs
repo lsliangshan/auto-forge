@@ -14,7 +14,7 @@ import {
   requireDirectory,
   withStableRegularFile,
 } from './pack-tooling-lib.mjs'
-import { loadConverterSourceLock } from './source-lock.mjs'
+import { loadConverterClosureLock } from './closure-lock.mjs'
 
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const partialMetadataLimit = 4 * 1024
@@ -73,12 +73,14 @@ function sameFileIdentity(left, right) {
 
 async function boundedToken(response, signal) {
   if (!response.ok || response.status !== 200 || !response.body || (response.url && !validHttpsUrl(response.url))) {
+    await response.body?.cancel().catch(() => undefined)
     throw acquisitionFailure('Converter source authentication failed.')
   }
   const reader = response.body.getReader()
   const chunks = []
   let total = 0
   let cancelling
+  let consumed = false
   const abort = () => { cancelling = reader.cancel().catch(() => undefined) }
   signal.addEventListener('abort', abort, { once: true })
   if (signal.aborted) abort()
@@ -86,7 +88,10 @@ async function boundedToken(response, signal) {
     while (true) {
       if (signal.aborted) throw acquisitionFailure('Converter source authentication failed.')
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        consumed = true
+        break
+      }
       total += value.byteLength
       if (total > 16 * 1024) {
         await reader.cancel().catch(() => undefined)
@@ -97,6 +102,7 @@ async function boundedToken(response, signal) {
   } finally {
     signal.removeEventListener('abort', abort)
     await cancelling
+    if (!consumed) await reader.cancel().catch(() => undefined)
     reader.releaseLock()
   }
   let value
@@ -111,17 +117,28 @@ async function boundedToken(response, signal) {
   return value.token
 }
 
-async function fetchArchive(fetchImpl, archiveUrl, init) {
+function expectedGhcrScope(archiveUrl, expectedSha256) {
+  const url = new URL(archiveUrl)
+  const match = /^\/v2\/(homebrew\/core\/[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*)\/blobs\/sha256:([a-f0-9]{64})$/u.exec(url.pathname)
+  if (!match || match[2] !== expectedSha256 || url.search.length !== 0) {
+    throw acquisitionFailure('Converter source authentication failed.')
+  }
+  return `repository:${match[1]}:pull`
+}
+
+async function fetchArchive(fetchImpl, archive, init) {
+  const archiveUrl = archive.url
   let response = await fetchImpl(archiveUrl, init)
-  const archive = new URL(archiveUrl)
-  if (response.status !== 401 || archive.hostname !== 'ghcr.io') return response
-  const challenge = response.headers.get('www-authenticate')
-  const match = /^Bearer realm="(https:\/\/ghcr\.io\/token)",service="(ghcr\.io)",scope="(repository:homebrew\/core\/[A-Za-z0-9._-]+:pull)"$/u.exec(challenge ?? '')
+  const url = new URL(archiveUrl)
+  if (response.status !== 401 || url.hostname !== 'ghcr.io') return response
   await response.body?.cancel().catch(() => undefined)
-  if (!match) throw acquisitionFailure('Converter source authentication failed.')
+  const expectedScope = expectedGhcrScope(archiveUrl, archive.sha256)
+  const challenge = response.headers.get('www-authenticate')
+  const match = /^Bearer realm="(https:\/\/ghcr\.io\/token)",service="(ghcr\.io)",scope="([^"]+)"$/u.exec(challenge ?? '')
+  if (!match || match[3] !== expectedScope) throw acquisitionFailure('Converter source authentication failed.')
   const tokenUrl = new URL(match[1])
   tokenUrl.searchParams.set('service', match[2])
-  tokenUrl.searchParams.set('scope', match[3])
+  tokenUrl.searchParams.set('scope', expectedScope)
   const token = await boundedToken(await fetchImpl(tokenUrl.href, { ...init, headers: undefined }), init.signal)
   const headers = new globalThis.Headers(init.headers)
   headers.set('authorization', `Bearer ${token}`)
@@ -301,6 +318,7 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
   let total = start
   let networkBytes = 0
   let cancelling
+  let consumed = false
   const abort = () => { cancelling = reader.cancel().catch(() => undefined) }
   signal.addEventListener('abort', abort, { once: true })
   if (signal.aborted) abort()
@@ -308,7 +326,10 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
     while (true) {
       if (signal.aborted) throw acquisitionFailure(downloadFailed)
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        consumed = true
+        break
+      }
       if (!(value instanceof Uint8Array) || value.byteLength === 0) throw acquisitionFailure(downloadFailed, true)
       total += value.byteLength
       networkBytes += value.byteLength
@@ -326,6 +347,7 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
   } finally {
     signal.removeEventListener('abort', abort)
     await cancelling
+    if (!consumed) await reader.cancel().catch(() => undefined)
     reader.releaseLock()
   }
   if (total !== archive.bytes) throw acquisitionFailure(downloadFailed)
@@ -387,7 +409,7 @@ export async function acquireVerifiedArchive({ archive, cacheRoot, fetchImpl = g
       }
       let response
       try {
-        response = await fetchArchive(fetchImpl, archive.url, requestInit)
+        response = await fetchArchive(fetchImpl, archive, requestInit)
       } catch (error) {
         if (error?.discardPartial === true || error?.message === 'Converter source authentication failed.') throw error
         throw acquisitionFailure(downloadFailed)
@@ -430,12 +452,35 @@ function lockedArtifact(value) {
 }
 
 function selectedArtifacts(selected) {
-  if (!plainRecord(selected) || !Array.isArray(selected.engines) || !Array.isArray(selected.formulae)) {
+  if (
+    !exactKeys(selected, ['sourceLock', 'closureLock', 'target'])
+    || !plainRecord(selected.sourceLock)
+    || !plainRecord(selected.closureLock)
+    || selected.sourceLock.target !== selected.target
+    || selected.closureLock.target !== selected.target
+    || !Array.isArray(selected.sourceLock.engines)
+    || !Array.isArray(selected.sourceLock.formulae)
+    || !Array.isArray(selected.closureLock.formulae)
+  ) {
     fail('Converter source acquisition inventory is invalid.')
   }
   const values = []
-  for (const engine of selected.engines) values.push(lockedArtifact(engine?.acquisition))
-  for (const formula of selected.formulae) {
+  for (const engine of selected.sourceLock.engines) values.push(lockedArtifact(engine?.acquisition))
+  const sourceFormulae = new Map()
+  for (const formula of selected.sourceLock.formulae) {
+    if (typeof formula?.name !== 'string' || sourceFormulae.has(formula.name)) {
+      fail('Converter source acquisition inventory is invalid.')
+    }
+    sourceFormulae.set(formula.name, formula)
+  }
+  const closureFormulae = new Set()
+  for (const closureFormula of selected.closureLock.formulae) {
+    if (typeof closureFormula?.name !== 'string' || closureFormulae.has(closureFormula.name)) {
+      fail('Converter source acquisition inventory is invalid.')
+    }
+    closureFormulae.add(closureFormula.name)
+    const formula = sourceFormulae.get(closureFormula.name)
+    if (formula === undefined) fail('Converter source closure references an unknown formula.')
     if (formula?.acquisition !== null) values.push(lockedArtifact(formula?.acquisition))
     if (!Array.isArray(formula?.licenses)) fail('Converter source acquisition inventory is invalid.')
     for (const license of formula.licenses) {
@@ -515,9 +560,9 @@ export async function acquireLockedArtifacts({
 }
 
 export async function acquireConverterSources({ lockPath, target, cacheRoot, fetchImpl = globalThis.fetch, signal }) {
-  const selected = await loadConverterSourceLock({ path: lockPath, target })
+  const selected = await loadConverterClosureLock({ sourceLockPath: lockPath, target })
   const acquired = await acquireLockedArtifacts({ selected, cacheRoot, fetchImpl, signal })
-  return { target: selected.target, ...acquired }
+  return { target, ...acquired }
 }
 
 const entry = process.argv[1]
