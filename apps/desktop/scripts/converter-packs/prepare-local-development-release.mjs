@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { createPrivateKey, createPublicKey } from 'node:crypto'
-import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import process from 'node:process'
@@ -9,6 +9,7 @@ import {
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
+  recoverLegacyDevelopmentPreparation,
   writeDevelopmentReleaseMetadata,
 } from './local-development-release-cache.mjs'
 import { pruneDevelopmentCache } from './development-cache-budget.mjs'
@@ -195,8 +196,11 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
   }
   if (await hasRelease(paths.release)) await removeRelease(paths.release)
 
-  const privateRoot = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}`)
-  await mkdir(privateRoot, { mode: 0o700 })
+  await recoverLegacyDevelopmentPreparation({ cacheRoot, fingerprint })
+  const privateRoot = await realpath(await mkdtemp(join(
+    cacheRoot,
+    `.local-development-preparation-${fingerprint.slice(0, 12)}-`,
+  )))
   let primaryError
   try {
     const helpersRoot = join(privateRoot, 'helpers')

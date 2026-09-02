@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
@@ -125,6 +125,33 @@ it('prepares a cold development cache in order and activates only after verifica
   expect(result.reused).toBe(false)
   expect(result.releaseRoot).toBe(join(cacheRoot, 'releases', result.fingerprint))
   expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
+})
+
+it('recovers a legacy fixed private workspace and prepares in a unique private directory', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const inputs = await developmentFingerprintInputs(desktopRoot)
+  const { fingerprintDevelopmentRelease } = await import('../../scripts/converter-packs/local-development-release-cache.mjs')
+  const fingerprint = fingerprintDevelopmentRelease({ target: 'darwin-arm64', inputs })
+  const legacy = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}`)
+  await mkdir(legacy)
+  await writeFile(join(legacy, 'interrupted'), 'stale')
+  let observedWorkspace = ''
+  const injected = dependencies([], {
+    preparePlan: async (value: Record<string, unknown>) => {
+      observedWorkspace = value.workspace as string
+      await (value.afterMaterialize as () => Promise<void>)()
+      await writeFile(value.planPath as string, '{}\n')
+      return { blobs: [], networkBytes: 0 }
+    },
+  })
+
+  await expect(prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)).resolves.toMatchObject({ reused: false })
+
+  expect(observedWorkspace).not.toBe(join(legacy, 'workspace'))
+  expect(existsSync(legacy)).toBe(false)
+  expect((await readdir(cacheRoot)).filter((name) => (
+    name.startsWith(`.local-development-preparation-${fingerprint.slice(0, 12)}`)
+  ))).toEqual([])
 })
 
 it('runs the authenticated cold pipeline in exact order and publishes metadata before activation', async () => {

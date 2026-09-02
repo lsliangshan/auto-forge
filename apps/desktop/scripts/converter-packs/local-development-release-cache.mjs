@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { constants, lstatSync, realpathSync } from 'node:fs'
-import { link, lstat, mkdir, open, readdir, realpath, rename, unlink } from 'node:fs/promises'
+import { link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import process from 'node:process'
 import { canonicalBytes, withStableRegularFile } from './pack-tooling-lib.mjs'
@@ -348,6 +348,23 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
     activeMarker: join(canonicalRoot, 'active-release.json'),
     markerTemporaryRoot: join(canonicalRoot, '.active-release-'),
   }
+}
+
+export async function recoverLegacyDevelopmentPreparation({ cacheRoot, fingerprint }) {
+  const canonicalRoot = await canonicalCacheRoot(cacheRoot)
+  assertFingerprint(fingerprint)
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
+    const legacy = join(root, `.local-development-preparation-${fingerprint.slice(0, 12)}`)
+    const details = await lstat(legacy).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    if (details === undefined) return false
+    if (!details.isDirectory() || details.isSymbolicLink() || await realpath(legacy).catch(() => undefined) !== legacy) {
+      throw new Error('Legacy development preparation workspace is unsafe')
+    }
+    await heartbeat.pulse()
+    await rm(legacy, { recursive: true })
+    await syncDirectory(root)
+    return true
+  })
 }
 
 async function verifyMetadataFile(path, expectedBytes, allowedLinks) {
