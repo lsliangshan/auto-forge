@@ -241,7 +241,8 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
   }
   if (!replaceActive && await hasRelease(paths.release)) await removeRelease(paths.release)
 
-  const privateRoot = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+  const privateWorkspace = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+  const privateRoot = privateWorkspace.path
   let primaryError
   try {
     const helpersRoot = join(privateRoot, 'helpers')
@@ -283,6 +284,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     if (replaceActive) {
       await dependencies.replaceActiveRelease({ cacheRoot, fingerprint, candidateRelease: releaseOutput })
     }
+    await privateWorkspace.stop()
     await removePrivateRoot(privateRoot)
   } catch (error) {
     primaryError = error
@@ -290,6 +292,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
   if (primaryError !== undefined) {
     await settleCleanup(primaryError, [
       () => removeRelease(paths.release),
+      () => privateWorkspace.stop(),
       () => removePrivateRoot(privateRoot),
     ], 'Local development preparation cleanup failed.')
   }

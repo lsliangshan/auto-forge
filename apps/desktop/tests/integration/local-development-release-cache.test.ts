@@ -1,12 +1,13 @@
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import process from 'node:process'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   activateDevelopmentRelease,
+  createDevelopmentPreparationWorkspace,
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
@@ -15,6 +16,7 @@ import {
   removeInactiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
 } from '../../scripts/converter-packs/local-development-release-cache.mjs'
+import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 
 const roots: string[] = []
 const children = new Set<ReturnType<typeof spawn>>()
@@ -51,7 +53,95 @@ function createRelease(cacheRoot: string, fingerprint: string): string {
   return release
 }
 
+function createReadyWorkspace(cacheRoot: string, fingerprint: string, index: number, age = Date.now() / 1000) {
+  const nonce = randomUUID()
+  const path = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}-A${String(index).padStart(5, '0')}`)
+  mkdirSync(path)
+  const owner = join(path, `.owner-${nonce}.ready`)
+  writeFileSync(owner, canonicalBytes({ fingerprint, nonce, pid: process.pid, schemaVersion: 1 }))
+  chmodSync(owner, 0o444)
+  utimesSync(owner, age, age)
+  return path
+}
+
 describe('local development release cache', () => {
+  it.each([
+    ['create', 'afterWorkspaceCreateForTest'],
+    ['write', 'afterOwnerWriteForTest'],
+    ['fsync', 'afterOwnerFileSyncForTest'],
+    ['ready', 'afterOwnerReadyForTest'],
+  ] as const)('never exposes a partial owner after %s failure and permits a clean retry', async (_phase, hook) => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '8'.repeat(64)
+    await expect(createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint,
+      [hook]: async () => { throw new Error(`owner ${_phase} failure`) },
+    })).rejects.toThrow(`owner ${_phase} failure`)
+    expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.local-development-preparation-'))).toEqual([])
+
+    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+    expect(readdirSync(lease.path).filter((name) => name.endsWith('.ready'))).toHaveLength(1)
+    await lease.stop()
+    rmSync(lease.path, { recursive: true })
+  })
+
+  it.each([
+    ['writing', 'afterOwnerFileSyncForTest'],
+    ['ready', 'afterOwnerReadyForTest'],
+  ] as const)('recovers a %s owner left by SIGKILL', async (_phase, hook) => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '7'.repeat(64)
+    const marker = join(root, `${_phase}-marker`)
+    const moduleUrl = new URL('../../scripts/converter-packs/local-development-release-cache.mjs', import.meta.url).href
+    const script = String.raw`
+      import { writeFile } from 'node:fs/promises'
+      const [moduleUrl, cacheRoot, fingerprint, marker, hook] = process.argv.slice(1)
+      const { createDevelopmentPreparationWorkspace } = await import(moduleUrl)
+      await createDevelopmentPreparationWorkspace({
+        cacheRoot,
+        fingerprint,
+        [hook]: async () => {
+          await writeFile(marker, 'ready')
+          await new Promise(() => globalThis.setInterval(() => {}, 1_000))
+        },
+      })
+    `
+    const child = spawn(process.execPath, [
+      '--input-type=module', '-e', script, moduleUrl, cacheRoot, fingerprint, marker, hook,
+    ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] })
+    children.add(child)
+    const closed = new Promise<void>((resolvePromise) => child.once('close', () => resolvePromise()))
+    await waitUntil(() => existsSync(marker))
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    await closed
+    children.delete(child)
+
+    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+    expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.local-development-preparation-'))).toEqual([
+      lease.path.split('/').at(-1),
+    ])
+    await lease.stop()
+    rmSync(lease.path, { recursive: true })
+  })
+
+  it('expires a reused PID lease before enforcing the eight-workspace bound', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '9'.repeat(64)
+    const expired = createReadyWorkspace(cacheRoot, fingerprint, 0, 1)
+    for (let index = 1; index < 8; index += 1) createReadyWorkspace(cacheRoot, fingerprint, index)
+
+    const eighth = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+    expect(existsSync(expired)).toBe(false)
+    await eighth.stop()
+    await expect(createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint }))
+      .rejects.toThrow(/limit/iu)
+    rmSync(eighth.path, { recursive: true })
+  })
   it('frames the development release fingerprint deterministically', () => {
     expect(fingerprintDevelopmentRelease({
       target: 'darwin-arm64',

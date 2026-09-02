@@ -18,6 +18,7 @@ const METADATA_TEMP_PATTERN = /^\.release-metadata-([a-f0-9]{64})-([a-f0-9-]{36}
 const CLAIM_PREDECESSOR_PATTERN = /^\.cache-mutation\.claim\.([a-f0-9-]+)\.predecessor$/u
 const ACTIVE_MARKER_TEMP_PATTERN = /^\.active-release-([a-f0-9-]{36})\.tmp$/u
 const PREPARATION_WORKSPACE_LIMIT = 8
+const PREPARATION_OWNER_PATTERN = /^\.owner-([a-f0-9-]{36})\.(writing|ready)$/u
 const REPLACED_RELEASE_PATTERN = /^\.replaced-active-release-([a-f0-9]{64})-([a-f0-9-]{36})$/u
 const REPLACED_RELEASE_LIMIT = 4
 
@@ -372,77 +373,155 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
 async function recoverPreparationWorkspaces(root, fingerprint, heartbeat) {
   const prefix = `.local-development-preparation-${fingerprint.slice(0, 12)}`
   const names = (await readdir(root)).filter((name) => name === prefix || new RegExp(`^${prefix}-[A-Za-z0-9]{6}$`, 'u').test(name))
-  if (names.length > PREPARATION_WORKSPACE_LIMIT) throw new Error('Development preparation workspace recovery exceeds its limit')
   let recovered = false
+  let activeCount = 0
   for (const name of names) {
     const path = join(root, name)
     const details = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
     if (!details?.isDirectory() || details.isSymbolicLink() || await realpath(path).catch(() => undefined) !== path) {
       throw new Error('Legacy development preparation workspace is unsafe')
     }
-    let active = false
-    const ownerPath = join(path, '.owner.json')
-    const ownerDetails = await lstat(ownerPath).catch((error) => missing(error) ? undefined : Promise.reject(error))
-    const owner = ownerDetails === undefined ? undefined : await withStableRegularFile(
-      ownerPath,
-      'Development preparation owner',
-      async (handle, metadata) => {
-        if (metadata.size > CLAIM_MAXIMUM_BYTES) throw new Error('Development preparation owner is invalid')
-        return handle.readFile()
-      },
-    )
-    if (owner !== undefined) {
+    const ownerNames = (await readdir(path)).filter((entry) => entry.startsWith('.owner-'))
+    if (ownerNames.length > 1) throw new Error('Development preparation owner is ambiguous')
+    const ownerMatch = ownerNames.length === 1 ? PREPARATION_OWNER_PATTERN.exec(ownerNames[0]) : undefined
+    if (ownerNames.length === 1 && (!ownerMatch || !NONCE_PATTERN.test(ownerMatch[1]))) {
+      throw new Error('Development preparation owner is invalid')
+    }
+    if (ownerMatch?.[2] === 'ready') {
+      const ownerPath = join(path, ownerNames[0])
+      const owner = await withStableRegularFile(ownerPath, 'Development preparation owner', async (handle, metadata) => {
+        if (metadata.size > CLAIM_MAXIMUM_BYTES || (metadata.mode & 0o777) !== 0o444) {
+          throw new Error('Development preparation owner is invalid')
+        }
+        return { bytes: await handle.readFile(), metadata }
+      })
       let value
-      try { value = JSON.parse(owner.toString('utf8')) } catch { throw new Error('Development preparation owner is invalid') }
-      const expected = canonicalBytes(value)
-      if (!owner.equals(expected)
-        || Object.keys(value).sort().join('\0') !== ['fingerprint', 'pid', 'schemaVersion'].join('\0')
+      try { value = JSON.parse(owner.bytes.toString('utf8')) } catch { throw new Error('Development preparation owner is invalid') }
+      if (!owner.bytes.equals(canonicalBytes(value))
+        || Object.keys(value).sort().join('\0') !== ['fingerprint', 'nonce', 'pid', 'schemaVersion'].join('\0')
         || value.fingerprint !== fingerprint
+        || value.nonce !== ownerMatch[1]
         || !Number.isSafeInteger(value.pid)
         || value.pid <= 0
         || value.schemaVersion !== 1) {
         throw new Error('Development preparation owner is invalid')
       }
-      active = ownerAlive(value.pid)
+      if (ownerAlive(value.pid) && Date.now() - owner.metadata.mtimeMs <= CLAIM_LEASE_MS) {
+        activeCount += 1
+        continue
+      }
     }
-    if (active) continue
     await heartbeat.pulse()
     await rm(path, { recursive: true })
     recovered = true
   }
   if (recovered) await syncDirectory(root)
-  return recovered
+  return { activeCount, recovered }
 }
 
 export async function recoverLegacyDevelopmentPreparation({ cacheRoot, fingerprint }) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
-  return withDevelopmentCacheMutationClaim(canonicalRoot, (root, heartbeat) => (
-    recoverPreparationWorkspaces(root, fingerprint, heartbeat)
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => (
+    (await recoverPreparationWorkspaces(root, fingerprint, heartbeat)).recovered
   ))
 }
 
-export async function createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint }) {
+function startPreparationOwnerHeartbeat({ path, handle, identity, bytes }) {
+  let pending = Promise.resolve()
+  let failure
+  let stopped = false
+  let stopPromise
+  const verify = async () => {
+    const [opened, current] = await Promise.all([handle.stat(), lstat(path).catch(() => undefined)])
+    if (!current?.isFile() || current.isSymbolicLink() || current.nlink !== 1 || opened.nlink !== 1
+      || (opened.mode & 0o777) !== 0o444 || (current.mode & 0o777) !== 0o444
+      || !sameIdentity(opened, identity) || !sameIdentity(current, identity)) {
+      throw new Error('Development preparation owner lease was lost')
+    }
+    const content = Buffer.alloc(bytes.byteLength)
+    const read = await handle.read(content, 0, content.byteLength, 0)
+    if (read.bytesRead !== bytes.byteLength || !content.equals(bytes)) {
+      throw new Error('Development preparation owner lease was lost')
+    }
+  }
+  const pulse = () => {
+    if (stopped || failure) return
+    pending = pending.then(async () => {
+      await verify()
+      const now = new Date()
+      await handle.utimes(now, now)
+      await verify()
+    }).catch((error) => { failure = error })
+  }
+  const timer = globalThis.setInterval(pulse, CLAIM_HEARTBEAT_MS)
+  timer.unref?.()
+  return Object.freeze({
+    path: dirname(path),
+    async pulse() { pulse(); await pending; if (failure) throw failure },
+    stop() {
+      if (stopPromise === undefined) {
+        stopped = true
+        globalThis.clearInterval(timer)
+        stopPromise = (async () => {
+          await pending
+          await handle.close()
+          if (failure) throw failure
+        })()
+      }
+      return stopPromise
+    },
+  })
+}
+
+export async function createDevelopmentPreparationWorkspace({
+  cacheRoot,
+  fingerprint,
+  afterWorkspaceCreateForTest,
+  afterOwnerWriteForTest,
+  afterOwnerFileSyncForTest,
+  afterOwnerReadyForTest,
+}) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
   return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
-    await recoverPreparationWorkspaces(root, fingerprint, heartbeat)
-    const privateRoot = await realpath(await mkdtemp(join(root, `.local-development-preparation-${fingerprint.slice(0, 12)}-`)))
-    const ownerBytes = canonicalBytes({ fingerprint, pid: process.pid, schemaVersion: 1 })
-    const ownerHandle = await open(
-      join(privateRoot, '.owner.json'),
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-      0o400,
-    )
-    try {
-      await ownerHandle.writeFile(ownerBytes)
-      await ownerHandle.sync()
-    } finally {
-      await ownerHandle.close()
+    const recovered = await recoverPreparationWorkspaces(root, fingerprint, heartbeat)
+    if (recovered.activeCount >= PREPARATION_WORKSPACE_LIMIT) {
+      throw new Error('Development preparation workspace limit was reached')
     }
-    await Promise.all([syncDirectory(privateRoot), syncDirectory(root)])
-    await heartbeat.pulse()
-    return privateRoot
+    const privateRoot = await realpath(await mkdtemp(join(root, `.local-development-preparation-${fingerprint.slice(0, 12)}-`)))
+    const nonce = randomUUID()
+    const writing = join(privateRoot, `.owner-${nonce}.writing`)
+    const ready = join(privateRoot, `.owner-${nonce}.ready`)
+    const ownerBytes = canonicalBytes({ fingerprint, nonce, pid: process.pid, schemaVersion: 1 })
+    let ownerHandle
+    try {
+      await afterWorkspaceCreateForTest?.({ privateRoot })
+      ownerHandle = await open(
+        writing,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      )
+      await ownerHandle.writeFile(ownerBytes)
+      await afterOwnerWriteForTest?.({ privateRoot, writing })
+      await ownerHandle.chmod(0o444)
+      await ownerHandle.sync()
+      await afterOwnerFileSyncForTest?.({ privateRoot, writing })
+      const identity = await ownerHandle.stat()
+      await rename(writing, ready)
+      await syncDirectory(privateRoot)
+      await afterOwnerReadyForTest?.({ privateRoot, ready })
+      await syncDirectory(root)
+      await heartbeat.pulse()
+      return startPreparationOwnerHeartbeat({ path: ready, handle: ownerHandle, identity, bytes: ownerBytes })
+    } catch (primary) {
+      const cleanup = []
+      try { await ownerHandle?.close() } catch (error) { cleanup.push(error) }
+      try { await rm(privateRoot, { recursive: true, force: true }) } catch (error) { cleanup.push(error) }
+      try { await syncDirectory(root) } catch (error) { cleanup.push(error) }
+      if (cleanup.length > 0) throw new AggregateError([primary, ...cleanup], primary instanceof Error ? primary.message : 'Development preparation owner failed', { cause: primary })
+      throw primary
+    }
   })
 }
 
