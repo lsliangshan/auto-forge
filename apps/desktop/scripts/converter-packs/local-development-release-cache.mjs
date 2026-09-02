@@ -232,7 +232,10 @@ export async function withDevelopmentCacheMutationClaim(cacheRoot, operation, cl
     primary = error
   }
   const cleanup = []
-  for (const action of [() => heartbeat.stop(), () => claim.handle.close(), () => unlinkIdentity(claim.path, claim), () => syncDirectory(root)]) {
+  const cleanupActions = claimOperations.claimCleanupForTest === undefined
+    ? []
+    : [claimOperations.claimCleanupForTest]
+  for (const action of [...cleanupActions, () => heartbeat.stop(), () => claim.handle.close(), () => unlinkIdentity(claim.path, claim), () => syncDirectory(root)]) {
     try { await action() } catch (error) { cleanup.push(error) }
   }
   if (primary) {
@@ -386,24 +389,51 @@ export async function removeInactiveDevelopmentRelease({ cacheRoot, fingerprint 
       || release.isSymbolicLink()
       || await realpath(paths.release).catch(() => undefined) !== paths.release
     )) throw new Error('Inactive development release is unsafe')
+    const metadataRoot = await lstat(paths.releaseMetadataRoot).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    if (metadataRoot !== undefined && (
+      !metadataRoot.isDirectory()
+      || metadataRoot.isSymbolicLink()
+      || await realpath(paths.releaseMetadataRoot).catch(() => undefined) !== paths.releaseMetadataRoot
+    )) throw new Error('Inactive development release metadata root is unsafe')
+    const temporaryNames = metadataRoot === undefined ? [] : (await readdir(paths.releaseMetadataRoot)).filter((name) => {
+      const match = METADATA_TEMP_PATTERN.exec(name)
+      return Boolean(match && match[1] === fingerprint && NONCE_PATTERN.test(match[2]))
+    })
+    if (temporaryNames.length > 1) throw new Error('Inactive development release metadata recovery is ambiguous')
+    const temporaryPath = temporaryNames.length === 1 ? join(paths.releaseMetadataRoot, temporaryNames[0]) : undefined
     const metadata = await lstat(paths.releaseMetadata).catch((error) => missing(error) ? undefined : Promise.reject(error))
-    if (metadata !== undefined && (
-      !metadata.isFile()
-      || metadata.isSymbolicLink()
-      || metadata.nlink !== 1
-      || await realpath(paths.releaseMetadata).catch(() => undefined) !== paths.releaseMetadata
+    const temporary = temporaryPath === undefined ? undefined : await lstat(temporaryPath)
+    for (const [path, details] of [[paths.releaseMetadata, metadata], [temporaryPath, temporary]]) {
+      if (details !== undefined && (
+        !details.isFile()
+        || details.isSymbolicLink()
+        || ![1, 2].includes(details.nlink)
+        || await realpath(path).catch(() => undefined) !== path
+      )) throw new Error('Inactive development release metadata is unsafe')
+    }
+    if (metadata?.nlink === 2 && (
+      temporary?.nlink !== 2
+      || !sameIdentity(metadata, temporary)
+    )) throw new Error('Inactive development release metadata is unsafe')
+    if (temporary?.nlink === 2 && (
+      metadata?.nlink !== 2
+      || !sameIdentity(metadata, temporary)
     )) throw new Error('Inactive development release metadata is unsafe')
     if (metadata !== undefined) {
       await heartbeat.pulse()
       await unlink(paths.releaseMetadata)
-      await syncDirectory(paths.releaseMetadataRoot)
     }
+    if (temporaryPath !== undefined) {
+      await heartbeat.pulse()
+      await unlink(temporaryPath)
+    }
+    if (metadata !== undefined || temporaryPath !== undefined) await syncDirectory(paths.releaseMetadataRoot)
     if (release !== undefined) {
       await heartbeat.pulse()
       await rm(paths.release, { recursive: true })
       await syncDirectory(dirname(paths.release))
     }
-    return release !== undefined || metadata !== undefined
+    return release !== undefined || metadata !== undefined || temporary !== undefined
   })
 }
 
@@ -436,6 +466,8 @@ export async function writeDevelopmentReleaseMetadata({
   afterClaimOpenForTest,
   afterTemporaryCreateForTest,
   afterMetadataLinkForTest,
+  syncDirectoryForTest,
+  claimCleanupForTest,
 }) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
@@ -465,6 +497,7 @@ export async function writeDevelopmentReleaseMetadata({
     release: `releases/${fingerprint}`,
     schemaVersion: 1,
   })
+  const syncMetadataDirectory = syncDirectoryForTest ?? syncDirectory
   return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
     await validateRelease(root, fingerprint)
     const sources = join(root, 'sources')
@@ -506,7 +539,7 @@ export async function writeDevelopmentReleaseMetadata({
         }
         await heartbeat.pulse()
         await unlink(temporary)
-        await syncDirectory(metadataRoot)
+        await syncMetadataDirectory(metadataRoot)
       }
       await verifyMetadataFile(path, bytes, [1])
       return path
@@ -535,7 +568,7 @@ export async function writeDevelopmentReleaseMetadata({
       if (read.bytesRead !== bytes.byteLength || !content.equals(bytes)) {
         throw new Error('Development release metadata temporary verification failed')
       }
-      await syncDirectory(metadataRoot)
+      await syncMetadataDirectory(metadataRoot)
       if (createdTemporary) await afterTemporaryCreateForTest?.({ temporary })
       const [openedAgain, temporaryAgain] = await Promise.all([handle.stat(), lstat(temporary).catch(() => undefined)])
       if (!temporaryAgain?.isFile() || temporaryAgain.isSymbolicLink() || temporaryAgain.nlink !== 1
@@ -546,7 +579,7 @@ export async function writeDevelopmentReleaseMetadata({
       await heartbeat.pulse()
       await link(temporary, path)
       linked = true
-      await syncDirectory(metadataRoot)
+      await syncMetadataDirectory(metadataRoot)
       await afterMetadataLinkForTest?.({ path, temporary })
       const [temporaryDetails, publishedDetails] = await Promise.all([lstat(temporary), lstat(path)])
       if (!sameIdentity(temporaryDetails, publishedDetails) || temporaryDetails.nlink !== 2 || publishedDetails.nlink !== 2) {
@@ -554,7 +587,7 @@ export async function writeDevelopmentReleaseMetadata({
       }
       await heartbeat.pulse()
       await unlink(temporary)
-      await syncDirectory(metadataRoot)
+      await syncMetadataDirectory(metadataRoot)
       await withStableRegularFile(path, 'Development release metadata', async (publishedHandle, details) => {
         if (details.size !== bytes.byteLength || (details.mode & 0o777) !== 0o444) {
           throw new Error('Development release metadata publication failed')
@@ -567,13 +600,13 @@ export async function writeDevelopmentReleaseMetadata({
       if (createdTemporary && !linked) {
         await heartbeat.pulse()
         await unlink(temporary).catch((cleanupError) => { if (!missing(cleanupError)) throw cleanupError })
-        await syncDirectory(metadataRoot)
+        await syncMetadataDirectory(metadataRoot)
       }
       throw error
     } finally {
       await handle?.close()
     }
-  }, { afterClaimOpenForTest })
+  }, { afterClaimOpenForTest, claimCleanupForTest })
 }
 
 export async function readActiveDevelopmentRelease({ cacheRoot }) {

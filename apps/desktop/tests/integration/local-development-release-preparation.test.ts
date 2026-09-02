@@ -210,6 +210,52 @@ it('publishes canonical immutable metadata with the exact acquired blob measurem
   expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
 })
 
+it.each([
+  ['after-link', () => ({ afterMetadataLinkForTest: async () => { throw new Error('metadata after-link failure') } })],
+  ['directory-sync', () => {
+    let syncs = 0
+    return {
+      syncDirectoryForTest: async () => {
+        syncs += 1
+        if (syncs === 2) throw new Error('metadata directory-sync failure')
+      },
+    }
+  }],
+  ['claim-cleanup', () => ({ claimCleanupForTest: async () => { throw new Error('metadata claim-cleanup failure') } })],
+])('removes linked metadata and its release when durable metadata publication reports a %s tail failure', async (_scenario, fault) => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const previous = 'e'.repeat(64)
+  const marker = `{"fingerprint":"${previous}","schemaVersion":1}\n`
+  await mkdir(join(cacheRoot, 'releases', previous), { recursive: true })
+  await writeFile(join(cacheRoot, 'active-release.json'), marker)
+  const archive = Buffer.from('tail-fault-archive')
+  const blob = { bytes: archive.byteLength, sha256: createHash('sha256').update(archive).digest('hex') }
+  let fingerprint = ''
+  const injected = dependencies([], {
+    preparePlan: async (value: Record<string, unknown>) => {
+      await (value.afterMaterialize as () => Promise<void>)()
+      await writeFile(join(value.cacheRoot as string, `${blob.sha256}.archive`), archive)
+      await writeFile(value.planPath as string, '{}\n')
+      return { blobs: [blob], networkBytes: archive.byteLength }
+    },
+    writeMetadata: async (value: Parameters<typeof writeDevelopmentReleaseMetadata>[0]) => {
+      fingerprint = value.fingerprint
+      await writeDevelopmentReleaseMetadata({
+        ...value,
+        ...fault(),
+      })
+    },
+  })
+
+  await expect(prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected))
+    .rejects.toThrow(/failure|failed/)
+
+  expect(await readFile(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
+  expect(existsSync(join(cacheRoot, 'releases', fingerprint))).toBe(false)
+  expect(existsSync(join(cacheRoot, 'release-metadata', `${fingerprint}.json`))).toBe(false)
+  expect((await readdir(join(cacheRoot, 'release-metadata'))).filter((name) => name.includes(fingerprint))).toEqual([])
+})
+
 it('reuses only the verified active fingerprint with integrity and safe pruning while preserving mtimes', async () => {
   const { desktopRoot, cacheRoot } = fixture()
   const firstEvents: string[] = []
