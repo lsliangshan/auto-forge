@@ -52,9 +52,14 @@ describe('production staging plan preparation', () => {
     mkdirSync(cache)
     mkdirSync(helpers)
     writeFileSync(lock, '{}')
-    const selected = { target: 'darwin-arm64', sourceLock: { formulae: [] }, closureLock: { target: 'darwin-arm64' } }
-    const blobs = new Map([['a', { path: join(root, 'a') }]])
+    const selected = {
+      target: 'darwin-arm64', sourceLock: { formulae: [] },
+      closureLock: { target: 'darwin-arm64', measurements: { downloadBytes: 1 } },
+    }
+    const digest = 'a'.repeat(64)
+    const blobs = new Map([[digest, { path: join(root, 'a'), sha256: digest, bytes: 1, networkBytes: 1 }]])
     const calls: string[] = []
+    const privateLock = join(workspace, 'locks', 'sources.lock.json')
 
     await prepareProductionStagingPlan({
       lockPath: lock,
@@ -70,7 +75,14 @@ describe('production staging plan preparation', () => {
       archiveBaseUrl: 'https://cdn.example.test/converter-packs/releases/7',
     }, {
       loadLocks: async () => { calls.push('locks'); return selected },
-      acquireSources: async () => { calls.push('acquire'); return { blobs } },
+      materializeLocks: async () => {
+        calls.push('private-locks')
+        mkdirSync(join(workspace, 'locks'), { recursive: true })
+        writeFileSync(privateLock, '{}')
+        return { selected, sourceLockPath: privateLock }
+      },
+      preflightCache: async () => { calls.push('preflight') },
+      acquireSources: async () => { calls.push('acquire'); return { blobs, networkBytes: 1 } },
       materializeUniverse: async ({ outputRoot }: { outputRoot: string }) => {
         calls.push('universe'); mkdirSync(outputRoot)
       },
@@ -84,12 +96,73 @@ describe('production staging plan preparation', () => {
       target: 'darwin-arm64', output: staging, version: '1.2.3', sequence: 7,
       generatedAt: '2026-08-31T00:00:00.000Z',
       archiveBaseUrl: 'https://cdn.example.test/converter-packs/releases/7',
-      sourceLockPath: lock,
+      sourceLockPath: privateLock,
       universeRoot: join(workspace, 'universe'),
       helpersRoot: helpers,
       engineAssetsRoot: join(workspace, 'engine-assets'),
     })
-    expect(calls).toEqual(['locks', 'acquire', 'universe', 'engine-assets'])
+    expect(calls).toEqual(['locks', 'private-locks', 'preflight', 'acquire', 'universe', 'engine-assets'])
+  })
+
+  it('preflights the authenticated closure before one unique acquisition and writes a private lock plan', async () => {
+    const root = temporaryRoot()
+    const helpers = join(root, 'helpers')
+    const plan = join(root, 'staging-plan.json')
+    const workspace = join(root, 'prepared')
+    const staging = join(root, 'staging')
+    const lock = join(root, 'sources.lock.json')
+    const cache = join(root, 'cache')
+    mkdirSync(cache)
+    writeFileSync(lock, '{}')
+    const privateLock = join(workspace, 'locks', 'sources.lock.json')
+    const selected = {
+      target: 'darwin-arm64',
+      sourceLock: { formulae: [], closureLock: { path: 'closures/darwin-arm64.lock.json' } },
+      closureLock: { target: 'darwin-arm64', measurements: { downloadBytes: 23 } },
+    }
+    const artifact = { path: join(cache, 'a'.repeat(64) + '.archive'), sha256: 'a'.repeat(64), bytes: 23, networkBytes: 23 }
+    const calls: string[] = []
+
+    const result = await prepareProductionStagingPlan({
+      lockPath: lock,
+      target: 'darwin-arm64',
+      cacheRoot: cache,
+      helpersRoot: helpers,
+      workspace,
+      staging,
+      planPath: plan,
+      version: '1.2.3',
+      sequence: 7,
+      generatedAt: '2026-08-31T00:00:00.000Z',
+      archiveBaseUrl: 'https://cdn.example.test/converter-packs/releases/7',
+      afterMaterialize: async () => {
+        calls.push('helpers')
+        mkdirSync(helpers)
+      },
+    }, {
+      loadLocks: async () => { calls.push('locks'); return selected },
+      materializeLocks: async () => {
+        calls.push('private-locks')
+        mkdirSync(join(workspace, 'locks'), { recursive: true })
+        writeFileSync(privateLock, '{}')
+        return { selected, sourceLockPath: privateLock }
+      },
+      preflightCache: async ({ requiredDownloadBytes }: { requiredDownloadBytes: number }) => {
+        calls.push('preflight')
+        expect(requiredDownloadBytes).toBe(23)
+      },
+      acquireSources: async () => { calls.push('acquire'); return { blobs: new Map([[artifact.sha256, artifact]]), networkBytes: 23 } },
+      materializeUniverse: async ({ outputRoot }: { outputRoot: string }) => {
+        calls.push('universe'); mkdirSync(outputRoot)
+      },
+      materializeEngineAssets: async ({ outputRoot }: { outputRoot: string }) => {
+        calls.push('engine-assets'); mkdirSync(outputRoot)
+      },
+    })
+
+    expect(calls).toEqual(['locks', 'private-locks', 'preflight', 'acquire', 'universe', 'engine-assets', 'helpers'])
+    expect(result).toEqual({ blobs: [{ bytes: 23, sha256: 'a'.repeat(64) }], networkBytes: 23 })
+    expect(JSON.parse(readFileSync(plan, 'utf8')).sourceLockPath).toBe(privateLock)
   })
 
   it('preserves the preparation failure first when workspace cleanup also fails', async () => {
@@ -105,7 +178,9 @@ describe('production staging plan preparation', () => {
       archiveBaseUrl: 'https://example.test/releases/7',
     }, {
       loadLocks: async () => { throw new Error('lock primary') },
-      acquireSources: async () => ({ blobs: new Map() }),
+      materializeLocks: async () => { throw new Error('unexpected private locks') },
+      preflightCache: async () => { throw new Error('unexpected preflight') },
+      acquireSources: async () => ({ blobs: new Map(), networkBytes: 0 }),
       materializeUniverse: async () => undefined,
       materializeEngineAssets: async () => undefined,
       removeWorkspace: async () => {
