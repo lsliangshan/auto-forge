@@ -17,6 +17,7 @@ const metadataLimit = 1024 * 1024
 const trashPattern = /^\.development-cache-trash-([a-f0-9-]{36})$/u
 const transactionTemporaryPattern = /^\.transaction-([a-f0-9-]{36})\.tmp$/u
 const transactionTargetPattern = /^(?:releases\/[a-f0-9]{64}|release-metadata\/[a-f0-9]{64}\.json|sources\/[a-f0-9]{64}\.archive)$/u
+const legacyMetadataTemporaryPattern = /^\.legacy-release-metadata-([a-f0-9]{64})-([a-f0-9-]{36})\.tmp$/u
 
 function fail(message) {
   throw new Error(message)
@@ -179,6 +180,88 @@ async function syncDirectory(path) {
     await handle.sync()
   } finally {
     await handle.close()
+  }
+}
+
+async function writeLegacyReleaseMetadata(metadataRoot, fingerprint, heartbeat) {
+  const bytes = canonicalBytes({
+    blobs: [],
+    fingerprint,
+    release: `releases/${fingerprint}`,
+    schemaVersion: 1,
+  })
+  const temporary = join(metadataRoot, `.legacy-release-metadata-${fingerprint}-${randomUUID()}.tmp`)
+  const destination = join(metadataRoot, `${fingerprint}.json`)
+  await heartbeat.pulse()
+  const handle = await open(
+    temporary,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  )
+  try {
+    await handle.writeFile(bytes)
+    await handle.chmod(0o444)
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  await syncDirectory(metadataRoot)
+  await heartbeat.pulse()
+  await rename(temporary, destination)
+  await syncDirectory(metadataRoot)
+}
+
+async function migrateLegacyReleaseMetadata(cacheRoot, activeFingerprint, heartbeat) {
+  const releasesRoot = join(cacheRoot, 'releases')
+  const metadataRoot = join(cacheRoot, 'release-metadata')
+  await validateDirectory(releasesRoot, 'Development converter releases root is unsafe.')
+  await validateDirectory(metadataRoot, 'Development release metadata root is unsafe.')
+  const releases = new Set()
+  for (const fingerprint of await readdir(releasesRoot)) {
+    if (!sha256Pattern.test(fingerprint)) fail('Development converter release entry is invalid.')
+    await validateDirectory(join(releasesRoot, fingerprint), 'Development converter release entry is unsafe.')
+    releases.add(fingerprint)
+  }
+  const published = new Set()
+  const temporaries = []
+  for (const name of await readdir(metadataRoot)) {
+    const final = /^([a-f0-9]{64})\.json$/u.exec(name)
+    if (final) {
+      published.add(final[1])
+      continue
+    }
+    const temporary = legacyMetadataTemporaryPattern.exec(name)
+    if (!temporary || !noncePattern.test(temporary[2])) {
+      fail('Development release metadata entry is invalid.')
+    }
+    temporaries.push({ fingerprint: temporary[1], path: join(metadataRoot, name) })
+  }
+  for (const temporary of temporaries) {
+    if (!releases.has(temporary.fingerprint) || temporary.fingerprint === activeFingerprint || published.has(temporary.fingerprint)) {
+      fail('Development legacy release metadata recovery is invalid.')
+    }
+    const expected = canonicalBytes({
+      blobs: [],
+      fingerprint: temporary.fingerprint,
+      release: `releases/${temporary.fingerprint}`,
+      schemaVersion: 1,
+    })
+    const file = await readRegular(temporary.path)
+    if ((file.stat.mode & 0o777) !== 0o444 || !file.bytes.equals(expected)) {
+      fail('Development legacy release metadata recovery is invalid.')
+    }
+    await heartbeat.pulse()
+    await rename(temporary.path, join(metadataRoot, `${temporary.fingerprint}.json`))
+    await syncDirectory(metadataRoot)
+    published.add(temporary.fingerprint)
+  }
+  if (!published.has(activeFingerprint)) {
+    fail('Development active release metadata must not be migrated.')
+  }
+  for (const fingerprint of [...releases].sort()) {
+    if (fingerprint !== activeFingerprint && !published.has(fingerprint)) {
+      await writeLegacyReleaseMetadata(metadataRoot, fingerprint, heartbeat)
+    }
   }
 }
 
@@ -615,10 +698,12 @@ export async function pruneDevelopmentCache({
   renameForTest,
   rmForTest,
   syncDirectoryForTest,
+  migrateLegacyReleases = false,
 }) {
   const root = await canonicalRoot(cacheRoot)
   return withDevelopmentCacheMutationClaim(root, async (claimedRoot, heartbeat) => {
     await recoverTrash(claimedRoot, heartbeat)
+    if (migrateLegacyReleases) await migrateLegacyReleaseMetadata(claimedRoot, activeFingerprint, heartbeat)
     const plan = await collectCache(claimedRoot, activeFingerprint, keepPrevious, maximumBlobBytes)
     await beforeMutationForTest?.()
     if (plan.targets.length > 0) {

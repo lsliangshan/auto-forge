@@ -114,6 +114,27 @@ describe('development converter cache budget', () => {
     expect(existsSync(join(cacheRoot, 'sources', `${newerExtraBlob}.archive`))).toBe(true)
   })
 
+  it('migrates only inactive legacy releases under the prune claim when explicitly enabled', async () => {
+    const cacheRoot = createCache()
+    const legacy = fingerprint('0')
+    mkdirSync(join(cacheRoot, 'releases', legacy))
+    const active = await createVerifiedRelease(cacheRoot, '1', [], 300)
+    writeActiveMarker(cacheRoot, active)
+
+    await expect(pruneDevelopmentCache({ cacheRoot, activeFingerprint: active, keepPrevious: 0 }))
+      .rejects.toThrow('Development converter release metadata is incomplete.')
+    expect(existsSync(join(cacheRoot, 'releases', legacy))).toBe(true)
+
+    await expect(pruneDevelopmentCache({
+      cacheRoot,
+      activeFingerprint: active,
+      keepPrevious: 0,
+      migrateLegacyReleases: true,
+    })).resolves.toEqual({ removedReleases: [legacy], removedBlobs: [] })
+    expect(existsSync(join(cacheRoot, 'releases', legacy))).toBe(false)
+    expect(existsSync(join(cacheRoot, 'release-metadata', `${legacy}.json`))).toBe(false)
+  })
+
   it('preserves active acquisition partials and their canonical owner metadata', async () => {
     const cacheRoot = createCache()
     const blob = fingerprint('5')

@@ -60,7 +60,7 @@ const productionDependencies = Object.freeze({
   smokeRelease: (request) => smokeTestLocalDevelopmentRelease(request),
   writeMetadata: (request) => writeDevelopmentReleaseMetadata(request),
   activateRelease: ({ cacheRoot, fingerprint }) => activateDevelopmentRelease({ cacheRoot, fingerprint }),
-  pruneCache: (request) => pruneDevelopmentCache(request),
+  pruneCache: (request) => pruneDevelopmentCache({ ...request, migrateLegacyReleases: true }),
 })
 
 function isPlainRecord(value) {
