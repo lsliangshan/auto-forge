@@ -17,8 +17,10 @@ const fingerprintFiles = [
   'scripts/converter-packs/acquire-sources.mjs',
   'scripts/converter-packs/bottle-archive.mjs',
   'scripts/converter-packs/bottle-universe.mjs',
+  'scripts/converter-packs/development-cache-budget.mjs',
   'scripts/converter-packs/build-native-helpers.mjs',
   'scripts/converter-packs/locked-engine-assets.mjs',
+  'scripts/converter-packs/local-development-release-cache.mjs',
   'scripts/converter-packs/private-directory-publication.mjs',
   'scripts/converter-packs/prepare-production-staging.mjs',
   'scripts/converter-packs/macho-closure.mjs',
@@ -27,6 +29,7 @@ const fingerprintFiles = [
   'scripts/converter-packs/sign-index.mjs',
   'scripts/converter-packs/pack-tooling-lib.mjs',
   'scripts/converter-packs/build-local-development-release.mjs',
+  'scripts/converter-packs/verify-local-development-release.mjs',
 ]
 
 afterEach(() => {
@@ -183,6 +186,9 @@ it.each([
   ['converter-packs/native/common/helper.c'],
   ['scripts/converter-packs/private-directory-publication.mjs'],
   ['scripts/converter-packs/prepare-production-staging.mjs'],
+  ['scripts/converter-packs/development-cache-budget.mjs'],
+  ['scripts/converter-packs/local-development-release-cache.mjs'],
+  ['scripts/converter-packs/verify-local-development-release.mjs'],
 ])('changes the fingerprint when %s bytes change', async (changedPath) => {
   const { desktopRoot, cacheRoot } = fixture()
   const first = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies([]))

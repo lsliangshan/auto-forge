@@ -29,8 +29,10 @@ const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/acquire-sources.mjs',
   'scripts/converter-packs/bottle-archive.mjs',
   'scripts/converter-packs/bottle-universe.mjs',
+  'scripts/converter-packs/development-cache-budget.mjs',
   'scripts/converter-packs/build-native-helpers.mjs',
   'scripts/converter-packs/locked-engine-assets.mjs',
+  'scripts/converter-packs/local-development-release-cache.mjs',
   'scripts/converter-packs/private-directory-publication.mjs',
   'scripts/converter-packs/prepare-production-staging.mjs',
   'scripts/converter-packs/macho-closure.mjs',
@@ -39,6 +41,7 @@ const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/sign-index.mjs',
   'scripts/converter-packs/pack-tooling-lib.mjs',
   'scripts/converter-packs/build-local-development-release.mjs',
+  'scripts/converter-packs/verify-local-development-release.mjs',
 ])
 const developmentPrivateKeyDer = Buffer.from(
   '302e020100300506032b6570042204209d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60',
