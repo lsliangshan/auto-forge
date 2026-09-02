@@ -262,26 +262,100 @@ describe('locked engine asset set', () => {
     },
   )
 
-  it('recovers an initializing predecessor whose inode became a canonical claim before active unlink', async () => {
+  it('refreshes an isolated initializing predecessor after its initializer writes the canonical claim', async () => {
     const root = temporaryRoot()
     const value = fixture(root)
     const outputRoot = join(root, 'engine-assets')
-    const claimPath = `${outputRoot}.claim`
-    writeFileSync(claimPath, '', { mode: 0o600 })
-    const identity = statSync(claimPath)
-    const predecessor = `${claimPath}.${identity.dev}-${identity.ino}.predecessor`
-    linkSync(claimPath, predecessor)
+    let releaseInitializer!: () => void
+    let releaseRecovery!: () => void
+    let initializerReady!: () => void
+    let recoveryReady!: () => void
+    const initializerGate = new Promise<void>((resolve) => { releaseInitializer = resolve })
+    const recoveryGate = new Promise<void>((resolve) => { releaseRecovery = resolve })
+    const sawInitializer = new Promise<void>((resolve) => { initializerReady = resolve })
+    const sawRecovery = new Promise<void>((resolve) => { recoveryReady = resolve })
+    const initializer = materializeLockedEngineAssets({
+      target: 'darwin-arm64', ...value, outputRoot,
+      afterClaimOpenForTest: async () => { initializerReady(); await initializerGate },
+    })
+    await sawInitializer
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const recovery = materializeLockedEngineAssets({
+      target: 'darwin-arm64', ...value, outputRoot,
+      afterFenceStepForTest: async ({ step }) => {
+        if (step !== 'predecessor-link') return
+        recoveryReady()
+        await recoveryGate
+      },
+    })
+    await sawRecovery
+    releaseInitializer()
+    await expect(initializer).rejects.toThrow('Private directory publication claim was lost.')
+    releaseRecovery()
+    await expect(recovery).resolves.toBeDefined()
+    await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot })).resolves.toBeDefined()
+    expect(readdirSync(root).filter((name) => name.includes('.claim.'))).toEqual([])
+  })
+
+  it.each([
+    ['predecessor hook', 'hook failure'],
+    ['partial removal', 'rm failure'],
+    ['parent fsync', 'fsync failure'],
+  ] as const)('does not strand a self-owned recovery after a %s error', async (failurePoint, message) => {
+    const root = temporaryRoot()
+    const value = fixture(root)
+    const outputRoot = join(root, 'engine-assets')
     const nonce = randomUUID()
     const partialName = `.engine-assets.${nonce}.partial`
-    mkdirSync(join(root, partialName))
-    writeFileSync(claimPath, canonicalBytes({
+    writeFileSync(`${outputRoot}.claim`, canonicalBytes({
       createdAtMs: Date.now(), leaseMs: 30_000, nonce, partialName, pid: 2_147_483_647,
-    }))
-    rmSync(claimPath)
+    }), { mode: 0o600 })
+    mkdirSync(join(root, partialName))
+
+    await expect(materializeLockedEngineAssets({
+      target: 'darwin-arm64', ...value, outputRoot,
+      afterFenceStepForTest: failurePoint === 'predecessor hook'
+        ? async ({ step }) => { if (step === 'predecessor-link') throw new Error(message) }
+        : undefined,
+      recoveryMutationForTest: failurePoint === 'predecessor hook'
+        ? undefined
+        : async ({ step, run }: { step: string; run: () => Promise<unknown> }) => {
+            if (
+              (failurePoint === 'partial removal' && step === 'remove-partial')
+              || (failurePoint === 'parent fsync' && step === 'sync-isolated-active')
+            ) throw new Error(message)
+            return run()
+          },
+    })).rejects.toThrow(message)
 
     await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot })).resolves.toBeDefined()
-    expect(existsSync(predecessor)).toBe(false)
-    expect(existsSync(join(root, partialName))).toBe(false)
+    expect(readdirSync(root).filter((name) => name.includes('.claim.'))).toEqual([])
+  })
+
+  it('keeps an active same-process recovery exclusive until that operation finishes', async () => {
+    const root = temporaryRoot()
+    const value = fixture(root)
+    const outputRoot = join(root, 'engine-assets')
+    const nonce = randomUUID()
+    writeFileSync(`${outputRoot}.claim`, canonicalBytes({
+      createdAtMs: Date.now(), leaseMs: 30_000, nonce,
+      partialName: `.engine-assets.${nonce}.partial`, pid: 2_147_483_647,
+    }), { mode: 0o600 })
+    let release!: () => void
+    let ready!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const started = new Promise<void>((resolve) => { ready = resolve })
+    const first = materializeLockedEngineAssets({
+      target: 'darwin-arm64', ...value, outputRoot,
+      afterFenceStepForTest: async ({ step }) => {
+        if (step === 'predecessor-link') { ready(); await gate }
+      },
+    })
+    await started
+    await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot }))
+      .rejects.toThrow('Private directory publication is already claimed.')
+    release()
+    await expect(first).resolves.toBeDefined()
   })
 
   it('serializes two real recovery processes without deleting the live recovery owner inode', async () => {
