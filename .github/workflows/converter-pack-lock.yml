@@ -7,8 +7,8 @@ on:
         description: Exact lowercase 40-hex homebrew/core revision
         required: true
         type: string
-      roots_directory:
-        description: Repository-relative directory containing target roots candidates
+      cask_revision:
+        description: Exact lowercase 40-hex homebrew/cask revision
         required: true
         type: string
 
@@ -25,8 +25,9 @@ jobs:
     timeout-minutes: 120
     env:
       AUTOFORGE_CONVERTER_TARGET: darwin-arm64
+      AUTOFORGE_REPOSITORY_REVISION: ${{ github.sha }}
       AUTOFORGE_CORE_REVISION: ${{ inputs.core_revision }}
-      AUTOFORGE_ROOTS_DIRECTORY: ${{ inputs.roots_directory }}
+      AUTOFORGE_CASK_REVISION: ${{ inputs.cask_revision }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -40,21 +41,29 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Check out the exact Homebrew core revision
+      - name: Pin exact Homebrew revisions
         run: |
+          [[ "$AUTOFORGE_CORE_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$AUTOFORGE_CASK_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
           brew tap --force homebrew/core
+          brew tap --force homebrew/cask
           CORE_REPOSITORY="$(brew --repo homebrew/core)"
+          CASK_REPOSITORY="$(brew --repo homebrew/cask)"
           git -C "$CORE_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CORE_REVISION"
-          git -C "$CORE_REPOSITORY" checkout --detach "$AUTOFORGE_CORE_REVISION"
+          git -C "$CORE_REPOSITORY" switch --detach -- "$AUTOFORGE_CORE_REVISION"
+          git -C "$CASK_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CASK_REVISION"
+          git -C "$CASK_REPOSITORY" switch --detach -- "$AUTOFORGE_CASK_REVISION"
+          test "$(git -C "$CORE_REPOSITORY" rev-parse HEAD)" = "$AUTOFORGE_CORE_REVISION"
+          test "$(git -C "$CASK_REPOSITORY" rev-parse HEAD)" = "$AUTOFORGE_CASK_REVISION"
       - name: Capture and probe arm64 closure
         run: |
-          ROOTS_PATH="$(realpath "$GITHUB_WORKSPACE/$AUTOFORGE_ROOTS_DIRECTORY/$AUTOFORGE_CONVERTER_TARGET.roots.json")"
+          ROOTS_PATH="$(realpath "$GITHUB_WORKSPACE/apps/desktop/converter-packs/lock-candidates.json")"
           case "$ROOTS_PATH" in
             "$GITHUB_WORKSPACE"/*) ;;
             *) exit 1 ;;
           esac
           BREW_PATH="$(realpath "$(command -v brew)")"
-          pnpm --filter @autoforge/desktop converter-packs:capture-lock-target --target "$AUTOFORGE_CONVERTER_TARGET" --brew "$BREW_PATH" --core-revision "$AUTOFORGE_CORE_REVISION" --roots "$ROOTS_PATH" --output "$RUNNER_TEMP/$AUTOFORGE_CONVERTER_TARGET.capture.json"
+          pnpm --filter @autoforge/desktop converter-packs:capture-lock-target --target "$AUTOFORGE_CONVERTER_TARGET" --brew "$BREW_PATH" --repository-revision "$AUTOFORGE_REPOSITORY_REVISION" --core-revision "$AUTOFORGE_CORE_REVISION" --cask-revision "$AUTOFORGE_CASK_REVISION" --roots "$ROOTS_PATH" --output "$RUNNER_TEMP/$AUTOFORGE_CONVERTER_TARGET.capture.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: converter-lock-capture-darwin-arm64
@@ -67,8 +76,9 @@ jobs:
     timeout-minutes: 120
     env:
       AUTOFORGE_CONVERTER_TARGET: darwin-x64
+      AUTOFORGE_REPOSITORY_REVISION: ${{ github.sha }}
       AUTOFORGE_CORE_REVISION: ${{ inputs.core_revision }}
-      AUTOFORGE_ROOTS_DIRECTORY: ${{ inputs.roots_directory }}
+      AUTOFORGE_CASK_REVISION: ${{ inputs.cask_revision }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -82,21 +92,29 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Check out the exact Homebrew core revision
+      - name: Pin exact Homebrew revisions
         run: |
+          [[ "$AUTOFORGE_CORE_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$AUTOFORGE_CASK_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
           brew tap --force homebrew/core
+          brew tap --force homebrew/cask
           CORE_REPOSITORY="$(brew --repo homebrew/core)"
+          CASK_REPOSITORY="$(brew --repo homebrew/cask)"
           git -C "$CORE_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CORE_REVISION"
-          git -C "$CORE_REPOSITORY" checkout --detach "$AUTOFORGE_CORE_REVISION"
+          git -C "$CORE_REPOSITORY" switch --detach -- "$AUTOFORGE_CORE_REVISION"
+          git -C "$CASK_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CASK_REVISION"
+          git -C "$CASK_REPOSITORY" switch --detach -- "$AUTOFORGE_CASK_REVISION"
+          test "$(git -C "$CORE_REPOSITORY" rev-parse HEAD)" = "$AUTOFORGE_CORE_REVISION"
+          test "$(git -C "$CASK_REPOSITORY" rev-parse HEAD)" = "$AUTOFORGE_CASK_REVISION"
       - name: Capture and probe x64 closure
         run: |
-          ROOTS_PATH="$(realpath "$GITHUB_WORKSPACE/$AUTOFORGE_ROOTS_DIRECTORY/$AUTOFORGE_CONVERTER_TARGET.roots.json")"
+          ROOTS_PATH="$(realpath "$GITHUB_WORKSPACE/apps/desktop/converter-packs/lock-candidates.json")"
           case "$ROOTS_PATH" in
             "$GITHUB_WORKSPACE"/*) ;;
             *) exit 1 ;;
           esac
           BREW_PATH="$(realpath "$(command -v brew)")"
-          pnpm --filter @autoforge/desktop converter-packs:capture-lock-target --target "$AUTOFORGE_CONVERTER_TARGET" --brew "$BREW_PATH" --core-revision "$AUTOFORGE_CORE_REVISION" --roots "$ROOTS_PATH" --output "$RUNNER_TEMP/$AUTOFORGE_CONVERTER_TARGET.capture.json"
+          pnpm --filter @autoforge/desktop converter-packs:capture-lock-target --target "$AUTOFORGE_CONVERTER_TARGET" --brew "$BREW_PATH" --repository-revision "$AUTOFORGE_REPOSITORY_REVISION" --core-revision "$AUTOFORGE_CORE_REVISION" --cask-revision "$AUTOFORGE_CASK_REVISION" --roots "$ROOTS_PATH" --output "$RUNNER_TEMP/$AUTOFORGE_CONVERTER_TARGET.capture.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: converter-lock-capture-darwin-x64
@@ -126,10 +144,20 @@ jobs:
           pattern: converter-lock-capture-*
           path: ${{ runner.temp }}/converter-lock-captures
           merge-multiple: true
-      - name: Merge authenticated captures
+      - name: Merge current-run integrity-checked captures
+        env:
+          AUTOFORGE_REPOSITORY_REVISION: ${{ github.sha }}
+          AUTOFORGE_CORE_REVISION: ${{ inputs.core_revision }}
+          AUTOFORGE_CASK_REVISION: ${{ inputs.cask_revision }}
         run: |
+          [[ "$AUTOFORGE_REPOSITORY_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$AUTOFORGE_CORE_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$AUTOFORGE_CASK_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          export AUTOFORGE_ARM64_CAPTURE_SHA="$(sha256sum "$RUNNER_TEMP/converter-lock-captures/darwin-arm64.capture.json" | cut -d ' ' -f 1)"
+          export AUTOFORGE_X64_CAPTURE_SHA="$(sha256sum "$RUNNER_TEMP/converter-lock-captures/darwin-x64.capture.json" | cut -d ' ' -f 1)"
+          node --input-type=module -e "import { writeFileSync } from 'node:fs'; const captures = { 'darwin-arm64': { sha256: process.env.AUTOFORGE_ARM64_CAPTURE_SHA }, 'darwin-x64': { sha256: process.env.AUTOFORGE_X64_CAPTURE_SHA } }; writeFileSync(process.env.RUNNER_TEMP + '/converter-lock-provenance.json', JSON.stringify({ captures, homebrewCaskRevision: process.env.AUTOFORGE_CASK_REVISION, homebrewCoreRevision: process.env.AUTOFORGE_CORE_REVISION, repositoryRevision: process.env.AUTOFORGE_REPOSITORY_REVISION, schemaVersion: 1 }))"
           mkdir "$RUNNER_TEMP/converter-generated-locks"
-          pnpm --filter @autoforge/desktop converter-packs:generate-lock --arm64-capture "$RUNNER_TEMP/converter-lock-captures/darwin-arm64.capture.json" --x64-capture "$RUNNER_TEMP/converter-lock-captures/darwin-x64.capture.json" --output-root "$RUNNER_TEMP/converter-generated-locks"
+          pnpm --filter @autoforge/desktop converter-packs:generate-lock --arm64-capture "$RUNNER_TEMP/converter-lock-captures/darwin-arm64.capture.json" --x64-capture "$RUNNER_TEMP/converter-lock-captures/darwin-x64.capture.json" --provenance-manifest "$RUNNER_TEMP/converter-lock-provenance.json" --output-root "$RUNNER_TEMP/converter-generated-locks"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: converter-generated-locks

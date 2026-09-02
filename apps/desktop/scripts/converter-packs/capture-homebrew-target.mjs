@@ -218,7 +218,12 @@ function parseFormulae(value, names, target) {
       || byName.has(formula.name)
     ) invalid('Homebrew formula metadata is invalid.')
     const bottle = formula.bottle?.stable?.files?.[bottleTag(target)]
-    if (!plainRecord(bottle) || bottle.cellar !== expectedCellar(target) || !validHttpsUrl(bottle.url) || !sha256Pattern.test(bottle.sha256)) {
+    if (
+      !plainRecord(bottle)
+      || ![expectedCellar(target), ':any', ':any_skip_relocation'].includes(bottle.cellar)
+      || !validHttpsUrl(bottle.url)
+      || !sha256Pattern.test(bottle.sha256)
+    ) {
       invalid('Homebrew formula bottle metadata is invalid for the selected target.')
     }
     const version = formula.revision === 0 ? formula.versions.stable : `${formula.versions.stable}_${formula.revision}`
@@ -550,9 +555,10 @@ async function authenticateAndMeasureClosure({ target, closure, engines, formula
   }
 }
 
-export async function captureHomebrewTarget({ target, brew, coreRevision, caskRevision, roots, output, run = defaultRun }) {
+export async function captureHomebrewTarget({ target, brew, repositoryRevision, coreRevision, caskRevision, roots, output, run = defaultRun }) {
   if (!targets.has(target) || target !== expectedHostTarget()) invalid('Capture target does not match the maintainer host.')
   if (typeof brew !== 'string' || !isAbsolute(brew)) invalid('Homebrew executable must be an absolute path.')
+  if (!revisionPattern.test(repositoryRevision)) invalid('Repository revision must be an exact lowercase 40-hex commit.')
   if (!revisionPattern.test(coreRevision)) invalid('Homebrew core revision must be an exact lowercase 40-hex commit.')
   if (!revisionPattern.test(caskRevision)) invalid('Homebrew cask revision must be an exact lowercase 40-hex commit.')
   requireAbsolutePath(output, 'Capture output')
@@ -618,7 +624,7 @@ export async function captureHomebrewTarget({ target, brew, coreRevision, caskRe
     const measuredClosure = { ...cloneJson(closure), measurements: measured.measurements }
 
     const payload = {
-      schemaVersion: 1, target, homebrewCoreRevision: coreRevision,
+      schemaVersion: 1, target, repositoryRevision, homebrewCoreRevision: coreRevision,
       homebrewCaskRevision: caskRevision, roots: [...roots.formulaRoots], engines,
       formulae: capturedFormulae, probes: measured.probes, closure: measuredClosure,
     }
@@ -630,10 +636,10 @@ export async function captureHomebrewTarget({ target, brew, coreRevision, caskRe
 
 export async function captureHomebrewTargetMain(argv) {
   try {
-    const args = parseArguments(argv, ['--target', '--brew', '--core-revision', '--cask-revision', '--roots', '--output'])
+    const args = parseArguments(argv, ['--target', '--brew', '--repository-revision', '--core-revision', '--cask-revision', '--roots', '--output'])
     const roots = (await readCanonicalJson(args['--roots'], 'Capture roots')).value
     await captureHomebrewTarget({
-      target: args['--target'], brew: args['--brew'], coreRevision: args['--core-revision'], caskRevision: args['--cask-revision'], roots, output: args['--output'],
+      target: args['--target'], brew: args['--brew'], repositoryRevision: args['--repository-revision'], coreRevision: args['--core-revision'], caskRevision: args['--cask-revision'], roots, output: args['--output'],
     })
     process.stdout.write('captured verified Homebrew converter target\n')
     return 0

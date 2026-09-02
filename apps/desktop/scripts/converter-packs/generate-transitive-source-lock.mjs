@@ -189,10 +189,11 @@ async function readCapture(path, target) {
   const payload = value.payload
   if (
     !exactKeys(payload, [
-      'schemaVersion', 'target', 'homebrewCoreRevision', 'homebrewCaskRevision', 'roots', 'engines', 'formulae', 'probes', 'closure',
+      'schemaVersion', 'target', 'repositoryRevision', 'homebrewCoreRevision', 'homebrewCaskRevision', 'roots', 'engines', 'formulae', 'probes', 'closure',
     ])
     || payload.schemaVersion !== 1
     || payload.target !== target
+    || !revisionPattern.test(payload.repositoryRevision)
     || !revisionPattern.test(payload.homebrewCoreRevision)
     || !revisionPattern.test(payload.homebrewCaskRevision)
     || !Array.isArray(payload.roots)
@@ -215,13 +216,35 @@ async function readCapture(path, target) {
   payload.engines.forEach((engine, index) => validateEngine(engine, engineNames[index], target, formulae))
   const closure = validateTargetClosureLock(payload.closure, target)
   validateClosureFormulae(closure, formulae)
-  return { ...payload, closure }
+  return { ...payload, closure, captureSha256: sha256(bytes) }
+}
+
+async function readProvenanceManifest(path) {
+  requireAbsolutePath(path, 'Capture provenance manifest')
+  const bytes = await readStableRegularFile(path, 'Capture provenance manifest', 1024 * 1024)
+  let value
+  try {
+    value = JSON.parse(bytes.toString('utf8'))
+  } catch {
+    invalid('Capture provenance manifest is invalid.')
+  }
+  if (
+    !bytes.equals(canonicalBytes(value))
+    || !exactKeys(value, ['schemaVersion', 'repositoryRevision', 'homebrewCoreRevision', 'homebrewCaskRevision', 'captures'])
+    || value.schemaVersion !== 1
+    || !revisionPattern.test(value.repositoryRevision)
+    || !revisionPattern.test(value.homebrewCoreRevision)
+    || !revisionPattern.test(value.homebrewCaskRevision)
+    || !exactKeys(value.captures, targets)
+    || targets.some((target) => !exactKeys(value.captures[target], ['sha256']) || !sha256Pattern.test(value.captures[target].sha256))
+  ) invalid('Capture provenance manifest is invalid.')
+  return value
 }
 
 function formulaIdentity(formula) {
   return canonicalBytes({
     name: formula.name, version: formula.version, revision: formula.revision,
-    license: formula.license, dependencies: formula.dependencies,
+    license: formula.license,
   })
 }
 
@@ -245,7 +268,7 @@ function mergeLicenses(arm, x64) {
   return merged
 }
 
-function buildSourceLock(arm64, x64, closureCoordinates) {
+function buildSourceLock(arm64, x64, closureCoordinates, manifest) {
   if (
     arm64.homebrewCoreRevision !== x64.homebrewCoreRevision
     || arm64.homebrewCaskRevision !== x64.homebrewCaskRevision
@@ -287,6 +310,16 @@ function buildSourceLock(arm64, x64, closureCoordinates) {
     engines,
     formulae,
     closureLocks: closureCoordinates,
+    provenance: {
+      repositoryRevision: manifest.repositoryRevision,
+      captures: Object.fromEntries(targets.map((target) => {
+        const capture = target === 'darwin-arm64' ? arm64 : x64
+        return [target, {
+          captureSha256: capture.captureSha256,
+          probesSha256: sha256(canonicalBytes(capture.probes)),
+        }]
+      })),
+    },
   }
 }
 
@@ -320,25 +353,34 @@ async function validateGenerated(sourceBytes, armBytes, x64Bytes, outputRoot) {
   }
 }
 
-export async function generateTransitiveSourceLock({ arm64Capture, x64Capture, outputRoot }) {
-  for (const [path, label] of [[arm64Capture, 'arm64 capture'], [x64Capture, 'x64 capture'], [outputRoot, 'lock output root']]) {
+export async function generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot }) {
+  for (const [path, label] of [[arm64Capture, 'arm64 capture'], [x64Capture, 'x64 capture'], [provenanceManifest, 'capture provenance manifest'], [outputRoot, 'lock output root']]) {
     requireAbsolutePath(path, label)
   }
   const metadata = await lstat(outputRoot).catch(() => undefined)
   if (!metadata?.isDirectory() || metadata.isSymbolicLink() || await realpath(outputRoot).catch(() => undefined) !== outputRoot) {
     invalid('Lock output root must be canonical and non-symbolic.')
   }
-  const [arm64, x64] = await Promise.all([
+  const [arm64, x64, manifest] = await Promise.all([
     readCapture(arm64Capture, 'darwin-arm64'),
     readCapture(x64Capture, 'darwin-x64'),
+    readProvenanceManifest(provenanceManifest),
   ])
+  for (const capture of [arm64, x64]) {
+    if (
+      manifest.captures[capture.target].sha256 !== capture.captureSha256
+      || manifest.repositoryRevision !== capture.repositoryRevision
+      || manifest.homebrewCoreRevision !== capture.homebrewCoreRevision
+      || manifest.homebrewCaskRevision !== capture.homebrewCaskRevision
+    ) invalid('Capture differs from the protected-run provenance manifest.')
+  }
   const armBytes = canonicalBytes(arm64.closure)
   const x64Bytes = canonicalBytes(x64.closure)
   const closureCoordinates = {
     'darwin-arm64': { path: 'closures/darwin-arm64.lock.json', sha256: sha256(armBytes), bytes: armBytes.byteLength },
     'darwin-x64': { path: 'closures/darwin-x64.lock.json', sha256: sha256(x64Bytes), bytes: x64Bytes.byteLength },
   }
-  const sourceBytes = canonicalBytes(buildSourceLock(arm64, x64, closureCoordinates))
+  const sourceBytes = canonicalBytes(buildSourceLock(arm64, x64, closureCoordinates, manifest))
   await validateGenerated(sourceBytes, armBytes, x64Bytes, outputRoot)
 
   const closuresRoot = join(outputRoot, 'closures')
@@ -364,11 +406,11 @@ export async function generateTransitiveSourceLock({ arm64Capture, x64Capture, o
 
 export async function generateTransitiveSourceLockMain(argv) {
   try {
-    const args = parseArguments(argv, ['--arm64-capture', '--x64-capture', '--output-root'])
+    const args = parseArguments(argv, ['--arm64-capture', '--x64-capture', '--provenance-manifest', '--output-root'])
     await generateTransitiveSourceLock({
-      arm64Capture: args['--arm64-capture'], x64Capture: args['--x64-capture'], outputRoot: args['--output-root'],
+      arm64Capture: args['--arm64-capture'], x64Capture: args['--x64-capture'], provenanceManifest: args['--provenance-manifest'], outputRoot: args['--output-root'],
     })
-    process.stdout.write('generated authenticated dual-target converter locks\n')
+    process.stdout.write('generated integrity-checked dual-target converter locks\n')
     return 0
   } catch {
     process.stderr.write('converter lock generation failed\n')

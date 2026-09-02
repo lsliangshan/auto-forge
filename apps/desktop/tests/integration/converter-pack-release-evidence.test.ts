@@ -111,6 +111,10 @@ function writeSourceLockV2(root: string) {
       engine('poppler', 'poppler'),
     ],
     formulae,
+    provenance: {
+      repositoryRevision: '3'.repeat(40),
+      captures: Object.fromEntries(targets.map((target) => [target, { captureSha256: '4'.repeat(64), probesSha256: '5'.repeat(64) }])),
+    },
     closureLocks: {
       'darwin-arm64': { path: 'closures/darwin-arm64.lock.json', sha256: '6'.repeat(64), bytes: 1 },
       'darwin-x64': { path: 'closures/darwin-x64.lock.json', sha256: '7'.repeat(64), bytes: 1 },

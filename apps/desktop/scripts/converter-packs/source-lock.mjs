@@ -211,10 +211,21 @@ function validClosureCoordinate(value) {
     && positiveInteger(value.bytes, maximumClosureLockBytes)
 }
 
+function validProvenance(value) {
+  return exactKeys(value, ['repositoryRevision', 'captures'])
+    && gitRevisionPattern.test(value.repositoryRevision)
+    && exactKeys(value.captures, targets)
+    && targets.every((target) => (
+      exactKeys(value.captures[target], ['captureSha256', 'probesSha256'])
+      && sha256Pattern.test(value.captures[target].captureSha256)
+      && sha256Pattern.test(value.captures[target].probesSha256)
+    ))
+}
+
 function validateSourceLock(value) {
   if (
     !exactKeys(value, [
-      'schemaVersion', 'homebrewCoreRevision', 'homebrewCaskRevision', 'targets', 'engines', 'formulae', 'closureLocks',
+      'schemaVersion', 'homebrewCoreRevision', 'homebrewCaskRevision', 'targets', 'engines', 'formulae', 'closureLocks', 'provenance',
     ])
     || value.schemaVersion !== 2
     || !gitRevisionPattern.test(value.homebrewCoreRevision)
@@ -228,6 +239,7 @@ function validateSourceLock(value) {
     || !sortedUnique(value.formulae, (formula) => formula.name)
     || !exactKeys(value.closureLocks, targets)
     || !targets.every((target) => validClosureCoordinate(value.closureLocks[target]))
+    || !validProvenance(value.provenance)
   ) fail('Source lock has an invalid schema.')
 
   const formulae = new Map(value.formulae.map((formula) => [formula.name, formula]))

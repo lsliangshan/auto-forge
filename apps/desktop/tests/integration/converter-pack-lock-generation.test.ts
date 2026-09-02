@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { gzipSync } from 'node:zlib'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import process from 'node:process'
@@ -236,7 +236,7 @@ function brewFormulaJson(fixture: ReturnType<typeof captureFixture>, target = ta
         stable: {
           files: {
             [tagForTarget(target)]: {
-              cellar: cellarForTarget(target),
+              cellar: formula.name === 'glib' ? ':any_skip_relocation' : formula.name === 'poppler' ? ':any' : cellarForTarget(target),
               url: fixture.coordinates[formula.name].url,
               sha256: fixture.coordinates[formula.name].sha256,
             },
@@ -313,7 +313,7 @@ async function captureWithFixture(
   overrides: Record<string, unknown> = {},
 ) {
   return captureHomebrewTarget({
-    target: targetForHost(), brew: '/opt/test/bin/brew', coreRevision: '1'.repeat(40), caskRevision: '2'.repeat(40),
+    target: targetForHost(), brew: '/opt/test/bin/brew', repositoryRevision: 'a'.repeat(40), coreRevision: '1'.repeat(40), caskRevision: '2'.repeat(40),
     roots: fixture.roots, output: join(root, 'capture.json'), run,
     ...overrides,
   })
@@ -343,6 +343,7 @@ function captureDocument(target: 'darwin-arm64' | 'darwin-x64') {
   const payload = {
     schemaVersion: 1,
     target,
+    repositoryRevision: 'a'.repeat(40),
     homebrewCoreRevision: '1'.repeat(40),
     homebrewCaskRevision: '2'.repeat(40),
     roots: [...fixture.roots.formulaRoots],
@@ -381,6 +382,21 @@ function writeCapture(root: string, name: string, value: ReturnType<typeof captu
   return path
 }
 
+function writeProvenance(root: string, arm64Capture: string, x64Capture: string) {
+  const path = join(root, 'provenance.json')
+  writeFileSync(path, canonicalBytes({
+    schemaVersion: 1,
+    repositoryRevision: 'a'.repeat(40),
+    homebrewCoreRevision: '1'.repeat(40),
+    homebrewCaskRevision: '2'.repeat(40),
+    captures: {
+      'darwin-arm64': { sha256: sha256(readFileSync(arm64Capture)) },
+      'darwin-x64': { sha256: sha256(readFileSync(x64Capture)) },
+    },
+  }))
+  return path
+}
+
 describe('converter pack lock generation', () => {
   it('exposes the target capture and dual-target merge seams', () => {
     expect(captureHomebrewTarget).toBeTypeOf('function')
@@ -411,7 +427,8 @@ describe('converter pack lock generation', () => {
     const workflow = parse(source)
     expect(workflow.permissions).toEqual({ contents: 'read' })
     expect(workflow.on.workflow_dispatch.inputs.core_revision).toMatchObject({ required: true, type: 'string' })
-    expect(workflow.on.workflow_dispatch.inputs.roots_directory).toMatchObject({ required: true, type: 'string' })
+    expect(workflow.on.workflow_dispatch.inputs.cask_revision).toMatchObject({ required: true, type: 'string' })
+    expect(workflow.on.workflow_dispatch.inputs.roots_directory).toBeUndefined()
     expect(workflow.jobs.capture_arm64).toMatchObject({ 'runs-on': 'macos-15', env: { AUTOFORGE_CONVERTER_TARGET: 'darwin-arm64' } })
     expect(workflow.jobs.capture_x64).toMatchObject({ 'runs-on': 'macos-15-intel', env: { AUTOFORGE_CONVERTER_TARGET: 'darwin-x64' } })
     expect(workflow.jobs.merge.needs).toEqual(['capture_arm64', 'capture_x64'])
@@ -424,10 +441,20 @@ describe('converter pack lock generation', () => {
     }
     const captureSource = JSON.stringify([workflow.jobs.capture_arm64, workflow.jobs.capture_x64])
     expect(captureSource).toContain('converter-packs:capture-lock-target')
-    expect(captureSource).toContain('checkout --detach')
+    expect(captureSource).toContain('switch --detach --')
     expect(captureSource).toContain('core_revision')
+    expect(captureSource).toContain('cask_revision')
+    expect(captureSource).toContain('apps/desktop/converter-packs/lock-candidates.json')
+    for (const name of ['capture_arm64', 'capture_x64'] as const) {
+      const pin = workflow.jobs[name].steps.find((step: { name?: string }) => step.name === 'Pin exact Homebrew revisions').run as string
+      expect(pin).toMatch(/\^\[0-9a-f\]\{40\}\$/u)
+      expect(pin.indexOf('^[0-9a-f]{40}$')).toBeLessThan(pin.indexOf('git -C'))
+      expect(pin).toContain('switch --detach -- "$AUTOFORGE_CORE_REVISION"')
+      expect(pin).toContain('switch --detach -- "$AUTOFORGE_CASK_REVISION"')
+    }
     const mergeSource = JSON.stringify(workflow.jobs.merge)
     expect(mergeSource).toContain('converter-packs:generate-lock')
+    expect(mergeSource).toContain('provenance-manifest')
     expect(mergeSource).not.toMatch(/\bgit (?:commit|push)\b|converter-packs:publish/u)
   })
 
@@ -440,6 +467,7 @@ describe('converter pack lock generation', () => {
     await captureHomebrewTarget({
       target: targetForHost(),
       brew: '/opt/test/bin/brew',
+      repositoryRevision: 'a'.repeat(40),
       coreRevision: '1'.repeat(40),
       caskRevision: '2'.repeat(40),
       roots: fixture.roots,
@@ -491,6 +519,7 @@ describe('converter pack lock generation', () => {
     let calls = 0
     const neverRun = async () => { calls += 1; throw new Error('must not run') }
     await expect(captureWithFixture(root, fixture, neverRun, { coreRevision: 'A'.repeat(40) })).rejects.toThrow(/40-hex|revision/iu)
+    await expect(captureWithFixture(root, fixture, neverRun, { repositoryRevision: 'A'.repeat(40) })).rejects.toThrow(/40-hex|revision/iu)
     await expect(captureWithFixture(root, fixture, neverRun, { caskRevision: 'A'.repeat(40) })).rejects.toThrow(/40-hex|revision/iu)
     await expect(captureWithFixture(root, fixture, neverRun, { brew: 'brew' })).rejects.toThrow(/absolute/iu)
     const otherTarget = targetForHost() === 'darwin-arm64' ? 'darwin-x64' : 'darwin-arm64'
@@ -599,8 +628,9 @@ describe('converter pack lock generation', () => {
     mkdirSync(outputRoot)
     const arm64Capture = writeCapture(captures, 'arm64.json', captureDocument('darwin-arm64'))
     const x64Capture = writeCapture(captures, 'x64.json', captureDocument('darwin-x64'))
+    const provenanceManifest = writeProvenance(captures, arm64Capture, x64Capture)
 
-    await generateTransitiveSourceLock({ arm64Capture, x64Capture, outputRoot })
+    await generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot })
 
     const sourcePath = join(outputRoot, 'sources.lock.json')
     const arm64ClosurePath = join(outputRoot, 'closures', 'darwin-arm64.lock.json')
@@ -616,13 +646,20 @@ describe('converter pack lock generation', () => {
       'darwin-x64': captureDocument('darwin-x64').payload.formulae.find((formula) => formula.name === 'glib')!.acquisition,
     })
     expect(source.formulae.find((formula: { name: string }) => formula.name === 'glib').licenses).toHaveLength(2)
+    expect(source.provenance).toEqual({
+      repositoryRevision: 'a'.repeat(40),
+      captures: {
+        'darwin-arm64': { captureSha256: sha256(readFileSync(arm64Capture)), probesSha256: sha256(canonicalBytes(captureDocument('darwin-arm64').payload.probes)) },
+        'darwin-x64': { captureSha256: sha256(readFileSync(x64Capture)), probesSha256: sha256(canonicalBytes(captureDocument('darwin-x64').payload.probes)) },
+      },
+    })
     await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' })).resolves.toMatchObject({ target: 'darwin-arm64' })
     await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-x64' })).resolves.toMatchObject({ target: 'darwin-x64' })
     expect(statSync(sourcePath).mtimeMs).toBeGreaterThanOrEqual(statSync(arm64ClosurePath).mtimeMs)
     expect(statSync(sourcePath).mtimeMs).toBeGreaterThanOrEqual(statSync(x64ClosurePath).mtimeMs)
 
     const snapshot = [sourcePath, arm64ClosurePath, x64ClosurePath].map((path) => readFileSync(path))
-    await generateTransitiveSourceLock({ arm64Capture, x64Capture, outputRoot })
+    await generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot })
     expect([sourcePath, arm64ClosurePath, x64ClosurePath].map((path) => readFileSync(path))).toEqual(snapshot)
   })
 
@@ -644,8 +681,49 @@ describe('converter pack lock generation', () => {
     if (_label !== 'capture hash mismatch') x64.payloadSha256 = sha256(canonicalBytes(x64.payload))
     const arm64Capture = writeCapture(captures, 'arm64.json', arm)
     const x64Capture = writeCapture(captures, 'x64.json', x64)
-    await expect(generateTransitiveSourceLock({ arm64Capture, x64Capture, outputRoot })).rejects.toThrow()
+    const provenanceManifest = writeProvenance(captures, arm64Capture, x64Capture)
+    await expect(generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot })).rejects.toThrow()
     expect(() => readFileSync(join(outputRoot, 'sources.lock.json'))).toThrow()
+  })
+
+  it('rejects captures which are not bound to the current-run provenance manifest', async () => {
+    const root = temporaryRoot()
+    const captures = join(root, 'captures')
+    const outputRoot = join(root, 'locks')
+    mkdirSync(captures)
+    mkdirSync(outputRoot)
+    const arm64Capture = writeCapture(captures, 'arm64.json', captureDocument('darwin-arm64'))
+    const x64Capture = writeCapture(captures, 'x64.json', captureDocument('darwin-x64'))
+    const provenanceManifest = writeProvenance(captures, arm64Capture, x64Capture)
+    const provenance = JSON.parse(readFileSync(provenanceManifest, 'utf8'))
+    provenance.captures['darwin-x64'].sha256 = '0'.repeat(64)
+    writeFileSync(provenanceManifest, canonicalBytes(provenance))
+
+    await expect(generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot })).rejects.toThrow(/provenance|manifest/iu)
+    expect(existsSync(join(outputRoot, 'sources.lock.json'))).toBe(false)
+  })
+
+  it('keeps target-specific dependency edges only in each target closure', async () => {
+    const root = temporaryRoot()
+    const captures = join(root, 'captures')
+    const outputRoot = join(root, 'locks')
+    mkdirSync(captures)
+    mkdirSync(outputRoot)
+    const arm = captureDocument('darwin-arm64')
+    const x64 = captureDocument('darwin-x64')
+    x64.payload.formulae.find((formula) => formula.name === 'vips')!.dependencies = []
+    x64.payload.closure.formulae.find((formula) => formula.name === 'vips')!.dependencies = []
+    x64.payloadSha256 = sha256(canonicalBytes(x64.payload))
+    const arm64Capture = writeCapture(captures, 'arm64.json', arm)
+    const x64Capture = writeCapture(captures, 'x64.json', x64)
+    const provenanceManifest = writeProvenance(captures, arm64Capture, x64Capture)
+
+    await generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot })
+
+    const source = JSON.parse(readFileSync(join(outputRoot, 'sources.lock.json'), 'utf8'))
+    expect(source.formulae.every((formula: Record<string, unknown>) => !Object.hasOwn(formula, 'dependencies'))).toBe(true)
+    const closure = JSON.parse(readFileSync(join(outputRoot, 'closures', 'darwin-x64.lock.json'), 'utf8'))
+    expect(closure.formulae.find((formula: { name: string }) => formula.name === 'vips').dependencies).toEqual([])
   })
 
   it('refuses to overwrite a generated file unless all bytes are identical', async () => {
@@ -656,10 +734,11 @@ describe('converter pack lock generation', () => {
     mkdirSync(join(outputRoot, 'closures'), { recursive: true })
     const arm64Capture = writeCapture(captures, 'arm64.json', captureDocument('darwin-arm64'))
     const x64Capture = writeCapture(captures, 'x64.json', captureDocument('darwin-x64'))
+    const provenanceManifest = writeProvenance(captures, arm64Capture, x64Capture)
     const existing = join(outputRoot, 'closures', 'darwin-x64.lock.json')
     writeFileSync(existing, 'do-not-overwrite')
 
-    await expect(generateTransitiveSourceLock({ arm64Capture, x64Capture, outputRoot })).rejects.toThrow(/overwrite|differs|existing/iu)
+    await expect(generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot })).rejects.toThrow(/overwrite|differs|existing/iu)
     expect(readFileSync(existing, 'utf8')).toBe('do-not-overwrite')
     expect(() => readFileSync(join(outputRoot, 'sources.lock.json'))).toThrow()
     expect(() => readFileSync(join(outputRoot, 'closures', 'darwin-arm64.lock.json'))).toThrow()

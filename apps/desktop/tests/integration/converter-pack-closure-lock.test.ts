@@ -151,6 +151,13 @@ function sourceFixture(closureBytes: Buffer, target = 'darwin-arm64') {
       { name: 'poppler', version: '26.8.0', license: 'GPL-3.0-only', rootFormula: 'poppler', acquisitions: structuredClone(root('poppler').acquisitions), licenses: [] },
     ],
     formulae,
+    provenance: {
+      repositoryRevision: '3'.repeat(40),
+      captures: {
+        'darwin-arm64': { captureSha256: '4'.repeat(64), probesSha256: '5'.repeat(64) },
+        'darwin-x64': { captureSha256: '6'.repeat(64), probesSha256: '7'.repeat(64) },
+      },
+    },
     closureLocks: {
       'darwin-arm64': target === 'darwin-arm64' ? closureCoordinate : { path: 'closures/darwin-arm64.lock.json', sha256: '6'.repeat(64), bytes: 1 },
       'darwin-x64': target === 'darwin-x64' ? closureCoordinate : { path: 'closures/darwin-x64.lock.json', sha256: '7'.repeat(64), bytes: 1 },
