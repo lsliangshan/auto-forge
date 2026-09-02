@@ -1,7 +1,8 @@
-import { lstat, mkdir, realpath } from 'node:fs/promises'
+import { lstat, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   canonicalBytes, compareUtf8, fail, isPathInsideRoot, readStableRegularFile, requireAbsolutePath, requireDirectory, sha256,
+  withStableRegularFile,
 } from './pack-tooling-lib.mjs'
 import { publishPrivateDirectory, writeDurableFile } from './private-directory-publication.mjs'
 
@@ -19,6 +20,20 @@ function exactKeys(value, keys) {
 
 function tupleKey(value) {
   return canonicalBytes(value).toString('utf8')
+}
+
+async function readModeLockedFile(path, label, maximumBytes, mode) {
+  try {
+    return await withStableRegularFile(path, label, async (handle, metadata) => {
+      if (metadata.size > maximumBytes || (metadata.mode & 0o777) !== mode) invalid()
+      const bytes = await handle.readFile()
+      const after = await handle.stat()
+      if (bytes.byteLength !== metadata.size || (after.mode & 0o777) !== mode) invalid()
+      return bytes
+    })
+  } catch {
+    invalid()
+  }
 }
 
 function expectedRecords({ target, sourceLock, closureLock }) {
@@ -76,16 +91,8 @@ function expectedRecords({ target, sourceLock, closureLock }) {
 
 async function verifyRecord(root, record) {
   const path = join(root, ...record.relativePath.split('/'))
-  const metadata = await lstat(path).catch(() => undefined)
-  if (
-    !isPathInsideRoot(root, path)
-    || !metadata?.isFile()
-    || metadata.isSymbolicLink()
-    || metadata.nlink !== 1
-    || (metadata.mode & 0o777) !== record.mode
-    || await realpath(path).catch(() => undefined) !== path
-  ) invalid()
-  const bytes = await readStableRegularFile(path, 'Locked engine asset')
+  if (!isPathInsideRoot(root, path)) invalid()
+  const bytes = await readModeLockedFile(path, 'Locked engine asset', Number.MAX_SAFE_INTEGER, record.mode)
   if (bytes.byteLength !== record.bytes || sha256(bytes) !== record.sha256) invalid()
   return path
 }
@@ -95,9 +102,7 @@ export async function openLockedEngineAssets({ root, target, sourceLock, closure
   await requireDirectory(root, 'Locked engine asset root')
   const expected = expectedRecords({ target, sourceLock, closureLock })
   const manifestPath = join(root, 'manifest.json')
-  const manifestMetadata = await lstat(manifestPath).catch(() => undefined)
-  if (!manifestMetadata?.isFile() || (manifestMetadata.mode & 0o777) !== 0o444) invalid()
-  const bytes = await readStableRegularFile(manifestPath, 'Locked engine asset manifest', 1024 * 1024)
+  const bytes = await readModeLockedFile(manifestPath, 'Locked engine asset manifest', 1024 * 1024, 0o444)
   let manifest
   try { manifest = JSON.parse(bytes.toString('utf8')) } catch { invalid() }
   if (

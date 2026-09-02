@@ -5,6 +5,7 @@ import process from 'node:process'
 import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import {
   canonicalBytes, compareUtf8, parseArguments, readStableRegularFile, requireAbsolutePath, requireDirectory, sha256,
+  withStableRegularFile,
 } from './pack-tooling-lib.mjs'
 import { publishPrivateDirectory, writeDurableFile } from './private-directory-publication.mjs'
 
@@ -52,6 +53,20 @@ function exactKeys(value, keys) {
     && Object.keys(value).sort(compareUtf8).join('\0') === [...keys].sort(compareUtf8).join('\0')
 }
 
+async function readModeLockedFile(path, label, maximumBytes, mode) {
+  try {
+    return await withStableRegularFile(path, label, async (handle, metadata) => {
+      if (metadata.size > maximumBytes || (metadata.mode & 0o777) !== mode) invalid()
+      const bytes = await handle.readFile()
+      const after = await handle.stat()
+      if (bytes.byteLength !== metadata.size || (after.mode & 0o777) !== mode) invalid()
+      return bytes
+    })
+  } catch {
+    invalid()
+  }
+}
+
 async function verifiedHelper(root, record) {
   if (
     !exactKeys(record, ['helper', 'destination', 'sha256', 'bytes', 'mode'])
@@ -62,15 +77,7 @@ async function verifiedHelper(root, record) {
     || record.mode !== 0o755
   ) invalid()
   const path = join(root, ...record.destination.split('/'))
-  const metadata = await lstat(path).catch(() => undefined)
-  if (
-    !metadata?.isFile()
-    || metadata.isSymbolicLink()
-    || metadata.nlink !== 1
-    || (metadata.mode & 0o777) !== record.mode
-    || await realpath(path).catch(() => undefined) !== path
-  ) invalid()
-  const bytes = await readStableRegularFile(path, 'Native helper')
+  const bytes = await readModeLockedFile(path, 'Native helper', Number.MAX_SAFE_INTEGER, record.mode)
   if (bytes.byteLength !== record.bytes || sha256(bytes) !== record.sha256) invalid()
   return path
 }
@@ -80,9 +87,7 @@ export async function openBuiltHelperSet({ root, target }) {
   requireAbsolutePath(root, 'Native helper root')
   await requireDirectory(root, 'Native helper root')
   const manifestPath = join(root, 'manifest.json')
-  const manifestMetadata = await lstat(manifestPath).catch(() => undefined)
-  if (!manifestMetadata?.isFile() || (manifestMetadata.mode & 0o777) !== 0o444) invalid()
-  const manifestBytes = await readStableRegularFile(manifestPath, 'Native helper manifest', 64 * 1024)
+  const manifestBytes = await readModeLockedFile(manifestPath, 'Native helper manifest', 64 * 1024, 0o444)
   let manifest
   try { manifest = JSON.parse(manifestBytes.toString('utf8')) } catch { invalid() }
   if (!manifestBytes.equals(canonicalBytes(manifest))) invalid()
