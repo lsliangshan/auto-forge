@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { lstatSync, realpathSync } from 'node:fs'
 import { chmod, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -8,14 +9,17 @@ import {
   compareUtf8,
   fail,
   firstReleaseTarget,
+  isPathInsideRoot,
   parseArguments,
   readCanonicalJson,
   readStableRegularFile,
   requireAbsolutePath,
   safeEntryPath,
+  sha256,
   validateExecutableSet,
 } from './pack-tooling-lib.mjs'
 import { adhocSignMachOClosure, inspectMachO, planMachOClosure, relocateMachOClosure } from './macho-closure.mjs'
+import { validateTargetClosureLock } from './closure-lock.mjs'
 
 const familyNames = Object.freeze(['image-icon', 'document', 'pdf', 'media'])
 const exactExecutables = Object.freeze({
@@ -54,7 +58,7 @@ function validateArchiveBase(value) {
 
 function validateRequest(request) {
   if (!exactKeys(request, [
-    'target', 'output', 'version', 'sequence', 'generatedAt', 'archiveBaseUrl', 'families',
+    'target', 'output', 'version', 'sequence', 'generatedAt', 'archiveBaseUrl', 'closureLockPath', 'universeRoot',
   ])) fail('Pack staging request is invalid.')
   if (request.target !== 'darwin-arm64' && request.target !== 'darwin-x64') {
     fail('Pack staging target is unsupported.')
@@ -69,7 +73,8 @@ function validateRequest(request) {
     if (new Date(request.generatedAt).toISOString() !== request.generatedAt) fail('Pack generatedAt is invalid.')
   } catch { fail('Pack generatedAt is invalid.') }
   validateArchiveBase(request.archiveBaseUrl)
-  if (!exactKeys(request.families, familyNames)) fail('Pack staging must contain exactly four families.')
+  requireAbsolutePath(request.closureLockPath, 'Target closure lock')
+  requireAbsolutePath(request.universeRoot, 'Bottle universe root')
   return { platform, arch, machoArchitecture: arch === 'x64' ? 'x86_64' : arch }
 }
 
@@ -134,9 +139,17 @@ export async function probeConverterFamily({ name, payload, executables }, { run
 }
 
 const productionDependencies = Object.freeze({
-  planClosure: ({ entrypoints, architecture }) => planMachOClosure({
+  loadClosure: async ({ closureLockPath, target }) => validateTargetClosureLock(
+    (await readCanonicalJson(closureLockPath, 'Target closure lock')).value,
+    target,
+  ),
+  openUniverse: ({ universeRoot, closureLock }) => openLockedUniverse({ universeRoot, closureLock }),
+  planClosure: ({ entrypoints, architecture, universe, expectedFiles, expectedRewrites }) => planMachOClosure({
     entrypoints,
     architecture,
+    universe,
+    expectedFiles,
+    expectedRewrites,
     inspect: (path) => inspectMachO(path),
   }),
   applyRelocation: async ({ payload, architecture, plan }) => {
@@ -146,7 +159,66 @@ const productionDependencies = Object.freeze({
   probeFamily: (request) => probeConverterFamily(request),
 })
 
-async function copyDeclaredFile({ source, destination, role, payload, seen }) {
+function currentRegular(path) {
+  try {
+    const metadata = lstatSync(path)
+    return metadata.isFile()
+      && !metadata.isSymbolicLink()
+      && metadata.nlink === 1
+      && realpathSync(path) === path
+  } catch {
+    return false
+  }
+}
+
+function currentDirectory(path) {
+  try {
+    const metadata = lstatSync(path)
+    return metadata.isDirectory() && !metadata.isSymbolicLink() && realpathSync(path) === path
+  } catch {
+    return false
+  }
+}
+
+function openLockedUniverse({ universeRoot, closureLock }) {
+  if (!currentDirectory(universeRoot)) fail('Bottle universe root must be canonical and non-symbolic.')
+  const formulae = new Map(closureLock.formulae.map((formula) => [formula.name, formula.version]))
+  const selected = new Set()
+  for (const family of Object.values(closureLock.families)) {
+    for (const file of family.files) selected.add(`${file.formula}\0${file.sourcePath}`)
+    for (const license of family.licenses) {
+      if (!license.source.startsWith('https://')) selected.add(`${license.formula}\0${license.source}`)
+    }
+  }
+  const formulaRoot = (formula, version) => {
+    if (formulae.get(formula) !== version) fail('Bottle universe formula is not locked.')
+    const root = join(universeRoot, 'Cellar', formula, version)
+    if (!currentDirectory(root) || !isPathInsideRoot(universeRoot, root)) fail('Bottle universe formula root is unsafe.')
+    return root
+  }
+  return Object.freeze({
+    target: closureLock.target,
+    cellar: formulaRoot,
+    opt(formula) {
+      const version = formulae.get(formula)
+      if (!version) fail('Bottle universe formula is not locked.')
+      return formulaRoot(formula, version)
+    },
+    resolveLockedFile(formula, sourcePath) {
+      if (!selected.has(`${formula}\0${sourcePath}`)) fail('Bottle universe file is not locked.')
+      const version = formulae.get(formula)
+      if (!version) fail('Bottle universe formula is not locked.')
+      const path = join(formulaRoot(formula, version), ...sourcePath.split('/'))
+      if (!isPathInsideRoot(universeRoot, path) || !currentRegular(path)) fail('Bottle universe file is unsafe.')
+      return path
+    },
+    contains(path) {
+      return typeof path === 'string' && isPathInsideRoot(universeRoot, path) && (currentRegular(path) || currentDirectory(path))
+    },
+  })
+}
+
+async function copyDeclaredFile({ source, destination, role, payload, seen, expectedBytes, expectedSha256 }) {
   if (!safeEntryPath(destination) || (role !== 'executable' && role !== 'code' && role !== 'data' && role !== 'license')) {
     fail('Staged file declaration is invalid.')
   }
@@ -154,6 +226,9 @@ async function copyDeclaredFile({ source, destination, role, payload, seen }) {
   if (seen.has(key)) fail(`Staged file destination collision: ${destination}`)
   requireAbsolutePath(source, 'Staged file source')
   const bytes = await readStableRegularFile(source, 'Staged file source')
+  if (expectedBytes !== undefined && (bytes.byteLength !== expectedBytes || sha256(bytes) !== expectedSha256)) {
+    fail(`Staged file differs from its locked inventory: ${destination}`)
+  }
   const target = join(payload, ...destination.split('/'))
   await mkdir(dirname(target), { recursive: true, mode: 0o755 })
   await writeFile(target, bytes, { flag: 'wx', mode: role === 'executable' ? 0o755 : 0o644 })
@@ -163,21 +238,49 @@ async function copyDeclaredFile({ source, destination, role, payload, seen }) {
 }
 
 function validateFamily(name, family) {
-  if (!exactKeys(family, ['entrypoints', 'assets']) || !Array.isArray(family.entrypoints) || !Array.isArray(family.assets)) {
+  if (!exactKeys(family, ['files', 'rewrites', 'licenses']) || !Array.isArray(family.files) || !Array.isArray(family.rewrites) || !Array.isArray(family.licenses)) {
     fail(`Pack family is invalid: ${name}`)
   }
-  const destinations = family.entrypoints.map((entrypoint) => entrypoint?.destination)
+  const destinations = family.files.filter((file) => file?.executable).map((file) => file.destination)
   if (
     destinations.length !== exactExecutables[name].length
     || [...destinations].sort(compareUtf8).join('\0') !== [...exactExecutables[name]].sort(compareUtf8).join('\0')
-    || family.entrypoints.some((entrypoint) => !exactKeys(entrypoint, ['source', 'destination']))
   ) fail(`Pack family executable inventory is invalid: ${name}`)
   validateExecutableSet(name, 'darwin', destinations)
-  if (family.assets.length === 0 || family.assets.some((asset) => (
-    !exactKeys(asset, ['source', 'destination', 'role'])
-    || (asset.role !== 'data' && asset.role !== 'license')
-  ))) fail(`Pack family assets are invalid: ${name}`)
-  if (!family.assets.some(({ role }) => role === 'license')) fail(`Pack family is missing a license: ${name}`)
+  if (family.licenses.length === 0) fail(`Pack family is missing a license: ${name}`)
+}
+
+function planFileKey(file) {
+  return `${file.destination}\0${file.formula}\0${file.role}\0${String(file.executable)}`
+}
+
+function rewriteKey(rewrite) {
+  return `${rewrite.destination}\0${rewrite.dependency}\0${rewrite.replacement}`
+}
+
+function validateExactPlan(name, plan, family, universe) {
+  if (!plainRecord(plan) || !Array.isArray(plan.files) || !Array.isArray(plan.rewrites)) {
+    fail(`Mach-O closure plan is invalid: ${name}`)
+  }
+  const expectedFiles = [...family.files].sort((left, right) => compareUtf8(planFileKey(left), planFileKey(right)))
+  const actualFiles = [...plan.files].sort((left, right) => compareUtf8(planFileKey(left), planFileKey(right)))
+  if (actualFiles.length !== expectedFiles.length) fail(`Mach-O closure plan differs from its locked inventory: ${name}`)
+  for (let index = 0; index < expectedFiles.length; index += 1) {
+    const actual = actualFiles[index]
+    const expected = expectedFiles[index]
+    if (
+      !exactKeys(actual, ['source', 'destination', 'executable', 'formula', 'role'])
+      || planFileKey(actual) !== planFileKey(expected)
+      || actual.source !== universe.resolveLockedFile(expected.formula, expected.sourcePath)
+      || !universe.contains(actual.source)
+    ) fail(`Mach-O closure plan differs from its locked inventory: ${name}`)
+  }
+  const expectedRewrites = [...family.rewrites].sort((left, right) => compareUtf8(rewriteKey(left), rewriteKey(right)))
+  const actualRewrites = [...plan.rewrites].sort((left, right) => compareUtf8(rewriteKey(left), rewriteKey(right)))
+  if (
+    actualRewrites.length !== expectedRewrites.length
+    || actualRewrites.some((rewrite, index) => rewriteKey(rewrite) !== rewriteKey(expectedRewrites[index]))
+  ) fail(`Mach-O closure rewrites differ from their locked inventory: ${name}`)
 }
 
 export async function stageProductionPacks(request, dependencies = productionDependencies) {
@@ -187,6 +290,8 @@ export async function stageProductionPacks(request, dependencies = productionDep
     || typeof dependencies.planClosure !== 'function'
     || typeof dependencies.applyRelocation !== 'function'
     || typeof dependencies.probeFamily !== 'function'
+    || (dependencies.loadClosure !== undefined && typeof dependencies.loadClosure !== 'function')
+    || (dependencies.openUniverse !== undefined && typeof dependencies.openUniverse !== 'function')
   ) fail('Pack staging dependencies are invalid.')
   if (await realpath(dirname(request.output)).catch(() => undefined) !== dirname(request.output)) {
     fail('Staging output parent must be a canonical directory.')
@@ -194,35 +299,61 @@ export async function stageProductionPacks(request, dependencies = productionDep
 
   await mkdir(request.output, { mode: 0o700 })
   try {
+    const loadClosure = dependencies.loadClosure ?? productionDependencies.loadClosure
+    const openUniverse = dependencies.openUniverse ?? productionDependencies.openUniverse
+    const closureLock = await loadClosure({ closureLockPath: request.closureLockPath, target: request.target })
+    if (!plainRecord(closureLock) || closureLock.target !== request.target || !exactKeys(closureLock.families, familyNames)) {
+      fail('Target closure lock does not match the staging request.')
+    }
+    const universe = await openUniverse({ universeRoot: request.universeRoot, closureLock })
+    if (!universe || universe.target !== request.target || typeof universe.resolveLockedFile !== 'function') {
+      fail('Bottle universe does not match the staging request.')
+    }
     const packsRoot = join(request.output, 'packs')
     await mkdir(packsRoot, { mode: 0o755 })
     for (const name of familyNames) {
-      const family = request.families[name]
+      const family = closureLock.families[name]
       validateFamily(name, family)
       const packRoot = join(packsRoot, `${name}-${request.target}`)
       const payload = join(packRoot, 'payload')
       await mkdir(payload, { recursive: true, mode: 0o755 })
+      const entrypoints = family.files.filter((file) => file.executable).map((file) => ({
+        source: universe.resolveLockedFile(file.formula, file.sourcePath),
+        destination: file.destination,
+      }))
       const plan = await dependencies.planClosure({
-        entrypoints: family.entrypoints,
+        entrypoints,
         architecture: target.machoArchitecture,
+        universe,
+        expectedFiles: family.files,
+        expectedRewrites: family.rewrites,
       })
-      if (!plainRecord(plan) || !Array.isArray(plan.files) || !Array.isArray(plan.rewrites)) {
-        fail(`Mach-O closure plan is invalid: ${name}`)
-      }
+      validateExactPlan(name, plan, family, universe)
       const seen = new Set()
       const files = []
       for (const file of plan.files) {
-        if (!exactKeys(file, ['source', 'destination', 'executable'])) fail(`Mach-O closure file is invalid: ${name}`)
+        if (!exactKeys(file, ['source', 'destination', 'executable', 'formula', 'role'])) fail(`Mach-O closure file is invalid: ${name}`)
         files.push(await copyDeclaredFile({
           source: file.source,
           destination: file.destination,
-          role: file.executable ? 'executable' : 'code',
+          role: file.role,
           payload,
           seen,
+          expectedBytes: family.files.find((expected) => expected.destination === file.destination)?.bytes,
+          expectedSha256: family.files.find((expected) => expected.destination === file.destination)?.sha256,
         }))
       }
-      for (const asset of family.assets) {
-        files.push(await copyDeclaredFile({ ...asset, payload, seen }))
+      for (const license of family.licenses) {
+        if (license.source.startsWith('https://')) fail('Remote licenses must be materialized before pack staging.')
+        files.push(await copyDeclaredFile({
+          source: universe.resolveLockedFile(license.formula, license.source),
+          destination: license.destination,
+          role: 'license',
+          payload,
+          seen,
+          expectedBytes: license.bytes,
+          expectedSha256: license.sha256,
+        }))
       }
       await dependencies.applyRelocation({ name, payload, plan, architecture: target.machoArchitecture })
       await dependencies.probeFamily({

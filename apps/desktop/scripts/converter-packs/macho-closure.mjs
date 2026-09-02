@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { lstat, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, posix } from 'node:path'
-import { compareUtf8, fail, isPathInsideRoot, requireAbsolutePath, safeEntryPath } from './pack-tooling-lib.mjs'
+import { compareUtf8, fail, isPathInsideRoot, readStableRegularFile, requireAbsolutePath, safeEntryPath, sha256 } from './pack-tooling-lib.mjs'
 
 const systemPrefixes = ['/usr/lib/', '/System/Library/']
 
@@ -80,13 +80,6 @@ function systemDependency(path) {
   return systemPrefixes.some((prefix) => path.startsWith(prefix))
 }
 
-async function existingRegular(path) {
-  const resolved = await realpath(path).catch(() => undefined)
-  if (resolved === undefined) return undefined
-  const metadata = await lstat(resolved).catch(() => undefined)
-  return metadata?.isFile() && !metadata.isSymbolicLink() ? resolved : undefined
-}
-
 function expandAnchor(value, sourceDirectory, executableDirectory) {
   if (value === '@loader_path') return sourceDirectory
   if (value.startsWith('@loader_path/')) return join(sourceDirectory, value.slice('@loader_path/'.length))
@@ -96,22 +89,63 @@ function expandAnchor(value, sourceDirectory, executableDirectory) {
   return undefined
 }
 
-async function resolveDependency(dependency, inspection, node) {
+const cellarPlaceholder = /^@@HOMEBREW_CELLAR@@\/([a-z0-9][a-z0-9+_.@-]*)\/([A-Za-z0-9._+-]+)\/(.+)$/u
+const prefixPlaceholder = /^@@HOMEBREW_PREFIX@@\/opt\/([a-z0-9][a-z0-9+_.@-]*)\/(.+)$/u
+
+function lockedKey(formula, sourcePath) {
+  return `${formula}\0${sourcePath}`
+}
+
+function pathKey(path) {
+  return path.toLocaleLowerCase('en-US')
+}
+
+async function resolveDependency(dependency, inspection, node, locked) {
   if (systemDependency(dependency)) return undefined
+  const cellar = cellarPlaceholder.exec(dependency)
+  if (cellar) {
+    const [, formula, version, sourcePath] = cellar
+    const expected = locked.byFormulaPath.get(lockedKey(formula, sourcePath))
+    if (!expected) fail(`Mach-O dependency is undeclared: ${dependency}`)
+    locked.universe.cellar(formula, version)
+    return expected
+  }
+  const prefix = prefixPlaceholder.exec(dependency)
+  if (prefix) {
+    const [, formula, sourcePath] = prefix
+    const expected = locked.byFormulaPath.get(lockedKey(formula, sourcePath))
+    if (!expected) fail(`Mach-O dependency is undeclared: ${dependency}`)
+    locked.universe.opt(formula)
+    return expected
+  }
+  if (dependency.includes('@@HOMEBREW_')) fail(`Mach-O dependency contains an invalid Homebrew placeholder: ${dependency}`)
+  if (isAbsolute(dependency)) fail(`Mach-O host absolute dependency is forbidden: ${dependency}`)
   const sourceDirectory = dirname(node.source)
   if (dependency.startsWith('@rpath/')) {
     const suffix = dependency.slice('@rpath/'.length)
     for (const rpath of inspection.rpaths) {
-      const base = expandAnchor(rpath, sourceDirectory, node.executableDirectory)
+      let base
+      const cellarRpath = cellarPlaceholder.exec(rpath)
+      const prefixRpath = prefixPlaceholder.exec(rpath)
+      if (cellarRpath) {
+        const [, formula, version, sourcePath] = cellarRpath
+        base = join(locked.universe.cellar(formula, version), ...sourcePath.split('/'))
+      } else if (prefixRpath) {
+        const [, formula, sourcePath] = prefixRpath
+        base = join(locked.universe.opt(formula), ...sourcePath.split('/'))
+      } else {
+        if (rpath.includes('@@HOMEBREW_') || isAbsolute(rpath)) continue
+        base = expandAnchor(rpath, sourceDirectory, node.executableDirectory)
+      }
       if (base === undefined) continue
-      const candidate = await existingRegular(join(base, suffix))
+      const candidate = locked.bySource.get(pathKey(join(base, suffix)))
       if (candidate !== undefined) return candidate
     }
     fail(`Mach-O dependency is unresolved: ${dependency}`)
   }
   const expanded = expandAnchor(dependency, sourceDirectory, node.executableDirectory)
   if (expanded === undefined) fail(`Mach-O dependency is unresolved: ${dependency}`)
-  const candidate = await existingRegular(expanded)
+  const candidate = locked.bySource.get(pathKey(expanded))
   if (candidate === undefined) fail(`Mach-O dependency is unresolved: ${dependency}`)
   return candidate
 }
@@ -136,53 +170,136 @@ function replacementFor(fromDestination, dependencyDestination) {
   return `@loader_path/${relative}`
 }
 
-export async function planMachOClosure({ entrypoints, architecture, inspect }) {
+function packLocalLoaderDependency(destination, dependency) {
+  if (!dependency.startsWith('@loader_path/') || dependency.includes('@@HOMEBREW_')) return false
+  const suffix = dependency.slice('@loader_path/'.length)
+  if (suffix.length === 0 || suffix.includes('\\') || suffix.includes('\0') || posix.isAbsolute(suffix)) return false
+  return safeEntryPath(posix.normalize(posix.join(posix.dirname(destination), suffix)))
+}
+
+function validExpectedFile(file) {
+  return file
+    && typeof file === 'object'
+    && typeof file.formula === 'string'
+    && /^[a-z0-9][a-z0-9+_.@-]*$/u.test(file.formula)
+    && safeEntryPath(file.sourcePath)
+    && safeEntryPath(file.destination)
+    && /^[a-f0-9]{64}$/u.test(file.sha256)
+    && Number.isSafeInteger(file.bytes)
+    && file.bytes > 0
+    && typeof file.executable === 'boolean'
+    && (file.role === 'executable' || file.role === 'code' || file.role === 'data')
+    && (file.role === 'executable' ? file.executable : !file.executable)
+}
+
+function validExpectedRewrite(rewrite) {
+  return rewrite
+    && typeof rewrite === 'object'
+    && safeEntryPath(rewrite.destination)
+    && typeof rewrite.dependency === 'string'
+    && rewrite.dependency.length > 0
+    && typeof rewrite.replacement === 'string'
+    && rewrite.replacement.startsWith('@loader_path/')
+}
+
+function rewriteKey(rewrite) {
+  return `${rewrite.destination}\0${rewrite.dependency}\0${rewrite.replacement}`
+}
+
+export async function planMachOClosure({ entrypoints, architecture, inspect, universe, expectedFiles, expectedRewrites }) {
   if (
     !Array.isArray(entrypoints)
     || entrypoints.length === 0
     || (architecture !== 'arm64' && architecture !== 'x86_64')
     || typeof inspect !== 'function'
+    || !universe
+    || typeof universe.cellar !== 'function'
+    || typeof universe.opt !== 'function'
+    || typeof universe.resolveLockedFile !== 'function'
+    || typeof universe.contains !== 'function'
+    || !Array.isArray(expectedFiles)
+    || expectedFiles.length === 0
+    || expectedFiles.some((file) => !validExpectedFile(file))
+    || !Array.isArray(expectedRewrites)
+    || expectedRewrites.some((rewrite) => !validExpectedRewrite(rewrite))
   ) fail('Mach-O closure request is invalid.')
 
   const files = []
   const rewrites = []
-  const bySource = new Map()
+  const discoveredSources = new Set()
   const byDestination = new Map()
   const queue = []
+  const byFormulaPath = new Map()
+  const bySource = new Map()
+  const expectedRewriteKeys = new Set()
 
-  const add = async (source, destination, executable, executableDirectory) => {
-    if (!safeEntryPath(destination)) fail('Mach-O destination is unsafe.')
-    const resolved = await existingRegular(source)
-    if (resolved === undefined) fail(`Mach-O source is not a regular file: ${source}`)
-    const existingDestination = byDestination.get(destination.toLowerCase())
-    if (existingDestination !== undefined && existingDestination !== resolved) {
-      fail(`Mach-O destination collision: ${destination}`)
+  for (const rewrite of expectedRewrites) {
+    const key = rewriteKey(rewrite)
+    if (expectedRewriteKeys.has(key)) fail('Mach-O locked rewrite inventory contains a duplicate.')
+    expectedRewriteKeys.add(key)
+  }
+
+  for (const expected of expectedFiles) {
+    const key = lockedKey(expected.formula, expected.sourcePath)
+    if (byFormulaPath.has(key)) fail('Mach-O locked file inventory contains a duplicate.')
+    const destinationKey = expected.destination.toLocaleLowerCase('en-US')
+    if (byDestination.has(destinationKey)) fail(`Mach-O destination collision: ${expected.destination}`)
+    if (!expected.executable) {
+      const requiredDestination = expected.role === 'code'
+        ? `lib/${expected.formula}/${posix.basename(expected.sourcePath)}`
+        : undefined
+      if (requiredDestination && expected.destination !== requiredDestination) {
+        fail(`Mach-O library destination is not namespaced: ${expected.destination}`)
+      }
     }
-    const existing = bySource.get(resolved)
-    if (existing !== undefined) return existing
-    const node = { source: resolved, destination, executable, executableDirectory }
-    bySource.set(resolved, node)
-    byDestination.set(destination.toLowerCase(), resolved)
-    files.push({ source: resolved, destination, executable })
+    const source = universe.resolveLockedFile(expected.formula, expected.sourcePath)
+    requireAbsolutePath(source, 'Bottle universe file')
+    if (!universe.contains(source)) fail('Mach-O locked source is outside the bottle universe.')
+    const metadata = await lstat(source).catch(() => undefined)
+    if (!metadata?.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || await realpath(source).catch(() => undefined) !== source) {
+      fail('Mach-O locked source must be a canonical non-symbolic regular file.')
+    }
+    const bytes = await readStableRegularFile(source, 'Mach-O locked source')
+    if (bytes.byteLength !== expected.bytes) fail(`Mach-O locked file size differs: ${expected.destination}`)
+    if (sha256(bytes) !== expected.sha256) fail(`Mach-O locked file hash differs: ${expected.destination}`)
+    const node = { expected, source, destination: expected.destination, executable: expected.executable }
+    byFormulaPath.set(key, node)
+    if (bySource.has(pathKey(source))) fail('Mach-O locked source inventory contains a duplicate.')
+    bySource.set(pathKey(source), node)
+    byDestination.set(destinationKey, node)
+  }
+
+  const add = (node, executableDirectory) => {
+    if (discoveredSources.has(node.source)) return node
+    discoveredSources.add(node.source)
+    node.executableDirectory = executableDirectory
+    files.push({
+      source: node.source,
+      destination: node.destination,
+      executable: node.executable,
+      formula: node.expected.formula,
+      role: node.expected.role,
+    })
     queue.push(node)
     return node
   }
 
   for (const entrypoint of entrypoints) {
     if (typeof entrypoint !== 'object' || entrypoint === null) fail('Mach-O entrypoint is invalid.')
-    const source = await existingRegular(entrypoint.source)
-    if (source === undefined) fail('Mach-O entrypoint is invalid.')
-    await add(source, entrypoint.destination, true, dirname(source))
+    const node = bySource.get(pathKey(entrypoint.source))
+    if (!node || !node.executable || node.destination !== entrypoint.destination) fail('Mach-O entrypoint is not in the locked inventory.')
+    add(node, dirname(node.source))
   }
 
   for (let cursor = 0; cursor < queue.length; cursor += 1) {
     const node = queue[cursor]
+    if (node.expected.role === 'data') continue
     const inspection = validateInspection(await inspect(node.source), node.source, architecture)
     for (const dependency of inspection.dependencies) {
-      const resolved = await resolveDependency(dependency, inspection, node)
-      if (resolved === undefined) continue
-      if (resolved === node.source) continue
-      const dependencyNode = await add(resolved, `lib/${basename(resolved)}`, false, node.executableDirectory)
+      const dependencyNode = await resolveDependency(dependency, inspection, node, { byFormulaPath, bySource, universe })
+      if (dependencyNode === undefined) continue
+      if (dependencyNode.source === node.source) continue
+      add(dependencyNode, node.executableDirectory)
       rewrites.push({
         destination: node.destination,
         dependency,
@@ -191,14 +308,27 @@ export async function planMachOClosure({ entrypoints, architecture, inspect }) {
     }
   }
 
-  files.sort((left, right) => {
-    if (left.executable !== right.executable) return left.executable ? -1 : 1
-    return compareUtf8(left.destination, right.destination)
-  })
+  for (const node of byFormulaPath.values()) {
+    if (node.expected.role === 'data') {
+      if (!discoveredSources.has(node.source)) {
+        discoveredSources.add(node.source)
+        files.push({ source: node.source, destination: node.destination, executable: false, formula: node.expected.formula, role: 'data' })
+      }
+    } else if (!discoveredSources.has(node.source)) {
+      fail(`Mach-O locked file is declared but unreachable: ${node.destination}`)
+    }
+  }
+
+  files.sort((left, right) => compareUtf8(left.destination, right.destination))
   rewrites.sort((left, right) => compareUtf8(
     `${left.destination}\0${left.dependency}`,
     `${right.destination}\0${right.dependency}`,
   ))
+  const wantedRewrites = [...expectedRewrites].sort((left, right) => compareUtf8(rewriteKey(left), rewriteKey(right)))
+  if (
+    rewrites.length !== wantedRewrites.length
+    || rewrites.some((rewrite, index) => rewriteKey(rewrite) !== rewriteKey(wantedRewrites[index]))
+  ) fail('Mach-O discovered rewrites differ from the locked rewrite inventory.')
   return { files, rewrites }
 }
 
@@ -212,6 +342,7 @@ export async function relocateMachOClosure({ payload, architecture, plan, run = 
     || !Array.isArray(plan.rewrites)
   ) fail('Mach-O relocation request is invalid.')
   const resolvedPayload = await realpath(payload)
+  const rewritePairs = new Set()
   for (const rewrite of plan.rewrites) {
     if (
       typeof rewrite?.destination !== 'string'
@@ -220,6 +351,14 @@ export async function relocateMachOClosure({ payload, architecture, plan, run = 
       || !safeEntryPath(rewrite.destination)
       || !rewrite.replacement.startsWith('@loader_path/')
     ) fail('Mach-O rewrite is invalid.')
+    const replacementDestination = posix.normalize(posix.join(
+      posix.dirname(rewrite.destination),
+      rewrite.replacement.slice('@loader_path/'.length),
+    ))
+    if (!safeEntryPath(replacementDestination)) fail('Mach-O rewrite replacement is unsafe.')
+    const pair = `${rewrite.destination}\0${rewrite.dependency}`
+    if (rewritePairs.has(pair)) fail('Mach-O rewrite is duplicated.')
+    rewritePairs.add(pair)
     const binary = join(resolvedPayload, ...rewrite.destination.split('/'))
     if (!isPathInsideRoot(resolvedPayload, binary)) fail('Mach-O rewrite destination is unsafe.')
     await successfulRun(
@@ -232,21 +371,28 @@ export async function relocateMachOClosure({ payload, architecture, plan, run = 
   for (const file of plan.files) {
     if (typeof file?.destination !== 'string' || !safeEntryPath(file.destination)) fail('Mach-O closure file is invalid.')
     const binary = join(resolvedPayload, ...file.destination.split('/'))
+    if (file.role === 'data') continue
+    let ownIdentity
     if (!file.executable) {
+      const segments = file.destination.split('/')
+      const formula = typeof file.formula === 'string' ? file.formula : segments[0] === 'lib' ? segments[1] : undefined
+      if (!formula || segments[0] !== 'lib' || segments[1] !== formula) fail('Mach-O library destination is not namespaced.')
+      ownIdentity = `@rpath/autoforge/${formula}/${basename(file.destination)}`
       await successfulRun(
         run,
         '/usr/bin/install_name_tool',
-        ['-id', `@rpath/${basename(file.destination)}`, binary],
+        ['-id', ownIdentity, binary],
         'install_name_tool identity rewrite',
       )
     }
     const inspection = validateInspection(await inspectMachO(binary, { run }), binary, architecture)
-    const ownIdentity = file.executable ? undefined : `@rpath/${basename(file.destination)}`
     if (inspection.dependencies.some((dependency) => (
       !systemDependency(dependency)
-      && !dependency.startsWith('@loader_path/')
+      && !packLocalLoaderDependency(file.destination, dependency)
       && dependency !== ownIdentity
-    ))) fail(`Mach-O dependency remains unresolved after relocation: ${binary}`)
+    )) || inspection.rpaths.some((rpath) => rpath.includes('@@HOMEBREW_') || isAbsolute(rpath))) {
+      fail(`Mach-O dependency remains unresolved after relocation: ${binary}`)
+    }
   }
 }
 
@@ -256,7 +402,7 @@ export async function adhocSignMachOClosure({ payload, plan, run = defaultRun })
     fail('Mach-O ad-hoc signing request is invalid.')
   }
   const resolvedPayload = await realpath(payload)
-  const files = [...plan.files].sort((left, right) => (
+  const files = plan.files.filter((file) => file?.role !== 'data').sort((left, right) => (
     Number(left.executable) - Number(right.executable)
     || compareUtf8(left.destination, right.destination)
   ))
