@@ -26,7 +26,7 @@
     "converter-packs:sign-payload": "node scripts/converter-packs/sign-pack-payload.mjs",
     "converter-packs:stage": "node scripts/converter-packs/stage-production-packs.mjs",
     "converter-packs:verify-evidence": "node scripts/converter-packs/verify-release-evidence.mjs",
-    "converter-packs:verify-sources": "node scripts/converter-packs/source-lock.mjs",
+    "converter-packs:verify-sources": "node scripts/converter-packs/closure-lock.mjs",
     "converter-packs:verify-development": "node scripts/converter-packs/verify-local-development-release.mjs",
     "converter-packs:verify-workflows": "node scripts/converter-packs/validate-workflows.mjs",
     "verify:converter-packs": "node scripts/verify-converter-packs.mjs",

@@ -1,11 +1,13 @@
 import { Buffer } from 'node:buffer'
 import { dirname, posix, resolve } from 'node:path'
-import { URL } from 'node:url'
+import process from 'node:process'
+import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import {
   canonicalBytes,
   compareUtf8,
   fail,
   PACK_NAMES,
+  parseArguments,
   readStableRegularFile,
   requireAbsolutePath,
   safeEntryPath,
@@ -21,6 +23,7 @@ const versionSegmentPattern = /^[A-Za-z0-9._+-]+$/u
 const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const maximumClosureLockBytes = 64 * 1024 * 1024
 const maximumDownloadBytes = 1_800_000_000
+const defaultSourceLockPath = fileURLToPath(new URL('../../converter-packs/sources.lock.json', import.meta.url))
 
 function plainRecord(value) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
@@ -423,4 +426,35 @@ export async function loadConverterClosureLock({ sourceLockPath, target }) {
   const closureLock = validateTargetClosureLock(value, target)
   validateSourceRelationship(sourceLock, closureLock)
   return deepFreeze({ sourceLock, closureLock, target })
+}
+
+export async function loadConverterSourceLockMain(argv, {
+  stdout = process.stdout,
+  stderr = process.stderr,
+  load = loadConverterClosureLock,
+  defaultLockPath = defaultSourceLockPath,
+} = {}) {
+  const defaultMode = argv.length === 0
+  try {
+    if (defaultMode) {
+      for (const target of targets) await load({ sourceLockPath: defaultLockPath, target })
+      stdout.write('verified converter source locks for darwin-arm64 and darwin-x64\n')
+      return 0
+    }
+    const args = parseArguments(argv, ['--lock', '--target'])
+    if (typeof args['--lock'] !== 'string' || typeof args['--target'] !== 'string') fail('Source lock arguments are incomplete.')
+    await load({ sourceLockPath: args['--lock'], target: args['--target'] })
+    stdout.write(`verified converter source lock for ${args['--target']}\n`)
+    return 0
+  } catch {
+    stderr.write(defaultMode
+      ? 'checked-in converter schema-v2 locks are not ready\n'
+      : 'converter source lock verification failed\n')
+    return 1
+  }
+}
+
+const entry = process.argv[1]
+if (entry && import.meta.url === pathToFileURL(entry).href) {
+  process.exitCode = await loadConverterSourceLockMain(process.argv.slice(2))
 }

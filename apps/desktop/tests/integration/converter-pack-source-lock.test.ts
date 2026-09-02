@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
-import { loadConverterSourceLock, loadConverterSourceLockMain } from '../../scripts/converter-packs/source-lock.mjs'
+import { loadConverterSourceLockMain } from '../../scripts/converter-packs/closure-lock.mjs'
+import { loadConverterSourceLock } from '../../scripts/converter-packs/source-lock.mjs'
 
 const temporaryRoots: string[] = []
 const targets = ['darwin-arm64', 'darwin-x64'] as const
@@ -124,7 +125,7 @@ describe('converter pack source lock schema v2', () => {
       defaultLockPath: path,
       stdout: { write: (value: string) => { stdout.push(value); return true } },
       stderr: { write: () => { throw new Error('unexpected stderr') } },
-      loadClosure: async (request) => { calls.push({ path: request.sourceLockPath, target: request.target }) },
+      load: async (request) => { calls.push({ path: request.sourceLockPath, target: request.target }) },
     })
 
     expect(exitCode).toBe(0)
@@ -153,7 +154,7 @@ describe('converter pack source lock schema v2', () => {
     const exitCode = await loadConverterSourceLockMain(['--lock', path, '--target', 'darwin-x64'], {
       stdout: { write: () => true },
       stderr: { write: () => { throw new Error('unexpected stderr') } },
-      load: async (request) => { calls.push(request) },
+      load: async (request) => { calls.push({ path: request.sourceLockPath, target: request.target }) },
     })
 
     expect(exitCode).toBe(0)
@@ -168,7 +169,7 @@ describe('converter pack source lock schema v2', () => {
       defaultLockPath: secret,
       stdout: { write: () => { throw new Error('unexpected stdout') } },
       stderr: { write: (value: string) => { stderr.push(value); return true } },
-      loadClosure: async () => { throw new Error(`failed to read ${secret}`) },
+      load: async () => { throw new Error(`failed to read ${secret}`) },
     })
 
     expect(exitCode).toBe(1)

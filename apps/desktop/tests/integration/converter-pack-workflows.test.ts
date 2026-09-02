@@ -72,7 +72,7 @@ describe('converter pack workflows', () => {
     const normalizedReadme = readme.replace(/\s+/gu, ' ')
     const packageConfig = JSON.parse(readFileSync(packagePath, 'utf8')) as { scripts: Record<string, string> }
 
-    expect(packageConfig.scripts['converter-packs:verify-sources']).toBe('node scripts/converter-packs/source-lock.mjs')
+    expect(packageConfig.scripts['converter-packs:verify-sources']).toBe('node scripts/converter-packs/closure-lock.mjs')
     for (const contract of [
       '1.8 GB download ceiling',
       '10 GiB free-space requirement',
