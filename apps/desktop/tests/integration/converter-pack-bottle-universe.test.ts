@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { gzipSync } from 'node:zlib'
 import {
@@ -366,6 +366,34 @@ describe('converter bottle universe', () => {
       },
     })).rejects.toThrow('Bottle archive is invalid.')
     expect([changed?.dev, changed?.ino, changed?.size]).toEqual([original.dev, original.ino, original.size])
+  })
+
+  it.each(['source', 'transform'] as const)('settles a mid-stream %s failure and permits a clean retry', async (failurePoint) => {
+    const root = temporaryRoot()
+    const fixture = writeBottleArchive(root, `failed-${failurePoint}.tar.gz`, [{
+      path: 'vips/8.18.6/share/random.bin', bytes: randomBytes(512 * 1024), mode: 0o444,
+    }])
+    const options = {
+      archive: fixture.archive,
+      expectedBytes: fixture.compressed.byteLength,
+      expectedSha256: fixture.sha256,
+      ...(failurePoint === 'source'
+        ? {
+            beforeStreamForTest: (context: { compressed: import('node:fs').ReadStream }) => {
+              context.compressed.once('data', () => context.compressed.destroy(new Error('injected source failure')))
+            },
+          }
+        : {
+            authenticateChunkForTest: () => { throw new Error('injected transform failure') },
+          }),
+    }
+
+    await expect(readVerifiedBottleEntries(options)).rejects.toThrow('Bottle archive is invalid.')
+    await expect(readVerifiedBottleEntries({
+      archive: fixture.archive,
+      expectedBytes: fixture.compressed.byteLength,
+      expectedSha256: fixture.sha256,
+    })).resolves.toHaveLength(1)
   })
 
   it.each([
@@ -746,6 +774,93 @@ describe('converter bottle universe', () => {
     })).resolves.toBeDefined()
     expect(readFileSync(join(destination, 'bin', 'tool'))).toEqual(bytes)
     expect(existsSync(`${destination}.claim`)).toBe(false)
+  })
+
+  it('fails closed on a new incomplete claim and recovers it after its owner dies and initialization grace expires', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.from('initializing tool')
+    const bottle = writeBottleArchive(root, 'initializing.tar.gz', [{ path: 'initializing/1.0/bin/tool', bytes, mode: 0o555 }])
+    const parent = join(root, 'Cellar', 'initializing')
+    mkdirSync(parent, { recursive: true })
+    const destination = join(parent, '1.0')
+    const marker = join(root, 'initializing-ready')
+    const moduleUrl = new URL('../../scripts/converter-packs/bottle-universe.mjs', import.meta.url).href
+    const acquisition = { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength }
+    const selected = [{ sourcePath: 'bin/tool', sha256: sha256(bytes), bytes: bytes.byteLength, executable: true, role: 'executable' }]
+    const script = String.raw`
+      import { writeFile } from 'node:fs/promises'
+      const [moduleUrl, archive, acquisitionJson, selectedJson, destination, marker] = process.argv.slice(1)
+      const { extractVerifiedBottle } = await import(moduleUrl)
+      await extractVerifiedBottle({
+        archive, coordinate: { name: 'initializing', version: '1.0', acquisition: JSON.parse(acquisitionJson) },
+        selectedEntries: JSON.parse(selectedJson), destination,
+        afterClaimOpenForTest: async () => {
+          await writeFile(marker, 'ready')
+          await new Promise(() => { setInterval(() => {}, 1_000) })
+        },
+      })
+    `
+    const child = trackChild(spawn(process.execPath, [
+      '--input-type=module', '-e', script, moduleUrl, bottle.archive, JSON.stringify(acquisition), JSON.stringify(selected),
+      destination, marker,
+    ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] }))
+    await waitUntil(() => existsSync(marker))
+    expect(statSync(`${destination}.claim`).size).toBe(0)
+
+    await expect(extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: { name: 'initializing', version: '1.0', acquisition },
+      selectedEntries: selected,
+      destination,
+    })).rejects.toThrow('already claimed')
+
+    const closed = new Promise<void>((resolvePromise) => child.once('close', () => resolvePromise()))
+    child.kill('SIGKILL')
+    await closed
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 350))
+
+    await expect(extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: { name: 'initializing', version: '1.0', acquisition },
+      selectedEntries: selected,
+      destination,
+    })).resolves.toBeDefined()
+    expect(readFileSync(join(destination, 'bin', 'tool'))).toEqual(bytes)
+    expect(existsSync(`${destination}.claim`)).toBe(false)
+  })
+
+  it('releases the claim and stops cleanup after an injected private-root removal failure', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.from('cleanup tool')
+    const bottle = writeBottleArchive(root, 'cleanup.tar.gz', [{ path: 'cleanup/1.0/bin/tool', bytes, mode: 0o555 }])
+    const parent = join(root, 'Cellar', 'cleanup')
+    mkdirSync(parent, { recursive: true })
+    const destination = join(parent, '1.0')
+    const acquisition = { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength }
+    const selected = [{ sourcePath: 'bin/tool', sha256: sha256(bytes), bytes: bytes.byteLength, executable: true, role: 'executable' }]
+
+    const failure = await extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: { name: 'cleanup', version: '1.0', acquisition },
+      selectedEntries: selected,
+      destination,
+      beforePublishForTest: () => { throw new Error('primary bottle failure') },
+      removePrivateRootForTest: async () => { throw new Error('injected rm failure') },
+    }).then(() => undefined, (error: unknown) => error)
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).message).toBe('primary bottle failure')
+    expect((failure as AggregateError).errors.map((error) => (error as Error).message)).toEqual([
+      'primary bottle failure',
+      'injected rm failure',
+    ])
+    expect(existsSync(`${destination}.claim`)).toBe(false)
+
+    await expect(extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: { name: 'cleanup', version: '1.0', acquisition },
+      selectedEntries: selected,
+      destination,
+    })).resolves.toBeDefined()
   })
 
   it('does not replace an empty destination that appears after the claim is acquired', async () => {

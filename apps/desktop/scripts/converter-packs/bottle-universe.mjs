@@ -23,6 +23,7 @@ const roles = new Set(['executable', 'code', 'data', 'license'])
 const targets = new Set(['darwin-arm64', 'darwin-x64'])
 const noncePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
 const claimMaximumBytes = 1024
+const claimInitializationGraceMs = 250
 const claimHeartbeatMs = 5 * 1000
 const claimLeaseTimeoutMs = 30 * 1000
 
@@ -220,15 +221,14 @@ async function readDestinationClaim(path, allowedLinks = [1]) {
       || !allowedLinks.includes(opened.nlink)
       || current.dev !== opened.dev
       || current.ino !== opened.ino
-      || opened.size <= 0
-      || opened.size > claimMaximumBytes
     ) invalid()
+    if (opened.size > claimMaximumBytes) return { stat: opened }
     const bytes = await handle.readFile()
     let value
     try {
       value = JSON.parse(bytes.toString('utf8'))
     } catch {
-      invalid()
+      return { bytes, stat: opened }
     }
     if (
       !bytes.equals(canonicalBytes(value))
@@ -238,7 +238,7 @@ async function readDestinationClaim(path, allowedLinks = [1]) {
       || !noncePattern.test(value.nonce)
       || !Number.isSafeInteger(value.pid)
       || value.pid <= 0
-    ) invalid()
+    ) return { bytes, stat: opened }
     return { bytes, stat: opened, value }
   } finally {
     await handle.close()
@@ -288,7 +288,39 @@ async function fenceClaimForTakeover(path, expected) {
   return true
 }
 
-async function unlinkMatchingIdentity(path, expected) {
+async function fenceIncompleteClaimForTakeover(path, expected) {
+  const predecessor = `${path}.${expected.stat.dev}-${expected.stat.ino}.incomplete`
+  const identity = { dev: expected.stat.dev, ino: expected.stat.ino }
+  try {
+    await link(path, predecessor)
+  } catch (error) {
+    if (missing(error)) return false
+    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
+  }
+  const [current, preserved] = await Promise.all([
+    lstat(path).catch(() => undefined),
+    lstat(predecessor).catch(() => undefined),
+  ])
+  if (
+    !current?.isFile()
+    || current.isSymbolicLink()
+    || current.nlink !== 2
+    || !preserved?.isFile()
+    || preserved.isSymbolicLink()
+    || preserved.nlink !== 2
+    || current.dev !== identity.dev
+    || current.ino !== identity.ino
+    || preserved.dev !== identity.dev
+    || preserved.ino !== identity.ino
+  ) invalid()
+  if (!await unlinkMatchingIdentity(path, identity, [2])) return false
+  await syncDirectory(dirname(path))
+  await unlinkMatchingIdentity(predecessor, identity)
+  await syncDirectory(dirname(path))
+  return true
+}
+
+async function unlinkMatchingIdentity(path, expected, allowedLinks = [1]) {
   const current = await lstat(path).catch((error) => {
     if (missing(error)) return undefined
     throw error
@@ -296,7 +328,7 @@ async function unlinkMatchingIdentity(path, expected) {
   if (
     !current?.isFile()
     || current.isSymbolicLink()
-    || current.nlink !== 1
+    || !allowedLinks.includes(current.nlink)
     || current.dev !== expected.dev
     || current.ino !== expected.ino
   ) return false
@@ -306,7 +338,7 @@ async function unlinkMatchingIdentity(path, expected) {
   return true
 }
 
-async function acquireDestinationClaim(destination) {
+async function acquireDestinationClaim(destination, afterClaimOpenForTest) {
   const path = `${destination}.claim`
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const nonce = randomUUID()
@@ -321,6 +353,7 @@ async function acquireDestinationClaim(destination) {
         0o600,
       )
       created = await handle.stat()
+      await afterClaimOpenForTest?.({ claimPath: path })
       await handle.writeFile(bytes)
       await handle.sync()
       await syncDirectory(dirname(path))
@@ -341,6 +374,13 @@ async function acquireDestinationClaim(destination) {
     if (!metadata) continue
     const current = await readDestinationClaim(path, metadata.nlink === 2 ? [2] : [1])
     if (!current) continue
+    if (!current.value) {
+      if (Date.now() - current.stat.mtimeMs <= claimInitializationGraceMs) {
+        fail('Bottle extraction destination is already claimed.')
+      }
+      await fenceIncompleteClaimForTakeover(path, current)
+      continue
+    }
     const fresh = Date.now() - current.stat.mtimeMs <= claimLeaseTimeoutMs
     if (fresh && ownerAlive(current.value.pid)) fail('Bottle extraction destination is already claimed.')
     await fenceClaimForTakeover(path, current)
@@ -404,10 +444,36 @@ function startDestinationClaimHeartbeat(claim) {
   }
 }
 
+async function collectCleanupErrors(actions) {
+  const errors = []
+  for (const action of actions) {
+    try {
+      await action()
+    } catch (error) {
+      errors.push(error)
+    }
+  }
+  return errors
+}
+
+function finishAfterCleanup({ failed, primaryError, cleanupErrors, cleanupMessage }) {
+  if (failed) {
+    if (cleanupErrors.length > 0) {
+      const message = primaryError instanceof Error ? primaryError.message : 'Bottle operation failed.'
+      throw new AggregateError([primaryError, ...cleanupErrors], message)
+    }
+    throw primaryError
+  }
+  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, cleanupMessage)
+}
+
 async function releaseDestinationClaim(claim) {
-  await claim.handle.close().catch(() => undefined)
-  await unlinkMatchingClaim(claim.path, claim)
-  await syncDirectory(dirname(claim.path))
+  const errors = await collectCleanupErrors([
+    () => claim.handle.close(),
+    () => unlinkMatchingClaim(claim.path, claim),
+    () => syncDirectory(dirname(claim.path)),
+  ])
+  if (errors.length > 0) throw new AggregateError(errors, 'Bottle claim release failed.')
 }
 
 async function writeAll(handle, bytes, position) {
@@ -453,9 +519,15 @@ export async function extractVerifiedBottle({
   selectedEntries,
   destination,
   beforePublishForTest,
+  afterClaimOpenForTest,
+  removePrivateRootForTest,
 }) {
   validateCoordinate(coordinate)
-  if (beforePublishForTest !== undefined && typeof beforePublishForTest !== 'function') invalid()
+  if (
+    (beforePublishForTest !== undefined && typeof beforePublishForTest !== 'function')
+    || (afterClaimOpenForTest !== undefined && typeof afterClaimOpenForTest !== 'function')
+    || (removePrivateRootForTest !== undefined && typeof removePrivateRootForTest !== 'function')
+  ) invalid()
   requireAbsolutePath(destination, 'Bottle extraction destination')
   const parent = dirname(destination)
   await requireDirectory(parent, 'Bottle extraction parent')
@@ -464,10 +536,12 @@ export async function extractVerifiedBottle({
   const acquisition = coordinate.acquisition
   const rootPrefix = `${coordinate.name}/${coordinate.version}/`
   const selectedByArchivePath = new Map(selected.map((entry) => [`${rootPrefix}${entry.sourcePath}`, entry]))
-  const claim = await acquireDestinationClaim(destination)
+  const claim = await acquireDestinationClaim(destination, afterClaimOpenForTest)
   const claimHeartbeat = startDestinationClaimHeartbeat(claim)
   let privateRoot
   let published = false
+  let failed = false
+  let primaryError
   const openHandles = new Set()
   try {
     if (await lstat(destination).catch(() => undefined)) invalid()
@@ -544,12 +618,27 @@ export async function extractVerifiedBottle({
     await rename(privateRoot, destination)
     await syncDirectory(parent)
     published = true
-  } finally {
-    await Promise.allSettled([...openHandles].map((handle) => handle.close()))
-    if (!published && privateRoot !== undefined) await rm(privateRoot, { recursive: true, force: true })
-    await claimHeartbeat.stop()
-    await releaseDestinationClaim(claim)
+  } catch (error) {
+    failed = true
+    primaryError = error
   }
+  const cleanupActions = [
+    ...[...openHandles].map((handle) => () => handle.close()),
+    ...(!published && privateRoot !== undefined
+      ? [() => removePrivateRootForTest
+          ? removePrivateRootForTest(privateRoot)
+          : rm(privateRoot, { recursive: true, force: true })]
+      : []),
+    () => claimHeartbeat.stop(),
+    () => releaseDestinationClaim(claim),
+  ]
+  const cleanupErrors = await collectCleanupErrors(cleanupActions)
+  finishAfterCleanup({
+    failed,
+    primaryError,
+    cleanupErrors,
+    cleanupMessage: 'Bottle extraction cleanup failed.',
+  })
   return Object.freeze(selected.map((entry) => Object.freeze({
     sourcePath: entry.sourcePath,
     path: join(destination, ...entry.sourcePath.split('/')),
@@ -675,6 +764,8 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
   const claimHeartbeat = startDestinationClaimHeartbeat(claim)
   let privateRoot
   let published = false
+  let failed = false
+  let primaryError
   try {
     if (await lstat(outputRoot).catch(() => undefined)) invalid()
     privateRoot = await createPrivateDirectory(parent, '.bottle-universe-')
@@ -721,11 +812,23 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
     await rename(privateRoot, outputRoot)
     await syncDirectory(parent)
     published = true
-  } finally {
-    if (!published && privateRoot !== undefined) await rm(privateRoot, { recursive: true, force: true })
-    await claimHeartbeat.stop()
-    await releaseDestinationClaim(claim)
+  } catch (error) {
+    failed = true
+    primaryError = error
   }
+  const cleanupErrors = await collectCleanupErrors([
+    ...(!published && privateRoot !== undefined
+      ? [() => rm(privateRoot, { recursive: true, force: true })]
+      : []),
+    () => claimHeartbeat.stop(),
+    () => releaseDestinationClaim(claim),
+  ])
+  finishAfterCleanup({
+    failed,
+    primaryError,
+    cleanupErrors,
+    cleanupMessage: 'Bottle universe cleanup failed.',
+  })
 
   const publishedRecords = records.map((record) => {
     const root = join(outputRoot, 'Cellar', record.name, record.version)

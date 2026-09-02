@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { TextDecoder } from 'node:util'
 import { Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { createGunzip } from 'node:zlib'
 import { posix } from 'node:path'
 import { fail, requireAbsolutePath, withStableRegularFile } from './pack-tooling-lib.mjs'
@@ -268,45 +269,13 @@ async function hashOpenFile(handle, expectedBytes) {
   return digest.digest('hex')
 }
 
-async function drainReadable(readable) {
-  if (readable.readableEnded || readable.destroyed) return
-  await new Promise((resolvePromise, rejectPromise) => {
-    const cleanup = () => {
-      readable.off('end', onEnd)
-      readable.off('error', onError)
-      readable.off('close', onClose)
-    }
-    const onEnd = () => {
-      cleanup()
-      resolvePromise()
-    }
-    const onError = (error) => {
-      cleanup()
-      rejectPromise(error)
-    }
-    const onClose = () => {
-      cleanup()
-      if (readable.readableEnded) resolvePromise()
-      else rejectPromise(new Error('Compressed bottle stream closed early.'))
-    }
-    readable.once('end', onEnd)
-    readable.once('error', onError)
-    readable.once('close', onClose)
-    if (readable.readableEnded) {
-      cleanup()
-      resolvePromise()
-      return
-    }
-    readable.resume()
-  })
-}
-
 export async function scanVerifiedBottleEntries({
   archive,
   expectedBytes,
   expectedSha256,
   onFile,
   beforeStreamForTest,
+  authenticateChunkForTest,
 }) {
   requireAbsolutePath(archive, 'Bottle archive path')
   if (
@@ -316,12 +285,17 @@ export async function scanVerifiedBottleEntries({
     || !sha256Pattern.test(expectedSha256)
     || (onFile !== undefined && typeof onFile !== 'function')
     || (beforeStreamForTest !== undefined && typeof beforeStreamForTest !== 'function')
+    || (authenticateChunkForTest !== undefined && typeof authenticateChunkForTest !== 'function')
   ) invalid()
   return withStableRegularFile(archive, 'Bottle archive', async (handle, metadata) => {
     if (metadata.size !== expectedBytes) invalid()
     if (await hashOpenFile(handle, expectedBytes) !== expectedSha256) invalid()
-    await beforeStreamForTest?.({ archive })
-    const compressed = handle.createReadStream({ autoClose: false, start: 0, end: expectedBytes - 1 })
+    const compressed = handle.createReadStream({
+      autoClose: false,
+      autoDestroy: false,
+      start: 0,
+      end: expectedBytes - 1,
+    })
     const streamedDigest = createHash('sha256')
     let streamedBytes = 0
     const authenticated = new Transform({
@@ -332,13 +306,28 @@ export async function scanVerifiedBottleEntries({
           return
         }
         streamedDigest.update(chunk)
-        callback(null, chunk)
+        try {
+          authenticateChunkForTest?.({ chunk, streamedBytes })
+          callback(null, chunk)
+        } catch (error) {
+          callback(error)
+        }
       },
     })
     const gunzip = createGunzip()
+    let pipelinePromise
+    let compressedPromise
+    const forwardCompressedError = (error) => authenticated.destroy(error)
     try {
-      compressed.pipe(authenticated).pipe(gunzip)
-      const entries = await scanTar(gunzip, onFile)
+      await beforeStreamForTest?.({ archive, compressed })
+      compressed.once('error', forwardCompressedError)
+      pipelinePromise = pipeline(authenticated, gunzip)
+      compressedPromise = new Promise((resolvePromise, rejectPromise) => {
+        compressed.once('end', resolvePromise)
+        compressed.once('error', rejectPromise)
+      })
+      compressed.pipe(authenticated)
+      const [entries] = await Promise.all([scanTar(gunzip, onFile), pipelinePromise, compressedPromise])
       if (streamedBytes !== expectedBytes || streamedDigest.digest('hex') !== expectedSha256) invalid()
       return entries
     } catch (error) {
@@ -348,11 +337,12 @@ export async function scanVerifiedBottleEntries({
       ) throw error
       invalid()
     } finally {
+      compressed.off('error', forwardCompressedError)
       compressed.unpipe(authenticated)
-      authenticated.unpipe(gunzip)
+      if (!compressed.readableEnded && !compressed.destroyed) compressed.resume()
       authenticated.destroy()
       gunzip.destroy()
-      await drainReadable(compressed).catch(() => invalid())
+      await Promise.allSettled([pipelinePromise, compressedPromise].filter(Boolean))
     }
   })
 }
