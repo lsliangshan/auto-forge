@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { gzipSync } from 'node:zlib'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import process from 'node:process'
@@ -450,7 +450,7 @@ describe('converter pack lock generation', () => {
     expect(existsSync(join(root, 'oversized.bin'))).toBe(false)
   })
 
-  it('durably publishes through short writes and recovers a fully synced SIGKILL temp', async () => {
+  it('durably publishes through short writes and recovers only a directory-synced ready temp', async () => {
     const root = temporaryRoot()
     const shortDestination = join(root, 'short.json')
     const bytes = canonicalBytes({ durable: true, value: 'short-write' })
@@ -475,16 +475,94 @@ describe('converter pack lock generation', () => {
         destination: ${JSON.stringify(interruptedDestination)},
         bytes: Buffer.from(${JSON.stringify(bytes.toString('base64'))}, 'base64'),
         mode: 0o600,
-        afterTempSyncForTest: () => process.kill(process.pid, 'SIGKILL'),
+        afterReadySyncForTest: () => process.kill(process.pid, 'SIGKILL'),
       })
     `])
     expect(child.signal).toBe('SIGKILL')
     expect(existsSync(interruptedDestination)).toBe(false)
-    expect(readdirSync(root).some((name) => name.startsWith('.interrupted.json.autoforge-tmp-'))).toBe(true)
+    expect(readdirSync(root).some((name) => name.startsWith('.interrupted.json.autoforge-ready-'))).toBe(true)
 
     await publishDurableLockFile({ destination: interruptedDestination, bytes, mode: 0o600 })
     expect(readFileSync(interruptedDestination)).toEqual(bytes)
-    expect(readdirSync(root).some((name) => name.startsWith('.interrupted.json.autoforge-tmp-'))).toBe(false)
+    expect(readdirSync(root).some((name) => name.startsWith('.interrupted.json.autoforge-ready-'))).toBe(false)
+  })
+
+  it.each([
+    ['mid-write', `writeChunkForTest: async ({ write }) => { await write(1); process.kill(process.pid, 'SIGKILL') },`],
+    ['pre-chmod', `afterWriteForTest: () => process.kill(process.pid, 'SIGKILL'),`],
+    ['pre-fsync', `afterChmodForTest: () => process.kill(process.pid, 'SIGKILL'),`],
+  ])('never recovers a %s writing-stage temp', async (_label, hook) => {
+    const root = temporaryRoot()
+    const destination = join(root, `${_label}.json`)
+    const bytes = canonicalBytes({ phase: _label, complete: true })
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts', 'converter-packs', 'durable-lock-publication.mjs')).href
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { Buffer } from 'node:buffer'
+      import { publishDurableLockFile } from ${JSON.stringify(moduleUrl)}
+      await publishDurableLockFile({
+        destination: ${JSON.stringify(destination)},
+        bytes: Buffer.from(${JSON.stringify(bytes.toString('base64'))}, 'base64'),
+        mode: 0o644,
+        ${hook}
+      })
+    `])
+    expect(child.signal).toBe('SIGKILL')
+    expect(existsSync(destination)).toBe(false)
+    const writingName = readdirSync(root).find((name) => name.startsWith(`.${_label}.json.autoforge-writing-`))!
+    const interruptedInode = statSync(join(root, writingName)).ino
+
+    await publishDurableLockFile({ destination, bytes, mode: 0o644 })
+
+    expect(readFileSync(destination)).toEqual(bytes)
+    expect(statSync(destination).ino).not.toBe(interruptedInode)
+    expect(readdirSync(root).some((name) => name.includes('.autoforge-writing-'))).toBe(false)
+  })
+
+  it('recovers a post-link crash and does not publish after ready-directory fsync failure', async () => {
+    const root = temporaryRoot()
+    const bytes = canonicalBytes({ durable: 'post-link' })
+    const destination = join(root, 'post-link.json')
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts', 'converter-packs', 'durable-lock-publication.mjs')).href
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { Buffer } from 'node:buffer'
+      import { publishDurableLockFile } from ${JSON.stringify(moduleUrl)}
+      await publishDurableLockFile({
+        destination: ${JSON.stringify(destination)},
+        bytes: Buffer.from(${JSON.stringify(bytes.toString('base64'))}, 'base64'),
+        mode: 0o600,
+        afterLinkForTest: () => process.kill(process.pid, 'SIGKILL'),
+      })
+    `])
+    expect(child.signal).toBe('SIGKILL')
+    expect(readFileSync(destination)).toEqual(bytes)
+    expect(readdirSync(root).some((name) => name.startsWith('.post-link.json.autoforge-ready-'))).toBe(true)
+    await publishDurableLockFile({ destination, bytes, mode: 0o600 })
+    expect(readdirSync(root).some((name) => name.startsWith('.post-link.json.autoforge-ready-'))).toBe(false)
+
+    const failed = join(root, 'dir-fsync.json')
+    await expect(publishDurableLockFile({
+      destination: failed,
+      bytes,
+      mode: 0o600,
+      syncDirectoryForTest: ({ stage, run }: { stage: string; run: () => Promise<void> }) => (
+        stage === 'ready' ? Promise.reject(new Error('ready directory fsync failed')) : run()
+      ),
+    })).rejects.toThrow('ready directory fsync failed')
+    expect(existsSync(failed)).toBe(false)
+    await publishDurableLockFile({ destination: failed, bytes, mode: 0o600 })
+    expect(readFileSync(failed)).toEqual(bytes)
+  })
+
+  it('checks a recovered ready temp mode before publishing it', async () => {
+    const root = temporaryRoot()
+    const destination = join(root, 'mode.json')
+    const bytes = canonicalBytes({ durable: 'mode' })
+    const ready = join(root, '.mode.json.autoforge-ready-12345678-1234-4123-8123-123456789abc')
+    writeFileSync(ready, bytes, { mode: 0o600 })
+    chmodSync(ready, 0o600)
+
+    await expect(publishDurableLockFile({ destination, bytes, mode: 0o644 })).rejects.toThrow(/mode|unsafe/iu)
+    expect(existsSync(destination)).toBe(false)
   })
 
   it('reports the primary durable-publication failure before cleanup failures', async () => {
