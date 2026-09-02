@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
+import { execFile } from 'node:child_process'
 import { constants, lstatSync, realpathSync } from 'node:fs'
 import { link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import process from 'node:process'
+import { promisify } from 'node:util'
 import { canonicalBytes, withStableRegularFile } from './pack-tooling-lib.mjs'
 
 const FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/
@@ -19,8 +21,10 @@ const CLAIM_PREDECESSOR_PATTERN = /^\.cache-mutation\.claim\.([a-f0-9-]+)\.prede
 const ACTIVE_MARKER_TEMP_PATTERN = /^\.active-release-([a-f0-9-]{36})\.tmp$/u
 const PREPARATION_WORKSPACE_LIMIT = 8
 const PREPARATION_OWNER_PATTERN = /^\.owner-([a-f0-9-]{36})\.(writing|ready)$/u
+const PROCESS_BIRTH_PATTERN = /^(?:Fri|Mon|Sat|Sun|Thu|Tue|Wed) (?:Apr|Aug|Dec|Feb|Jan|Jul|Jun|Mar|May|Nov|Oct|Sep) (?: [1-9]|[12]\d|3[01]) \d{2}:\d{2}:\d{2} \d{4}$/u
 const REPLACED_RELEASE_PATTERN = /^\.replaced-active-release-([a-f0-9]{64})-([a-f0-9-]{36})$/u
 const REPLACED_RELEASE_LIMIT = 4
+const execFileAsync = promisify(execFile)
 
 function missing(error) {
   return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
@@ -46,6 +50,27 @@ function ownerAlive(pid) {
   } catch (error) {
     return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'EPERM')
   }
+}
+
+async function readProcessIdentity(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Development preparation process identity request is invalid')
+  let output
+  try {
+    output = await execFileAsync('/bin/ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8',
+      maxBuffer: 256,
+      timeout: 1_000,
+    })
+  } catch (error) {
+    if (error?.code === 1 && !error.stdout && !error.stderr) return undefined
+    throw new Error('Development preparation process identity could not be read', { cause: error })
+  }
+  if (output.stderr !== '' || Buffer.byteLength(output.stdout) > 128) {
+    throw new Error('Development preparation process identity is invalid')
+  }
+  const birth = output.stdout.trim()
+  if (!PROCESS_BIRTH_PATTERN.test(birth)) throw new Error('Development preparation process identity is invalid')
+  return birth
 }
 
 async function syncDirectory(path) {
@@ -370,11 +395,12 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
   }
 }
 
-async function recoverPreparationWorkspaces(root, fingerprint, heartbeat) {
+async function recoverPreparationWorkspaces(root, fingerprint, heartbeat, processIdentity = readProcessIdentity) {
   const prefix = `.local-development-preparation-${fingerprint.slice(0, 12)}`
   const names = (await readdir(root)).filter((name) => name === prefix || new RegExp(`^${prefix}-[A-Za-z0-9]{6}$`, 'u').test(name))
   let recovered = false
   let activeCount = 0
+  const processIdentities = new Map()
   for (const name of names) {
     const path = join(root, name)
     const details = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
@@ -398,15 +424,17 @@ async function recoverPreparationWorkspaces(root, fingerprint, heartbeat) {
       let value
       try { value = JSON.parse(owner.bytes.toString('utf8')) } catch { throw new Error('Development preparation owner is invalid') }
       if (!owner.bytes.equals(canonicalBytes(value))
-        || Object.keys(value).sort().join('\0') !== ['fingerprint', 'nonce', 'pid', 'schemaVersion'].join('\0')
+        || Object.keys(value).sort().join('\0') !== ['birth', 'fingerprint', 'nonce', 'pid', 'schemaVersion'].join('\0')
+        || !PROCESS_BIRTH_PATTERN.test(value.birth)
         || value.fingerprint !== fingerprint
         || value.nonce !== ownerMatch[1]
         || !Number.isSafeInteger(value.pid)
         || value.pid <= 0
-        || value.schemaVersion !== 1) {
+        || value.schemaVersion !== 2) {
         throw new Error('Development preparation owner is invalid')
       }
-      if (ownerAlive(value.pid) && Date.now() - owner.metadata.mtimeMs <= CLAIM_LEASE_MS) {
+      if (!processIdentities.has(value.pid)) processIdentities.set(value.pid, await processIdentity(value.pid))
+      if (processIdentities.get(value.pid) === value.birth) {
         activeCount += 1
         continue
       }
@@ -478,6 +506,7 @@ function startPreparationOwnerHeartbeat({ path, handle, identity, bytes }) {
 export async function createDevelopmentPreparationWorkspace({
   cacheRoot,
   fingerprint,
+  processIdentity = readProcessIdentity,
   afterWorkspaceCreateForTest,
   afterOwnerWriteForTest,
   afterOwnerFileSyncForTest,
@@ -485,16 +514,19 @@ export async function createDevelopmentPreparationWorkspace({
 }) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
+  if (typeof processIdentity !== 'function') throw new Error('Development preparation process identity reader is invalid')
   return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
-    const recovered = await recoverPreparationWorkspaces(root, fingerprint, heartbeat)
+    const recovered = await recoverPreparationWorkspaces(root, fingerprint, heartbeat, processIdentity)
     if (recovered.activeCount >= PREPARATION_WORKSPACE_LIMIT) {
       throw new Error('Development preparation workspace limit was reached')
     }
+    const birth = await processIdentity(process.pid)
+    if (!PROCESS_BIRTH_PATTERN.test(birth)) throw new Error('Development preparation process identity is invalid')
     const privateRoot = await realpath(await mkdtemp(join(root, `.local-development-preparation-${fingerprint.slice(0, 12)}-`)))
     const nonce = randomUUID()
     const writing = join(privateRoot, `.owner-${nonce}.writing`)
     const ready = join(privateRoot, `.owner-${nonce}.ready`)
-    const ownerBytes = canonicalBytes({ fingerprint, nonce, pid: process.pid, schemaVersion: 1 })
+    const ownerBytes = canonicalBytes({ birth, fingerprint, nonce, pid: process.pid, schemaVersion: 2 })
     let ownerHandle
     try {
       await afterWorkspaceCreateForTest?.({ privateRoot })

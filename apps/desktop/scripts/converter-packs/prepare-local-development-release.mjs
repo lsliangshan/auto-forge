@@ -59,6 +59,7 @@ const maximumNativeHelperSourceBytes = 1024 * 1024
 const maximumNativeHelperInventoryBytes = 4 * 1024 * 1024
 
 const productionDependencies = Object.freeze({
+  createWorkspace: (request) => createDevelopmentPreparationWorkspace(request),
   buildHelpers: (request) => buildNativeHelpers(request),
   preparePlan: (request) => prepareProductionStagingPlan(request),
   stagePacks: ({ plan }) => stageProductionPacks(plan),
@@ -172,7 +173,7 @@ export async function developmentFingerprintInputs(desktopRoot) {
 
 function validateDependencies(dependencies) {
   if (!isPlainRecord(dependencies) || [
-    'buildHelpers', 'preparePlan', 'stagePacks', 'buildRelease', 'verifyRelease', 'smokeRelease',
+    'createWorkspace', 'buildHelpers', 'preparePlan', 'stagePacks', 'buildRelease', 'verifyRelease', 'smokeRelease',
     'writeMetadata', 'replaceActiveRelease', 'activateRelease', 'pruneCache',
   ].some((name) => typeof dependencies[name] !== 'function')
     || (dependencies.removeRelease !== undefined && typeof dependencies.removeRelease !== 'function')
@@ -247,7 +248,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
   }
   if (!replaceActive && await hasRelease(paths.release)) await removeRelease(paths.release)
 
-  const privateWorkspace = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+  const privateWorkspace = await dependencies.createWorkspace({ cacheRoot, fingerprint })
   const privateRoot = privateWorkspace.path
   let primaryError
   try {

@@ -13,6 +13,7 @@ import {
 } from '../../scripts/converter-packs/prepare-local-development-release.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 import {
+  createDevelopmentPreparationWorkspace,
   replaceActiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
 } from '../../scripts/converter-packs/local-development-release-cache.mjs'
@@ -245,6 +246,9 @@ function request({ desktopRoot, cacheRoot }: { desktopRoot: string, cacheRoot: s
 
 function dependencies(events: string[], overrides: Record<string, unknown> = {}) {
   return {
+    createWorkspace: (value: Parameters<typeof createDevelopmentPreparationWorkspace>[0]) => (
+      createDevelopmentPreparationWorkspace({ ...value, processIdentity: async () => 'Tue Jan  2 00:00:00 2024' })
+    ),
     buildHelpers: async ({ output }: { output: string }) => {
       events.push('helpers')
       await mkdir(output)
@@ -300,6 +304,10 @@ it('runs the public cold entry through real lock, acquisition, universe, metadat
   const result = await prepareLocalDevelopmentRelease({
     desktopRoot, cacheRoot, platform: 'darwin', arch: 'arm64', compiler,
   }, {
+    createWorkspace: (value) => createDevelopmentPreparationWorkspace({
+      ...value,
+      processIdentity: async () => 'Tue Jan  2 00:00:00 2024',
+    }),
     buildHelpers: (value: Parameters<typeof buildNativeHelpers>[0]) => buildNativeHelpers(value),
     preparePlan: (value: Parameters<typeof prepareProductionStagingPlan>[0]) => prepareProductionStagingPlan(value, {
       loadLocks: (request) => loadConverterClosureLock(request),

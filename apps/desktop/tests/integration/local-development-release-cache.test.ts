@@ -20,6 +20,8 @@ import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.m
 
 const roots: string[] = []
 const children = new Set<ReturnType<typeof spawn>>()
+const testBirth = 'Tue Jan  2 00:00:00 2024'
+const testProcessIdentity = async (pid: number) => pid === process.pid ? testBirth : undefined
 
 afterEach(() => {
   for (const child of children) {
@@ -53,12 +55,17 @@ function createRelease(cacheRoot: string, fingerprint: string): string {
   return release
 }
 
-function createReadyWorkspace(cacheRoot: string, fingerprint: string, index: number, age = Date.now() / 1000) {
+function createReadyWorkspace(
+  cacheRoot: string,
+  fingerprint: string,
+  index: number,
+  { age = Date.now() / 1000, birth = 'Tue Jan  2 00:00:00 2024' } = {},
+) {
   const nonce = randomUUID()
   const path = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}-A${String(index).padStart(5, '0')}`)
   mkdirSync(path)
   const owner = join(path, `.owner-${nonce}.ready`)
-  writeFileSync(owner, canonicalBytes({ fingerprint, nonce, pid: process.pid, schemaVersion: 1 }))
+  writeFileSync(owner, canonicalBytes({ birth, fingerprint, nonce, pid: process.pid, schemaVersion: 2 }))
   chmodSync(owner, 0o444)
   utimesSync(owner, age, age)
   return path
@@ -77,11 +84,12 @@ describe('local development release cache', () => {
     await expect(createDevelopmentPreparationWorkspace({
       cacheRoot,
       fingerprint,
+      processIdentity: testProcessIdentity,
       [hook]: async () => { throw new Error(`owner ${_phase} failure`) },
     })).rejects.toThrow(`owner ${_phase} failure`)
     expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.local-development-preparation-'))).toEqual([])
 
-    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint, processIdentity: testProcessIdentity })
     expect(readdirSync(lease.path).filter((name) => name.endsWith('.ready'))).toHaveLength(1)
     await lease.stop()
     rmSync(lease.path, { recursive: true })
@@ -99,11 +107,12 @@ describe('local development release cache', () => {
     const moduleUrl = new URL('../../scripts/converter-packs/local-development-release-cache.mjs', import.meta.url).href
     const script = String.raw`
       import { writeFile } from 'node:fs/promises'
-      const [moduleUrl, cacheRoot, fingerprint, marker, hook] = process.argv.slice(1)
+      const [moduleUrl, cacheRoot, fingerprint, marker, hook, birth] = process.argv.slice(1)
       const { createDevelopmentPreparationWorkspace } = await import(moduleUrl)
       await createDevelopmentPreparationWorkspace({
         cacheRoot,
         fingerprint,
+        processIdentity: async () => birth,
         [hook]: async () => {
           await writeFile(marker, 'ready')
           await new Promise(() => globalThis.setInterval(() => {}, 1_000))
@@ -111,7 +120,7 @@ describe('local development release cache', () => {
       })
     `
     const child = spawn(process.execPath, [
-      '--input-type=module', '-e', script, moduleUrl, cacheRoot, fingerprint, marker, hook,
+      '--input-type=module', '-e', script, moduleUrl, cacheRoot, fingerprint, marker, hook, testBirth,
     ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] })
     children.add(child)
     const closed = new Promise<void>((resolvePromise) => child.once('close', () => resolvePromise()))
@@ -120,7 +129,7 @@ describe('local development release cache', () => {
     await closed
     children.delete(child)
 
-    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint, processIdentity: testProcessIdentity })
     expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.local-development-preparation-'))).toEqual([
       lease.path.split('/').at(-1),
     ])
@@ -128,26 +137,44 @@ describe('local development release cache', () => {
     rmSync(lease.path, { recursive: true })
   })
 
-  it('expires a reused PID lease before enforcing the eight-workspace bound', async () => {
+  it('reclaims a reused PID owner before enforcing the eight-workspace bound', async () => {
     const cacheRoot = join(temporaryRoot(), 'cache')
     mkdirSync(cacheRoot)
     const fingerprint = '9'.repeat(64)
-    const expired = createReadyWorkspace(cacheRoot, fingerprint, 0, 1)
+    const expired = createReadyWorkspace(cacheRoot, fingerprint, 0, { birth: 'Mon Jan  1 00:00:00 2024' })
     for (let index = 1; index < 8; index += 1) createReadyWorkspace(cacheRoot, fingerprint, index)
+    const processIdentity = async () => 'Tue Jan  2 00:00:00 2024'
 
-    const eighth = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+    const eighth = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint, processIdentity })
     expect(existsSync(expired)).toBe(false)
     await eighth.stop()
-    await expect(createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint }))
+    await expect(createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint, processIdentity }))
       .rejects.toThrow(/limit/iu)
     rmSync(eighth.path, { recursive: true })
+  })
+
+  it('protects an exact live process owner after a 31-second wall-clock jump', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '5'.repeat(64)
+    const birth = 'Mon Jan  1 00:00:00 2024'
+    const live = createReadyWorkspace(cacheRoot, fingerprint, 0, { age: Date.now() / 1000 - 31, birth })
+    const lease = await createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint,
+      processIdentity: async () => birth,
+    })
+
+    expect(existsSync(live)).toBe(true)
+    await lease.stop()
+    rmSync(lease.path, { recursive: true })
   })
 
   it('fences an owner lease whose stable inode grows behind the open handle', async () => {
     const cacheRoot = join(temporaryRoot(), 'cache')
     mkdirSync(cacheRoot)
     const fingerprint = '6'.repeat(64)
-    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint, processIdentity: testProcessIdentity })
     const owner = join(lease.path, readdirSync(lease.path).find((name) => name.endsWith('.ready'))!)
     const bytes = readFileSync(owner)
     chmodSync(owner, 0o644)
