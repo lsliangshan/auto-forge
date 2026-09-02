@@ -1,0 +1,141 @@
+name: Generate converter pack locks
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_revision:
+        description: Exact lowercase 40-hex homebrew/core revision
+        required: true
+        type: string
+      roots_directory:
+        description: Repository-relative directory containing target roots candidates
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: converter-pack-lock-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  capture_arm64:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      AUTOFORGE_CONVERTER_TARGET: darwin-arm64
+      AUTOFORGE_CORE_REVISION: ${{ inputs.core_revision }}
+      AUTOFORGE_ROOTS_DIRECTORY: ${{ inputs.roots_directory }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9
+        with:
+          version: '11.15.0'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24.13.3'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check out the exact Homebrew core revision
+        run: |
+          brew tap --force homebrew/core
+          CORE_REPOSITORY="$(brew --repo homebrew/core)"
+          git -C "$CORE_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CORE_REVISION"
+          git -C "$CORE_REPOSITORY" checkout --detach "$AUTOFORGE_CORE_REVISION"
+      - name: Capture and probe arm64 closure
+        run: |
+          ROOTS_PATH="$(realpath "$GITHUB_WORKSPACE/$AUTOFORGE_ROOTS_DIRECTORY/$AUTOFORGE_CONVERTER_TARGET.roots.json")"
+          case "$ROOTS_PATH" in
+            "$GITHUB_WORKSPACE"/*) ;;
+            *) exit 1 ;;
+          esac
+          BREW_PATH="$(realpath "$(command -v brew)")"
+          pnpm --filter @autoforge/desktop converter-packs:capture-lock-target --target "$AUTOFORGE_CONVERTER_TARGET" --brew "$BREW_PATH" --core-revision "$AUTOFORGE_CORE_REVISION" --roots "$ROOTS_PATH" --output "$RUNNER_TEMP/$AUTOFORGE_CONVERTER_TARGET.capture.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: converter-lock-capture-darwin-arm64
+          path: ${{ runner.temp }}/darwin-arm64.capture.json
+          retention-days: 1
+          if-no-files-found: error
+
+  capture_x64:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      AUTOFORGE_CONVERTER_TARGET: darwin-x64
+      AUTOFORGE_CORE_REVISION: ${{ inputs.core_revision }}
+      AUTOFORGE_ROOTS_DIRECTORY: ${{ inputs.roots_directory }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9
+        with:
+          version: '11.15.0'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24.13.3'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check out the exact Homebrew core revision
+        run: |
+          brew tap --force homebrew/core
+          CORE_REPOSITORY="$(brew --repo homebrew/core)"
+          git -C "$CORE_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CORE_REVISION"
+          git -C "$CORE_REPOSITORY" checkout --detach "$AUTOFORGE_CORE_REVISION"
+      - name: Capture and probe x64 closure
+        run: |
+          ROOTS_PATH="$(realpath "$GITHUB_WORKSPACE/$AUTOFORGE_ROOTS_DIRECTORY/$AUTOFORGE_CONVERTER_TARGET.roots.json")"
+          case "$ROOTS_PATH" in
+            "$GITHUB_WORKSPACE"/*) ;;
+            *) exit 1 ;;
+          esac
+          BREW_PATH="$(realpath "$(command -v brew)")"
+          pnpm --filter @autoforge/desktop converter-packs:capture-lock-target --target "$AUTOFORGE_CONVERTER_TARGET" --brew "$BREW_PATH" --core-revision "$AUTOFORGE_CORE_REVISION" --roots "$ROOTS_PATH" --output "$RUNNER_TEMP/$AUTOFORGE_CONVERTER_TARGET.capture.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: converter-lock-capture-darwin-x64
+          path: ${{ runner.temp }}/darwin-x64.capture.json
+          retention-days: 1
+          if-no-files-found: error
+
+  merge:
+    needs: [capture_arm64, capture_x64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9
+        with:
+          version: '11.15.0'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24.13.3'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: converter-lock-capture-*
+          path: ${{ runner.temp }}/converter-lock-captures
+          merge-multiple: true
+      - name: Merge authenticated captures
+        run: |
+          mkdir "$RUNNER_TEMP/converter-generated-locks"
+          pnpm --filter @autoforge/desktop converter-packs:generate-lock --arm64-capture "$RUNNER_TEMP/converter-lock-captures/darwin-arm64.capture.json" --x64-capture "$RUNNER_TEMP/converter-lock-captures/darwin-x64.capture.json" --output-root "$RUNNER_TEMP/converter-generated-locks"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: converter-generated-locks
+          path: |
+            ${{ runner.temp }}/converter-generated-locks/sources.lock.json
+            ${{ runner.temp }}/converter-generated-locks/closures/darwin-arm64.lock.json
+            ${{ runner.temp }}/converter-generated-locks/closures/darwin-x64.lock.json
+          retention-days: 1
+          if-no-files-found: error
