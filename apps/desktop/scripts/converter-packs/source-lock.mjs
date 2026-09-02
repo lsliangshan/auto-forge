@@ -305,8 +305,9 @@ export async function loadConverterSourceLockMain(argv, {
   load = loadConverterSourceLock,
   defaultLockPath = defaultSourceLockPath,
 } = {}) {
+  const defaultMode = argv.length === 0
   try {
-    if (argv.length === 0) {
+    if (defaultMode) {
       for (const target of targets) await load({ path: defaultLockPath, target })
       stdout.write('verified converter source locks for darwin-arm64 and darwin-x64\n')
       return 0
@@ -317,7 +318,9 @@ export async function loadConverterSourceLockMain(argv, {
     stdout.write(`verified converter source lock for ${args['--target']}\n`)
     return 0
   } catch {
-    stderr.write('converter source lock verification failed\n')
+    stderr.write(defaultMode
+      ? 'checked-in converter schema-v2 locks are not ready\n'
+      : 'converter source lock verification failed\n')
     return 1
   }
 }

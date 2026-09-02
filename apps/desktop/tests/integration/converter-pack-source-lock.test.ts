@@ -146,6 +146,22 @@ describe('converter pack source lock schema v2', () => {
     expect(calls).toEqual([{ path, target: 'darwin-x64' }])
   })
 
+  it('identifies missing checked-in schema-v2 locks without exposing a path', async () => {
+    const stderr: string[] = []
+    const secret = '/private/source-lock/customer-name/sources.lock.json'
+
+    const exitCode = await loadConverterSourceLockMain([], {
+      defaultLockPath: secret,
+      stdout: { write: () => { throw new Error('unexpected stdout') } },
+      stderr: { write: (value: string) => { stderr.push(value); return true } },
+      load: async () => { throw new Error(`failed to read ${secret}`) },
+    })
+
+    expect(exitCode).toBe(1)
+    expect(stderr).toEqual(['checked-in converter schema-v2 locks are not ready\n'])
+    expect(stderr.join('')).not.toContain(secret)
+  })
+
   it('reports CLI verification failures with a fixed path-free message', async () => {
     const stderr: string[] = []
     const secret = '/private/source-lock/customer-name/sources.lock.json'
