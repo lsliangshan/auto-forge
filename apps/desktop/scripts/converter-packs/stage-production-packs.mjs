@@ -90,7 +90,7 @@ async function defaultRun(executable, args, options = {}) {
 async function probeCommand(run, executable, args, payload) {
   const result = await run(executable, args, { cwd: payload })
   if (!result || result.status !== 0 || typeof result.stdout !== 'string' || typeof result.stderr !== 'string') {
-    fail(`Converter capability command failed: ${executable}`)
+    fail('Converter capability command failed.')
   }
   return `${result.stdout}\n${result.stderr}`
 }
@@ -184,10 +184,15 @@ function openLockedUniverse({ universeRoot, closureLock }) {
   if (!currentDirectory(universeRoot)) fail('Bottle universe root must be canonical and non-symbolic.')
   const formulae = new Map(closureLock.formulae.map((formula) => [formula.name, formula.version]))
   const selected = new Set()
+  const downloadedLicenses = new Set()
   for (const family of Object.values(closureLock.families)) {
     for (const file of family.files) selected.add(`${file.formula}\0${file.sourcePath}`)
     for (const license of family.licenses) {
-      if (!license.source.startsWith('https://')) selected.add(`${license.formula}\0${license.source}`)
+      if (license.source.startsWith('https://')) {
+        downloadedLicenses.add(`${license.formula}\0${license.source}\0${license.sha256}\0${license.bytes}`)
+      } else {
+        selected.add(`${license.formula}\0${license.source}`)
+      }
     }
   }
   const formulaRoot = (formula, version) => {
@@ -210,6 +215,13 @@ function openLockedUniverse({ universeRoot, closureLock }) {
       if (!version) fail('Bottle universe formula is not locked.')
       const path = join(formulaRoot(formula, version), ...sourcePath.split('/'))
       if (!isPathInsideRoot(universeRoot, path) || !currentRegular(path)) fail('Bottle universe file is unsafe.')
+      return path
+    },
+    resolveLockedLicense(license) {
+      const key = `${license?.formula}\0${license?.source}\0${license?.sha256}\0${license?.bytes}`
+      if (!downloadedLicenses.has(key)) fail('Downloaded license is not locked.')
+      const path = join(universeRoot, 'Licenses', license.sha256)
+      if (!isPathInsideRoot(universeRoot, path) || !currentRegular(path)) fail('Downloaded license file is unsafe.')
       return path
     },
     contains(path) {
@@ -306,7 +318,12 @@ export async function stageProductionPacks(request, dependencies = productionDep
       fail('Target closure lock does not match the staging request.')
     }
     const universe = await openUniverse({ universeRoot: request.universeRoot, closureLock })
-    if (!universe || universe.target !== request.target || typeof universe.resolveLockedFile !== 'function') {
+    if (
+      !universe
+      || universe.target !== request.target
+      || typeof universe.resolveLockedFile !== 'function'
+      || typeof universe.resolveLockedLicense !== 'function'
+    ) {
       fail('Bottle universe does not match the staging request.')
     }
     const packsRoot = join(request.output, 'packs')
@@ -344,9 +361,10 @@ export async function stageProductionPacks(request, dependencies = productionDep
         }))
       }
       for (const license of family.licenses) {
-        if (license.source.startsWith('https://')) fail('Remote licenses must be materialized before pack staging.')
         files.push(await copyDeclaredFile({
-          source: universe.resolveLockedFile(license.formula, license.source),
+          source: license.source.startsWith('https://')
+            ? universe.resolveLockedLicense(license)
+            : universe.resolveLockedFile(license.formula, license.source),
           destination: license.destination,
           role: 'license',
           payload,
@@ -383,12 +401,22 @@ export async function stageProductionPacks(request, dependencies = productionDep
   }
 }
 
+export async function stageProductionPacksMain(argv, { stdout = process.stdout, stderr = process.stderr } = {}) {
+  try {
+    const args = parseArguments(argv, ['--plan'])
+    const planPath = args['--plan']
+    requireAbsolutePath(planPath, 'Staging plan')
+    const request = (await readCanonicalJson(planPath, 'Staging plan')).value
+    await stageProductionPacks(request)
+    stdout.write('staged four production converter pack families\n')
+    return 0
+  } catch {
+    stderr.write('converter pack staging failed\n')
+    return 1
+  }
+}
+
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(entry).href) {
-  const args = parseArguments(process.argv.slice(2), ['--plan'])
-  const planPath = args['--plan']
-  requireAbsolutePath(planPath, 'Staging plan')
-  const request = (await readCanonicalJson(planPath, 'Staging plan')).value
-  await stageProductionPacks(request)
-  process.stdout.write('staged four production converter pack families\n')
+  process.exitCode = await stageProductionPacksMain(process.argv.slice(2))
 }

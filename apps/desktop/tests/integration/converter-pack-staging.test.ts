@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -11,7 +11,7 @@ import {
   planMachOClosure,
   relocateMachOClosure,
 } from '../../scripts/converter-packs/macho-closure.mjs'
-import { probeConverterFamily, stageProductionPacks } from '../../scripts/converter-packs/stage-production-packs.mjs'
+import { probeConverterFamily, stageProductionPacks, stageProductionPacksMain } from '../../scripts/converter-packs/stage-production-packs.mjs'
 import { buildConverterPackIndex } from '../../scripts/converter-packs/build-index.mjs'
 import { selectVerifiedSourceLicense } from '../../scripts/converter-packs/prepare-production-staging.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
@@ -123,7 +123,15 @@ function stagingFixture(root: string) {
   })
   const dependencies = {
     loadClosure: async ({ target }: { target: string }) => ({ ...closure, target }),
-    openUniverse: async ({ closureLock }: { closureLock: { target: string } }) => ({ ...universe, target: closureLock.target }),
+    openUniverse: async ({ closureLock }: { closureLock: { target: string } }) => ({
+      ...universe,
+      target: closureLock.target,
+      resolveLockedLicense(license: { source: string; sha256: string }) {
+        return license.source.startsWith('https://')
+          ? join(universeRoot, 'Licenses', license.sha256)
+          : universe.resolveLockedFile((license as { formula: string }).formula, license.source)
+      },
+    }),
     planClosure: async ({ expectedFiles }: { expectedFiles: Array<{ formula: string; sourcePath: string; destination: string; executable: boolean; role: string }> }) => ({
       files: expectedFiles.map((file) => ({
         source: universe.resolveLockedFile(file.formula, file.sourcePath),
@@ -287,6 +295,7 @@ describe('converter pack Mach-O closure', () => {
     await expect(planMachOClosure({ ...request(), expectedRewrites: [{ ...rewrite, replacement: '@loader_path/../lib/glib/other.dylib' }] })).rejects.toThrow(/rewrite/iu)
     await expect(planMachOClosure({ ...request(), expectedFiles: [tool.lock, { ...library.lock, destination: 'lib/libsame.dylib' }, data.lock] })).rejects.toThrow(/namespace|destination/iu)
     await expect(planMachOClosure({ ...request(), inspect: async (path: string) => path === tool.source ? { architectures: ['arm64'], dependencies: ['/opt/homebrew/lib/libsame.dylib'], rpaths: [] } : inspect(path) })).rejects.toThrow(/absolute|host|unresolved/iu)
+    await expect(planMachOClosure({ ...request(), inspect: async (path: string) => path === tool.source ? { architectures: ['arm64'], dependencies: ['/usr/lib/../local/libsame.dylib'], rpaths: [] } : inspect(path) })).rejects.toThrow(/absolute|host|system/iu)
     await expect(planMachOClosure({ ...request(), inspect: async (path: string) => path === tool.source ? { architectures: ['arm64'], dependencies: ['@@HOMEBREW_CELLAR@@/glib/0/lib/libsame.dylib'], rpaths: [] } : inspect(path) })).rejects.toThrow(/locked|version|formula/iu)
 
     writeFileSync(library.source, 'changed')
@@ -312,6 +321,7 @@ describe('converter pack Mach-O closure', () => {
     const root = temporaryRoot()
     const payload = join(root, 'payload')
     const executable = fixtureFile(payload, 'bin/tool')
+    const library = fixtureFile(payload, 'lib/a/liba.dylib')
     chmodSync(executable, 0o755)
     const calls: Array<{ executable: string; args: readonly string[] }> = []
     const run = async (command: string, args: readonly string[]) => {
@@ -334,19 +344,21 @@ describe('converter pack Mach-O closure', () => {
       payload,
       architecture: 'arm64',
       plan: {
-        files: [{ source: executable, destination: 'bin/tool', executable: true }],
-        rewrites: [{ destination: 'bin/tool', dependency: '/brew/liba.dylib', replacement: '@loader_path/../lib/liba.dylib' }],
+        files: [
+          { source: executable, destination: 'bin/tool', executable: true, formula: 'tool', role: 'executable' },
+          { source: library, destination: 'lib/a/liba.dylib', executable: false, formula: 'a', role: 'code' },
+        ],
+        rewrites: [{ destination: 'bin/tool', dependency: '/brew/liba.dylib', replacement: '@loader_path/../lib/a/liba.dylib' }],
       },
       run,
     })
 
     expect(calls).toContainEqual({
       executable: '/usr/bin/install_name_tool',
-      args: ['-change', '/brew/liba.dylib', '@loader_path/../lib/liba.dylib', executable],
+      args: ['-change', '/brew/liba.dylib', '@loader_path/../lib/a/liba.dylib', executable],
     })
     expect(calls.every((call) => call.executable.startsWith('/usr/bin/'))).toBe(true)
 
-    const library = fixtureFile(payload, 'lib/a/liba.dylib')
     await expect(relocateMachOClosure({
       payload,
       architecture: 'arm64',
@@ -399,6 +411,83 @@ describe('converter pack Mach-O closure', () => {
       },
     })
     expect(signCalls).toEqual([library, executable])
+  })
+
+  it.each([
+    ['missing', '@loader_path/../lib/a/ghost.dylib'],
+    ['data', '@loader_path/../share/runtime.dat'],
+    ['executable', '@loader_path/tool'],
+    ['noncanonical system', '/usr/lib/../local/libbad.dylib'],
+  ])('rejects a post-relocation %s dependency outside the exact code inventory', async (_label, dependency) => {
+    const root = temporaryRoot()
+    const payload = join(root, 'payload')
+    const tool = fixtureFile(payload, 'bin/tool')
+    const data = fixtureFile(payload, 'share/runtime.dat')
+    const plan = {
+      files: [
+        { source: tool, destination: 'bin/tool', executable: true, formula: 'tool', role: 'executable' },
+        { source: data, destination: 'share/runtime.dat', executable: false, formula: 'tool', role: 'data' },
+      ],
+      rewrites: [],
+    }
+    const run = async (command: string, args: readonly string[]) => {
+      if (command === '/usr/bin/lipo') return { status: 0, stdout: 'arm64\n', stderr: '' }
+      if (command === '/usr/bin/otool' && args[0] === '-L') return { status: 0, stdout: `${args[1]}:\n\t${dependency} (compatibility version 1.0.0, current version 1.0.0)\n`, stderr: '' }
+      if (command === '/usr/bin/otool' && args[0] === '-l') return { status: 0, stdout: '', stderr: '' }
+      if (command === '/usr/bin/install_name_tool') return { status: 0, stdout: '', stderr: '' }
+      throw new Error('unexpected command')
+    }
+    await expect(relocateMachOClosure({ payload, architecture: 'arm64', plan, run })).rejects.toThrow(/unresolved|inventory/iu)
+  })
+
+  it.each([
+    ['data', '@loader_path/../share/runtime.dat'],
+    ['executable', '@loader_path/tool-two'],
+  ])('rejects a rewrite whose replacement resolves to a %s file', async (_label, replacement) => {
+    const root = temporaryRoot()
+    const payload = join(root, 'payload')
+    const tool = fixtureFile(payload, 'bin/tool')
+    const toolTwo = fixtureFile(payload, 'bin/tool-two')
+    const data = fixtureFile(payload, 'share/runtime.dat')
+    let calls = 0
+    await expect(relocateMachOClosure({
+      payload,
+      architecture: 'arm64',
+      plan: {
+        files: [
+          { source: tool, destination: 'bin/tool', executable: true, formula: 'tool', role: 'executable' },
+          { source: toolTwo, destination: 'bin/tool-two', executable: true, formula: 'tool', role: 'executable' },
+          { source: data, destination: 'share/runtime.dat', executable: false, formula: 'tool', role: 'data' },
+        ],
+        rewrites: [{ destination: 'bin/tool', dependency: '@rpath/bad.dylib', replacement }],
+      },
+      run: async () => { calls += 1; return { status: 0, stdout: '', stderr: '' } },
+    })).rejects.toThrow(/code destination/iu)
+    expect(calls).toBe(0)
+  })
+
+  it('rejects symbolic payload roots and symbolic or hard-linked binaries before invoking tools', async () => {
+    const root = temporaryRoot()
+    const realPayload = join(root, 'real-payload')
+    const tool = fixtureFile(realPayload, 'bin/tool')
+    const symbolicPayload = join(root, 'payload-link')
+    symlinkSync(realPayload, symbolicPayload)
+    let calls = 0
+    const run = async () => { calls += 1; return { status: 0, stdout: '', stderr: '' } }
+    const plan = { files: [{ source: tool, destination: 'bin/tool', executable: true, formula: 'tool', role: 'executable' }], rewrites: [] }
+    await expect(relocateMachOClosure({ payload: symbolicPayload, architecture: 'arm64', plan, run })).rejects.toThrow(/payload|symbolic|canonical/iu)
+    await expect(adhocSignMachOClosure({ payload: symbolicPayload, plan, run })).rejects.toThrow(/payload|symbolic|canonical/iu)
+
+    const outside = fixtureFile(root, 'outside/tool')
+    rmSync(tool)
+    symlinkSync(outside, tool)
+    await expect(relocateMachOClosure({ payload: realPayload, architecture: 'arm64', plan, run })).rejects.toThrow(/binary|symbolic|regular/iu)
+    await expect(adhocSignMachOClosure({ payload: realPayload, plan, run })).rejects.toThrow(/binary|symbolic|regular/iu)
+    rmSync(tool)
+    linkSync(outside, tool)
+    await expect(relocateMachOClosure({ payload: realPayload, architecture: 'arm64', plan, run })).rejects.toThrow(/binary|regular/iu)
+    await expect(adhocSignMachOClosure({ payload: realPayload, plan, run })).rejects.toThrow(/binary|regular/iu)
+    expect(calls).toBe(0)
   })
 
   it('plans a transitive closure, excludes system libraries, and emits loader-relative rewrites', async () => {
@@ -606,5 +695,38 @@ describe('converter pack target staging', () => {
         rewrites: [],
       }),
     })).rejects.toThrow(/locked inventory/iu)
+  })
+
+  it('stages an authenticated downloaded license only from universe/Licenses/<sha256>', async () => {
+    const root = temporaryRoot()
+    const fixture = stagingFixture(root)
+    const license = fixture.closure.families.media.licenses[0]
+    const bytes = readFileSync(fixture.universe.resolveLockedFile(license.formula, license.source))
+    license.source = 'https://licenses.example.test/media.txt'
+    mkdirSync(join(fixture.request('darwin-arm64', join(root, 'ignored')).universeRoot, 'Licenses'))
+    writeFileSync(join(fixture.request('darwin-arm64', join(root, 'ignored')).universeRoot, 'Licenses', license.sha256), bytes)
+    writeFileSync(fixture.request('darwin-arm64', join(root, 'ignored')).closureLockPath, canonicalBytes(fixture.closure))
+    const output = join(root, 'download-license-output')
+
+    await stageProductionPacks(fixture.request('darwin-arm64', output), {
+      planClosure: fixture.dependencies.planClosure,
+      applyRelocation: fixture.dependencies.applyRelocation,
+      probeFamily: fixture.dependencies.probeFamily,
+    })
+
+    expect(readFileSync(join(output, 'packs/media-darwin-arm64/payload', license.destination))).toEqual(bytes)
+  })
+
+  it('reports CLI failures with a fixed path-free message', async () => {
+    const root = temporaryRoot()
+    const secretPath = join(root, 'private-plan.json')
+    const output: string[] = []
+    const exitCode = await stageProductionPacksMain(['--plan', secretPath], {
+      stdout: { write: (value: string) => { output.push(value); return true } },
+      stderr: { write: (value: string) => { output.push(value); return true } },
+    })
+    expect(exitCode).toBe(1)
+    expect(output.join('')).toBe('converter pack staging failed\n')
+    expect(output.join('')).not.toContain(root)
   })
 })
