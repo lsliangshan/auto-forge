@@ -170,14 +170,26 @@ function validateFamily(value, formulae) {
 
 function validateDependencyGraph(formulae) {
   const state = new Map()
-  function visit(name) {
-    if (state.get(name) === 'visiting') fail('Converter formula dependency graph contains a cycle.')
-    if (state.get(name) === 'done') return
-    state.set(name, 'visiting')
-    for (const dependency of formulae.get(name).dependencies) visit(dependency)
-    state.set(name, 'done')
+  for (const start of formulae.keys()) {
+    if (state.get(start) === 'done') continue
+    state.set(start, 'visiting')
+    const stack = [{ name: start, dependencyIndex: 0 }]
+    while (stack.length > 0) {
+      const frame = stack.at(-1)
+      const dependencies = formulae.get(frame.name).dependencies
+      if (frame.dependencyIndex >= dependencies.length) {
+        state.set(frame.name, 'done')
+        stack.pop()
+        continue
+      }
+      const dependency = dependencies[frame.dependencyIndex]
+      frame.dependencyIndex += 1
+      if (state.get(dependency) === 'visiting') fail('Converter formula dependency graph contains a cycle.')
+      if (state.get(dependency) === 'done') continue
+      state.set(dependency, 'visiting')
+      stack.push({ name: dependency, dependencyIndex: 0 })
+    }
   }
-  for (const name of formulae.keys()) visit(name)
 }
 
 function deepFreeze(value) {
@@ -243,34 +255,44 @@ function validateSourceRelationship(sourceLock, closureLock) {
   const reachable = new Set()
   const seeds = new Set(sourceLock.engines.flatMap((engine) => engine.rootFormula === null ? [] : [engine.rootFormula]))
   for (const family of Object.values(closureLock.families)) {
-    for (const entry of [...family.files, ...family.licenses]) seeds.add(entry.formula)
+    for (const file of family.files) seeds.add(file.formula)
   }
   const closureFormulae = new Map(closureLock.formulae.map((formula) => [formula.name, formula]))
-  function visit(name) {
-    if (reachable.has(name)) return
+  const pending = [...seeds]
+  while (pending.length > 0) {
+    const name = pending.pop()
+    if (reachable.has(name)) continue
     const formula = closureFormulae.get(name)
     if (!formula) fail('Target closure lock references an undeclared formula.')
     reachable.add(name)
-    for (const dependency of formula.dependencies) visit(dependency)
+    for (const dependency of formula.dependencies) pending.push(dependency)
   }
-  for (const seed of seeds) visit(seed)
   if (reachable.size !== closureFormulae.size) fail('Target closure lock contains an unreachable formula.')
 
+  const sourceLicenseTuples = new Map(sourceLock.formulae.map((formula) => [
+    formula.name,
+    new Set(formula.licenses.map((asset) => canonicalBytes({
+      formula: formula.name,
+      source: asset.kind === 'bottle-entry' ? asset.path : asset.url,
+      destination: asset.destination,
+      sha256: asset.sha256,
+      bytes: asset.bytes,
+    }).toString('utf8'))),
+  ]))
   for (const family of Object.values(closureLock.families)) {
     const contributed = new Set(family.files.map((file) => file.formula))
-    const matched = new Set()
+    const licensed = new Set()
     for (const license of family.licenses) {
-      const formula = selectedFormulae.get(license.formula)
-      const matches = formula?.licenses.some((asset) => (
-        asset.destination === license.destination
-        && asset.sha256 === license.sha256
-        && asset.bytes === license.bytes
-        && (asset.kind === 'bottle-entry' ? asset.path : asset.url) === license.source
-      ))
-      if (!matches) fail('Target closure lock license inventory is inconsistent.')
-      matched.add(license.formula)
+      const tuple = canonicalBytes(license).toString('utf8')
+      if (!sourceLicenseTuples.get(license.formula)?.has(tuple)) {
+        fail('Target closure lock license inventory is inconsistent.')
+      }
+      licensed.add(license.formula)
     }
-    if ([...contributed].some((formula) => !matched.has(formula))) {
+    if (
+      licensed.size !== contributed.size
+      || [...contributed].some((formula) => !licensed.has(formula))
+    ) {
       fail('Target closure lock license inventory is inconsistent.')
     }
   }

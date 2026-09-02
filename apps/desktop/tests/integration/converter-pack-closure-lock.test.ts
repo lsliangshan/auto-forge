@@ -300,6 +300,116 @@ describe('converter target closure lock', () => {
       .rejects.toThrow('Target closure lock contains an unreachable formula.')
   })
 
+  it('does not let a valid license-only formula make an orphan reachable', async () => {
+    const closure = closureFixture()
+    closure.formulae.push({ name: 'zlib', version: '1.3.1', dependencies: [] })
+    closure.families.media.licenses.push(license('zlib', '9'))
+    closure.measurements.downloadBytes += 150
+    const { sourcePath } = writeAuthenticatedFixture(temporaryRoot(), closure, (source) => {
+      const zlib = structuredClone(source.formulae[3]!)
+      zlib.name = 'zlib'
+      zlib.version = '1.3.1'
+      zlib.acquisitions['darwin-arm64'] = bottle('zlib', 'darwin-arm64', '9', 150)
+      zlib.acquisitions['darwin-x64'] = bottle('zlib', 'darwin-x64', '9', 151)
+      zlib.licenses = zlib.licenses.map((entry) => ({
+        ...entry, sha256: '9'.repeat(64), destination: 'licenses/zlib.LICENSE',
+      }))
+      source.formulae.push(zlib)
+    })
+
+    await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
+      .rejects.toThrow('Target closure lock contains an unreachable formula.')
+  })
+
+  it('rejects a license-only formula even when that formula is otherwise reachable', async () => {
+    const closure = closureFixture()
+    closure.families.media.licenses.push(license('glib', 'e'))
+    const { sourcePath } = writeAuthenticatedFixture(temporaryRoot(), closure)
+
+    await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
+      .rejects.toThrow('Target closure lock license inventory is inconsistent.')
+  })
+
+  it('validates a deep acyclic dependency graph without overflowing the call stack', () => {
+    const closure = closureFixture()
+    const count = 15_000
+    const chain = Array.from({ length: count }, (_unused, index) => ({
+      name: `n${String(index).padStart(5, '0')}`,
+      version: '1',
+      dependencies: index + 1 === count ? [] : [`n${String(index + 1).padStart(5, '0')}`],
+    }))
+    closure.formulae[0]!.dependencies = ['glib', 'n00000']
+    closure.formulae.splice(2, 0, ...chain)
+
+    expect(() => validateTargetClosureLock(closure, 'darwin-arm64')).not.toThrow()
+  })
+
+  it('loads a deep reachable source relationship without overflowing the call stack', async () => {
+    const closure = closureFixture()
+    const count = 10_000
+    const chain = Array.from({ length: count }, (_unused, index) => ({
+      name: `n${String(index).padStart(5, '0')}`,
+      version: '1',
+      dependencies: index + 1 === count ? [] : [`n${String(index + 1).padStart(5, '0')}`],
+    }))
+    closure.formulae.splice(2, 0, ...chain)
+    closure.families.media.files.push(file('n00000', 'share/runtime', 'zz/runtime', '1'))
+    closure.families.media.licenses.push({
+      formula: 'n00000', source: 'https://e.test/a', destination: 'licenses/n00000.LICENSE',
+      sha256: '1'.repeat(64), bytes: 1,
+    })
+    closure.measurements.downloadBytes += 1
+
+    const { sourcePath } = writeAuthenticatedFixture(temporaryRoot(), closure, (source) => {
+      const formulae = chain.map(({ name }) => ({
+        name,
+        version: '1',
+        revision: 0,
+        license: 'MIT',
+        acquisitions: {
+          'darwin-arm64': {
+            kind: 'homebrew-bottle', url: 'https://e.test/a', sha256: '1'.repeat(64), bytes: 1,
+            cellar: '/opt/homebrew/Cellar',
+          },
+          'darwin-x64': {
+            kind: 'homebrew-bottle', url: 'https://e.test/a', sha256: '1'.repeat(64), bytes: 1,
+            cellar: '/usr/local/Cellar',
+          },
+        },
+        licenses: [{
+          kind: 'download', url: 'https://e.test/a', sha256: '1'.repeat(64), bytes: 1,
+          destination: `licenses/${name}.LICENSE`,
+        }],
+      }))
+      source.formulae.splice(2, 0, ...formulae)
+    })
+
+    const loaded = await loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' })
+    expect(loaded.closureLock.formulae.some(({ name }: { name: string }) => name === 'n09999')).toBe(true)
+  }, 20_000)
+
+  it('matches multiple canonical license tuples through the per-formula index', async () => {
+    const closure = closureFixture()
+    const notices = [{
+      kind: 'download', url: 'https://licenses.example.test/ffmpeg-NOTICE', sha256: '5'.repeat(64),
+      bytes: 5, destination: 'licenses/ffmpeg.NOTICE',
+    }, {
+      kind: 'download', url: 'https://licenses.example.test/ffmpeg-PATENTS', sha256: '6'.repeat(64),
+      bytes: 6, destination: 'licenses/ffmpeg.PATENTS',
+    }]
+    closure.families.media.licenses.push(...notices.map((asset) => ({
+      formula: 'ffmpeg', source: asset.url, destination: asset.destination,
+      sha256: asset.sha256, bytes: asset.bytes,
+    })))
+    closure.measurements.downloadBytes += 11
+    const { sourcePath } = writeAuthenticatedFixture(temporaryRoot(), closure, (source) => {
+      source.formulae[0]!.licenses.push(...notices)
+    })
+
+    await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
+      .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 611 } } })
+  })
+
   it.each([
     ['URL', 'https://licenses.example.test/conflict', 140],
     ['byte length', 'https://downloads.example.test/libreoffice-arm64.dmg', 7],
