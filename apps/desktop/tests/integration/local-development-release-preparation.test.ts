@@ -142,8 +142,11 @@ it('recovers a legacy fixed private workspace and prepares in a unique private d
   const { fingerprintDevelopmentRelease } = await import('../../scripts/converter-packs/local-development-release-cache.mjs')
   const fingerprint = fingerprintDevelopmentRelease({ target: 'darwin-arm64', inputs })
   const legacy = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}`)
+  const orphan = `${legacy}-ABC123`
   await mkdir(legacy)
   await writeFile(join(legacy, 'interrupted'), 'stale')
+  await mkdir(orphan)
+  await writeFile(join(orphan, 'interrupted'), 'stale unique workspace')
   let observedWorkspace = ''
   const injected = dependencies([], {
     preparePlan: async (value: Record<string, unknown>) => {

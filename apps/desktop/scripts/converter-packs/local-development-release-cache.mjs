@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { constants, lstatSync, realpathSync } from 'node:fs'
-import { link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink } from 'node:fs/promises'
+import { link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import process from 'node:process'
 import { canonicalBytes, withStableRegularFile } from './pack-tooling-lib.mjs'
@@ -17,6 +17,7 @@ const NONCE_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[
 const METADATA_TEMP_PATTERN = /^\.release-metadata-([a-f0-9]{64})-([a-f0-9-]{36})\.tmp$/u
 const CLAIM_PREDECESSOR_PATTERN = /^\.cache-mutation\.claim\.([a-f0-9-]+)\.predecessor$/u
 const ACTIVE_MARKER_TEMP_PATTERN = /^\.active-release-([a-f0-9-]{36})\.tmp$/u
+const PREPARATION_WORKSPACE_LIMIT = 8
 
 function missing(error) {
   return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
@@ -366,20 +367,80 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
   }
 }
 
+async function recoverPreparationWorkspaces(root, fingerprint, heartbeat) {
+  const prefix = `.local-development-preparation-${fingerprint.slice(0, 12)}`
+  const names = (await readdir(root)).filter((name) => name === prefix || new RegExp(`^${prefix}-[A-Za-z0-9]{6}$`, 'u').test(name))
+  if (names.length > PREPARATION_WORKSPACE_LIMIT) throw new Error('Development preparation workspace recovery exceeds its limit')
+  let recovered = false
+  for (const name of names) {
+    const path = join(root, name)
+    const details = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    if (!details?.isDirectory() || details.isSymbolicLink() || await realpath(path).catch(() => undefined) !== path) {
+      throw new Error('Legacy development preparation workspace is unsafe')
+    }
+    let active = false
+    const ownerPath = join(path, '.owner.json')
+    const ownerDetails = await lstat(ownerPath).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    const owner = ownerDetails === undefined ? undefined : await withStableRegularFile(
+      ownerPath,
+      'Development preparation owner',
+      async (handle, metadata) => {
+        if (metadata.size > CLAIM_MAXIMUM_BYTES) throw new Error('Development preparation owner is invalid')
+        return handle.readFile()
+      },
+    )
+    if (owner !== undefined) {
+      let value
+      try { value = JSON.parse(owner.toString('utf8')) } catch { throw new Error('Development preparation owner is invalid') }
+      const expected = canonicalBytes(value)
+      if (!owner.equals(expected)
+        || Object.keys(value).sort().join('\0') !== ['fingerprint', 'pid', 'schemaVersion'].join('\0')
+        || value.fingerprint !== fingerprint
+        || !Number.isSafeInteger(value.pid)
+        || value.pid <= 0
+        || value.schemaVersion !== 1) {
+        throw new Error('Development preparation owner is invalid')
+      }
+      active = ownerAlive(value.pid)
+    }
+    if (active) continue
+    await heartbeat.pulse()
+    await rm(path, { recursive: true })
+    recovered = true
+  }
+  if (recovered) await syncDirectory(root)
+  return recovered
+}
+
 export async function recoverLegacyDevelopmentPreparation({ cacheRoot, fingerprint }) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
+  return withDevelopmentCacheMutationClaim(canonicalRoot, (root, heartbeat) => (
+    recoverPreparationWorkspaces(root, fingerprint, heartbeat)
+  ))
+}
+
+export async function createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint }) {
+  const canonicalRoot = await canonicalCacheRoot(cacheRoot)
+  assertFingerprint(fingerprint)
   return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
-    const legacy = join(root, `.local-development-preparation-${fingerprint.slice(0, 12)}`)
-    const details = await lstat(legacy).catch((error) => missing(error) ? undefined : Promise.reject(error))
-    if (details === undefined) return false
-    if (!details.isDirectory() || details.isSymbolicLink() || await realpath(legacy).catch(() => undefined) !== legacy) {
-      throw new Error('Legacy development preparation workspace is unsafe')
+    await recoverPreparationWorkspaces(root, fingerprint, heartbeat)
+    const privateRoot = await realpath(await mkdtemp(join(root, `.local-development-preparation-${fingerprint.slice(0, 12)}-`)))
+    const ownerBytes = canonicalBytes({ fingerprint, pid: process.pid, schemaVersion: 1 })
+    const ownerHandle = await open(
+      join(privateRoot, '.owner.json'),
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o400,
+    )
+    try {
+      await ownerHandle.writeFile(ownerBytes)
+      await ownerHandle.sync()
+    } finally {
+      await ownerHandle.close()
     }
+    await Promise.all([syncDirectory(privateRoot), syncDirectory(root)])
     await heartbeat.pulse()
-    await rm(legacy, { recursive: true })
-    await syncDirectory(root)
-    return true
+    return privateRoot
   })
 }
 
