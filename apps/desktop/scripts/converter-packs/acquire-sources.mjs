@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { link, lstat, open, realpath, rename, unlink } from 'node:fs/promises'
+import { link, lstat, open, readdir, realpath, rename, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL, URL } from 'node:url'
@@ -221,16 +221,16 @@ async function cachedArchive(path, archive) {
   return { path, sha256: archive.sha256, bytes: archive.bytes, networkBytes: 0 }
 }
 
-function metadataValue(archive, partialBytes) {
-  return { bytes: archive.bytes, partialBytes, sha256: archive.sha256, url: archive.url }
+function metadataValue(archive, partialBytes, nonce) {
+  return { bytes: archive.bytes, nonce, partialBytes, sha256: archive.sha256, url: archive.url }
 }
 
-async function writePartialMetadata(path, archive, partialBytes) {
+async function writePartialMetadata(path, archive, partialBytes, nonce) {
   const temporary = `${path}.${randomUUID()}.tmp`
   let handle
   try {
     handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
-    await handle.writeFile(canonicalBytes(metadataValue(archive, partialBytes)))
+    await handle.writeFile(canonicalBytes(metadataValue(archive, partialBytes, nonce)))
     await handle.sync()
     await handle.close()
     handle = undefined
@@ -255,11 +255,20 @@ async function syncDirectory(path) {
   }
 }
 
-function ownerValue(archive, nonce) {
-  return { bytes: archive.bytes, nonce, pid: process.pid, sha256: archive.sha256, url: archive.url }
+function ownerValue(archive, nonce, state = 'active') {
+  return { bytes: archive.bytes, nonce, pid: process.pid, sha256: archive.sha256, state, url: archive.url }
 }
 
-async function readOwnerLock(path) {
+function ownerPartialPaths(cacheRoot, sha256, nonce) {
+  const partialPath = join(cacheRoot, `.${sha256}.${nonce}.partial`)
+  return { partialPath, metadataPath: `${partialPath}.json` }
+}
+
+function predecessorPath(cacheRoot, sha256, nonce) {
+  return join(cacheRoot, `.${sha256}.${nonce}.predecessor`)
+}
+
+async function readOwnerLock(path, allowedLinks = 1) {
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch((error) => {
     if (isMissing(error)) return undefined
     throw error
@@ -267,7 +276,7 @@ async function readOwnerLock(path) {
   if (!handle) return undefined
   try {
     const stat = await handle.stat()
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size > partialMetadataLimit) return { stat }
+    if (!stat.isFile() || stat.nlink !== allowedLinks || stat.size > partialMetadataLimit) return { stat }
     const bytes = await handle.readFile()
     let value
     try {
@@ -277,13 +286,14 @@ async function readOwnerLock(path) {
     }
     if (
       !bytes.equals(canonicalBytes(value))
-      || !exactKeys(value, ['bytes', 'nonce', 'pid', 'sha256', 'url'])
+      || !exactKeys(value, ['bytes', 'nonce', 'pid', 'sha256', 'state', 'url'])
       || !Number.isSafeInteger(value.bytes)
       || value.bytes <= 0
       || !noncePattern.test(value.nonce)
       || !Number.isSafeInteger(value.pid)
       || value.pid <= 0
       || !sha256Pattern.test(value.sha256)
+      || !['active', 'resume'].includes(value.state)
       || !validHttpsUrl(value.url)
     ) return { stat }
     return { stat, value }
@@ -302,8 +312,8 @@ function ownerAlive(pid) {
   }
 }
 
-async function unlinkMatchingOwner(path, expected) {
-  const current = await readOwnerLock(path)
+async function unlinkMatchingOwner(path, expected, allowedLinks = 1) {
+  const current = await readOwnerLock(path, allowedLinks)
   if (
     !current
     || current.stat.dev !== expected.stat.dev
@@ -335,6 +345,7 @@ async function assertOwnerLease(path, owner) {
     !matchingOwner(current, owner)
     || opened.dev !== owner.stat.dev
     || opened.ino !== owner.stat.ino
+    || current.value.state !== 'active'
     || !freshOwnerLease(current)
   ) throw acquisitionFailure(downloadFailed)
   return current
@@ -367,11 +378,44 @@ function startOwnerHeartbeat(path, owner, loseLease) {
   }
 }
 
-async function reclaimOwner({ path, cacheRoot, partialPath, metadataPath, owner }) {
-  if (!await unlinkMatchingOwner(path, owner)) return false
-  await removePartial(partialPath, metadataPath)
+async function discardOwnerData(cacheRoot, archive, owner) {
+  const paths = ownerPartialPaths(cacheRoot, archive.sha256, owner.nonce)
+  await removePartial(paths.partialPath, paths.metadataPath)
+}
+
+async function preservePredecessor(path, cacheRoot, archive, owner) {
+  const markerPath = predecessorPath(cacheRoot, archive.sha256, owner.value.nonce)
+  try {
+    await link(path, markerPath)
+  } catch (error) {
+    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') return false
+  }
+  const marker = await readOwnerLock(markerPath, 2)
+  if (!matchingOwner(marker, owner)) return false
+  if (!await unlinkMatchingOwner(path, owner, 2)) return false
   await syncDirectory(cacheRoot)
   return true
+}
+
+async function lockedPredecessors(cacheRoot, archive) {
+  const prefix = `.${archive.sha256}.`
+  const suffix = '.predecessor'
+  const predecessors = []
+  for (const name of await readdir(cacheRoot)) {
+    if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue
+    const nonce = name.slice(prefix.length, -suffix.length)
+    if (!noncePattern.test(nonce)) continue
+    const markerPath = join(cacheRoot, name)
+    const marker = await readOwnerLock(markerPath)
+    if (!marker?.value || marker.value.nonce !== nonce) continue
+    if (
+      marker.value.sha256 !== archive.sha256
+      || marker.value.url !== archive.url
+      || marker.value.bytes !== archive.bytes
+    ) fail('Converter source artifact identities conflict.')
+    predecessors.push({ ...marker.value, markerPath })
+  }
+  return predecessors
 }
 
 async function waitForOwner(signal) {
@@ -391,7 +435,7 @@ async function waitForOwner(signal) {
   })
 }
 
-async function acquireOwnerLock({ path, cacheRoot, partialPath, metadataPath, archive, signal }) {
+async function acquireOwnerLock({ path, cacheRoot, archive, signal }) {
   while (true) {
     if (signal.aborted) throw acquisitionFailure(downloadFailed)
     const nonce = randomUUID()
@@ -403,7 +447,8 @@ async function acquireOwnerLock({ path, cacheRoot, partialPath, metadataPath, ar
       await handle.sync()
       const stat = await handle.stat()
       await syncDirectory(cacheRoot)
-      return { handle, stat, value }
+      const predecessors = await lockedPredecessors(cacheRoot, archive)
+      return { handle, predecessors, stat, value }
     } catch (error) {
       await handle?.close().catch(() => undefined)
       if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
@@ -415,7 +460,8 @@ async function acquireOwnerLock({ path, cacheRoot, partialPath, metadataPath, ar
       || owner.value.url !== archive.url
       || owner.value.bytes !== archive.bytes
     )) fail('Converter source artifact identities conflict.')
-    if (owner?.value && ownerAlive(owner.value.pid) && freshOwnerLease(owner)) {
+    const live = owner?.value?.state === 'active' && ownerAlive(owner.value.pid)
+    if (live && freshOwnerLease(owner)) {
       await waitForOwner(signal)
       continue
     }
@@ -423,7 +469,11 @@ async function acquireOwnerLock({ path, cacheRoot, partialPath, metadataPath, ar
       await waitForOwner(signal)
       continue
     }
-    if (owner && await reclaimOwner({ path, cacheRoot, partialPath, metadataPath, owner })) {
+    if (owner?.value && (owner.value.state === 'resume' || !live)) {
+      if (await preservePredecessor(path, cacheRoot, archive, owner)) continue
+    } else if (owner && await unlinkMatchingOwner(path, owner)) {
+      if (owner.value) await discardOwnerData(cacheRoot, archive, owner.value)
+      await syncDirectory(cacheRoot)
       continue
     }
     await waitForOwner(signal)
@@ -442,12 +492,38 @@ async function releaseOwnerLock(path, cacheRoot, owner) {
   }
 }
 
-async function createPartial(partialPath, metadataPath, archive) {
+async function parkOwnerForResume(path, cacheRoot, owner) {
+  try {
+    const [current, opened] = await Promise.all([readOwnerLock(path), owner.handle.stat()])
+    if (
+      !matchingOwner(current, owner)
+      || opened.dev !== owner.stat.dev
+      || opened.ino !== owner.stat.ino
+    ) return false
+    const value = { ...owner.value, state: 'resume' }
+    const bytes = canonicalBytes(value)
+    await owner.handle.truncate(0)
+    await writeAll(owner.handle, bytes, 0)
+    await owner.handle.sync()
+    owner.value = value
+    owner.stat = await owner.handle.stat()
+    const parked = await readOwnerLock(path)
+    if (!matchingOwner(parked, owner) || parked.value.state !== 'resume') return false
+    await syncDirectory(cacheRoot)
+    return true
+  } catch {
+    return false
+  } finally {
+    await owner.handle.close().catch(() => undefined)
+  }
+}
+
+async function createPartial(partialPath, metadataPath, archive, nonce) {
   let handle
   try {
     handle = await open(partialPath, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
     await handle.sync()
-    await writePartialMetadata(metadataPath, archive, 0)
+    await writePartialMetadata(metadataPath, archive, 0, nonce)
     return { handle, partialBytes: 0 }
   } catch (error) {
     await handle?.close().catch(() => undefined)
@@ -456,12 +532,16 @@ async function createPartial(partialPath, metadataPath, archive) {
   }
 }
 
-async function openExistingPartial(partialPath, metadataPath, archive) {
+async function openExistingPartial(
+  partialPath, metadataPath, archive, nonce, createIfMissing = true, allowPublishedLink = false,
+) {
   const [partialStat, metadataStat] = await Promise.all([
     lstat(partialPath).catch((error) => isMissing(error) ? undefined : Promise.reject(error)),
     lstat(metadataPath).catch((error) => isMissing(error) ? undefined : Promise.reject(error)),
   ])
-  if (partialStat === undefined && metadataStat === undefined) return createPartial(partialPath, metadataPath, archive)
+  if (partialStat === undefined && metadataStat === undefined) {
+    return createIfMissing ? createPartial(partialPath, metadataPath, archive, nonce) : undefined
+  }
   if (partialStat === undefined || metadataStat === undefined) {
     await removePartial(partialPath, metadataPath)
     throw acquisitionFailure(partialInvalid, true)
@@ -477,8 +557,9 @@ async function openExistingPartial(partialPath, metadataPath, archive) {
     throw acquisitionFailure(partialInvalid, true)
   }
   if (
-    !exactKeys(value, ['bytes', 'partialBytes', 'sha256', 'url'])
+    !exactKeys(value, ['bytes', 'nonce', 'partialBytes', 'sha256', 'url'])
     || value.bytes !== archive.bytes
+    || value.nonce !== nonce
     || value.sha256 !== archive.sha256
     || value.url !== archive.url
     || !Number.isSafeInteger(value.partialBytes)
@@ -491,7 +572,7 @@ async function openExistingPartial(partialPath, metadataPath, archive) {
   if (
     !partialStat.isFile()
     || partialStat.isSymbolicLink()
-    || partialStat.nlink !== 1
+    || (partialStat.nlink !== 1 && !(allowPublishedLink && partialStat.nlink === 2))
     || partialStat.size < value.partialBytes
     || partialStat.size > archive.bytes
     || await realpath(partialPath).catch(() => undefined) !== partialPath
@@ -506,7 +587,11 @@ async function openExistingPartial(partialPath, metadataPath, archive) {
     throw acquisitionFailure(partialInvalid, true)
   }
   const opened = await handle.stat()
-  if (!opened.isFile() || opened.nlink !== 1 || !sameFileIdentity(partialStat, opened)) {
+  if (
+    !opened.isFile()
+    || (opened.nlink !== 1 && !(allowPublishedLink && opened.nlink === 2))
+    || !sameFileIdentity(partialStat, opened)
+  ) {
     await handle.close()
     await removePartial(partialPath, metadataPath)
     throw acquisitionFailure(partialInvalid, true)
@@ -516,6 +601,52 @@ async function openExistingPartial(partialPath, metadataPath, archive) {
     await handle.sync()
   }
   return { handle, partialBytes: value.partialBytes }
+}
+
+async function prepareOwnedPartial(cacheRoot, archive, owner) {
+  const owned = ownerPartialPaths(cacheRoot, archive.sha256, owner.value.nonce)
+  let resumed
+  for (const predecessor of owner.predecessors) {
+    const previous = ownerPartialPaths(cacheRoot, archive.sha256, predecessor.nonce)
+    if (resumed) {
+      await removePartial(previous.partialPath, previous.metadataPath)
+      await unlink(predecessor.markerPath).catch((error) => { if (!isMissing(error)) throw error })
+      continue
+    }
+    let candidate
+    try {
+      candidate = await openExistingPartial(
+        previous.partialPath, previous.metadataPath, archive, predecessor.nonce, false, true,
+      )
+    } catch (error) {
+      await unlink(predecessor.markerPath).catch((unlinkError) => { if (!isMissing(unlinkError)) throw unlinkError })
+      throw error
+    }
+    if (!candidate) {
+      await unlink(predecessor.markerPath).catch((error) => { if (!isMissing(error)) throw error })
+      continue
+    }
+    try {
+      await rename(previous.partialPath, owned.partialPath)
+      const [opened, moved] = await Promise.all([candidate.handle.stat(), lstat(owned.partialPath)])
+      if (!sameFileIdentity(opened, moved)) throw acquisitionFailure(partialInvalid, true)
+      await unlink(previous.metadataPath)
+      await writePartialMetadata(owned.metadataPath, archive, candidate.partialBytes, owner.value.nonce)
+      await unlink(predecessor.markerPath)
+      resumed = candidate
+    } catch (error) {
+      await candidate.handle.close().catch(() => undefined)
+      await removePartial(owned.partialPath, owned.metadataPath)
+      await unlink(predecessor.markerPath).catch((unlinkError) => { if (!isMissing(unlinkError)) throw unlinkError })
+      throw error
+    }
+  }
+  return {
+    ...owned,
+    partial: resumed ?? await openExistingPartial(
+      owned.partialPath, owned.metadataPath, archive, owner.value.nonce,
+    ),
+  }
 }
 
 function contentLength(response) {
@@ -570,7 +701,7 @@ export async function writeAll(handle, bytes, position) {
   return offset
 }
 
-async function streamResponse({ response, handle, archive, metadataPath, start, signal, assertLease }) {
+async function streamResponse({ response, handle, archive, metadataPath, nonce, start, signal, assertLease }) {
   const reader = response.body.getReader()
   let total = start
   let networkBytes = 0
@@ -598,7 +729,7 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
       if (total - checkpoint >= checkpointBytes) {
         await assertLease()
         await handle.sync()
-        await writePartialMetadata(metadataPath, archive, total)
+        await writePartialMetadata(metadataPath, archive, total, nonce)
         await assertLease()
         checkpoint = total
       }
@@ -615,7 +746,7 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
   if (total !== archive.bytes) throw acquisitionFailure(downloadFailed)
   await assertLease()
   await handle.sync()
-  await writePartialMetadata(metadataPath, archive, total)
+  await writePartialMetadata(metadataPath, archive, total, nonce)
   await assertLease()
   return networkBytes
 }
@@ -755,8 +886,6 @@ async function publishPartial({ handle, partialPath, metadataPath, target, archi
 
 async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
   const target = join(cacheRoot, `${archive.sha256}.archive`)
-  const partialPath = join(cacheRoot, `.${archive.sha256}.partial`)
-  const metadataPath = join(cacheRoot, `.${archive.sha256}.partial.json`)
   const ownerPath = join(cacheRoot, `.${archive.sha256}.owner`)
   let cached
   try {
@@ -765,11 +894,11 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
     if (error instanceof Error && error.message.startsWith('Cached converter archive ')) throw error
     fail('Cached converter archive is invalid.')
   }
-  if (cached !== undefined) return cached
+  if (cached !== undefined && (await lockedPredecessors(cacheRoot, archive)).length === 0) return cached
 
   let owner
   try {
-    owner = await acquireOwnerLock({ path: ownerPath, cacheRoot, partialPath, metadataPath, archive, signal })
+    owner = await acquireOwnerLock({ path: ownerPath, cacheRoot, archive, signal })
   } catch (error) {
     if (error?.message === downloadFailed || error?.message === 'Converter source artifact identities conflict.') throw error
     throw acquisitionFailure(downloadFailed)
@@ -782,20 +911,35 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
   const stopHeartbeat = startOwnerHeartbeat(ownerPath, owner, loseLease)
   const operationSignal = operationController.signal
   const assertLease = () => assertOwnerLease(ownerPath, owner)
+  const ownedPaths = ownerPartialPaths(cacheRoot, archive.sha256, owner.value.nonce)
+  const { partialPath, metadataPath } = ownedPaths
   let handle
   let networkBytes = 0
+  let resumeOwner = false
+  let resumableStat
   try {
     await assertLease()
     cached = await cachedArchive(target, archive)
     if (cached !== undefined) {
       await assertLease()
       await removePartial(partialPath, metadataPath)
+      for (const predecessor of owner.predecessors) {
+        const previous = ownerPartialPaths(cacheRoot, archive.sha256, predecessor.nonce)
+        await removePartial(previous.partialPath, previous.metadataPath)
+        await unlink(predecessor.markerPath).catch((error) => { if (!isMissing(error)) throw error })
+      }
       return cached
     }
-    cached = await recoverPublishedLink({ partialPath, metadataPath, target, archive, cacheRoot, assertLease })
-    if (cached !== undefined) return cached
-    const partial = await openExistingPartial(partialPath, metadataPath, archive)
+    const prepared = await prepareOwnedPartial(cacheRoot, archive, owner)
+    const partial = prepared.partial
     handle = partial.handle
+    if ((await handle.stat()).nlink === 2) {
+      await handle.close()
+      handle = undefined
+      cached = await recoverPublishedLink({ partialPath, metadataPath, target, archive, cacheRoot, assertLease })
+      if (cached !== undefined) return cached
+      throw acquisitionFailure(downloadFailed)
+    }
     let start = partial.partialBytes
     if (start < archive.bytes) {
       if (operationSignal.aborted) throw acquisitionFailure(downloadFailed)
@@ -823,12 +967,13 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
         await assertLease()
         await handle.truncate(0)
         await handle.sync()
-        await writePartialMetadata(metadataPath, archive, 0)
+        await writePartialMetadata(metadataPath, archive, 0, owner.value.nonce)
         await assertLease()
         start = 0
       }
       networkBytes = await streamResponse({
-        response, handle, archive, metadataPath, start, signal: operationSignal, assertLease,
+        response, handle, archive, metadataPath, nonce: owner.value.nonce,
+        start, signal: operationSignal, assertLease,
       })
     }
     await publishPartial({ handle, partialPath, metadataPath, target, archive, cacheRoot, assertLease })
@@ -843,6 +988,9 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
       }
     } else if (error?.discardPartial === true) {
       await removePartial(partialPath, metadataPath)
+    } else if (handle) {
+      resumableStat = await handle.stat().catch(() => undefined)
+      resumeOwner = Boolean(resumableStat)
     }
     await handle?.close().catch(() => undefined)
     if (error instanceof Error && [
@@ -853,7 +1001,15 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
   } finally {
     await stopHeartbeat()
     signal.removeEventListener('abort', upstreamAbort)
-    await releaseOwnerLock(ownerPath, cacheRoot, owner)
+    if (resumeOwner) {
+      const parked = await parkOwnerForResume(ownerPath, cacheRoot, owner)
+      if (!parked && resumableStat && await unlinkMatchingInode(partialPath, resumableStat).catch(() => false)) {
+        await unlink(metadataPath).catch(() => undefined)
+        await syncDirectory(cacheRoot).catch(() => undefined)
+      }
+    } else {
+      await releaseOwnerLock(ownerPath, cacheRoot, owner)
+    }
   }
 }
 

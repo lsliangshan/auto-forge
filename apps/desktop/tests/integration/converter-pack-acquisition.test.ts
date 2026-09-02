@@ -82,16 +82,17 @@ function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
   })
 }
 
-function spawnAcquisitionChild({ cacheRoot, archive, counterPath, mode = 'complete' }: {
+function spawnAcquisitionChild({ cacheRoot, archive, counterPath, mode = 'complete', releasePath = '' }: {
   cacheRoot: string
   archive: { url: string; sha256: string; bytes: number }
   counterPath: string
-  mode?: 'complete' | 'crash-owner'
+  mode?: 'complete' | 'crash-owner' | 'wait-release'
+  releasePath?: string
 }) {
   const moduleUrl = new URL('../../scripts/converter-packs/acquire-sources.mjs', import.meta.url).href
   const script = String.raw`
-    import { appendFile } from 'node:fs/promises'
-    const [moduleUrl, cacheRoot, archiveJson, counterPath, mode] = process.argv.slice(1)
+    import { access, appendFile } from 'node:fs/promises'
+    const [moduleUrl, cacheRoot, archiveJson, counterPath, mode, releasePath] = process.argv.slice(1)
     const { acquireVerifiedArchive } = await import(moduleUrl)
     const archive = JSON.parse(archiveJson)
     const bytes = Buffer.from('cross-process artifact')
@@ -101,6 +102,11 @@ function spawnAcquisitionChild({ cacheRoot, archive, counterPath, mode = 'comple
       fetchImpl: async () => {
         await appendFile(counterPath, mode + '\n')
         if (mode === 'crash-owner') await new Promise(() => { setInterval(() => {}, 1_000) })
+        if (mode === 'wait-release') {
+          while (true) {
+            try { await access(releasePath); break } catch { await new Promise((resolve) => setTimeout(resolve, 20)) }
+          }
+        }
         await new Promise((resolve) => setTimeout(resolve, 150))
         return new Response(bytes, { status: 200 })
       },
@@ -108,7 +114,7 @@ function spawnAcquisitionChild({ cacheRoot, archive, counterPath, mode = 'comple
     process.stdout.write(JSON.stringify(result))
   `
   const child = trackChild(spawn(process.execPath, [
-    '--input-type=module', '-e', script, moduleUrl, cacheRoot, JSON.stringify(archive), counterPath, mode,
+    '--input-type=module', '-e', script, moduleUrl, cacheRoot, JSON.stringify(archive), counterPath, mode, releasePath,
   ], {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -163,14 +169,35 @@ function lockedSelection({
   }
 }
 
+const fixtureOwnerNonce = '00000000-0000-4000-8000-000000000001'
+
+function ownerDataPaths(cacheRoot: string, sha: string, nonce = fixtureOwnerNonce) {
+  const partialPath = join(cacheRoot, `.${sha}.${nonce}.partial`)
+  return { partialPath, metadataPath: `${partialPath}.json` }
+}
+
+function writeOwner(cacheRoot: string, archive: { url: string; sha256: string; bytes: number }, {
+  nonce = fixtureOwnerNonce,
+  pid = 2_147_483_647,
+  state = 'resume',
+} = {}) {
+  writeFileSync(join(cacheRoot, `.${archive.sha256}.owner`), canonicalBytes({
+    bytes: archive.bytes, nonce, pid, sha256: archive.sha256, state, url: archive.url,
+  }), { mode: 0o600 })
+}
+
 function writePartial(cacheRoot: string, archive: { url: string; sha256: string; bytes: number }, bytes: Buffer, partialBytes = bytes.byteLength) {
-  writeFileSync(join(cacheRoot, `.${archive.sha256}.partial`), bytes, { mode: 0o600 })
-  writeFileSync(join(cacheRoot, `.${archive.sha256}.partial.json`), canonicalBytes({
+  const paths = ownerDataPaths(cacheRoot, archive.sha256)
+  writeFileSync(paths.partialPath, bytes, { mode: 0o600 })
+  writeFileSync(paths.metadataPath, canonicalBytes({
     bytes: archive.bytes,
+    nonce: fixtureOwnerNonce,
     partialBytes,
     sha256: archive.sha256,
     url: archive.url,
   }), { mode: 0o600 })
+  writeOwner(cacheRoot, archive)
+  return paths
 }
 
 describe('converter pack source acquisition', () => {
@@ -207,13 +234,7 @@ describe('converter pack source acquisition', () => {
       sha256: sha256(bytes),
       bytes: bytes.byteLength,
     }
-    writeFileSync(join(cacheRoot, `.${archive.sha256}.partial`), bytes.subarray(0, 4), { mode: 0o600 })
-    writeFileSync(join(cacheRoot, `.${archive.sha256}.partial.json`), canonicalBytes({
-      bytes: archive.bytes,
-      partialBytes: 4,
-      sha256: archive.sha256,
-      url: archive.url,
-    }), { mode: 0o600 })
+    writePartial(cacheRoot, archive, bytes.subarray(0, 4))
     const requests: Array<{ range: string | null; signal: AbortSignal | null }> = []
 
     const result = await acquireVerifiedArchive({
@@ -302,8 +323,8 @@ describe('converter pack source acquisition', () => {
       }), { status: 200 }),
     })
     await reached.promise
-    const partialPath = join(cacheRoot, `.${archive.sha256}.partial`)
-    const metadataPath = `${partialPath}.json`
+    const activeOwner = JSON.parse(readFileSync(join(cacheRoot, `.${archive.sha256}.owner`), 'utf8'))
+    const { partialPath, metadataPath } = ownerDataPaths(cacheRoot, archive.sha256, activeOwner.nonce)
     await waitUntil(() => lstatSync(partialPath).size === 100)
     expect(JSON.parse(readFileSync(metadataPath, 'utf8')).partialBytes).toBe(0)
     controller.abort()
@@ -377,10 +398,10 @@ describe('converter pack source acquisition', () => {
     mkdirSync(cacheRoot)
     const bytes = Buffer.from('0123456789')
     const archive = { url: 'https://downloads.example.test/current.tar.gz', sha256: sha256(bytes), bytes: 10 }
-    writeFileSync(join(cacheRoot, `.${archive.sha256}.partial`), bytes.subarray(0, 4), { mode: 0o600 })
-    const metadata = { ...archive, partialBytes: 4 }
+    const paths = writePartial(cacheRoot, archive, bytes.subarray(0, 4))
+    const metadata = { ...archive, nonce: fixtureOwnerNonce, partialBytes: 4 }
     mutate(metadata)
-    writeFileSync(join(cacheRoot, `.${archive.sha256}.partial.json`), canonicalBytes(metadata), { mode: 0o600 })
+    writeFileSync(paths.metadataPath, canonicalBytes(metadata), { mode: 0o600 })
     let requests = 0
 
     await expect(acquireVerifiedArchive({
@@ -403,11 +424,12 @@ describe('converter pack source acquisition', () => {
     const archive = { url: 'https://downloads.example.test/symlink.tar.gz', sha256: sha256(bytes), bytes: 10 }
     const external = join(root, 'external')
     writeFileSync(external, 'outside', { mode: 0o600 })
-    const partialPath = join(cacheRoot, `.${archive.sha256}.partial`)
+    const { partialPath, metadataPath } = ownerDataPaths(cacheRoot, archive.sha256)
     symlinkSync(external, partialPath)
-    writeFileSync(join(cacheRoot, `.${archive.sha256}.partial.json`), canonicalBytes({
-      bytes: archive.bytes, partialBytes: 4, sha256: archive.sha256, url: archive.url,
+    writeFileSync(metadataPath, canonicalBytes({
+      bytes: archive.bytes, nonce: fixtureOwnerNonce, partialBytes: 4, sha256: archive.sha256, url: archive.url,
     }), { mode: 0o600 })
+    writeOwner(cacheRoot, archive)
 
     await expect(acquireVerifiedArchive({ archive, cacheRoot, fetchImpl: async () => new Response(bytes) }))
       .rejects.toThrow('Converter source partial cache is invalid.')
@@ -446,8 +468,7 @@ describe('converter pack source acquisition', () => {
       sha256: sha256(bytes),
       bytes: bytes.byteLength,
     }
-    writePartial(cacheRoot, archive, bytes)
-    const partialPath = join(cacheRoot, `.${archive.sha256}.partial`)
+    const { partialPath } = writePartial(cacheRoot, archive, bytes)
     const target = join(cacheRoot, `${archive.sha256}.archive`)
     linkSync(partialPath, target)
     expect(lstatSync(partialPath).nlink).toBe(2)
@@ -873,7 +894,6 @@ describe('converter pack source acquisition', () => {
       sha256: sha256(bytes),
       bytes: bytes.byteLength,
     }
-    const metadataPath = join(cacheRoot, `.${archive.sha256}.partial.json`)
     let pulled = false
     let cancelled = false
 
@@ -884,6 +904,8 @@ describe('converter pack source acquisition', () => {
         pull(controller) {
           if (pulled) return
           pulled = true
+          const owner = JSON.parse(readFileSync(join(cacheRoot, `.${archive.sha256}.owner`), 'utf8'))
+          const { metadataPath } = ownerDataPaths(cacheRoot, archive.sha256, owner.nonce)
           rmSync(metadataPath)
           mkdirSync(metadataPath)
           controller.enqueue(bytes)
@@ -997,11 +1019,14 @@ describe('converter pack source acquisition', () => {
     const waiter = acquireVerifiedArchive({ archive, cacheRoot, fetchImpl, signal: controller.signal })
     controller.abort()
     await expect(waiter).rejects.toThrow('Converter source download failed.')
+    const active = JSON.parse(readFileSync(join(cacheRoot, `.${archive.sha256}.owner`), 'utf8'))
+    const activePaths = ownerDataPaths(cacheRoot, archive.sha256, active.nonce)
     expect(readdirSync(cacheRoot).sort()).toEqual([
+      `.${archive.sha256}.${active.nonce}.partial`,
+      `.${archive.sha256}.${active.nonce}.partial.json`,
       `.${archive.sha256}.owner`,
-      `.${archive.sha256}.partial`,
-      `.${archive.sha256}.partial.json`,
     ])
+    expect(lstatSync(activePaths.partialPath).isFile()).toBe(true)
     response.resolve(new Response(bytes, { status: 200 }))
 
     const [result, followerResult] = await Promise.all([owner, follower])
@@ -1068,9 +1093,10 @@ describe('converter pack source acquisition', () => {
     const ownerPath = join(cacheRoot, `.${archive.sha256}.owner`)
     writeFileSync(ownerPath, canonicalBytes({
       bytes: archive.bytes,
-      nonce: '00000000-0000-4000-8000-000000000000',
+      nonce: fixtureOwnerNonce,
       pid: unrelated.pid,
       sha256: archive.sha256,
+      state: 'active',
       url: archive.url,
     }), { mode: 0o600 })
     const expired = new Date(Date.now() - 2 * 60 * 1_000)
@@ -1093,6 +1119,93 @@ describe('converter pack source acquisition', () => {
       clearTimeout(timeout)
     }
     expect(range).toBe(null)
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
+  it('does not let a resumed stale owner modify or remove its successor data', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const counterPath = join(root, 'requests.log')
+    const successorReleasePath = join(root, 'release-successor')
+    writeFileSync(counterPath, '')
+    const bytes = Buffer.from('cross-process artifact')
+    const archive = {
+      url: 'https://downloads.example.test/stale-owner-fencing.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    const started = deferred<void>()
+    const release = deferred<void>()
+    const stale = acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async () => {
+        started.resolve()
+        await release.promise
+        return new Response(bytes, { status: 200 })
+      },
+    })
+    await started.promise
+    const ownerPath = join(cacheRoot, `.${archive.sha256}.owner`)
+    const expired = new Date(Date.now() - 2 * 60 * 1_000)
+    utimesSync(ownerPath, expired, expired)
+
+    const successor = spawnAcquisitionChild({
+      cacheRoot, archive, counterPath, mode: 'wait-release', releasePath: successorReleasePath,
+    })
+    await waitUntil(() => readFileSync(counterPath, 'utf8').includes('wait-release'))
+    const successorOwnerBefore = readFileSync(ownerPath, 'utf8')
+    const successorOwner = JSON.parse(successorOwnerBefore)
+    const successorPaths = ownerDataPaths(cacheRoot, archive.sha256, successorOwner.nonce)
+    const successorPartialBefore = readFileSync(successorPaths.partialPath)
+    const successorMetadataBefore = readFileSync(successorPaths.metadataPath)
+    release.resolve()
+    await expect(stale).rejects.toThrow('Converter source download failed.')
+    expect(readFileSync(ownerPath, 'utf8')).toBe(successorOwnerBefore)
+    expect(readFileSync(successorPaths.partialPath)).toEqual(successorPartialBefore)
+    expect(readFileSync(successorPaths.metadataPath)).toEqual(successorMetadataBefore)
+
+    writeFileSync(successorReleasePath, '')
+    const successorResult = await successor.completion
+    expect(JSON.parse(successorResult.stdout).sha256).toBe(archive.sha256)
+    expect(readFileSync(join(cacheRoot, `${archive.sha256}.archive`))).toEqual(bytes)
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
+  it('keeps the winner nonce data isolated when two contenders reclaim one stale owner', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const counterPath = join(root, 'requests.log')
+    writeFileSync(counterPath, '')
+    const bytes = Buffer.from('cross-process artifact')
+    const archive = {
+      url: 'https://downloads.example.test/stale-contenders.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    writePartial(cacheRoot, archive, bytes.subarray(0, 5))
+    const unrelated = trackChild(spawn(process.execPath, ['--input-type=module', '-e', 'setInterval(() => {}, 1_000)'], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      stdio: 'ignore',
+    }))
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      unrelated.once('spawn', resolvePromise)
+      unrelated.once('error', rejectPromise)
+    })
+    const ownerPath = join(cacheRoot, `.${archive.sha256}.owner`)
+    writeOwner(cacheRoot, archive, { nonce: fixtureOwnerNonce, pid: unrelated.pid, state: 'active' })
+    const expired = new Date(Date.now() - 2 * 60 * 1_000)
+    utimesSync(ownerPath, expired, expired)
+
+    const first = spawnAcquisitionChild({ cacheRoot, archive, counterPath })
+    const second = spawnAcquisitionChild({ cacheRoot, archive, counterPath })
+    const results = await Promise.all([first.completion, second.completion])
+
+    expect(results.map(({ stdout }) => JSON.parse(stdout).sha256)).toEqual([archive.sha256, archive.sha256])
+    expect(readFileSync(counterPath, 'utf8').trim().split('\n')).toEqual(['complete'])
+    expect(readFileSync(join(cacheRoot, `${archive.sha256}.archive`))).toEqual(bytes)
     expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
   })
 
@@ -1315,8 +1428,11 @@ describe('converter pack source acquisition', () => {
     await expect(acquisitionPromise).rejects.toThrow('Converter source download failed.')
     expect(starts).toHaveLength(3)
     expect(settled).toHaveLength(3)
-    expect(readdirSync(cacheRoot).every((name) => /^\.[a-f0-9]{64}\.partial(?:\.json)?$/u.test(name))).toBe(true)
     const names = readdirSync(cacheRoot)
+    expect(names.every((name) => (
+      /^\.[a-f0-9]{64}\.owner$/u.test(name)
+      || /^\.[a-f0-9]{64}\.[a-f0-9-]{36}\.partial(?:\.json)?$/u.test(name)
+    ))).toBe(true)
     for (const name of names.filter((value) => value.endsWith('.partial'))) {
       expect(names).toContain(`${name}.json`)
     }
