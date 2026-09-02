@@ -436,6 +436,7 @@ function startPreparationOwnerHeartbeat({ path, handle, identity, bytes }) {
     const [opened, current] = await Promise.all([handle.stat(), lstat(path).catch(() => undefined)])
     if (!current?.isFile() || current.isSymbolicLink() || current.nlink !== 1 || opened.nlink !== 1
       || (opened.mode & 0o777) !== 0o444 || (current.mode & 0o777) !== 0o444
+      || opened.size !== bytes.byteLength || current.size !== bytes.byteLength
       || !sameIdentity(opened, identity) || !sameIdentity(current, identity)) {
       throw new Error('Development preparation owner lease was lost')
     }

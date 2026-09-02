@@ -142,6 +142,22 @@ describe('local development release cache', () => {
       .rejects.toThrow(/limit/iu)
     rmSync(eighth.path, { recursive: true })
   })
+
+  it('fences an owner lease whose stable inode grows behind the open handle', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '6'.repeat(64)
+    const lease = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint })
+    const owner = join(lease.path, readdirSync(lease.path).find((name) => name.endsWith('.ready'))!)
+    const bytes = readFileSync(owner)
+    chmodSync(owner, 0o644)
+    writeFileSync(owner, Buffer.concat([bytes, Buffer.from('evil')]))
+    chmodSync(owner, 0o444)
+
+    await expect(lease.pulse()).rejects.toThrow(/lease was lost/iu)
+    await lease.stop().catch(() => undefined)
+    rmSync(lease.path, { recursive: true })
+  })
   it('frames the development release fingerprint deterministically', () => {
     expect(fingerprintDevelopmentRelease({
       target: 'darwin-arm64',
