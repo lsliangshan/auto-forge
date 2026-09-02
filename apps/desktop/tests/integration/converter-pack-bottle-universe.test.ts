@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { readVerifiedBottleEntries } from '../../scripts/converter-packs/bottle-archive.mjs'
 import { extractVerifiedBottle, materializeBottleUniverse } from '../../scripts/converter-packs/bottle-universe.mjs'
+import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 
 const temporaryRoots: string[] = []
 const spawnedChildren = new Set<ReturnType<typeof spawn>>()
@@ -345,6 +346,28 @@ describe('converter bottle universe', () => {
     })).rejects.toThrow('Bottle archive is invalid.')
   })
 
+  it('authenticates the exact second-pass compressed stream delivered to gunzip', async () => {
+    const root = temporaryRoot()
+    const fixture = writeBottleArchive(root, 'stream-authenticated.tar.gz', [{
+      path: 'vips/8.18.6/bin/vips', bytes: Buffer.from('vips'), mode: 0o555,
+    }])
+
+    const original = lstatSync(fixture.archive)
+    let changed: ReturnType<typeof lstatSync> | undefined
+    await expect(readVerifiedBottleEntries({
+      archive: fixture.archive,
+      expectedBytes: fixture.compressed.byteLength,
+      expectedSha256: fixture.sha256,
+      beforeStreamForTest: () => {
+        const bytes = readFileSync(fixture.archive)
+        bytes[4] ^= 1
+        writeFileSync(fixture.archive, bytes)
+        changed = lstatSync(fixture.archive)
+      },
+    })).rejects.toThrow('Bottle archive is invalid.')
+    expect([changed?.dev, changed?.ino, changed?.size]).toEqual([original.dev, original.ino, original.size])
+  })
+
   it.each([
     ['link cycle', () => ({
       entries: [
@@ -626,7 +649,7 @@ describe('converter bottle universe', () => {
     })).rejects.toThrow('Bottle universe inventory is invalid.')
   })
 
-  it('holds a sibling claim across processes until rename and parent sync complete', async () => {
+  it('serializes cooperating module processes with a sibling claim through rename and parent sync', async () => {
     const root = temporaryRoot()
     const bytes = Buffer.from('claimed tool')
     const bottle = writeBottleArchive(root, 'claimed.tar.gz', [{ path: 'claim/1.0/bin/tool', bytes, mode: 0o555 }])
@@ -665,6 +688,10 @@ describe('converter bottle universe', () => {
       child.once('close', (code) => code === 0 ? resolvePromise() : rejectPromise(new Error(stderr)))
     })
     await waitUntil(() => existsSync(marker))
+    const claimBytes = readFileSync(`${destination}.claim`)
+    const claim = JSON.parse(claimBytes.toString('utf8'))
+    expect(claimBytes).toEqual(canonicalBytes(claim))
+    expect(Object.keys(claim).sort()).toEqual(['createdAtMs', 'nonce', 'pid'])
 
     await expect(extractVerifiedBottle({
       archive: bottle.archive,
@@ -674,6 +701,49 @@ describe('converter bottle universe', () => {
     })).rejects.toThrow('already claimed')
     writeFileSync(release, 'release')
     await completion
+    expect(readFileSync(join(destination, 'bin', 'tool'))).toEqual(bytes)
+    expect(existsSync(`${destination}.claim`)).toBe(false)
+  })
+
+  it('fences and recovers a fresh claim after its owning process is killed', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.from('recoverable tool')
+    const bottle = writeBottleArchive(root, 'recoverable.tar.gz', [{ path: 'recover/1.0/bin/tool', bytes, mode: 0o555 }])
+    const parent = join(root, 'Cellar', 'recover')
+    mkdirSync(parent, { recursive: true })
+    const destination = join(parent, '1.0')
+    const marker = join(root, 'recover-ready')
+    const moduleUrl = new URL('../../scripts/converter-packs/bottle-universe.mjs', import.meta.url).href
+    const acquisition = { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength }
+    const selected = [{ sourcePath: 'bin/tool', sha256: sha256(bytes), bytes: bytes.byteLength, executable: true, role: 'executable' }]
+    const script = String.raw`
+      import { writeFile } from 'node:fs/promises'
+      const [moduleUrl, archive, acquisitionJson, selectedJson, destination, marker] = process.argv.slice(1)
+      const { extractVerifiedBottle } = await import(moduleUrl)
+      await extractVerifiedBottle({
+        archive, coordinate: { name: 'recover', version: '1.0', acquisition: JSON.parse(acquisitionJson) },
+        selectedEntries: JSON.parse(selectedJson), destination,
+        beforePublishForTest: async () => {
+          await writeFile(marker, 'ready')
+          await new Promise(() => { setInterval(() => {}, 1_000) })
+        },
+      })
+    `
+    const child = trackChild(spawn(process.execPath, [
+      '--input-type=module', '-e', script, moduleUrl, bottle.archive, JSON.stringify(acquisition), JSON.stringify(selected),
+      destination, marker,
+    ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] }))
+    await waitUntil(() => existsSync(marker))
+    const closed = new Promise<void>((resolvePromise) => child.once('close', () => resolvePromise()))
+    child.kill('SIGKILL')
+    await closed
+
+    await expect(extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: { name: 'recover', version: '1.0', acquisition },
+      selectedEntries: selected,
+      destination,
+    })).resolves.toBeDefined()
     expect(readFileSync(join(destination, 'bin', 'tool'))).toEqual(bytes)
     expect(existsSync(`${destination}.claim`)).toBe(false)
   })

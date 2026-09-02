@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { TextDecoder } from 'node:util'
+import { Transform } from 'node:stream'
 import { createGunzip } from 'node:zlib'
 import { posix } from 'node:path'
 import { fail, requireAbsolutePath, withStableRegularFile } from './pack-tooling-lib.mjs'
@@ -300,7 +301,13 @@ async function drainReadable(readable) {
   })
 }
 
-export async function scanVerifiedBottleEntries({ archive, expectedBytes, expectedSha256, onFile }) {
+export async function scanVerifiedBottleEntries({
+  archive,
+  expectedBytes,
+  expectedSha256,
+  onFile,
+  beforeStreamForTest,
+}) {
   requireAbsolutePath(archive, 'Bottle archive path')
   if (
     !Number.isSafeInteger(expectedBytes)
@@ -308,15 +315,32 @@ export async function scanVerifiedBottleEntries({ archive, expectedBytes, expect
     || expectedBytes > maximumExpandedBytes
     || !sha256Pattern.test(expectedSha256)
     || (onFile !== undefined && typeof onFile !== 'function')
+    || (beforeStreamForTest !== undefined && typeof beforeStreamForTest !== 'function')
   ) invalid()
   return withStableRegularFile(archive, 'Bottle archive', async (handle, metadata) => {
     if (metadata.size !== expectedBytes) invalid()
     if (await hashOpenFile(handle, expectedBytes) !== expectedSha256) invalid()
+    await beforeStreamForTest?.({ archive })
     const compressed = handle.createReadStream({ autoClose: false, start: 0, end: expectedBytes - 1 })
+    const streamedDigest = createHash('sha256')
+    let streamedBytes = 0
+    const authenticated = new Transform({
+      transform(chunk, _encoding, callback) {
+        streamedBytes += chunk.byteLength
+        if (!Number.isSafeInteger(streamedBytes) || streamedBytes > expectedBytes) {
+          callback(new Error('Bottle archive is invalid.'))
+          return
+        }
+        streamedDigest.update(chunk)
+        callback(null, chunk)
+      },
+    })
     const gunzip = createGunzip()
     try {
-      compressed.pipe(gunzip)
-      return await scanTar(gunzip, onFile)
+      compressed.pipe(authenticated).pipe(gunzip)
+      const entries = await scanTar(gunzip, onFile)
+      if (streamedBytes !== expectedBytes || streamedDigest.digest('hex') !== expectedSha256) invalid()
+      return entries
     } catch (error) {
       if (
         error instanceof Error
@@ -324,7 +348,9 @@ export async function scanVerifiedBottleEntries({ archive, expectedBytes, expect
       ) throw error
       invalid()
     } finally {
-      compressed.unpipe(gunzip)
+      compressed.unpipe(authenticated)
+      authenticated.unpipe(gunzip)
+      authenticated.destroy()
       gunzip.destroy()
       await drainReadable(compressed).catch(() => invalid())
     }

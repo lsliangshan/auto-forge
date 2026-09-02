@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { constants, lstatSync, realpathSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, open, realpath, rename, rm, unlink } from 'node:fs/promises'
+import { link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import {
@@ -21,6 +21,10 @@ const versionPattern = /^[A-Za-z0-9._+-]+$/u
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const roles = new Set(['executable', 'code', 'data', 'license'])
 const targets = new Set(['darwin-arm64', 'darwin-x64'])
+const noncePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
+const claimMaximumBytes = 1024
+const claimHeartbeatMs = 5 * 1000
+const claimLeaseTimeoutMs = 30 * 1000
 
 function invalid() {
   fail('Bottle universe inventory is invalid.')
@@ -177,28 +181,171 @@ async function syncDirectory(path) {
   }
 }
 
+function exactKeys(value, expected) {
+  return value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Object.keys(value).length === expected.length
+    && expected.every((key) => Object.hasOwn(value, key))
+}
+
+function missing(error) {
+  return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+}
+
+function ownerAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'EPERM')
+  }
+}
+
+async function readDestinationClaim(path, allowedLinks = [1]) {
+  let handle
+  try {
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  } catch (error) {
+    if (missing(error)) return undefined
+    invalid()
+  }
+  try {
+    const [opened, current] = await Promise.all([handle.stat(), lstat(path).catch(() => undefined)])
+    if (
+      !current?.isFile()
+      || current.isSymbolicLink()
+      || !opened.isFile()
+      || !allowedLinks.includes(current.nlink)
+      || !allowedLinks.includes(opened.nlink)
+      || current.dev !== opened.dev
+      || current.ino !== opened.ino
+      || opened.size <= 0
+      || opened.size > claimMaximumBytes
+    ) invalid()
+    const bytes = await handle.readFile()
+    let value
+    try {
+      value = JSON.parse(bytes.toString('utf8'))
+    } catch {
+      invalid()
+    }
+    if (
+      !bytes.equals(canonicalBytes(value))
+      || !exactKeys(value, ['createdAtMs', 'nonce', 'pid'])
+      || !Number.isSafeInteger(value.createdAtMs)
+      || value.createdAtMs <= 0
+      || !noncePattern.test(value.nonce)
+      || !Number.isSafeInteger(value.pid)
+      || value.pid <= 0
+    ) invalid()
+    return { bytes, stat: opened, value }
+  } finally {
+    await handle.close()
+  }
+}
+
+function matchingClaim(current, expected) {
+  return Boolean(
+    current?.value
+    && current.stat.dev === expected.dev
+    && current.stat.ino === expected.ino
+    && current.value.nonce === expected.nonce,
+  )
+}
+
+async function unlinkMatchingClaim(path, expected, allowedLinks = [1]) {
+  const current = await readDestinationClaim(path, allowedLinks)
+  if (!matchingClaim(current, expected)) return false
+  await unlink(path).catch((error) => {
+    if (!missing(error)) throw error
+  })
+  return true
+}
+
+async function fenceClaimForTakeover(path, expected) {
+  const predecessor = `${path}.${expected.value.nonce}.predecessor`
+  const identity = {
+    dev: expected.stat.dev,
+    ino: expected.stat.ino,
+    nonce: expected.value.nonce,
+  }
+  try {
+    await link(path, predecessor)
+  } catch (error) {
+    if (missing(error)) return false
+    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
+  }
+  const [current, preserved] = await Promise.all([
+    readDestinationClaim(path, [2]),
+    readDestinationClaim(predecessor, [2]),
+  ])
+  if (!matchingClaim(current, identity) || !matchingClaim(preserved, identity)) invalid()
+  if (!await unlinkMatchingClaim(path, identity, [2])) return false
+  await syncDirectory(dirname(path))
+  await unlinkMatchingClaim(predecessor, identity)
+  await syncDirectory(dirname(path))
+  return true
+}
+
+async function unlinkMatchingIdentity(path, expected) {
+  const current = await lstat(path).catch((error) => {
+    if (missing(error)) return undefined
+    throw error
+  })
+  if (
+    !current?.isFile()
+    || current.isSymbolicLink()
+    || current.nlink !== 1
+    || current.dev !== expected.dev
+    || current.ino !== expected.ino
+  ) return false
+  await unlink(path).catch((error) => {
+    if (!missing(error)) throw error
+  })
+  return true
+}
+
 async function acquireDestinationClaim(destination) {
   const path = `${destination}.claim`
-  const nonce = randomUUID()
-  const pid = process.pid
-  const bytes = canonicalBytes({ nonce, pid })
-  const handle = await open(
-    path,
-    constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-    0o600,
-  ).catch(() => undefined)
-  if (!handle) fail('Bottle extraction destination is already claimed.')
-  try {
-    await handle.writeFile(bytes)
-    await handle.sync()
-    await syncDirectory(dirname(path))
-    const metadata = await handle.stat()
-    return { path, handle, dev: metadata.dev, ino: metadata.ino, bytes, nonce }
-  } catch (error) {
-    await handle.close().catch(() => undefined)
-    await unlink(path).catch(() => undefined)
-    throw error
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const nonce = randomUUID()
+    const value = { createdAtMs: Date.now(), nonce, pid: process.pid }
+    const bytes = canonicalBytes(value)
+    let handle
+    let created
+    try {
+      handle = await open(
+        path,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      )
+      created = await handle.stat()
+      await handle.writeFile(bytes)
+      await handle.sync()
+      await syncDirectory(dirname(path))
+      const metadata = await handle.stat()
+      return { path, handle, dev: metadata.dev, ino: metadata.ino, bytes, nonce }
+    } catch (error) {
+      await handle?.close().catch(() => undefined)
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') {
+        if (created) await unlinkMatchingIdentity(path, created)
+        throw error
+      }
+    }
+
+    const metadata = await lstat(path).catch((error) => {
+      if (missing(error)) return undefined
+      throw error
+    })
+    if (!metadata) continue
+    const current = await readDestinationClaim(path, metadata.nlink === 2 ? [2] : [1])
+    if (!current) continue
+    const fresh = Date.now() - current.stat.mtimeMs <= claimLeaseTimeoutMs
+    if (fresh && ownerAlive(current.value.pid)) fail('Bottle extraction destination is already claimed.')
+    await fenceClaimForTakeover(path, current)
   }
+  fail('Bottle extraction destination is already claimed.')
 }
 
 async function verifyDestinationClaim(claim) {
@@ -223,10 +370,43 @@ async function verifyDestinationClaim(claim) {
   ) invalid()
 }
 
+async function renewDestinationClaim(claim) {
+  await verifyDestinationClaim(claim)
+  const now = new Date()
+  await claim.handle.utimes(now, now)
+  await verifyDestinationClaim(claim)
+}
+
+function startDestinationClaimHeartbeat(claim) {
+  let pending = Promise.resolve()
+  let failure
+  let stopped = false
+  const heartbeat = () => {
+    if (stopped || failure) return
+    pending = pending.then(() => renewDestinationClaim(claim)).catch((error) => {
+      failure = error
+      stopped = true
+    })
+  }
+  const timer = globalThis.setInterval(heartbeat, claimHeartbeatMs)
+  timer.unref?.()
+  return {
+    async pulse() {
+      heartbeat()
+      await pending
+      if (failure) throw failure
+    },
+    async stop() {
+      stopped = true
+      globalThis.clearInterval(timer)
+      await pending
+    },
+  }
+}
+
 async function releaseDestinationClaim(claim) {
   await claim.handle.close().catch(() => undefined)
-  const current = await lstat(claim.path).catch(() => undefined)
-  if (current?.dev === claim.dev && current.ino === claim.ino) await unlink(claim.path)
+  await unlinkMatchingClaim(claim.path, claim)
   await syncDirectory(dirname(claim.path))
 }
 
@@ -285,6 +465,7 @@ export async function extractVerifiedBottle({
   const rootPrefix = `${coordinate.name}/${coordinate.version}/`
   const selectedByArchivePath = new Map(selected.map((entry) => [`${rootPrefix}${entry.sourcePath}`, entry]))
   const claim = await acquireDestinationClaim(destination)
+  const claimHeartbeat = startDestinationClaimHeartbeat(claim)
   let privateRoot
   let published = false
   const openHandles = new Set()
@@ -353,16 +534,20 @@ export async function extractVerifiedBottle({
       })
     }
     await beforePublishForTest?.({ claimPath: claim.path, destination })
+    await claimHeartbeat.pulse()
     await verifyDestinationClaim(claim)
     await requireDirectory(parent, 'Bottle extraction parent')
     await requireDirectory(privateRoot, 'Bottle private extraction root')
     if (await lstat(destination).catch(() => undefined)) invalid()
+    // Node/macOS has no atomic directory rename-no-replace. This claim prevents clobbering
+    // between cooperating module processes; the final lstat only narrows outside races.
     await rename(privateRoot, destination)
     await syncDirectory(parent)
     published = true
   } finally {
     await Promise.allSettled([...openHandles].map((handle) => handle.close()))
     if (!published && privateRoot !== undefined) await rm(privateRoot, { recursive: true, force: true })
+    await claimHeartbeat.stop()
     await releaseDestinationClaim(claim)
   }
   return Object.freeze(selected.map((entry) => Object.freeze({
@@ -487,6 +672,7 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
   const closureNames = new Set()
   const records = []
   const claim = await acquireDestinationClaim(outputRoot)
+  const claimHeartbeat = startDestinationClaimHeartbeat(claim)
   let privateRoot
   let published = false
   try {
@@ -525,15 +711,19 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
       })
     }
     if ([...selected.keys()].some((key) => !closureNames.has(key.slice(0, key.indexOf('\0'))))) invalid()
+    await claimHeartbeat.pulse()
     await verifyDestinationClaim(claim)
     await requireDirectory(parent, 'Bottle universe parent')
     await requireDirectory(privateRoot, 'Bottle private universe root')
     if (await lstat(outputRoot).catch(() => undefined)) invalid()
+    // Node/macOS has no atomic directory rename-no-replace. This claim prevents clobbering
+    // between cooperating module processes; the final lstat only narrows outside races.
     await rename(privateRoot, outputRoot)
     await syncDirectory(parent)
     published = true
   } finally {
     if (!published && privateRoot !== undefined) await rm(privateRoot, { recursive: true, force: true })
+    await claimHeartbeat.stop()
     await releaseDestinationClaim(claim)
   }
 
