@@ -10,6 +10,7 @@ import {
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
+  recoverInterruptedActiveReplacement,
   removeInactiveDevelopmentRelease,
   replaceActiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
@@ -221,6 +222,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
   const removeRelease = dependencies.removeRelease ?? (() => removeInactiveDevelopmentRelease({ cacheRoot, fingerprint }))
   const removePrivateRoot = dependencies.removePrivateRoot ?? ((path) => rm(path, { recursive: true, force: true }))
 
+  await recoverInterruptedActiveReplacement({ cacheRoot })
   const activeRelease = await readActiveDevelopmentRelease({ cacheRoot }).catch((error) => {
     if (error?.code === 'ENOENT') return undefined
     throw error

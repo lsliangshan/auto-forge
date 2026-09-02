@@ -10,6 +10,7 @@ import {
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
+  recoverInterruptedActiveReplacement,
   replaceActiveDevelopmentRelease,
   removeInactiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
@@ -185,6 +186,22 @@ describe('local development release cache', () => {
     expect(readFileSync(join(active, 'state'), 'utf8')).toBe('verified')
     expect(existsSync(candidate)).toBe(false)
     expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.replaced-active-release-'))).toEqual([])
+  })
+
+  it('restores an active release from a bounded interrupted replacement quarantine', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(join(cacheRoot, 'releases'), { recursive: true })
+    const fingerprint = '4'.repeat(64)
+    const marker = `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`
+    writeFileSync(join(cacheRoot, 'active-release.json'), marker)
+    const quarantine = join(cacheRoot, `.replaced-active-release-${fingerprint}-123e4567-e89b-42d3-a456-426614174000`)
+    mkdirSync(quarantine)
+    writeFileSync(join(quarantine, 'state'), 'previous')
+
+    await expect(recoverInterruptedActiveReplacement({ cacheRoot })).resolves.toBe(1)
+    await expect(readActiveDevelopmentRelease({ cacheRoot })).resolves.toBe(join(cacheRoot, 'releases', fingerprint))
+    expect(readFileSync(join(cacheRoot, 'releases', fingerprint, 'state'), 'utf8')).toBe('previous')
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
   })
 
   it('activates an existing release atomically without leaking marker temporaries', async () => {

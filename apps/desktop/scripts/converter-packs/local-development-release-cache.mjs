@@ -18,6 +18,8 @@ const METADATA_TEMP_PATTERN = /^\.release-metadata-([a-f0-9]{64})-([a-f0-9-]{36}
 const CLAIM_PREDECESSOR_PATTERN = /^\.cache-mutation\.claim\.([a-f0-9-]+)\.predecessor$/u
 const ACTIVE_MARKER_TEMP_PATTERN = /^\.active-release-([a-f0-9-]{36})\.tmp$/u
 const PREPARATION_WORKSPACE_LIMIT = 8
+const REPLACED_RELEASE_PATTERN = /^\.replaced-active-release-([a-f0-9]{64})-([a-f0-9-]{36})$/u
+const REPLACED_RELEASE_LIMIT = 4
 
 function missing(error) {
   return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
@@ -590,6 +592,41 @@ export async function replaceActiveDevelopmentRelease({
       }
       throw primary
     }
+  })
+}
+
+export async function recoverInterruptedActiveReplacement({ cacheRoot }) {
+  const canonicalRoot = await canonicalCacheRoot(cacheRoot)
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
+    const quarantines = []
+    for (const name of await readdir(root)) {
+      if (!name.startsWith('.replaced-active-release-')) continue
+      const match = REPLACED_RELEASE_PATTERN.exec(name)
+      if (!match || !NONCE_PATTERN.test(match[2])) throw new Error('Development replacement recovery entry is unsafe')
+      quarantines.push({ fingerprint: match[1], path: join(root, name) })
+    }
+    if (quarantines.length > REPLACED_RELEASE_LIMIT
+      || new Set(quarantines.map(({ fingerprint }) => fingerprint)).size !== quarantines.length) {
+      throw new Error('Development replacement recovery is ambiguous')
+    }
+    for (const quarantine of quarantines) {
+      const details = await lstat(quarantine.path)
+      if (!details.isDirectory() || details.isSymbolicLink() || await realpath(quarantine.path).catch(() => undefined) !== quarantine.path) {
+        throw new Error('Development replacement recovery entry is unsafe')
+      }
+      const release = releasePath(root, quarantine.fingerprint)
+      const published = await lstat(release).catch((error) => missing(error) ? undefined : Promise.reject(error))
+      if (published !== undefined && (
+        !published.isDirectory()
+        || published.isSymbolicLink()
+        || await realpath(release).catch(() => undefined) !== release
+      )) throw new Error('Development replacement recovery release is unsafe')
+      await heartbeat.pulse()
+      if (published === undefined) await rename(quarantine.path, release)
+      else await rm(quarantine.path, { recursive: true })
+      await Promise.all([syncDirectory(dirname(release)), syncDirectory(root)])
+    }
+    return quarantines.length
   })
 }
 
