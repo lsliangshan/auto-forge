@@ -17,6 +17,7 @@ import {
   verifyLocalDevelopmentReleaseIntegrity,
 } from './build-local-development-release.mjs'
 import { smokeTestLocalDevelopmentRelease } from './verify-local-development-release.mjs'
+import { canonicalBytes, readStableRegularFile, safeEntryPath } from './pack-tooling-lib.mjs'
 
 const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/source-lock.mjs',
@@ -84,11 +85,10 @@ function relativeInputPath(root, path) {
 }
 
 async function regularFileUnderRoot(desktopRoot, path) {
-  const metadata = await lstat(path)
-  if (!metadata.isFile() || metadata.isSymbolicLink() || await realpath(path) !== path) {
-    throw new Error('Development fingerprint input must be a non-symbolic regular file')
+  return {
+    path: relativeInputPath(desktopRoot, path),
+    bytes: await readStableRegularFile(path, 'Development fingerprint input'),
   }
-  return { path: relativeInputPath(desktopRoot, path), bytes: await readFile(path) }
 }
 
 async function nativeInputs(desktopRoot) {
@@ -114,8 +114,28 @@ async function nativeInputs(desktopRoot) {
 
 export async function developmentFingerprintInputs(desktopRoot) {
   await canonicalDirectory(desktopRoot, 'Desktop root')
+  const sourcePath = join(desktopRoot, 'converter-packs', 'sources.lock.json')
+  const sourceInput = await regularFileUnderRoot(desktopRoot, sourcePath)
+  let sourceLock
+  try {
+    sourceLock = JSON.parse(sourceInput.bytes.toString('utf8'))
+  } catch {
+    throw new Error('Development source lock is not valid JSON')
+  }
+  if (!sourceInput.bytes.equals(canonicalBytes(sourceLock))) throw new Error('Development source lock is not canonical JSON')
+  const closureLocks = sourceLock?.closureLocks
+  const targets = ['darwin-arm64', 'darwin-x64']
+  if (
+    !isPlainRecord(closureLocks)
+    || Object.keys(closureLocks).sort().join('\0') !== targets.join('\0')
+    || targets.some((target) => !isPlainRecord(closureLocks[target]) || !safeEntryPath(closureLocks[target].path))
+  ) throw new Error('Development source lock closure coordinates are invalid')
   const inputs = [
-    await regularFileUnderRoot(desktopRoot, join(desktopRoot, 'converter-packs', 'sources.lock.json')),
+    sourceInput,
+    ...await Promise.all(targets.map((target) => regularFileUnderRoot(
+      desktopRoot,
+      join(desktopRoot, 'converter-packs', ...closureLocks[target].path.split('/')),
+    ))),
     ...await nativeInputs(desktopRoot),
   ]
   for (const path of fingerprintScriptPaths) {

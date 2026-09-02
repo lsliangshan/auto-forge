@@ -2,7 +2,10 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { prepareProductionStagingPlan } from '../../scripts/converter-packs/prepare-production-staging.mjs'
+import {
+  prepareProductionStagingPlan,
+  prepareProductionStagingPlanMain,
+} from '../../scripts/converter-packs/prepare-production-staging.mjs'
 
 const temporaryRoots: string[] = []
 
@@ -17,6 +20,27 @@ function temporaryRoot(): string {
 }
 
 describe('production staging plan preparation', () => {
+  it('reports CLI failures with a fixed path-free message and exit code', async () => {
+    const stderr: string[] = []
+    const secret = '/private/customer/staging-plan.json'
+    const argv = [
+      '--lock', '/private/lock.json', '--target', 'darwin-arm64', '--cache', '/private/cache',
+      '--helpers', '/private/helpers', '--workspace', '/private/workspace', '--staging', '/private/staging',
+      '--plan', secret, '--version', '1.2.3', '--sequence', '7',
+      '--generated-at', '2026-08-31T00:00:00.000Z', '--archive-base-url', 'https://example.test/releases/7',
+    ]
+
+    const exitCode = await prepareProductionStagingPlanMain(argv, {
+      stdout: { write: () => { throw new Error('unexpected stdout') } },
+      stderr: { write: (value: string) => { stderr.push(value); return true } },
+      prepare: async () => { throw new Error(`failed to publish ${secret}`) },
+    })
+
+    expect(exitCode).toBe(1)
+    expect(stderr).toEqual(['converter staging preparation failed\n'])
+    expect(stderr.join('')).not.toContain(secret)
+  })
+
   it('materializes authenticated inputs and writes only private resolver roots', async () => {
     const root = temporaryRoot()
     const helpers = join(root, 'helpers')

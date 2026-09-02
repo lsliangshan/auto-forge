@@ -286,9 +286,23 @@ export async function loadConverterSourceLock({ path, target }) {
   })
 }
 
+export async function loadConverterSourceLockMain(argv, {
+  stdout = process.stdout,
+  stderr = process.stderr,
+  load = loadConverterSourceLock,
+} = {}) {
+  try {
+    const args = parseArguments(argv, ['--lock', '--target'])
+    await load({ path: args['--lock'], target: args['--target'] })
+    stdout.write(`verified converter source lock for ${args['--target']}\n`)
+    return 0
+  } catch {
+    stderr.write('converter source lock verification failed\n')
+    return 1
+  }
+}
+
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(entry).href) {
-  const args = parseArguments(process.argv.slice(2), ['--lock', '--target'])
-  await loadConverterSourceLock({ path: args['--lock'], target: args['--target'] })
-  process.stdout.write(`verified converter source lock for ${args['--target']}\n`)
+  process.exitCode = await loadConverterSourceLockMain(process.argv.slice(2))
 }

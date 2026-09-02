@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
@@ -13,8 +13,12 @@ import {
 const roots: string[] = []
 const fingerprintFiles = [
   'scripts/converter-packs/source-lock.mjs',
+  'scripts/converter-packs/closure-lock.mjs',
   'scripts/converter-packs/acquire-sources.mjs',
+  'scripts/converter-packs/bottle-archive.mjs',
+  'scripts/converter-packs/bottle-universe.mjs',
   'scripts/converter-packs/build-native-helpers.mjs',
+  'scripts/converter-packs/locked-engine-assets.mjs',
   'scripts/converter-packs/prepare-production-staging.mjs',
   'scripts/converter-packs/macho-closure.mjs',
   'scripts/converter-packs/stage-production-packs.mjs',
@@ -36,8 +40,18 @@ function temporaryRoot() {
 
 function writeFixtureDesktop(root: string) {
   mkdirSync(join(root, 'converter-packs', 'native', 'common'), { recursive: true })
+  mkdirSync(join(root, 'converter-packs', 'closures'), { recursive: true })
   mkdirSync(join(root, 'scripts', 'converter-packs'), { recursive: true })
-  writeFileSync(join(root, 'converter-packs', 'sources.lock.json'), '{"schemaVersion":1}\n', { flag: 'w' })
+  const lock = {
+    closureLocks: {
+      'darwin-arm64': { path: 'closures/darwin-arm64.lock.json' },
+      'darwin-x64': { path: 'closures/darwin-x64.lock.json' },
+    },
+    schemaVersion: 2,
+  }
+  writeFileSync(join(root, 'converter-packs', 'sources.lock.json'), JSON.stringify(lock), { flag: 'w' })
+  writeFileSync(join(root, 'converter-packs', 'closures', 'darwin-arm64.lock.json'), '{"target":"darwin-arm64"}', { flag: 'w' })
+  writeFileSync(join(root, 'converter-packs', 'closures', 'darwin-x64.lock.json'), '{"target":"darwin-x64"}', { flag: 'w' })
   writeFileSync(join(root, 'converter-packs', 'native', 'common', 'helper.c'), 'int helper(void) { return 1; }\n', { flag: 'w' })
   for (const relative of fingerprintFiles) {
     writeFileSync(join(root, relative), `// ${relative}\n`, { flag: 'w' })
@@ -114,13 +128,30 @@ it('reuses a verified matching release without build callbacks', async () => {
 })
 
 it.each([
-  ['converter-packs/sources.lock.json'],
+  ['converter-packs/closures/darwin-arm64.lock.json'],
+  ['converter-packs/closures/darwin-x64.lock.json'],
   ['converter-packs/native/common/helper.c'],
   ['scripts/converter-packs/prepare-production-staging.mjs'],
 ])('changes the fingerprint when %s bytes change', async (changedPath) => {
   const { desktopRoot, cacheRoot } = fixture()
   const first = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies([]))
   writeFileSync(join(desktopRoot, changedPath), 'changed bytes\n')
+
+  const second = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies([]))
+
+  expect(second.fingerprint).not.toBe(first.fingerprint)
+})
+
+it('changes the fingerprint when canonical source lock bytes change', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const first = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies([]))
+  const sourcePath = join(desktopRoot, 'converter-packs', 'sources.lock.json')
+  const source = JSON.parse(readFileSync(sourcePath, 'utf8'))
+  writeFileSync(sourcePath, JSON.stringify({
+    closureLocks: source.closureLocks,
+    fixtureRevision: 1,
+    schemaVersion: source.schemaVersion,
+  }))
 
   const second = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies([]))
 

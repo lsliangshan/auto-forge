@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
-import { loadConverterSourceLock } from '../../scripts/converter-packs/source-lock.mjs'
+import { loadConverterSourceLock, loadConverterSourceLockMain } from '../../scripts/converter-packs/source-lock.mjs'
 
 const temporaryRoots: string[] = []
 const targets = ['darwin-arm64', 'darwin-x64'] as const
@@ -111,6 +111,21 @@ function writeLock(root: string, value: unknown): string {
 }
 
 describe('converter pack source lock schema v2', () => {
+  it('reports CLI verification failures with a fixed path-free message', async () => {
+    const stderr: string[] = []
+    const secret = '/private/source-lock/customer-name/sources.lock.json'
+
+    const exitCode = await loadConverterSourceLockMain(['--lock', secret, '--target', 'darwin-arm64'], {
+      stdout: { write: () => { throw new Error('unexpected stdout') } },
+      stderr: { write: (value: string) => { stderr.push(value); return true } },
+      load: async () => { throw new Error(`failed to read ${secret}`) },
+    })
+
+    expect(exitCode).toBe(1)
+    expect(stderr).toEqual(['converter source lock verification failed\n'])
+    expect(stderr.join('')).not.toContain(secret)
+  })
+
   it('selects exact engine, formula, license, and authenticated closure coordinates', async () => {
     const path = writeLock(temporaryRoot(), fixture())
 
