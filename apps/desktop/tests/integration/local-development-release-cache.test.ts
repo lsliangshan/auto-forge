@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -186,7 +187,7 @@ describe('local development release cache', () => {
     const cacheRoot = join(temporaryRoot(), 'cache')
     mkdirSync(join(cacheRoot, 'sources'), { recursive: true })
     const fingerprint = '1'.repeat(64)
-    const blob = '2'.repeat(64)
+    const blob = createHash('sha256').update('blob').digest('hex')
     createRelease(cacheRoot, fingerprint)
     writeFileSync(join(cacheRoot, 'sources', `${blob}.archive`), 'blob')
 

@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { constants } from 'node:fs'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { lstat, mkdir, open, readdir, realpath, rename, rm, statfs } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import process from 'node:process'
@@ -93,6 +93,49 @@ async function readRegular(path, maximumBytes = metadataLimit) {
       || after.size !== before.size
     ) fail('Development converter cache changed while reading.')
     return { bytes, stat: before }
+  } finally {
+    await handle.close()
+  }
+}
+
+async function readVerifiedBlob(path, expectedSha256) {
+  const before = await lstat(path).catch(() => undefined)
+  if (
+    !before?.isFile()
+    || before.isSymbolicLink()
+    || before.nlink !== 1
+    || !safeInteger(before.size)
+    || await realpath(path).catch(() => undefined) !== path
+  ) fail('Development converter complete blob is unsafe.')
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const opened = await handle.stat()
+    if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size || opened.nlink !== 1) {
+      fail('Development converter complete blob changed while opening.')
+    }
+    const digest = createHash('sha256')
+    const buffer = Buffer.alloc(Math.min(1024 * 1024, Math.max(opened.size, 1)))
+    let offset = 0
+    while (offset < opened.size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.byteLength, opened.size - offset), offset)
+      if (bytesRead === 0) fail('Development converter complete blob changed while hashing.')
+      digest.update(buffer.subarray(0, bytesRead))
+      offset += bytesRead
+    }
+    const [afterHandle, afterPath] = await Promise.all([handle.stat(), lstat(path).catch(() => undefined)])
+    if (
+      digest.digest('hex') !== expectedSha256
+      || afterHandle.dev !== opened.dev
+      || afterHandle.ino !== opened.ino
+      || afterHandle.size !== opened.size
+      || afterHandle.nlink !== 1
+      || afterPath?.dev !== opened.dev
+      || afterPath.ino !== opened.ino
+      || afterPath.size !== opened.size
+      || afterPath.nlink !== 1
+      || afterPath.isSymbolicLink()
+    ) fail('Development converter complete blob hash or identity is invalid.')
+    return before
   } finally {
     await handle.close()
   }
@@ -345,10 +388,7 @@ async function collectCache(cacheRoot, activeFingerprint, keepPrevious, maximumB
     let match = /^([a-f0-9]{64})\.archive$/u.exec(name)
     if (match) {
       const path = join(sourcesRoot, name)
-      const stat = await lstat(path)
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || !safeInteger(stat.size) || await realpath(path) !== path) {
-        fail('Development converter complete blob is unsafe.')
-      }
+      const stat = await readVerifiedBlob(path, match[1])
       complete.set(match[1], { path, stat })
       continue
     }

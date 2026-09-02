@@ -22,6 +22,19 @@ function missing(error) {
   return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
 }
 
+async function sha256FromHandle(handle, size, label) {
+  const digest = createHash('sha256')
+  const buffer = Buffer.alloc(Math.min(1024 * 1024, Math.max(size, 1)))
+  let offset = 0
+  while (offset < size) {
+    const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.byteLength, size - offset), offset)
+    if (bytesRead === 0) throw new Error(`${label} changed while hashing`)
+    digest.update(buffer.subarray(0, bytesRead))
+    offset += bytesRead
+  }
+  return digest.digest('hex')
+}
+
 function ownerAlive(pid) {
   try {
     process.kill(pid, 0)
@@ -502,8 +515,11 @@ export async function writeDevelopmentReleaseMetadata({
     await validateRelease(root, fingerprint)
     const sources = join(root, 'sources')
     for (const blob of selected) {
-      await withStableRegularFile(join(sources, `${blob.sha256}.archive`), 'Development release blob', async (_handle, details) => {
+      await withStableRegularFile(join(sources, `${blob.sha256}.archive`), 'Development release blob', async (handle, details) => {
         if (details.size !== blob.bytes) throw new Error('Development release metadata blob size is invalid')
+        if (await sha256FromHandle(handle, details.size, 'Development release blob') !== blob.sha256) {
+          throw new Error('Development release metadata blob hash is invalid')
+        }
       })
     }
 

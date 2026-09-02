@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
@@ -45,10 +45,12 @@ function fingerprint(character: string): string {
   return character.repeat(64)
 }
 
-function createBlob(cacheRoot: string, sha256: string, bytes: Buffer, age: number): void {
+function createBlob(cacheRoot: string, bytes: Buffer, age: number): string {
+  const sha256 = createHash('sha256').update(bytes).digest('hex')
   const path = join(cacheRoot, 'sources', `${sha256}.archive`)
   writeFileSync(path, bytes)
   utimesSync(path, age, age)
+  return sha256
 }
 
 function writeActiveMarker(cacheRoot: string, value: string): void {
@@ -88,14 +90,10 @@ describe('development converter cache budget', () => {
 
   it('retains the active and newest previous releases and prunes unreferenced blobs oldest first', async () => {
     const cacheRoot = createCache()
-    const activeBlob = fingerprint('1')
-    const previousBlob = fingerprint('2')
-    const oldBlob = fingerprint('3')
-    const newerExtraBlob = fingerprint('4')
-    createBlob(cacheRoot, activeBlob, Buffer.alloc(2), 400)
-    createBlob(cacheRoot, previousBlob, Buffer.alloc(2), 300)
-    createBlob(cacheRoot, oldBlob, Buffer.alloc(2), 100)
-    createBlob(cacheRoot, newerExtraBlob, Buffer.alloc(2), 200)
+    const activeBlob = createBlob(cacheRoot, Buffer.from('a1'), 400)
+    const previousBlob = createBlob(cacheRoot, Buffer.from('p2'), 300)
+    const oldBlob = createBlob(cacheRoot, Buffer.from('o3'), 100)
+    const newerExtraBlob = createBlob(cacheRoot, Buffer.from('n4'), 200)
     const old = await createVerifiedRelease(cacheRoot, 'a', [{ sha256: oldBlob, bytes: 2 }], 100)
     const previous = await createVerifiedRelease(cacheRoot, 'b', [{ sha256: previousBlob, bytes: 2 }], 200)
     const active = await createVerifiedRelease(cacheRoot, 'c', [{ sha256: activeBlob, bytes: 2 }], 300)
@@ -137,8 +135,7 @@ describe('development converter cache budget', () => {
 
   it('preserves active acquisition partials and their canonical owner metadata', async () => {
     const cacheRoot = createCache()
-    const blob = fingerprint('5')
-    createBlob(cacheRoot, blob, Buffer.from('kept'), 100)
+    const blob = createBlob(cacheRoot, Buffer.from('kept'), 100)
     const active = await createVerifiedRelease(cacheRoot, 'd', [{ sha256: blob, bytes: 4 }], 100)
     writeActiveMarker(cacheRoot, active)
     const partialSha = fingerprint('6')
@@ -157,10 +154,8 @@ describe('development converter cache budget', () => {
 
   it('fails without mutation when protected blobs alone exceed the ceiling', async () => {
     const cacheRoot = createCache()
-    const activeBlob = fingerprint('7')
-    const previousBlob = fingerprint('8')
-    createBlob(cacheRoot, activeBlob, Buffer.alloc(3), 100)
-    createBlob(cacheRoot, previousBlob, Buffer.alloc(3), 200)
+    const activeBlob = createBlob(cacheRoot, Buffer.from('one'), 100)
+    const previousBlob = createBlob(cacheRoot, Buffer.from('two'), 200)
     const previous = await createVerifiedRelease(cacheRoot, 'e', [{ sha256: previousBlob, bytes: 3 }], 100)
     const active = await createVerifiedRelease(cacheRoot, 'f', [{ sha256: activeBlob, bytes: 3 }], 200)
     writeActiveMarker(cacheRoot, active)
@@ -177,8 +172,7 @@ describe('development converter cache budget', () => {
     'rejects %s before removing any cache entry',
     async (failure) => {
       const cacheRoot = createCache()
-      const blob = fingerprint('9')
-      createBlob(cacheRoot, blob, Buffer.from('blob'), 100)
+      const blob = createBlob(cacheRoot, Buffer.from('blob'), 100)
       const active = await createVerifiedRelease(cacheRoot, '1', [{ sha256: blob, bytes: 4 }], 100)
       writeActiveMarker(cacheRoot, active)
       if (failure === 'malformed metadata') {
@@ -216,8 +210,7 @@ describe('development converter cache budget', () => {
 
   it('writes canonical release metadata outside the runtime release directory', async () => {
     const cacheRoot = createCache()
-    const blob = fingerprint('a')
-    createBlob(cacheRoot, blob, Buffer.from('data'), 100)
+    const blob = createBlob(cacheRoot, Buffer.from('data'), 100)
     const value = fingerprint('b')
     mkdirSync(join(cacheRoot, 'releases', value))
     const path = await writeDevelopmentReleaseMetadata({
@@ -233,10 +226,32 @@ describe('development converter cache budget', () => {
     }))
   })
 
+  it('rejects same-length blob substitution while publishing metadata and while pruning', async () => {
+    const publishingCache = createCache()
+    const expected = Buffer.from('good')
+    const sha256 = createHash('sha256').update(expected).digest('hex')
+    writeFileSync(join(publishingCache, 'sources', `${sha256}.archive`), 'evil')
+    const publishingRelease = fingerprint('d')
+    mkdirSync(join(publishingCache, 'releases', publishingRelease))
+    await expect(writeDevelopmentReleaseMetadata({
+      cacheRoot: publishingCache,
+      fingerprint: publishingRelease,
+      blobs: [{ sha256, bytes: expected.byteLength }],
+    })).rejects.toThrow(/hash|digest/iu)
+
+    const pruningCache = createCache()
+    createBlob(pruningCache, expected, 100)
+    const active = await createVerifiedRelease(pruningCache, 'e', [{ sha256, bytes: expected.byteLength }], 100)
+    writeActiveMarker(pruningCache, active)
+    writeFileSync(join(pruningCache, 'sources', `${sha256}.archive`), 'evil')
+    await expect(pruneDevelopmentCache({ cacheRoot: pruningCache, activeFingerprint: active }))
+      .rejects.toThrow(/hash|digest/iu)
+    expect(existsSync(join(pruningCache, 'releases', active))).toBe(true)
+  })
+
   it('recovers a metadata temporary and mutation claim after the publishing process is killed', async () => {
     const cacheRoot = createCache()
-    const blob = fingerprint('a')
-    createBlob(cacheRoot, blob, Buffer.from('data'), 100)
+    const blob = createBlob(cacheRoot, Buffer.from('data'), 100)
     const value = fingerprint('b')
     mkdirSync(join(cacheRoot, 'releases', value))
     const marker = join(cacheRoot, 'metadata-temp-ready')
