@@ -4,6 +4,7 @@ import { constants, lstatSync, realpathSync } from 'node:fs'
 import { link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
+import { URL } from 'node:url'
 import {
   canonicalBytes,
   fail,
@@ -42,6 +43,20 @@ function validVersion(value) {
     && value !== '..'
     && value.normalize('NFC') === value
     && versionPattern.test(value)
+}
+
+function validHttpsUrl(value) {
+  if (typeof value !== 'string' || value.length === 0) return false
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:'
+      && url.href === value
+      && url.username === ''
+      && url.password === ''
+      && url.hash === ''
+  } catch {
+    return false
+  }
 }
 
 function regularMode(entry) {
@@ -486,10 +501,17 @@ async function writeAll(handle, bytes, position) {
   return offset
 }
 
-async function copyVerifiedRegularFile({ source, destinationRoot, destinationPath, expected, openHandles }) {
+async function copyVerifiedRegularFile({
+  source,
+  destinationRoot,
+  destinationPath,
+  expected,
+  openHandles,
+  outputMode = regularMode(expected),
+}) {
   return withStableRegularFile(source, 'Bottle selected link target', async (sourceHandle, metadata) => {
     if (metadata.size !== expected.bytes) invalid()
-    const output = await createOutputHandle(destinationRoot, destinationPath, regularMode(expected))
+    const output = await createOutputHandle(destinationRoot, destinationPath, outputMode)
     openHandles.add(output.handle)
     const digest = createHash('sha256')
     const buffer = Buffer.allocUnsafe(1024 * 1024)
@@ -504,7 +526,7 @@ async function copyVerifiedRegularFile({ source, destinationRoot, destinationPat
         position += bytesRead
       }
       if (digest.digest('hex') !== expected.sha256) invalid()
-      await output.handle.chmod(regularMode(expected))
+      await output.handle.chmod(outputMode)
       await output.handle.sync()
     } finally {
       openHandles.delete(output.handle)
@@ -668,8 +690,18 @@ function addSelectedEntry(inventory, formula, entry) {
   inventory.set(key, selected)
 }
 
-function selectedInventory(closureLock) {
+function downloadLicenseKey(value) {
+  return canonicalBytes({
+    formula: value.formula,
+    source: value.source,
+    sha256: value.sha256,
+    bytes: value.bytes,
+  }).toString('utf8')
+}
+
+function selectedInventory(closureLock, sourceFormulae) {
   const inventory = new Map()
+  const downloads = new Map()
   for (const family of PACK_NAMES) {
     const value = closureLock.families?.[family]
     if (!value || !Array.isArray(value.files) || !Array.isArray(value.licenses)) invalid()
@@ -677,7 +709,32 @@ function selectedInventory(closureLock) {
       addSelectedEntry(inventory, file.formula, file)
     }
     for (const license of value.licenses) {
-      if (typeof license.source !== 'string' || license.source.startsWith('https://')) continue
+      if (validHttpsUrl(license.source)) {
+        const formula = sourceFormulae.get(license.formula)
+        const matches = formula?.licenses?.some((candidate) => (
+          candidate?.kind === 'download'
+          && candidate.url === license.source
+          && candidate.destination === license.destination
+          && candidate.sha256 === license.sha256
+          && candidate.bytes === license.bytes
+        ))
+        if (
+          !matches
+          || !validFormula(license.formula)
+          || !sha256Pattern.test(license.sha256)
+          || !Number.isSafeInteger(license.bytes)
+          || license.bytes <= 0
+        ) invalid()
+        const selected = Object.freeze({
+          formula: license.formula,
+          source: license.source,
+          sha256: license.sha256,
+          bytes: license.bytes,
+        })
+        downloads.set(downloadLicenseKey(selected), selected)
+        continue
+      }
+      if (typeof license.source !== 'string') invalid()
       addSelectedEntry(inventory, license.formula, {
         sourcePath: license.source,
         sha256: license.sha256,
@@ -687,10 +744,10 @@ function selectedInventory(closureLock) {
       })
     }
   }
-  return inventory
+  return { inventory, downloads }
 }
 
-function createUniverse({ target, outputRoot, records, lockedPaths }) {
+function createUniverse({ target, outputRoot, records, lockedPaths, licenses }) {
   const formulae = new Map(records.map((record) => [record.name, record]))
   const pathTypes = new Map([
     [outputRoot, 'directory'],
@@ -698,6 +755,7 @@ function createUniverse({ target, outputRoot, records, lockedPaths }) {
     ...records.map((record) => [record.root, 'directory']),
     ...lockedPaths.map((path) => [path, 'file']),
   ])
+  if (licenses.size > 0) pathTypes.set(join(outputRoot, 'Licenses'), 'directory')
   for (const record of records) {
     for (const path of record.files.values()) {
       let directory = dirname(path)
@@ -741,6 +799,19 @@ function createUniverse({ target, outputRoot, records, lockedPaths }) {
       if (!path) fail('Bottle universe file is not locked.')
       return requireCurrentPath(path, 'file')
     },
+    resolveLockedLicense(value) {
+      if (
+        !exactKeys(value, ['formula', 'source', 'sha256', 'bytes'])
+        || !validFormula(value.formula)
+        || !validHttpsUrl(value.source)
+        || !sha256Pattern.test(value.sha256)
+        || !Number.isSafeInteger(value.bytes)
+        || value.bytes <= 0
+      ) fail('Bottle universe license is not locked.')
+      const path = licenses.get(downloadLicenseKey(value))
+      if (!path) fail('Bottle universe license is not locked.')
+      return requireCurrentPath(path, 'file')
+    },
     contains(path) {
       const expectedType = typeof path === 'string' ? pathTypes.get(path) : undefined
       return expectedType !== undefined && currentPathIsSafe(path, expectedType)
@@ -755,9 +826,9 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
   await requireDirectory(parent, 'Bottle universe parent')
   if (await lstat(outputRoot).catch(() => undefined)) invalid()
 
-  const selected = selectedInventory(closureLock)
   const sourceFormulae = new Map(formulae.map((formula) => [formula?.name, formula]))
   if (sourceFormulae.size !== formulae.length) invalid()
+  const { inventory: selected, downloads } = selectedInventory(closureLock, sourceFormulae)
   const closureNames = new Set()
   const records = []
   const claim = await acquireDestinationClaim(outputRoot)
@@ -772,6 +843,34 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
     const cellarRoot = join(privateRoot, 'Cellar')
     await mkdir(cellarRoot, { mode: 0o755 })
     await requireDirectory(cellarRoot, 'Bottle universe Cellar')
+    if (downloads.size > 0) {
+      const licensesRoot = join(privateRoot, 'Licenses')
+      await mkdir(licensesRoot, { mode: 0o755 })
+      await requireDirectory(licensesRoot, 'Bottle universe licenses')
+      const bySha256 = new Map()
+      for (const license of downloads.values()) {
+        const previous = bySha256.get(license.sha256)
+        if (previous !== undefined && previous.bytes !== license.bytes) invalid()
+        bySha256.set(license.sha256, license)
+      }
+      for (const license of bySha256.values()) {
+        const blob = blobs.get(license.sha256)
+        if (
+          !blob
+          || blob.sha256 !== license.sha256
+          || blob.bytes !== license.bytes
+          || typeof blob.path !== 'string'
+        ) invalid()
+        await copyVerifiedRegularFile({
+          source: blob.path,
+          destinationRoot: privateRoot,
+          destinationPath: `Licenses/${license.sha256}`,
+          expected: { sha256: license.sha256, bytes: license.bytes, executable: false },
+          openHandles: new Set(),
+          outputMode: 0o444,
+        })
+      }
+    }
     for (const closureFormula of closureLock.formulae) {
       if (!validFormula(closureFormula?.name) || !validVersion(closureFormula?.version) || closureNames.has(closureFormula.name)) invalid()
       closureNames.add(closureFormula.name)
@@ -840,5 +939,16 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
     }
   })
   const lockedPaths = publishedRecords.flatMap((record) => [...record.files.values()])
-  return createUniverse({ target, outputRoot, records: publishedRecords, lockedPaths })
+  const publishedLicenses = new Map([...downloads].map(([key, license]) => [
+    key,
+    join(outputRoot, 'Licenses', license.sha256),
+  ]))
+  lockedPaths.push(...new Set(publishedLicenses.values()))
+  return createUniverse({
+    target,
+    outputRoot,
+    records: publishedRecords,
+    lockedPaths,
+    licenses: publishedLicenses,
+  })
 }

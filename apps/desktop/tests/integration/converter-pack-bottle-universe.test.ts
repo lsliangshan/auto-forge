@@ -117,6 +117,53 @@ function file(formula: string, sourcePath: string, destination: string, bytes: B
   return { formula, sourcePath, destination, sha256: sha256(bytes), bytes: bytes.byteLength, executable, role }
 }
 
+function downloadLicenseFixture(root: string) {
+  const executable = Buffer.from('download-license tool')
+  const bottle = writeBottleArchive(root, 'download-license.tar.gz', [
+    { path: 'licensed/', type: '5' },
+    { path: 'licensed/1.0/', type: '5' },
+    { path: 'licensed/1.0/bin/tool', bytes: executable, mode: 0o555 },
+  ])
+  const license = Buffer.from('independent downloaded license\n')
+  const licensePath = join(root, 'downloaded-license')
+  writeFileSync(licensePath, license)
+  const acquisition = {
+    kind: 'homebrew-bottle', url: 'https://downloads.example.test/licensed.tar.gz',
+    sha256: bottle.sha256, bytes: bottle.compressed.byteLength, cellar: '/opt/homebrew/Cellar',
+  }
+  const downloaded = {
+    kind: 'download', url: 'https://licenses.example.test/licensed-COPYING',
+    sha256: sha256(license), bytes: license.byteLength, destination: 'licenses/licensed.txt',
+  }
+  const closureLicense = {
+    formula: 'licensed', source: downloaded.url, destination: downloaded.destination,
+    sha256: downloaded.sha256, bytes: downloaded.bytes,
+  }
+  const selectedFile = file('licensed', 'bin/tool', 'bin/tool', executable, true, 'executable')
+  return {
+    executable,
+    license,
+    licensePath,
+    downloaded,
+    outputRoot: join(root, 'universe'),
+    closureLock: {
+      target: 'darwin-arm64',
+      formulae: [{ name: 'licensed', version: '1.0', dependencies: [] }],
+      families: {
+        'image-icon': { files: [selectedFile], rewrites: [], licenses: [closureLicense] },
+        document: { files: [], rewrites: [], licenses: [] },
+        pdf: { files: [structuredClone(selectedFile)], rewrites: [], licenses: [structuredClone(closureLicense)] },
+        media: { files: [], rewrites: [], licenses: [] },
+      },
+    },
+    formulae: [{ name: 'licensed', version: '1.0', acquisition, licenses: [downloaded] }],
+    blobs: new Map([
+      [acquisition.sha256, { path: bottle.archive, sha256: acquisition.sha256, bytes: acquisition.bytes, networkBytes: 0 }],
+      [downloaded.sha256, { path: licensePath, sha256: downloaded.sha256, bytes: downloaded.bytes, networkBytes: 0 }],
+    ]),
+  }
+}
+
 describe('converter bottle universe', () => {
   it('materializes one verified formula once for multiple families behind immutable exact lookups', async () => {
     const root = temporaryRoot()
@@ -221,6 +268,66 @@ describe('converter bottle universe', () => {
     expect(() => universe.cellar('vips', '8.18.6')).toThrow('no longer safe')
     expect(() => universe.opt('vips')).toThrow('no longer safe')
   })
+
+  it('materializes and deduplicates authenticated download licenses behind exact no-follow lookups', async () => {
+    const root = temporaryRoot()
+    const fixture = downloadLicenseFixture(root)
+    const universe = await materializeBottleUniverse({
+      target: 'darwin-arm64',
+      closureLock: fixture.closureLock,
+      formulae: fixture.formulae,
+      blobs: fixture.blobs,
+      outputRoot: fixture.outputRoot,
+    })
+    const coordinate = {
+      formula: 'licensed',
+      source: fixture.downloaded.url,
+      sha256: fixture.downloaded.sha256,
+      bytes: fixture.downloaded.bytes,
+    }
+    const expected = join(fixture.outputRoot, 'Licenses', fixture.downloaded.sha256)
+    expect(universe.resolveLockedLicense(coordinate)).toBe(expected)
+    expect(universe.contains(expected)).toBe(true)
+    expect(readFileSync(expected)).toEqual(fixture.license)
+    expect(lstatSync(expected).isSymbolicLink()).toBe(false)
+    expect(statSync(expected).mode & 0o777).toBe(0o444)
+    expect(readdirSync(join(fixture.outputRoot, 'Licenses'))).toEqual([fixture.downloaded.sha256])
+    expect(() => universe.resolveLockedLicense({ ...coordinate, bytes: coordinate.bytes + 1 })).toThrow('not locked')
+
+    const outside = join(root, 'outside-license')
+    writeFileSync(outside, fixture.license)
+    rmSync(expected)
+    symlinkSync(outside, expected)
+    expect(universe.contains(expected)).toBe(false)
+    expect(() => universe.resolveLockedLicense(coordinate)).toThrow('no longer safe')
+  })
+
+  it.each(['missing blob', 'hash mismatch', 'byte mismatch', 'symbolic-link blob'] as const)(
+    'rejects a download license with %s and removes the private universe',
+    async (failure) => {
+      const root = temporaryRoot()
+      const fixture = downloadLicenseFixture(root)
+      if (failure === 'missing blob') fixture.blobs.delete(fixture.downloaded.sha256)
+      if (failure === 'hash mismatch') writeFileSync(fixture.licensePath, Buffer.alloc(fixture.license.byteLength, 0x78))
+      if (failure === 'byte mismatch') writeFileSync(fixture.licensePath, Buffer.from('short'))
+      if (failure === 'symbolic-link blob') {
+        const regular = join(root, 'regular-license')
+        writeFileSync(regular, fixture.license)
+        rmSync(fixture.licensePath)
+        symlinkSync(regular, fixture.licensePath)
+      }
+
+      await expect(materializeBottleUniverse({
+        target: 'darwin-arm64',
+        closureLock: fixture.closureLock,
+        formulae: fixture.formulae,
+        blobs: fixture.blobs,
+        outputRoot: fixture.outputRoot,
+      })).rejects.toThrow()
+      expect(existsSync(fixture.outputRoot)).toBe(false)
+      expect(readdirSync(root).filter((name) => name.startsWith('.bottle-universe-'))).toEqual([])
+    },
+  )
 
   it('applies bounded local PAX records and copies a selected internal symlink as verified regular bytes', async () => {
     const root = temporaryRoot()
