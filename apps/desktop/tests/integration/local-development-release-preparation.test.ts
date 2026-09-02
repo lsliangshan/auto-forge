@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -149,16 +149,32 @@ it('runs the authenticated cold pipeline in exact order and publishes metadata b
   ])
 })
 
-it('reuses a verified matching release without build callbacks', async () => {
+it('reuses only the verified active fingerprint with integrity and safe pruning while preserving mtimes', async () => {
   const { desktopRoot, cacheRoot } = fixture()
   const firstEvents: string[] = []
   const first = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies(firstEvents))
   const events: string[] = []
+  const sourcePath = join(desktopRoot, 'converter-packs', 'sources.lock.json')
+  const sourceMtime = statSync(sourcePath).mtimeMs
+  const releaseMtime = statSync(first.releaseRoot).mtimeMs
+  const forbidden = async () => { throw new Error('warm path performed cold work') }
+  const injected = dependencies(events, {
+    buildHelpers: forbidden,
+    preparePlan: forbidden,
+    stagePacks: forbidden,
+    buildRelease: forbidden,
+    smokeRelease: forbidden,
+    writeMetadata: forbidden,
+    activateRelease: forbidden,
+    pruneCache: async () => { events.push('prune') },
+  })
 
-  const result = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies(events))
+  const result = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)
 
   expect(result).toEqual({ fingerprint: first.fingerprint, releaseRoot: first.releaseRoot, reused: true })
-  expect(events).toEqual(['verify'])
+  expect(events).toEqual(['verify', 'prune'])
+  expect(statSync(sourcePath).mtimeMs).toBe(sourceMtime)
+  expect(statSync(first.releaseRoot).mtimeMs).toBe(releaseMtime)
 })
 
 it.each([
@@ -338,7 +354,7 @@ it('keeps a release when activation writes its marker and then throws', async ()
   expect(existsSync(releaseRoot)).toBe(true)
 })
 
-it('removes only a corrupted derived release before rebuilding and activation', async () => {
+it('does not warm-reuse a non-active derived release before rebuilding and activation', async () => {
   const { desktopRoot, cacheRoot } = fixture()
   const inputs = await developmentFingerprintInputs(desktopRoot)
   const { fingerprintDevelopmentRelease } = await import('../../scripts/converter-packs/local-development-release-cache.mjs')
@@ -349,14 +365,8 @@ it('removes only a corrupted derived release before rebuilding and activation', 
     await mkdir(join(cacheRoot, 'sources'), { recursive: true })
     await writeFile(join(cacheRoot, 'sources', 'keep.archive'), 'source cache')
   })
-  let verifications = 0
   const events: string[] = []
   const injected = dependencies(events, {
-    verifyRelease: async () => {
-      events.push('verify')
-      verifications += 1
-      if (verifications === 1) throw new Error('corrupted derived release')
-    },
     buildRelease: async ({ outputRoot }: { outputRoot: string }) => {
       events.push('build')
       expect(existsSync(outputRoot)).toBe(false)
@@ -367,7 +377,7 @@ it('removes only a corrupted derived release before rebuilding and activation', 
   const result = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)
 
   expect(result.reused).toBe(false)
-  expect(events).toEqual(['verify', 'helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
+  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
   await expect(readFile(join(cacheRoot, 'sources', 'keep.archive'), 'utf8')).resolves.toBe('source cache')
 })
 

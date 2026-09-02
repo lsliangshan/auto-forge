@@ -8,6 +8,7 @@ import {
   activateDevelopmentRelease,
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
+  readActiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
 } from './local-development-release-cache.mjs'
 import { pruneDevelopmentCache } from './development-cache-budget.mjs'
@@ -180,14 +181,16 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
   const removeRelease = dependencies.removeRelease ?? ((path) => rm(path, { recursive: true, force: true }))
   const removePrivateRoot = dependencies.removePrivateRoot ?? ((path) => rm(path, { recursive: true, force: true }))
 
-  if (await hasRelease(paths.release)) {
-    try {
-      await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
-      return { fingerprint, releaseRoot: paths.release, reused: true }
-    } catch {
-      await removeRelease(paths.release)
-    }
+  const activeRelease = await readActiveDevelopmentRelease({ cacheRoot }).catch((error) => {
+    if (error?.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (activeRelease === paths.release) {
+    await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
+    await dependencies.pruneCache({ cacheRoot, activeFingerprint: fingerprint })
+    return { fingerprint, releaseRoot: paths.release, reused: true }
   }
+  if (await hasRelease(paths.release)) await removeRelease(paths.release)
 
   const privateRoot = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}`)
   await mkdir(privateRoot, { mode: 0o700 })
