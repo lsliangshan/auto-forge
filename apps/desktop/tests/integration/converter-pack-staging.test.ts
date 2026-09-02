@@ -261,7 +261,16 @@ describe('converter pack Mach-O closure', () => {
     const plan = await planMachOClosure({
       architecture: 'arm64',
       entrypoints: discovered.entrypoints,
-      expectedFiles: discovered.files.map(({ source: _source, version: _version, ...file }) => file),
+      expectedFiles: discovered.files.map((file) => ({
+        formula: file.formula,
+        sourcePath: file.sourcePath,
+        destination: file.destination,
+        sha256: file.sha256,
+        bytes: file.bytes,
+        executable: file.executable,
+        role: file.role,
+        runtimeRoot: file.runtimeRoot,
+      })),
       expectedRewrites: discovered.rewrites,
       inspect: async (path: string) => inspections.get(path),
       universe: syntheticUniverse(root, { vips: '8.18.6', glib: '2.86.0' }),

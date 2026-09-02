@@ -190,6 +190,7 @@ function captureFixture(target = targetForHost()) {
       sha256: sha256(bytes), bytes: bytes.byteLength, cellar: cellarForTarget(target),
     }]
   }))
+  coordinates.glib.url = `https://ghcr.io/v2/homebrew/core/glib/blobs/sha256:${coordinates.glib.sha256}`
   closure.measurements.downloadBytes = Object.values(coordinates).reduce((sum, coordinate) => sum + coordinate.bytes, 0)
     + libreOfficeBytes.byteLength + libreOfficeLicenseBytes.byteLength
   const roots = {
@@ -271,8 +272,11 @@ function syntheticRun(fixture: ReturnType<typeof captureFixture>, calls: Capture
       return { status: 0, stdout: canonicalBytes(brewFormulaJson(fixture)), stderr: Buffer.alloc(0) }
     }
     if (executable === '/usr/bin/curl') {
-      const output = args[args.indexOf('--output') + 1]!
       const url = args.at(-1)!
+      if (url.startsWith('https://ghcr.io/token?')) {
+        return { status: 0, stdout: canonicalBytes({ token: 'synthetic-public-pull-token' }), stderr: Buffer.alloc(0) }
+      }
+      const output = args[args.indexOf('--output') + 1]!
       const formula = [...fixture.bottleBytes.keys()].find((name) => fixture.coordinates[name].url === url)
       const bytes = formula
         ? fixture.bottleBytes.get(formula)!
@@ -565,7 +569,8 @@ describe('converter pack lock generation', () => {
       && options.env.HOMEBREW_NO_AUTO_UPDATE === '1'
       && options.env.HOMEBREW_NO_INSTALL_FROM_API === '1'
     ))).toBe(true)
-    expect(calls.filter(({ executable }) => executable === '/usr/bin/curl')).toHaveLength(6)
+    expect(calls.filter(({ executable }) => executable === '/usr/bin/curl')).toHaveLength(7)
+    expect(calls.some(({ args }) => args.includes('Authorization: Bearer synthetic-public-pull-token'))).toBe(true)
     expect(calls.flatMap(({ args }) => args).filter(isAbsolute).every((path) => path === '/opt/test/bin/brew' || path.startsWith(root) || path.startsWith('/private/var/') || path.startsWith('/var/'))).toBe(true)
 
     await captureWithFixture(root, fixture)
@@ -611,6 +616,19 @@ describe('converter pack lock generation', () => {
       fixture.coordinates.glib.url = 'http://downloads.example.test/glib.tar.gz'
       return base
     }],
+    ['GHCR bottle outside the pinned Homebrew Core scope', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => {
+      fixture.coordinates.glib.url = `https://ghcr.io/v2/other/core/glib/blobs/sha256:${fixture.coordinates.glib.sha256}`
+      return base
+    }],
+    ['GHCR blob digest outside the pinned artifact coordinate', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => {
+      fixture.coordinates.glib.url = `https://ghcr.io/v2/homebrew/core/glib/blobs/sha256:${'0'.repeat(64)}`
+      return base
+    }],
+    ['malformed GHCR pull token', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => async (executable: string, args: string[], options: RunOptions) => (
+      executable === '/usr/bin/curl' && args.at(-1)?.startsWith('https://ghcr.io/token?')
+        ? { status: 0, stdout: canonicalBytes({ token: 'invalid token' }), stderr: Buffer.alloc(0) }
+        : base(executable, args, options)
+    )],
     ['missing selected target bottle', (fixture: ReturnType<typeof captureFixture>, base: ReturnType<typeof syntheticRun>) => async (executable: string, args: string[], options: RunOptions) => {
       if (args[0] !== 'info') return base(executable, args, options)
       const json = brewFormulaJson(fixture)

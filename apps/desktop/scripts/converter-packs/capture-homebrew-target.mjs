@@ -254,6 +254,37 @@ function requireReachable(formulae, roots) {
   if (reached.size !== formulae.size) invalid('Homebrew formula is not reachable from a root.')
 }
 
+function ghcrScope(artifact) {
+  const url = new URL(artifact.url)
+  if (url.hostname !== 'ghcr.io') return undefined
+  const match = /^\/v2\/(homebrew\/core\/[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*)\/blobs\/sha256:([a-f0-9]{64})$/u.exec(url.pathname)
+  if (url.origin !== 'https://ghcr.io' || !match || match[2] !== artifact.sha256 || url.search.length !== 0) {
+    invalid('Capture GHCR artifact coordinate is invalid.')
+  }
+  return `repository:${match[1]}:pull`
+}
+
+async function ghcrAuthorization(run, workspace, artifact) {
+  const scope = ghcrScope(artifact)
+  if (scope === undefined) return []
+  const tokenUrl = new URL('https://ghcr.io/token')
+  tokenUrl.searchParams.set('service', 'ghcr.io')
+  tokenUrl.searchParams.set('scope', scope)
+  const bytes = await runChecked(run, '/usr/bin/curl', [
+    '--fail', '--proto', '=https', '--silent', '--show-error', tokenUrl.href,
+  ], { cwd: workspace, env: maintainerEnv }, 'Capture GHCR token request')
+  if (bytes.byteLength === 0 || bytes.byteLength > 16 * 1024) invalid('Capture GHCR token response is invalid.')
+  const value = parseJson(bytes, 'Capture GHCR token response')
+  if (
+    !exactKeys(value, ['token'])
+    || typeof value.token !== 'string'
+    || value.token.length === 0
+    || value.token.length > 8_192
+    || [...value.token].some((character) => character.codePointAt(0) <= 0x20 || character.codePointAt(0) === 0x7f)
+  ) invalid('Capture GHCR token response is invalid.')
+  return ['--header', `Authorization: Bearer ${value.token}`]
+}
+
 async function verifyDownload({ run, workspace, artifact, verified }) {
   const previous = verified.get(artifact.sha256)
   if (previous) {
@@ -264,9 +295,10 @@ async function verifyDownload({ run, workspace, artifact, verified }) {
   }
   if (!validHttpsUrl(artifact.url) || !sha256Pattern.test(artifact.sha256)) invalid('Capture artifact coordinate is invalid.')
   const path = join(workspace, artifact.sha256)
+  const authorization = await ghcrAuthorization(run, workspace, artifact)
   await runChecked(run, '/usr/bin/curl', [
     '--fail', '--location', '--proto', '=https', '--proto-redir', '=https',
-    '--silent', '--show-error', '--output', path, artifact.url,
+    '--silent', '--show-error', ...authorization, '--output', path, artifact.url,
   ], { cwd: workspace, env: maintainerEnv }, 'Capture artifact download')
   const bytes = await readStableRegularFile(path, 'Downloaded capture artifact')
   if (bytes.byteLength <= 0 || (artifact.bytes !== undefined && bytes.byteLength !== artifact.bytes)) {
