@@ -298,6 +298,11 @@
 **Files:**
 - Create: `apps/desktop/scripts/converter-packs/capture-homebrew-target.mjs`
 - Create: `apps/desktop/scripts/converter-packs/generate-transitive-source-lock.mjs`
+- Create: `apps/desktop/scripts/converter-packs/durable-lock-publication.mjs`
+- Create: `apps/desktop/converter-packs/lock-candidates.json`
+- Modify: `apps/desktop/scripts/converter-packs/bottle-archive.mjs`
+- Modify: `apps/desktop/scripts/converter-packs/macho-closure.mjs`
+- Modify: `apps/desktop/scripts/converter-packs/source-lock.mjs`
 - Create: `apps/desktop/tests/integration/converter-pack-lock-generation.test.ts`
 - Create: `.github/workflows/converter-pack-lock.yml`
 - Modify: `apps/desktop/package.json`
@@ -306,8 +311,8 @@
 - Create: `apps/desktop/converter-packs/closures/darwin-x64.lock.json`
 
 **Interfaces:**
-- Produce: `captureHomebrewTarget({ target, brew, coreRevision, roots, output, run }) -> Promise<void>` for an isolated correct-architecture maintainer runner; its canonical capture contains the fully probed target closure.
-- Produce: `generateTransitiveSourceLock({ arm64Capture, x64Capture, outputRoot }) -> Promise<void>`; merge never executes a foreign-architecture binary.
+- Produce: `captureHomebrewTarget({ target, brew, repositoryRevision, coreRevision, caskRevision, roots, output, run }) -> Promise<void>` for an isolated correct-architecture maintainer runner; its canonical integrity-checked capture contains the fully probed target closure.
+- Produce: `generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot }) -> Promise<void>`; merge never executes a foreign-architecture binary and accepts only captures bound by the protected current-run manifest.
 - Package commands: `converter-packs:capture-lock-target` and `converter-packs:generate-lock`.
 - Development and production preparation consume only the generated canonical files; these commands never run from `predev`.
 
@@ -330,12 +335,13 @@
 
   Require absolute `brew`, verify `process.platform === 'darwin'` and target
   architecture, run `brew tap-info --json=v1 homebrew/core`, and require the
-  exact requested 40-hex revision. Obtain the dependency union and formula JSON
+  exact requested lowercase 40-hex revisions for both `homebrew/core` and
+  `homebrew/cask`. Obtain the dependency union and formula JSON
   with fixed argument arrays and a fixed maintainer environment. Fetch each
   selected bottle into a private workspace, compute byte length and SHA-256,
   and fail when they differ from Homebrew metadata. On that same target runner,
   materialize the universe, derive exact Mach-O and declared runtime-asset
-  closures, build and probe all four target packs, and include the authenticated
+  closures, build and probe all four target packs, and include the integrity-checked
   closure plus measurements in one canonical capture fragment. The fixed
   runtime-asset policy permits only known formula-relative roots required by
   libvips loaders/configuration and is expanded to exact files in the capture;
@@ -344,20 +350,25 @@
 
 - [ ] **Step 4: Implement dual-target merge and closure generation**
 
-  Validate both already-probed capture fragments and merge only equal
-  formula/version/license identities. Recompute capture hashes and all graph,
+  Validate both already-probed capture fragments against a current-run manifest
+  binding repository SHA, both tap revisions, target, and capture digest. Merge
+  only equal formula/version/license identities; dependency edges remain target
+  local in closure locks. Recompute capture hashes and all graph,
   file, rewrite, license, and measurement invariants without executing either
   architecture. Write both closure files, then write source lock last after
   hashing them. Refuse to overwrite existing outputs unless every existing file
-  exactly equals newly generated canonical bytes.
+  exactly equals newly generated canonical bytes. Publish each file through a
+  same-directory private temp, fsync/chmod/verification, and hardlink
+  no-replace; publish the source lock last and recover bounded interrupted temps.
 
 - [ ] **Step 5: Add the protected maintainer workflow**
 
   Use one `macos-15` arm64 capture job and one `macos-15-intel` x64 capture job,
   each with contents-read permissions, pinned actions, one-day artifacts, no
-  production secrets, and an explicit core revision input. Each capture job
-  checks out that exact revision in its isolated `homebrew/core` tap before the
-  capture command validates it. A merge job runs the
+  production secrets, and explicit core and cask revision inputs. Each capture
+  job validates strict lowercase 40-hex input before any tap Git operation,
+  checks out both exact revisions in isolated taps, and lets capture revalidate
+  both HEADs. A merge job binds the two artifacts to the current run, runs the
   generator and uploads the three generated lock files for human review; it
   never commits or publishes automatically.
 

@@ -81,6 +81,13 @@ type SourceLockV2 = {
     sha256: string
     bytes: number
   }>
+  provenance: {
+    repositoryRevision: string
+    captures: Record<Target, {
+      captureSha256: string
+      probesSha256: string
+    }>
+  }
 }
 ```
 
@@ -124,10 +131,10 @@ type LicenseAsset =
     }
 ```
 
-Bottle entries are preferred. When a bottle lacks the required license or
-notice, the lock records a direct upstream license file instead of an entire
-source archive. A formula used by a pack must contribute at least one verified
-license asset to that pack.
+Every contributing formula must provide its selected license or notice from its
+verified bottle; capture fails closed when none exists. Only a non-formula
+engine such as LibreOffice may use the reviewed direct-download license
+coordinate from the portable candidate file.
 
 ### Target closure locks
 
@@ -224,6 +231,14 @@ performs these phases:
 7. Produce exact per-family file, rewrite, runtime-data, and license inventories.
 8. Build and probe the four packs for each target.
 9. Write canonical source and closure locks only after both targets pass.
+
+The capture artifacts are integrity-checked but are not independently
+cryptographically authenticated. Their trust boundary is the protected current
+workflow run: each target capture binds the checked-out repository revision and
+both tap revisions, and the merge job supplies a canonical provenance manifest
+containing both artifact digests. The source lock preserves those capture
+digests plus a digest of every target's four probe results. The workflow does
+not request artifact-attestation or write permissions.
 
 Generated lock changes are code-reviewed. Development preparation only
 validates and consumes committed locks; it never invokes `brew`, GitHub APIs,

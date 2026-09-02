@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL, URL } from 'node:url'
 import { loadConverterClosureLock, validateTargetClosureLock } from './closure-lock.mjs'
+import { publishDurableLockFile } from './durable-lock-publication.mjs'
 import {
   canonicalBytes,
   compareUtf8,
@@ -340,6 +341,7 @@ async function requireIdenticalOrMissing(path, wanted) {
 
 async function validateGenerated(sourceBytes, armBytes, x64Bytes, outputRoot) {
   const temporary = await mkdtemp(join(outputRoot, '.converter-lock-validation-'))
+  let primaryError
   try {
     await mkdir(join(temporary, 'closures'), { mode: 0o700 })
     await writeFile(join(temporary, 'closures', 'darwin-arm64.lock.json'), armBytes, { flag: 'wx', mode: 0o600 })
@@ -348,9 +350,16 @@ async function validateGenerated(sourceBytes, armBytes, x64Bytes, outputRoot) {
     await writeFile(sourcePath, sourceBytes, { flag: 'wx', mode: 0o600 })
     await loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' })
     await loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-x64' })
-  } finally {
-    await rm(temporary, { recursive: true, force: true })
+  } catch (error) {
+    primaryError = error
   }
+  const cleanup = await Promise.allSettled([rm(temporary, { recursive: true, force: true })])
+  const cleanupErrors = cleanup.filter((result) => result.status === 'rejected').map((result) => result.reason)
+  if (primaryError !== undefined) {
+    if (cleanupErrors.length > 0) throw new AggregateError([primaryError, ...cleanupErrors], primaryError?.message ?? 'Generated lock validation failed.', { cause: primaryError })
+    throw primaryError
+  }
+  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'Generated lock validation cleanup failed.')
 }
 
 export async function generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot }) {
@@ -393,15 +402,15 @@ export async function generateTransitiveSourceLock({ arm64Capture, x64Capture, p
     x64: join(closuresRoot, 'darwin-x64.lock.json'),
     source: join(outputRoot, 'sources.lock.json'),
   }
-  const [armExists, x64Exists, sourceExists] = await Promise.all([
+  await Promise.all([
     requireIdenticalOrMissing(paths.arm64, armBytes),
     requireIdenticalOrMissing(paths.x64, x64Bytes),
     requireIdenticalOrMissing(paths.source, sourceBytes),
   ])
   if (!closuresMetadata) await mkdir(closuresRoot, { mode: 0o755 })
-  if (!armExists) await writeFile(paths.arm64, armBytes, { flag: 'wx', mode: 0o644 })
-  if (!x64Exists) await writeFile(paths.x64, x64Bytes, { flag: 'wx', mode: 0o644 })
-  if (!sourceExists) await writeFile(paths.source, sourceBytes, { flag: 'wx', mode: 0o644 })
+  await publishDurableLockFile({ destination: paths.arm64, bytes: armBytes, mode: 0o644 })
+  await publishDurableLockFile({ destination: paths.x64, bytes: x64Bytes, mode: 0o644 })
+  await publishDurableLockFile({ destination: paths.source, bytes: sourceBytes, mode: 0o644 })
 }
 
 export async function generateTransitiveSourceLockMain(argv) {

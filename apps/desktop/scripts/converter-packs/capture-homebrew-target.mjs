@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
-import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL, URL } from 'node:url'
@@ -12,6 +12,7 @@ import { probeConverterFamily, stageProductionPacks } from './stage-production-p
 import { buildConverterPackIndex } from './build-index.mjs'
 import { buildNativeHelpers } from './build-native-helpers.mjs'
 import { materializeLockedEngineAssets } from './locked-engine-assets.mjs'
+import { publishDurableLockFile } from './durable-lock-publication.mjs'
 import {
   canonicalBytes,
   compareUtf8,
@@ -570,6 +571,7 @@ export async function captureHomebrewTarget({ target, brew, repositoryRevision, 
   }
   roots = validateRoots(roots)
   const workspace = await mkdtemp(join(parent, '.converter-lock-capture-'))
+  let primaryError
   try {
     parseTapInfo(parseJson(await runChecked(
       run, brew, ['tap-info', '--json=v1', 'homebrew/core'], { cwd: workspace, env: maintainerEnv }, 'Homebrew tap inspection',
@@ -628,10 +630,21 @@ export async function captureHomebrewTarget({ target, brew, repositoryRevision, 
       homebrewCaskRevision: caskRevision, roots: [...roots.formulaRoots], engines,
       formulae: capturedFormulae, probes: measured.probes, closure: measuredClosure,
     }
-    await writeFile(output, canonicalBytes({ payloadSha256: sha256(canonicalBytes(payload)), payload }), { flag: 'wx', mode: 0o600 })
-  } finally {
-    await rm(workspace, { recursive: true, force: true })
+    await publishDurableLockFile({
+      destination: output,
+      bytes: canonicalBytes({ payloadSha256: sha256(canonicalBytes(payload)), payload }),
+      mode: 0o600,
+    })
+  } catch (error) {
+    primaryError = error
   }
+  const cleanup = await Promise.allSettled([rm(workspace, { recursive: true, force: true })])
+  const cleanupErrors = cleanup.filter((result) => result.status === 'rejected').map((result) => result.reason)
+  if (primaryError !== undefined) {
+    if (cleanupErrors.length > 0) throw new AggregateError([primaryError, ...cleanupErrors], primaryError?.message ?? 'Converter capture failed.', { cause: primaryError })
+    throw primaryError
+  }
+  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'Converter capture cleanup failed.')
 }
 
 export async function captureHomebrewTargetMain(argv) {

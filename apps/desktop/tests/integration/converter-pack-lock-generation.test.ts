@@ -1,15 +1,18 @@
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { gzipSync } from 'node:zlib'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import process from 'node:process'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { parse } from 'yaml'
 import { captureHomebrewTarget } from '../../scripts/converter-packs/capture-homebrew-target.mjs'
 import { generateTransitiveSourceLock } from '../../scripts/converter-packs/generate-transitive-source-lock.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 import { loadConverterClosureLock } from '../../scripts/converter-packs/closure-lock.mjs'
+import { publishDurableLockFile } from '../../scripts/converter-packs/durable-lock-publication.mjs'
 
 const rootsToRemove: string[] = []
 const sha256 = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex')
@@ -403,6 +406,63 @@ describe('converter pack lock generation', () => {
     expect(generateTransitiveSourceLock).toBeTypeOf('function')
   })
 
+  it('durably publishes through short writes and recovers a fully synced SIGKILL temp', async () => {
+    const root = temporaryRoot()
+    const shortDestination = join(root, 'short.json')
+    const bytes = canonicalBytes({ durable: true, value: 'short-write' })
+    await publishDurableLockFile({
+      destination: shortDestination,
+      bytes,
+      mode: 0o600,
+      writeChunkForTest: ({ bytes: wanted, offset, write }: { bytes: Buffer; offset: number; write: (length?: number) => Promise<unknown> }) => (
+        write(Math.min(3, wanted.byteLength - offset))
+      ),
+    })
+    expect(readFileSync(shortDestination)).toEqual(bytes)
+    expect(statSync(shortDestination).mode & 0o777).toBe(0o600)
+    await publishDurableLockFile({ destination: shortDestination, bytes, mode: 0o600 })
+
+    const interruptedDestination = join(root, 'interrupted.json')
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts', 'converter-packs', 'durable-lock-publication.mjs')).href
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { Buffer } from 'node:buffer'
+      import { publishDurableLockFile } from ${JSON.stringify(moduleUrl)}
+      await publishDurableLockFile({
+        destination: ${JSON.stringify(interruptedDestination)},
+        bytes: Buffer.from(${JSON.stringify(bytes.toString('base64'))}, 'base64'),
+        mode: 0o600,
+        afterTempSyncForTest: () => process.kill(process.pid, 'SIGKILL'),
+      })
+    `])
+    expect(child.signal).toBe('SIGKILL')
+    expect(existsSync(interruptedDestination)).toBe(false)
+    expect(readdirSync(root).some((name) => name.startsWith('.interrupted.json.autoforge-tmp-'))).toBe(true)
+
+    await publishDurableLockFile({ destination: interruptedDestination, bytes, mode: 0o600 })
+    expect(readFileSync(interruptedDestination)).toEqual(bytes)
+    expect(readdirSync(root).some((name) => name.startsWith('.interrupted.json.autoforge-tmp-'))).toBe(false)
+  })
+
+  it('reports the primary durable-publication failure before cleanup failures', async () => {
+    const root = temporaryRoot()
+    let error: unknown
+    try {
+      await publishDurableLockFile({
+        destination: join(root, 'cleanup.json'),
+        bytes: canonicalBytes({ cleanup: true }),
+        mode: 0o600,
+        afterTempSyncForTest: () => { throw new Error('primary publication failure') },
+        cleanupForTest: ({ index, run }: { index: number; run: () => Promise<unknown> }) => (
+          index === 0 ? Promise.reject(new Error('cleanup failure')) : run()
+        ),
+      })
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(AggregateError)
+    expect((error as AggregateError).errors[0]).toMatchObject({ message: 'primary publication failure' })
+  })
+
   it('registers explicit maintainer commands without adding lock generation to predev', () => {
     const packageJson = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8'))
     expect(packageJson.scripts['converter-packs:capture-lock-target']).toBe('node scripts/converter-packs/capture-homebrew-target.mjs')
@@ -507,6 +567,9 @@ describe('converter pack lock generation', () => {
     ))).toBe(true)
     expect(calls.filter(({ executable }) => executable === '/usr/bin/curl')).toHaveLength(6)
     expect(calls.flatMap(({ args }) => args).filter(isAbsolute).every((path) => path === '/opt/test/bin/brew' || path.startsWith(root) || path.startsWith('/private/var/') || path.startsWith('/var/'))).toBe(true)
+
+    await captureWithFixture(root, fixture)
+    expect(readFileSync(output)).toEqual(bytes)
 
     const secondRoot = temporaryRoot()
     await captureWithFixture(secondRoot, fixture)
