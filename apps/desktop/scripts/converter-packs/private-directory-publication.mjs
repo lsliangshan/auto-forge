@@ -11,7 +11,7 @@ const maximumClaimBytes = 2048
 const initializationGraceMs = 250
 const heartbeatMs = 5 * 1000
 const leaseMs = 30 * 1000
-const maximumPredecessors = 1
+const maximumPredecessors = 2
 const maximumParentEntries = 4096
 
 function missing(error) {
@@ -142,103 +142,164 @@ async function unlinkIdentity(path, expected, allowedLinks = [1]) {
   return true
 }
 
+function recoveryPath(path, token, recoveryNonce, kind) {
+  return `${path}.${token}.${process.pid}.${recoveryNonce}.${kind}`
+}
+
+function validPredecessorToken(token, predecessor) {
+  return token === predecessor.value?.nonce || token === `${predecessor.stat.dev}-${predecessor.stat.ino}`
+}
+
+async function takeRecoveryCandidate(candidate, destination, recoveryNonce) {
+  const before = await readClaim(candidate.path, destination, [1, 2])
+  if (!before) return undefined
+  const path = recoveryPath(`${destination}.claim`, candidate.token, recoveryNonce, candidate.kind)
+  try {
+    await rename(candidate.path, path)
+  } catch (error) {
+    if (missing(error)) return undefined
+    throw error
+  }
+  const moved = await readClaim(path, destination, [1, 2])
+  if (!moved || !sameIdentity(moved.stat, before.stat)) {
+    fail('Private directory publication predecessor changed during recovery.')
+  }
+  return { ...candidate, path, pid: process.pid, recoveryNonce, record: moved }
+}
+
+async function finishRecovery(destination, candidates, afterFenceStepForTest) {
+  const claimPath = `${destination}.claim`
+  let preserved = candidates.find((candidate) => candidate.kind === 'recovering')
+  let active = candidates.find((candidate) => candidate.kind === 'active')
+  if (!preserved && !active) return false
+  const record = preserved?.record ?? active.record
+  if (!validPredecessorToken((preserved ?? active).token, record)) {
+    fail('Private directory publication predecessor is invalid.')
+  }
+  if (preserved && active) {
+    if (
+      preserved.token !== active.token
+      || !sameIdentity(preserved.record.stat, active.record.stat)
+      || preserved.record.stat.nlink !== 2
+      || active.record.stat.nlink !== 2
+    ) fail('Private directory publication predecessor is invalid.')
+  } else if (preserved?.record.stat.nlink === 2) {
+    const current = await readClaim(claimPath, destination, [2])
+    if (
+      !current
+      || !sameIdentity(current.stat, preserved.record.stat)
+      || Boolean(current.value) !== Boolean(preserved.record.value)
+      || (current.value && current.value.nonce !== preserved.record.value.nonce)
+    ) fail('Private directory publication predecessor does not match the active claim.')
+    const isolatedActive = recoveryPath(claimPath, preserved.token, preserved.recoveryNonce, 'active')
+    await rename(claimPath, isolatedActive)
+    const moved = await readClaim(isolatedActive, destination, [2])
+    if (!moved || !sameIdentity(moved.stat, preserved.record.stat)) {
+      fail('Private directory publication claim changed during recovery.')
+    }
+    active = { ...preserved, kind: 'active', path: isolatedActive, record: moved }
+  } else if (preserved?.record.stat.nlink === 1) {
+    active = { ...preserved, kind: 'active' }
+    preserved = undefined
+  } else if (active?.record.stat.nlink !== 1) {
+    fail('Private directory publication predecessor has an invalid link count.')
+  }
+  if (preserved) {
+    if (!await unlinkIdentity(preserved.path, preserved.record.stat, [2])) {
+      fail('Private directory publication predecessor changed during cleanup.')
+    }
+    await syncDirectory(dirname(claimPath))
+  }
+  await afterFenceStepForTest?.({ step: 'active-unlink', predecessor: active.path })
+  if (record.value) {
+    const partial = join(dirname(destination), record.value.partialName)
+    if (!isPathInsideRoot(dirname(destination), partial)) fail('Private directory publication predecessor is invalid.')
+    await rm(partial, { recursive: true, force: true })
+  }
+  await afterFenceStepForTest?.({ step: 'partial-cleanup', predecessor: active.path })
+  if (!await unlinkIdentity(active.path, active.record.stat)) {
+    fail('Private directory publication predecessor changed during cleanup.')
+  }
+  await syncDirectory(dirname(claimPath))
+  return true
+}
+
 async function fenceClaim(path, destination, current, afterFenceStepForTest) {
   const suffix = current.value?.nonce ?? `${current.stat.dev}-${current.stat.ino}`
   const predecessor = `${path}.${suffix}.predecessor`
-  let linked = false
   try {
     await link(path, predecessor)
-    linked = true
   } catch (error) {
     if (missing(error)) return false
-      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') return false
+    throw error
   }
-  if (linked) await afterFenceStepForTest?.({ step: 'predecessor-link', predecessor })
-  const [active, preserved] = await Promise.all([
-    lstat(path).catch(() => undefined),
-    lstat(predecessor).catch(() => undefined),
-  ])
-  if (
-    !active?.isFile()
-    || active.isSymbolicLink()
-    || active.nlink !== 2
-    || !preserved?.isFile()
-    || preserved.isSymbolicLink()
-    || preserved.nlink !== 2
-    || !sameIdentity(active, current.stat)
-    || !sameIdentity(preserved, current.stat)
-  ) fail('Private directory publication claim changed during recovery.')
-  if (!await unlinkIdentity(path, current.stat, [2])) return false
-  await syncDirectory(dirname(path))
-  await afterFenceStepForTest?.({ step: 'active-unlink', predecessor })
-  if (current.value) {
-    const partial = join(dirname(destination), current.value.partialName)
-    if (!isPathInsideRoot(dirname(destination), partial)) fail('Private directory publication claim is invalid.')
-    await rm(partial, { recursive: true, force: true })
-  }
-  await afterFenceStepForTest?.({ step: 'partial-cleanup', predecessor })
-  await unlinkIdentity(predecessor, current.stat)
-  await syncDirectory(dirname(path))
-  return true
+  const recoveryNonce = randomUUID()
+  const owned = await takeRecoveryCandidate(
+    { kind: 'recovering', path: predecessor, token: suffix },
+    destination,
+    recoveryNonce,
+  )
+  if (!owned) return false
+  await afterFenceStepForTest?.({ step: 'predecessor-link', predecessor: owned.path })
+  return finishRecovery(destination, [owned], afterFenceStepForTest)
 }
 
 async function predecessorPaths(destination) {
   const claimPath = `${destination}.claim`
   const prefix = `${basename(claimPath)}.`
-  const suffix = '.predecessor'
   const paths = []
   let inspected = 0
   const directory = await opendir(dirname(claimPath))
   for await (const entry of directory) {
     inspected += 1
     if (inspected > maximumParentEntries) fail('Private directory publication parent inventory is too large.')
-    if (!entry.name.startsWith(prefix) || !entry.name.endsWith(suffix)) continue
+    if (!entry.name.startsWith(prefix)) continue
     if (!entry.isFile()) fail('Private directory publication predecessor is invalid.')
-    const token = entry.name.slice(prefix.length, -suffix.length)
+    const remainder = entry.name.slice(prefix.length)
+    let token
+    let kind = 'recovering'
+    let pid
+    let recoveryNonce
+    if (remainder.endsWith('.predecessor')) {
+      token = remainder.slice(0, -'.predecessor'.length)
+    } else {
+      const parts = remainder.split('.')
+      kind = parts.at(-1)
+      recoveryNonce = parts.at(-2)
+      pid = Number(parts.at(-3))
+      token = parts.slice(0, -3).join('.')
+      if (!['recovering', 'active'].includes(kind) || !noncePattern.test(recoveryNonce) || !Number.isSafeInteger(pid) || pid <= 0) continue
+    }
     if (!noncePattern.test(token) && !/^[1-9]\d*-[1-9]\d*$/u.test(token)) {
       fail('Private directory publication predecessor is invalid.')
     }
-    paths.push({ path: join(dirname(claimPath), entry.name), token })
+    paths.push({ kind, path: join(dirname(claimPath), entry.name), pid, recoveryNonce, token })
     if (paths.length > maximumPredecessors) fail('Private directory publication has too many predecessors.')
   }
   return paths
 }
 
 async function recoverPredecessors(destination) {
-  const claimPath = `${destination}.claim`
-  for (const candidate of await predecessorPaths(destination)) {
-    const predecessor = await readClaim(candidate.path, destination, [1, 2])
-    if (!predecessor) continue
-    const identityToken = `${predecessor.stat.dev}-${predecessor.stat.ino}`
-    if (
-      (predecessor.value && candidate.token !== predecessor.value.nonce)
-      || (!predecessor.value && candidate.token !== identityToken)
-    ) fail('Private directory publication predecessor is invalid.')
-    if (predecessor.stat.nlink === 2) {
-      const active = await readClaim(claimPath, destination, [2])
-      if (
-        !active
-        || !sameIdentity(active.stat, predecessor.stat)
-        || Boolean(active.value) !== Boolean(predecessor.value)
-        || (active.value && active.value.nonce !== predecessor.value.nonce)
-      ) fail('Private directory publication predecessor does not match the active claim.')
-      if (!await unlinkIdentity(claimPath, predecessor.stat, [2])) {
-        fail('Private directory publication predecessor changed during recovery.')
-      }
-      await syncDirectory(dirname(claimPath))
-    } else if (predecessor.stat.nlink !== 1) {
-      fail('Private directory publication predecessor has an invalid link count.')
+  const candidates = await predecessorPaths(destination)
+  if (candidates.length === 0) return
+  for (const candidate of candidates) {
+    if (candidate.pid && ownerState(candidate.pid) !== 'dead') {
+      fail('Private directory publication is already claimed.')
     }
-    if (predecessor.value) {
-      const partial = join(dirname(destination), predecessor.value.partialName)
-      if (!isPathInsideRoot(dirname(destination), partial)) fail('Private directory publication predecessor is invalid.')
-      await rm(partial, { recursive: true, force: true })
-    }
-    if (!await unlinkIdentity(candidate.path, predecessor.stat)) {
-      fail('Private directory publication predecessor changed during cleanup.')
-    }
-    await syncDirectory(dirname(claimPath))
   }
+  const recoveryNonce = randomUUID()
+  const ordered = [...candidates].sort((left, right) => (
+    (left.kind === 'recovering' ? 0 : left.kind === 'active' ? 1 : 2)
+    - (right.kind === 'recovering' ? 0 : right.kind === 'active' ? 1 : 2)
+  ))
+  const owned = []
+  for (const candidate of ordered) {
+    const claimed = await takeRecoveryCandidate(candidate, destination, recoveryNonce)
+    if (!claimed) return
+    owned.push(claimed)
+  }
+  await finishRecovery(destination, owned)
 }
 
 async function verifyClaim(claim) {
