@@ -472,6 +472,66 @@ async function verifyMetadataFile(path, expectedBytes, allowedLinks) {
   }
 }
 
+export async function replaceActiveDevelopmentRelease({
+  cacheRoot,
+  fingerprint,
+  candidateRelease,
+  afterOldReleaseRenameForTest,
+}) {
+  const canonicalRoot = await canonicalCacheRoot(cacheRoot)
+  assertFingerprint(fingerprint)
+  if (typeof candidateRelease !== 'string' || !isAbsolute(candidateRelease) || resolve(candidateRelease) !== candidateRelease) {
+    throw new Error('Development replacement release must be canonical and absolute')
+  }
+  const candidateRelative = relative(canonicalRoot, candidateRelease)
+  if (!candidateRelative || candidateRelative === '..' || candidateRelative.startsWith('../')) {
+    throw new Error('Development replacement release must be inside the cache root')
+  }
+  const paths = developmentReleasePaths(canonicalRoot, fingerprint)
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
+    if (await readActiveDevelopmentRelease({ cacheRoot: root }) !== paths.release) {
+      throw new Error('Development replacement release is no longer active')
+    }
+    for (const [path, label] of [[paths.release, 'active'], [candidateRelease, 'candidate']]) {
+      const details = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
+      if (!details?.isDirectory() || details.isSymbolicLink() || await realpath(path).catch(() => undefined) !== path) {
+        throw new Error(`Development ${label} release is unsafe`)
+      }
+    }
+    const quarantine = join(root, `.replaced-active-release-${fingerprint}-${randomUUID()}`)
+    let oldMoved = false
+    let candidateMoved = false
+    try {
+      await heartbeat.pulse()
+      await rename(paths.release, quarantine)
+      oldMoved = true
+      await syncDirectory(dirname(paths.release))
+      await afterOldReleaseRenameForTest?.()
+      await heartbeat.pulse()
+      await rename(candidateRelease, paths.release)
+      candidateMoved = true
+      await Promise.all([syncDirectory(dirname(paths.release)), syncDirectory(dirname(candidateRelease))])
+      await heartbeat.pulse()
+      await rm(quarantine, { recursive: true })
+      await syncDirectory(root)
+      return paths.release
+    } catch (primary) {
+      const cleanup = []
+      if (candidateMoved) {
+        try { await rename(paths.release, candidateRelease) } catch (error) { cleanup.push(error) }
+      }
+      if (oldMoved) {
+        try { await rename(quarantine, paths.release) } catch (error) { cleanup.push(error) }
+      }
+      try { await Promise.all([syncDirectory(dirname(paths.release)), syncDirectory(dirname(candidateRelease))]) } catch (error) { cleanup.push(error) }
+      if (cleanup.length > 0) {
+        throw new AggregateError([primary, ...cleanup], primary instanceof Error ? primary.message : 'Development active release replacement failed')
+      }
+      throw primary
+    }
+  })
+}
+
 export async function writeDevelopmentReleaseMetadata({
   cacheRoot,
   fingerprint,

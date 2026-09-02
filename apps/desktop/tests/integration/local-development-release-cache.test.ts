@@ -10,6 +10,7 @@ import {
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
+  replaceActiveDevelopmentRelease,
   removeInactiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
 } from '../../scripts/converter-packs/local-development-release-cache.mjs'
@@ -151,6 +152,39 @@ describe('local development release cache', () => {
     writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${candidate}","schemaVersion":1}\n`)
     await expect(removeInactiveDevelopmentRelease({ cacheRoot, fingerprint: candidate })).resolves.toBe(false)
     expect(existsSync(join(cacheRoot, 'releases', candidate))).toBe(true)
+  })
+
+  it('replaces a corrupt active release from a private candidate and rolls back before exposing failure', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '3'.repeat(64)
+    const active = createRelease(cacheRoot, fingerprint)
+    writeFileSync(join(active, 'state'), 'corrupt')
+    const marker = `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`
+    writeFileSync(join(cacheRoot, 'active-release.json'), marker)
+    const failedCandidate = join(cacheRoot, '.candidate-failed')
+    mkdirSync(failedCandidate)
+    writeFileSync(join(failedCandidate, 'state'), 'candidate')
+
+    await expect(replaceActiveDevelopmentRelease({
+      cacheRoot,
+      fingerprint,
+      candidateRelease: failedCandidate,
+      afterOldReleaseRenameForTest: async () => { throw new Error('injected replacement failure') },
+    })).rejects.toThrow('injected replacement failure')
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
+    expect(readFileSync(join(active, 'state'), 'utf8')).toBe('corrupt')
+    expect(readFileSync(join(failedCandidate, 'state'), 'utf8')).toBe('candidate')
+
+    const candidate = join(cacheRoot, '.candidate-ready')
+    mkdirSync(candidate)
+    writeFileSync(join(candidate, 'state'), 'verified')
+    await expect(replaceActiveDevelopmentRelease({ cacheRoot, fingerprint, candidateRelease: candidate }))
+      .resolves.toBe(active)
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
+    expect(readFileSync(join(active, 'state'), 'utf8')).toBe('verified')
+    expect(existsSync(candidate)).toBe(false)
+    expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.replaced-active-release-'))).toEqual([])
   })
 
   it('activates an existing release atomically without leaking marker temporaries', async () => {

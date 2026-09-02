@@ -11,6 +11,7 @@ import {
   readActiveDevelopmentRelease,
   recoverLegacyDevelopmentPreparation,
   removeInactiveDevelopmentRelease,
+  replaceActiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
 } from './local-development-release-cache.mjs'
 import { pruneDevelopmentCache } from './development-cache-budget.mjs'
@@ -62,6 +63,7 @@ const productionDependencies = Object.freeze({
   verifyRelease: (request) => verifyLocalDevelopmentReleaseIntegrity(request),
   smokeRelease: (request) => smokeTestLocalDevelopmentRelease(request),
   writeMetadata: (request) => writeDevelopmentReleaseMetadata(request),
+  replaceActiveRelease: (request) => replaceActiveDevelopmentRelease(request),
   activateRelease: ({ cacheRoot, fingerprint }) => activateDevelopmentRelease({ cacheRoot, fingerprint }),
   pruneCache: (request) => pruneDevelopmentCache({ ...request, migrateLegacyReleases: true }),
 })
@@ -164,7 +166,7 @@ export async function developmentFingerprintInputs(desktopRoot) {
 function validateDependencies(dependencies) {
   if (!isPlainRecord(dependencies) || [
     'buildHelpers', 'preparePlan', 'stagePacks', 'buildRelease', 'verifyRelease', 'smokeRelease',
-    'writeMetadata', 'activateRelease', 'pruneCache',
+    'writeMetadata', 'replaceActiveRelease', 'activateRelease', 'pruneCache',
   ].some((name) => typeof dependencies[name] !== 'function')
     || (dependencies.removeRelease !== undefined && typeof dependencies.removeRelease !== 'function')
     || (dependencies.removePrivateRoot !== undefined && typeof dependencies.removePrivateRoot !== 'function')) {
@@ -223,12 +225,19 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     if (error?.code === 'ENOENT') return undefined
     throw error
   })
+  let replaceActive = false
   if (activeRelease === paths.release) {
-    await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
-    await dependencies.pruneCache({ cacheRoot, activeFingerprint: fingerprint })
-    return { fingerprint, releaseRoot: paths.release, reused: true }
+    try {
+      await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
+    } catch {
+      replaceActive = true
+    }
+    if (!replaceActive) {
+      await dependencies.pruneCache({ cacheRoot, activeFingerprint: fingerprint })
+      return { fingerprint, releaseRoot: paths.release, reused: true }
+    }
   }
-  if (await hasRelease(paths.release)) await removeRelease(paths.release)
+  if (!replaceActive && await hasRelease(paths.release)) await removeRelease(paths.release)
 
   await recoverLegacyDevelopmentPreparation({ cacheRoot, fingerprint })
   const privateRoot = await realpath(await mkdtemp(join(
@@ -245,6 +254,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     const privateKeyPath = join(signingRoot, 'private.pem')
     const publicKeyPath = join(signingRoot, 'public.pem')
     const lockPath = await materializeLockSnapshot(privateRoot, inputs)
+    const releaseOutput = replaceActive ? join(privateRoot, 'replacement-release') : paths.release
     await mkdir(join(cacheRoot, 'sources'), { recursive: true, mode: 0o700 })
     await mkdir(join(cacheRoot, 'releases'), { recursive: true, mode: 0o700 })
     await mkdir(signingRoot, { mode: 0o700 })
@@ -265,14 +275,17 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     const plan = JSON.parse(await readFile(planPath, 'utf8'))
     await dependencies.stagePacks({ plan, output: stagingRoot })
     await dependencies.buildRelease({
-      stagingRoot, outputRoot: paths.release, privateKeyPath, publicKeyPath, platform: request.platform, arch: request.arch,
+      stagingRoot, outputRoot: releaseOutput, privateKeyPath, publicKeyPath, platform: request.platform, arch: request.arch,
     })
-    await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
+    await dependencies.verifyRelease({ releaseRoot: releaseOutput, platform: request.platform, arch: request.arch })
     const smokeWorkRoot = join(privateRoot, 'smoke')
     await mkdir(smokeWorkRoot, { mode: 0o700 })
-    await dependencies.smokeRelease({ releaseRoot: paths.release, workRoot: smokeWorkRoot })
-    await removePrivateRoot(privateRoot)
+    await dependencies.smokeRelease({ releaseRoot: releaseOutput, workRoot: smokeWorkRoot })
     await dependencies.writeMetadata({ cacheRoot, fingerprint, blobs: prepared.blobs })
+    if (replaceActive) {
+      await dependencies.replaceActiveRelease({ cacheRoot, fingerprint, candidateRelease: releaseOutput })
+    }
+    await removePrivateRoot(privateRoot)
   } catch (error) {
     primaryError = error
   }

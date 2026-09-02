@@ -11,7 +11,10 @@ import {
   runLocalDevelopmentReleasePreparation,
 } from '../../scripts/converter-packs/prepare-local-development-release.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
-import { writeDevelopmentReleaseMetadata } from '../../scripts/converter-packs/local-development-release-cache.mjs'
+import {
+  replaceActiveDevelopmentRelease,
+  writeDevelopmentReleaseMetadata,
+} from '../../scripts/converter-packs/local-development-release-cache.mjs'
 import { nativeHelperSourceInventory } from '../../scripts/converter-packs/build-native-helpers.mjs'
 
 const roots: string[] = []
@@ -111,6 +114,7 @@ function dependencies(events: string[], overrides: Record<string, unknown> = {})
     verifyRelease: async () => { events.push('verify') },
     smokeRelease: async () => { events.push('smoke') },
     writeMetadata: async () => { events.push('metadata') },
+    replaceActiveRelease: async () => { events.push('replace') },
     activateRelease: async ({ cacheRoot, fingerprint, releaseRoot }: { cacheRoot: string, fingerprint: string, releaseRoot: string }) => {
       events.push('activate')
       await writeFile(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`)
@@ -287,6 +291,46 @@ it('reuses only the verified active fingerprint with integrity and safe pruning 
   expect(events).toEqual(['verify', 'prune'])
   expect(statSync(sourcePath).mtimeMs).toBe(sourceMtime)
   expect(statSync(first.releaseRoot).mtimeMs).toBe(releaseMtime)
+})
+
+it('rebuilds a corrupted active fingerprint in isolation before a fenced replacement', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const inputs = await developmentFingerprintInputs(desktopRoot)
+  const { fingerprintDevelopmentRelease } = await import('../../scripts/converter-packs/local-development-release-cache.mjs')
+  const fingerprint = fingerprintDevelopmentRelease({ target: 'darwin-arm64', inputs })
+  const active = join(cacheRoot, 'releases', fingerprint)
+  await mkdir(active, { recursive: true })
+  await writeFile(join(active, 'state'), 'corrupt')
+  const marker = `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`
+  await writeFile(join(cacheRoot, 'active-release.json'), marker)
+  const events: string[] = []
+  const injected = dependencies(events, {
+    verifyRelease: async ({ releaseRoot }: { releaseRoot: string }) => {
+      events.push('verify')
+      if (releaseRoot === active && await readFile(join(active, 'state'), 'utf8') === 'corrupt') {
+        throw new Error('active integrity failure')
+      }
+    },
+    buildRelease: async ({ outputRoot }: { outputRoot: string }) => {
+      events.push('build')
+      expect(outputRoot).not.toBe(active)
+      await mkdir(outputRoot)
+      await writeFile(join(outputRoot, 'state'), 'verified')
+    },
+    replaceActiveRelease: async (value: Parameters<typeof replaceActiveDevelopmentRelease>[0]) => {
+      events.push('replace')
+      return replaceActiveDevelopmentRelease(value)
+    },
+  })
+
+  const result = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)
+
+  expect(result).toEqual({ fingerprint, releaseRoot: active, reused: false })
+  expect(await readFile(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
+  expect(await readFile(join(active, 'state'), 'utf8')).toBe('verified')
+  expect(events).toEqual([
+    'verify', 'helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'replace', 'activate', 'prune',
+  ])
 })
 
 it.each([
