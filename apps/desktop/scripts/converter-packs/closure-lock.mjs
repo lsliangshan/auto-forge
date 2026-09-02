@@ -17,6 +17,8 @@ const targets = Object.freeze(['darwin-arm64', 'darwin-x64'])
 const roles = new Set(['executable', 'code', 'data'])
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const formulaNamePattern = /^[a-z0-9][a-z0-9+_.@-]*$/u
+const versionSegmentPattern = /^[A-Za-z0-9._+-]+$/u
+const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const maximumClosureLockBytes = 64 * 1024 * 1024
 
 function plainRecord(value) {
@@ -48,6 +50,16 @@ function validFormulaName(value) {
   return validText(value, 128) && formulaNamePattern.test(value)
 }
 
+function validVersionSegment(value) {
+  return validText(value, 128)
+    && value.normalize('NFC') === value
+    && value !== '.'
+    && value !== '..'
+    && versionSegmentPattern.test(value)
+    && !value.endsWith('.')
+    && !reservedWindowsName.test(value)
+}
+
 function validHttpsUrl(value) {
   if (!validText(value, 2_048)) return false
   try {
@@ -71,7 +83,7 @@ function sortedUnique(values, key) {
 function validFormula(value) {
   return exactKeys(value, ['name', 'version', 'dependencies'])
     && validFormulaName(value.name)
-    && validText(value.version, 128)
+    && validVersionSegment(value.version)
     && Array.isArray(value.dependencies)
     && value.dependencies.every(validFormulaName)
     && sortedUnique(value.dependencies, (dependency) => dependency)
@@ -98,12 +110,12 @@ function validLicense(value, formulae) {
     && positiveInteger(value.bytes)
 }
 
-function rewriteReplacement(destination, replacement) {
-  if (!validText(replacement) || !replacement.startsWith('@loader_path/')) return false
+function rewriteDestination(destination, replacement) {
+  if (!validText(replacement) || !replacement.startsWith('@loader_path/')) return undefined
   const suffix = replacement.slice('@loader_path/'.length)
-  if (suffix.length === 0 || suffix.includes('\\') || suffix.includes('\0') || posix.isAbsolute(suffix)) return false
+  if (suffix.length === 0 || suffix.includes('\\') || suffix.includes('\0') || posix.isAbsolute(suffix)) return undefined
   const resolved = posix.normalize(posix.join(posix.dirname(destination), suffix))
-  return safeEntryPath(resolved)
+  return safeEntryPath(resolved) ? resolved : undefined
 }
 
 function validRewrite(value, files) {
@@ -111,7 +123,7 @@ function validRewrite(value, files) {
     && safeEntryPath(value.destination)
     && files.has(value.destination)
     && validText(value.dependency)
-    && rewriteReplacement(value.destination, value.replacement)
+    && files.has(rewriteDestination(value.destination, value.replacement))
 }
 
 function validateFamily(value, formulae) {
@@ -134,8 +146,14 @@ function validateFamily(value, formulae) {
   }
 
   const files = new Set(value.files.map((file) => file.destination))
-  return value.rewrites.every((rewrite) => validRewrite(rewrite, files))
-    && sortedUnique(value.rewrites, (rewrite) => `${rewrite.destination}\0${rewrite.dependency}\0${rewrite.replacement}`)
+  const rewritePairs = new Set()
+  for (const rewrite of value.rewrites) {
+    if (!validRewrite(rewrite, files)) return false
+    const pair = `${rewrite.destination}\0${rewrite.dependency}`
+    if (rewritePairs.has(pair)) return false
+    rewritePairs.add(pair)
+  }
+  return sortedUnique(value.rewrites, (rewrite) => `${rewrite.destination}\0${rewrite.dependency}\0${rewrite.replacement}`)
 }
 
 function validateDependencyGraph(formulae) {
@@ -210,20 +228,57 @@ function validateSourceRelationship(sourceLock, closureLock) {
     }
   }
 
+  const reachable = new Set()
+  const seeds = new Set(sourceLock.engines.flatMap((engine) => engine.rootFormula === null ? [] : [engine.rootFormula]))
+  for (const family of Object.values(closureLock.families)) {
+    for (const entry of [...family.files, ...family.licenses]) seeds.add(entry.formula)
+  }
+  const closureFormulae = new Map(closureLock.formulae.map((formula) => [formula.name, formula]))
+  function visit(name) {
+    if (reachable.has(name)) return
+    const formula = closureFormulae.get(name)
+    if (!formula) fail('Target closure lock references an undeclared formula.')
+    reachable.add(name)
+    for (const dependency of formula.dependencies) visit(dependency)
+  }
+  for (const seed of seeds) visit(seed)
+  if (reachable.size !== closureFormulae.size) fail('Target closure lock contains an unreachable formula.')
+
+  for (const family of Object.values(closureLock.families)) {
+    const contributed = new Set(family.files.map((file) => file.formula))
+    const matched = new Set()
+    for (const license of family.licenses) {
+      const formula = selectedFormulae.get(license.formula)
+      const matches = formula?.licenses.some((asset) => (
+        asset.destination === license.destination
+        && asset.sha256 === license.sha256
+        && asset.bytes === license.bytes
+        && (asset.kind === 'bottle-entry' ? asset.path : asset.url) === license.source
+      ))
+      if (!matches) fail('Target closure lock license inventory is inconsistent.')
+      matched.add(license.formula)
+    }
+    if ([...contributed].some((formula) => !matched.has(formula))) {
+      fail('Target closure lock license inventory is inconsistent.')
+    }
+  }
+
   const coordinates = new Map()
   function add(coordinate) {
-    const identity = `${coordinate.url}\0${coordinate.sha256}\0${coordinate.bytes}`
-    coordinates.set(identity, coordinate.bytes)
+    const previous = coordinates.get(coordinate.sha256)
+    if (previous && (previous.url !== coordinate.url || previous.bytes !== coordinate.bytes)) {
+      fail('Selected network artifacts conflict for one SHA-256.')
+    }
+    coordinates.set(coordinate.sha256, { url: coordinate.url, bytes: coordinate.bytes })
   }
   for (const engine of sourceLock.engines) add(engine.acquisition)
-  for (const formula of closureLock.formulae) {
-    const selected = selectedFormulae.get(formula.name)
-    add(selected.acquisition)
-    for (const license of selected.licenses) {
+  for (const formula of sourceLock.formulae) {
+    if (formula.acquisition !== null) add(formula.acquisition)
+    for (const license of formula.licenses) {
       if (license.kind === 'download') add(license)
     }
   }
-  const downloadBytes = [...coordinates.values()].reduce((sum, bytes) => sum + bytes, 0)
+  const downloadBytes = [...coordinates.values()].reduce((sum, coordinate) => sum + coordinate.bytes, 0)
   if (downloadBytes !== closureLock.measurements.downloadBytes) {
     fail('Target closure lock download measurement is inconsistent.')
   }

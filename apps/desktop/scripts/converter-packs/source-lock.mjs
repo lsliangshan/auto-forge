@@ -16,6 +16,8 @@ const engineNames = Object.freeze(['ffmpeg', 'libreoffice', 'libvips', 'poppler'
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const gitRevisionPattern = /^[a-f0-9]{40}$/u
 const formulaNamePattern = /^[a-z0-9][a-z0-9+_.@-]*$/u
+const versionSegmentPattern = /^[A-Za-z0-9._+-]+$/u
+const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const maximumSourceLockBytes = 8 * 1024 * 1024
 const maximumClosureLockBytes = 64 * 1024 * 1024
 
@@ -56,6 +58,16 @@ function validText(value, maximumBytes = 256) {
 
 function validName(value) {
   return validText(value, 128) && formulaNamePattern.test(value)
+}
+
+function validVersionSegment(value) {
+  return validText(value, 128)
+    && value.normalize('NFC') === value
+    && value !== '.'
+    && value !== '..'
+    && versionSegmentPattern.test(value)
+    && !value.endsWith('.')
+    && !reservedWindowsName.test(value)
 }
 
 function validCoordinate(value, target, expectedKind) {
@@ -119,7 +131,7 @@ function validFormula(value) {
   if (!exactKeys(value, ['name', 'version', 'revision', 'license', 'acquisitions', 'licenses'])) return false
   if (
     !validName(value.name)
-    || !validText(value.version, 128)
+    || !validVersionSegment(value.version)
     || !Number.isSafeInteger(value.revision)
     || value.revision < 0
     || !validText(value.license, 512)
@@ -145,7 +157,7 @@ function validFormula(value) {
 
 function validEngine(value, expectedName, formulae) {
   if (!exactKeys(value, ['name', 'version', 'license', 'rootFormula', 'acquisitions'])) return false
-  if (value.name !== expectedName || !validText(value.version, 128) || !validText(value.license, 512)) return false
+  if (value.name !== expectedName || !validVersionSegment(value.version) || !validText(value.license, 512)) return false
   if (expectedName === 'libreoffice') {
     return value.rootFormula === null && validAcquisitions(value.acquisitions, 'dmg')
   }
