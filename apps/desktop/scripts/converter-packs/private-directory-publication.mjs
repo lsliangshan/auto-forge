@@ -151,6 +151,23 @@ function validPredecessorToken(token, predecessor) {
   return token === predecessor.value?.nonce || token === `${predecessor.stat.dev}-${predecessor.stat.ino}`
 }
 
+function authoritativeRecoveryRecord(predecessor, active) {
+  if (!sameIdentity(predecessor.stat, active.stat)) {
+    fail('Private directory publication predecessor does not match the active claim.')
+  }
+  if (predecessor.value) {
+    if (!active.value || !predecessor.bytes?.equals(active.bytes)) {
+      fail('Private directory publication predecessor does not match the active claim.')
+    }
+  } else if (predecessor.bytes?.byteLength !== 0) {
+    fail('Private directory publication predecessor is invalid.')
+  }
+  if (!active.value && active.bytes?.byteLength !== 0) {
+    fail('Private directory publication claim is invalid.')
+  }
+  return active
+}
+
 async function takeRecoveryCandidate(candidate, destination, recoveryNonce) {
   const before = await readClaim(candidate.path, destination, [1, 2])
   if (!before) return undefined
@@ -186,7 +203,10 @@ async function finishRecovery(destination, candidates, afterFenceStepForTest, re
   let preserved = candidates.find((candidate) => candidate.kind === 'recovering')
   let active = candidates.find((candidate) => candidate.kind === 'active')
   if (!preserved && !active) return false
-  const record = preserved?.record ?? active.record
+  if (preserved && !active && preserved.record.stat.nlink === 2) {
+    await afterFenceStepForTest?.({ step: 'predecessor-refresh', predecessor: preserved.path })
+  }
+  let record = preserved?.record ?? active.record
   if (!validPredecessorToken((preserved ?? active).token, record)) {
     fail('Private directory publication predecessor is invalid.')
   }
@@ -197,13 +217,12 @@ async function finishRecovery(destination, candidates, afterFenceStepForTest, re
       || preserved.record.stat.nlink !== 2
       || active.record.stat.nlink !== 2
     ) fail('Private directory publication predecessor is invalid.')
+    record = authoritativeRecoveryRecord(preserved.record, active.record)
   } else if (preserved?.record.stat.nlink === 2) {
     const current = await readClaim(claimPath, destination, [2])
     if (
       !current
       || !sameIdentity(current.stat, preserved.record.stat)
-      || Boolean(current.value) !== Boolean(preserved.record.value)
-      || (current.value && current.value.nonce !== preserved.record.value.nonce)
     ) fail('Private directory publication predecessor does not match the active claim.')
     const isolatedActive = recoveryPath(claimPath, preserved.token, preserved.recoveryNonce, 'active')
     await rename(claimPath, isolatedActive)
@@ -211,6 +230,7 @@ async function finishRecovery(destination, candidates, afterFenceStepForTest, re
     if (!moved || !sameIdentity(moved.stat, preserved.record.stat)) {
       fail('Private directory publication claim changed during recovery.')
     }
+    record = authoritativeRecoveryRecord(preserved.record, moved)
     active = { ...preserved, kind: 'active', path: isolatedActive, record: moved }
   } else if (preserved?.record.stat.nlink === 1) {
     active = { ...preserved, kind: 'active' }

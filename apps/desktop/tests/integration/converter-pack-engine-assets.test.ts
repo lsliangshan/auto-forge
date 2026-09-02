@@ -262,40 +262,42 @@ describe('locked engine asset set', () => {
     },
   )
 
-  it('refreshes an isolated initializing predecessor after its initializer writes the canonical claim', async () => {
-    const root = temporaryRoot()
-    const value = fixture(root)
-    const outputRoot = join(root, 'engine-assets')
-    let releaseInitializer!: () => void
-    let releaseRecovery!: () => void
-    let initializerReady!: () => void
-    let recoveryReady!: () => void
-    const initializerGate = new Promise<void>((resolve) => { releaseInitializer = resolve })
-    const recoveryGate = new Promise<void>((resolve) => { releaseRecovery = resolve })
-    const sawInitializer = new Promise<void>((resolve) => { initializerReady = resolve })
-    const sawRecovery = new Promise<void>((resolve) => { recoveryReady = resolve })
-    const initializer = materializeLockedEngineAssets({
-      target: 'darwin-arm64', ...value, outputRoot,
-      afterClaimOpenForTest: async () => { initializerReady(); await initializerGate },
-    })
-    await sawInitializer
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    const recovery = materializeLockedEngineAssets({
-      target: 'darwin-arm64', ...value, outputRoot,
-      afterFenceStepForTest: async ({ step }) => {
-        if (step !== 'predecessor-link') return
-        recoveryReady()
-        await recoveryGate
-      },
-    })
-    await sawRecovery
-    releaseInitializer()
-    await expect(initializer).rejects.toThrow('Private directory publication claim was lost.')
-    releaseRecovery()
-    await expect(recovery).resolves.toBeDefined()
-    await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot })).resolves.toBeDefined()
-    expect(readdirSync(root).filter((name) => name.includes('.claim.'))).toEqual([])
-  })
+  it.each(['predecessor-link', 'predecessor-refresh'] as const)(
+    'refreshes an isolated initializing predecessor across the %s barrier', async (barrier) => {
+      const root = temporaryRoot()
+      const value = fixture(root)
+      const outputRoot = join(root, 'engine-assets')
+      let releaseInitializer!: () => void
+      let releaseRecovery!: () => void
+      let initializerReady!: () => void
+      let recoveryReady!: () => void
+      const initializerGate = new Promise<void>((resolve) => { releaseInitializer = resolve })
+      const recoveryGate = new Promise<void>((resolve) => { releaseRecovery = resolve })
+      const sawInitializer = new Promise<void>((resolve) => { initializerReady = resolve })
+      const sawRecovery = new Promise<void>((resolve) => { recoveryReady = resolve })
+      const initializer = materializeLockedEngineAssets({
+        target: 'darwin-arm64', ...value, outputRoot,
+        afterClaimOpenForTest: async () => { initializerReady(); await initializerGate },
+      })
+      await sawInitializer
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      const recovery = materializeLockedEngineAssets({
+        target: 'darwin-arm64', ...value, outputRoot,
+        afterFenceStepForTest: async ({ step }) => {
+          if (step !== barrier) return
+          recoveryReady()
+          await recoveryGate
+        },
+      })
+      await sawRecovery
+      releaseInitializer()
+      await expect(initializer).rejects.toThrow('Private directory publication claim was lost.')
+      releaseRecovery()
+      await expect(recovery).resolves.toBeDefined()
+      await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot })).resolves.toBeDefined()
+      expect(readdirSync(root).filter((name) => name.includes('.claim.'))).toEqual([])
+    },
+  )
 
   it.each([
     ['predecessor hook', 'hook failure'],
