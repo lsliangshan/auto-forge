@@ -1,12 +1,222 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { constants, lstatSync, realpathSync } from 'node:fs'
-import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises'
+import { link, lstat, mkdir, open, readdir, realpath, rename, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import process from 'node:process'
 import { canonicalBytes, withStableRegularFile } from './pack-tooling-lib.mjs'
 
 const FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/
 const TARGETS = new Set(['darwin-arm64', 'darwin-x64'])
+const MUTATION_CLAIM = '.cache-mutation.claim'
+const CLAIM_LEASE_MS = 30_000
+const CLAIM_HEARTBEAT_MS = 5_000
+const CLAIM_GRACE_MS = 250
+const CLAIM_MAXIMUM_BYTES = 4096
+const NONCE_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
+const METADATA_TEMP_PATTERN = /^\.release-metadata-([a-f0-9]{64})-([a-f0-9-]{36})\.tmp$/u
+const CLAIM_PREDECESSOR_PATTERN = /^\.cache-mutation\.claim\.([a-f0-9-]+)\.predecessor$/u
+
+function missing(error) {
+  return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+}
+
+function ownerAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'EPERM')
+  }
+}
+
+async function syncDirectory(path) {
+  const handle = await open(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function readClaim(path, allowedLinks = [1]) {
+  let handle
+  try {
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  } catch (error) {
+    if (missing(error)) return undefined
+    throw error
+  }
+  try {
+    const [opened, current] = await Promise.all([handle.stat(), lstat(path).catch(() => undefined)])
+    if (!current?.isFile() || current.isSymbolicLink() || !opened.isFile()
+      || !allowedLinks.includes(current.nlink) || !allowedLinks.includes(opened.nlink)
+      || current.dev !== opened.dev || current.ino !== opened.ino) {
+      throw new Error('Development converter cache mutation claim is unsafe.')
+    }
+    if (opened.size > CLAIM_MAXIMUM_BYTES) return { stat: opened }
+    const bytes = await handle.readFile()
+    let value
+    try {
+      value = JSON.parse(bytes.toString('utf8'))
+    } catch {
+      return { stat: opened }
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || !bytes.equals(canonicalBytes(value))
+      || Object.keys(value).length !== 3
+      || !Object.hasOwn(value, 'createdAtMs') || !Object.hasOwn(value, 'nonce') || !Object.hasOwn(value, 'pid')
+      || !Number.isSafeInteger(value.createdAtMs) || value.createdAtMs <= 0
+      || !NONCE_PATTERN.test(value.nonce) || !Number.isSafeInteger(value.pid) || value.pid <= 0) {
+      return { stat: opened }
+    }
+    return { bytes, stat: opened, value }
+  } finally {
+    await handle.close()
+  }
+}
+
+function sameIdentity(current, expected) {
+  return Boolean(current && current.dev === expected.dev && current.ino === expected.ino)
+}
+
+async function unlinkIdentity(path, expected, allowedLinks = [1]) {
+  const current = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
+  if (!current?.isFile() || current.isSymbolicLink() || !allowedLinks.includes(current.nlink) || !sameIdentity(current, expected)) return false
+  await unlink(path).catch((error) => { if (!missing(error)) throw error })
+  return true
+}
+
+async function fenceClaim(path, current) {
+  const suffix = current.value?.nonce ?? `${current.stat.dev}-${current.stat.ino}`
+  const predecessor = `${path}.${suffix}.predecessor`
+  try {
+    await link(path, predecessor)
+  } catch (error) {
+    if (missing(error)) return false
+    if (error?.code !== 'EEXIST') throw error
+  }
+  const [active, preserved] = await Promise.all([lstat(path).catch(() => undefined), lstat(predecessor).catch(() => undefined)])
+  if (!sameIdentity(active, current.stat) || !sameIdentity(preserved, current.stat) || active.nlink !== 2 || preserved.nlink !== 2) {
+    throw new Error('Development converter cache mutation claim changed during recovery.')
+  }
+  if (!await unlinkIdentity(path, current.stat, [2])) return false
+  await syncDirectory(dirname(path))
+  await unlinkIdentity(predecessor, current.stat)
+  await syncDirectory(dirname(path))
+  return true
+}
+
+async function acquireMutationClaim(cacheRoot) {
+  const path = join(cacheRoot, MUTATION_CLAIM)
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const value = { createdAtMs: Date.now(), nonce: randomUUID(), pid: process.pid }
+    const bytes = canonicalBytes(value)
+    let handle
+    try {
+      handle = await open(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+      await handle.writeFile(bytes)
+      await handle.sync()
+      await syncDirectory(cacheRoot)
+      const stat = await handle.stat()
+      return { bytes, dev: stat.dev, handle, ino: stat.ino, path }
+    } catch (error) {
+      if (handle) {
+        const stat = await handle.stat().catch(() => undefined)
+        await handle.close().catch(() => undefined)
+        if (stat) await unlinkIdentity(path, stat).catch(() => undefined)
+        await syncDirectory(cacheRoot).catch(() => undefined)
+      }
+      if (error?.code !== 'EEXIST') throw error
+    }
+    const claimDetails = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    if (!claimDetails) continue
+    const current = await readClaim(path, claimDetails.nlink === 2 ? [2] : [1])
+    if (!current) continue
+    if (!current.value) {
+      if (Date.now() - current.stat.mtimeMs <= CLAIM_GRACE_MS) {
+        throw new Error('Development converter cache mutation is already claimed.')
+      }
+    } else if (Date.now() - current.stat.mtimeMs <= CLAIM_LEASE_MS && ownerAlive(current.value.pid)) {
+      throw new Error('Development converter cache mutation is already claimed.')
+    }
+    await fenceClaim(path, current)
+  }
+  throw new Error('Development converter cache mutation is already claimed.')
+}
+
+async function removeOrphanedClaimPredecessors(cacheRoot, activeClaim) {
+  for (const name of await readdir(cacheRoot)) {
+    const match = CLAIM_PREDECESSOR_PATTERN.exec(name)
+    if (!match || (!NONCE_PATTERN.test(match[1]) && !/^\d+-\d+$/u.test(match[1]))) continue
+    const path = join(cacheRoot, name)
+    const details = await lstat(path).catch(() => undefined)
+    if (!details) continue
+    if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1 || sameIdentity(details, activeClaim)) {
+      throw new Error('Development converter cache mutation predecessor is unsafe.')
+    }
+    await unlinkIdentity(path, details)
+  }
+  await syncDirectory(cacheRoot)
+}
+
+async function verifyClaim(claim) {
+  const content = Buffer.alloc(claim.bytes.byteLength)
+  const [opened, current, read] = await Promise.all([
+    claim.handle.stat(), lstat(claim.path).catch(() => undefined), claim.handle.read(content, 0, content.byteLength, 0),
+  ])
+  if (!current?.isFile() || current.isSymbolicLink() || current.nlink !== 1 || opened.nlink !== 1
+    || !sameIdentity(current, claim) || !sameIdentity(opened, claim)
+    || opened.size !== claim.bytes.byteLength || read.bytesRead !== claim.bytes.byteLength || !content.equals(claim.bytes)) {
+    throw new Error('Development converter cache mutation claim was lost.')
+  }
+}
+
+function startClaimHeartbeat(claim) {
+  let pending = Promise.resolve()
+  let failure
+  let stopped = false
+  const pulse = () => {
+    if (stopped || failure) return
+    pending = pending.then(async () => {
+      await verifyClaim(claim)
+      const now = new Date()
+      await claim.handle.utimes(now, now)
+      await verifyClaim(claim)
+    }).catch((error) => { failure = error })
+  }
+  const timer = globalThis.setInterval(pulse, CLAIM_HEARTBEAT_MS)
+  timer.unref?.()
+  return {
+    async pulse() { pulse(); await pending; if (failure) throw failure },
+    async stop() { stopped = true; globalThis.clearInterval(timer); await pending },
+  }
+}
+
+export async function withDevelopmentCacheMutationClaim(cacheRoot, operation) {
+  const root = await canonicalCacheRoot(cacheRoot)
+  const claim = await acquireMutationClaim(root)
+  const heartbeat = startClaimHeartbeat(claim)
+  let result
+  let primary
+  try {
+    await removeOrphanedClaimPredecessors(root, claim)
+    result = await operation(root, heartbeat)
+    await heartbeat.pulse()
+  } catch (error) {
+    primary = error
+  }
+  const cleanup = []
+  for (const action of [() => heartbeat.stop(), () => claim.handle.close(), () => unlinkIdentity(claim.path, claim), () => syncDirectory(root)]) {
+    try { await action() } catch (error) { cleanup.push(error) }
+  }
+  if (primary) {
+    if (cleanup.length > 0) throw new AggregateError([primary, ...cleanup], primary instanceof Error ? primary.message : 'Cache mutation failed.')
+    throw primary
+  }
+  if (cleanup.length > 0) throw new AggregateError(cleanup, 'Development converter cache mutation cleanup failed.')
+  return result
+}
 
 function assertFingerprint(fingerprint) {
   if (typeof fingerprint !== 'string' || !FINGERPRINT_PATTERN.test(fingerprint)) {
@@ -115,7 +325,7 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
   }
 }
 
-export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, blobs }) {
+export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, blobs, afterTemporaryCreateForTest }) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
   if (!Array.isArray(blobs)) throw new Error('Development release metadata blobs are invalid')
@@ -138,46 +348,85 @@ export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, 
       throw new Error('Development release metadata blobs must be unique')
     }
   }
-  await validateRelease(canonicalRoot, fingerprint)
-  const sources = join(canonicalRoot, 'sources')
-  for (const blob of selected) {
-    await withStableRegularFile(join(sources, `${blob.sha256}.archive`), 'Development release blob', async (_handle, details) => {
-      if (details.size !== blob.bytes) throw new Error('Development release metadata blob size is invalid')
-    })
-  }
-
-  const metadataRoot = join(canonicalRoot, 'release-metadata')
-  await mkdir(metadataRoot, { recursive: true, mode: 0o755 })
-  const metadataDetails = await lstat(metadataRoot)
-  if (metadataDetails.isSymbolicLink() || !metadataDetails.isDirectory() || await realpath(metadataRoot) !== metadataRoot) {
-    throw new Error('Development release metadata root is unsafe')
-  }
-  const path = join(metadataRoot, `${fingerprint}.json`)
   const bytes = canonicalBytes({
     blobs: selected,
     fingerprint,
     release: `releases/${fingerprint}`,
     schemaVersion: 1,
   })
-  let handle
-  try {
-    handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
-    await handle.writeFile(bytes)
-    await handle.chmod(0o444)
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-    const directoryHandle = await open(metadataRoot, 'r')
-    try {
-      await directoryHandle.sync()
-    } finally {
-      await directoryHandle.close()
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root) => {
+    await validateRelease(root, fingerprint)
+    const sources = join(root, 'sources')
+    for (const blob of selected) {
+      await withStableRegularFile(join(sources, `${blob.sha256}.archive`), 'Development release blob', async (_handle, details) => {
+        if (details.size !== blob.bytes) throw new Error('Development release metadata blob size is invalid')
+      })
     }
-  } catch (error) {
-    await handle?.close().catch(() => undefined)
-    throw error
-  }
-  return path
+
+    const metadataRoot = join(root, 'release-metadata')
+    await mkdir(metadataRoot, { recursive: true, mode: 0o755 })
+    const metadataDetails = await lstat(metadataRoot)
+    if (metadataDetails.isSymbolicLink() || !metadataDetails.isDirectory() || await realpath(metadataRoot) !== metadataRoot) {
+      throw new Error('Development release metadata root is unsafe')
+    }
+    for (const name of await readdir(metadataRoot)) {
+      const match = METADATA_TEMP_PATTERN.exec(name)
+      if (!match || !NONCE_PATTERN.test(match[2])) continue
+      const stale = join(metadataRoot, name)
+      const details = await lstat(stale).catch(() => undefined)
+      if (!details?.isFile() || details.isSymbolicLink() || details.nlink !== 1 || await realpath(stale).catch(() => undefined) !== stale) {
+        throw new Error('Development release metadata temporary is unsafe')
+      }
+      await unlink(stale)
+    }
+    const path = join(metadataRoot, `${fingerprint}.json`)
+    const temporary = join(metadataRoot, `.release-metadata-${fingerprint}-${randomUUID()}.tmp`)
+    let handle
+    try {
+      handle = await open(temporary, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+      await handle.writeFile(bytes)
+      await handle.chmod(0o444)
+      await handle.sync()
+      const prepared = await handle.stat()
+      if (!prepared.isFile() || prepared.size !== bytes.byteLength || (prepared.mode & 0o777) !== 0o444) {
+        throw new Error('Development release metadata temporary verification failed')
+      }
+      const content = Buffer.alloc(bytes.byteLength)
+      const read = await handle.read(content, 0, content.byteLength, 0)
+      if (read.bytesRead !== bytes.byteLength || !content.equals(bytes)) {
+        throw new Error('Development release metadata temporary verification failed')
+      }
+      await syncDirectory(metadataRoot)
+      await afterTemporaryCreateForTest?.({ temporary })
+      const [openedAgain, temporaryAgain] = await Promise.all([handle.stat(), lstat(temporary).catch(() => undefined)])
+      if (!temporaryAgain?.isFile() || temporaryAgain.isSymbolicLink() || temporaryAgain.nlink !== 1
+        || openedAgain.nlink !== 1 || !sameIdentity(openedAgain, prepared) || !sameIdentity(temporaryAgain, prepared)
+        || openedAgain.size !== bytes.byteLength || (openedAgain.mode & 0o777) !== 0o444) {
+        throw new Error('Development release metadata temporary verification failed')
+      }
+      await link(temporary, path)
+      const [temporaryDetails, publishedDetails] = await Promise.all([lstat(temporary), lstat(path)])
+      if (!sameIdentity(temporaryDetails, publishedDetails) || temporaryDetails.nlink !== 2 || publishedDetails.nlink !== 2) {
+        throw new Error('Development release metadata publication failed')
+      }
+      await unlink(temporary)
+      await syncDirectory(metadataRoot)
+      await withStableRegularFile(path, 'Development release metadata', async (publishedHandle, details) => {
+        if (details.size !== bytes.byteLength || (details.mode & 0o777) !== 0o444) {
+          throw new Error('Development release metadata publication failed')
+        }
+        const published = await publishedHandle.readFile()
+        if (!published.equals(bytes)) throw new Error('Development release metadata publication failed')
+      })
+      return path
+    } catch (error) {
+      await unlink(temporary).catch((cleanupError) => { if (!missing(cleanupError)) throw cleanupError })
+      await syncDirectory(metadataRoot)
+      throw error
+    } finally {
+      await handle?.close()
+    }
+  })
 }
 
 export async function readActiveDevelopmentRelease({ cacheRoot }) {
@@ -197,36 +446,34 @@ export async function readActiveDevelopmentRelease({ cacheRoot }) {
 
 export async function activateDevelopmentRelease({ cacheRoot, fingerprint }, operations = {}) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
-  const paths = developmentReleasePaths(canonicalRoot, fingerprint)
-  const release = await validateRelease(canonicalRoot, fingerprint)
-  try {
-    const markerDetails = await lstat(paths.activeMarker)
-    if (markerDetails.isSymbolicLink() || !markerDetails.isFile()) throw new Error('Development release marker must be a regular file')
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
-  }
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root) => {
+    const paths = developmentReleasePaths(root, fingerprint)
+    const release = await validateRelease(root, fingerprint)
+    try {
+      const markerDetails = await lstat(paths.activeMarker)
+      if (markerDetails.isSymbolicLink() || !markerDetails.isFile()) throw new Error('Development release marker must be a regular file')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
 
-  await mkdir(dirname(paths.activeMarker), { recursive: true })
-  const temporaryMarker = `${paths.markerTemporaryRoot}${randomUUID()}.tmp`
-  const contents = `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`
-  try {
-    const markerHandle = await open(temporaryMarker, 'wx', 0o600)
+    await mkdir(dirname(paths.activeMarker), { recursive: true })
+    const temporaryMarker = `${paths.markerTemporaryRoot}${randomUUID()}.tmp`
+    const contents = `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`
     try {
-      await markerHandle.writeFile(contents)
-      await markerHandle.sync()
-    } finally {
-      await markerHandle.close()
+      const markerHandle = await open(temporaryMarker, 'wx', 0o600)
+      try {
+        await markerHandle.writeFile(contents)
+        await markerHandle.sync()
+      } finally {
+        await markerHandle.close()
+      }
+      await operations.beforePublishForTest?.()
+      await (operations.rename ?? rename)(temporaryMarker, paths.activeMarker)
+      await syncDirectory(root)
+    } catch (error) {
+      await unlink(temporaryMarker).catch(() => undefined)
+      throw error
     }
-    await (operations.rename ?? rename)(temporaryMarker, paths.activeMarker)
-    const directoryHandle = await open(canonicalRoot, 'r')
-    try {
-      await directoryHandle.sync()
-    } finally {
-      await directoryHandle.close()
-    }
-  } catch (error) {
-    await unlink(temporaryMarker).catch(() => undefined)
-    throw error
-  }
-  return release
+    return release
+  })
 }

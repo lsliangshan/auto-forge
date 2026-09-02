@@ -1,10 +1,12 @@
 import { Buffer } from 'node:buffer'
 import { constants } from 'node:fs'
-import { lstat, mkdtemp, open, readdir, realpath, rename, rm, statfs } from 'node:fs/promises'
-import { basename, isAbsolute, join, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { lstat, mkdir, open, readdir, realpath, rename, rm, statfs } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import process from 'node:process'
 import { URL } from 'node:url'
 import { canonicalBytes } from './pack-tooling-lib.mjs'
+import { withDevelopmentCacheMutationClaim } from './local-development-release-cache.mjs'
 
 const GiB = 1024 * 1024 * 1024
 const minimumFreeBytes = 10 * GiB
@@ -12,6 +14,7 @@ const defaultMaximumBlobBytes = 5 * GiB
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const noncePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
 const metadataLimit = 1024 * 1024
+const trashPattern = /^\.development-cache-trash-([a-f0-9-]{36})$/u
 
 function fail(message) {
   throw new Error(message)
@@ -191,7 +194,7 @@ async function collectCache(cacheRoot, activeFingerprint, keepPrevious, maximumB
     fail('Development converter cache retention request is invalid.')
   }
   const rootNames = await readdir(cacheRoot)
-  if (rootNames.some((name) => !['active-release.json', 'release-metadata', 'releases', 'sources'].includes(name))) {
+  if (rootNames.some((name) => !['.cache-mutation.claim', 'active-release.json', 'release-metadata', 'releases', 'sources'].includes(name))) {
     fail('Development converter cache contains an unknown entry.')
   }
   const releasesRoot = join(cacheRoot, 'releases')
@@ -336,33 +339,115 @@ async function collectCache(cacheRoot, activeFingerprint, keepPrevious, maximumB
   return { removedBlobs, removedReleases, targets }
 }
 
+async function recoverTrash(cacheRoot) {
+  for (const name of await readdir(cacheRoot)) {
+    const match = trashPattern.exec(name)
+    if (!match || !noncePattern.test(match[1])) continue
+    const trash = join(cacheRoot, name)
+    await validateDirectory(trash, 'Development converter cache trash is unsafe.')
+    const categories = await readdir(trash)
+    if (categories.some((category) => !['release-metadata', 'releases', 'sources'].includes(category))) {
+      fail('Development converter cache trash is unsafe.')
+    }
+    const moved = []
+    for (const category of categories) {
+      const categoryRoot = join(trash, category)
+      await validateDirectory(categoryRoot, 'Development converter cache trash is unsafe.')
+      for (const entry of await readdir(categoryRoot)) {
+        const valid = category === 'releases'
+          ? sha256Pattern.test(entry)
+          : category === 'release-metadata'
+            ? /^([a-f0-9]{64})\.json$/u.test(entry)
+            : /^([a-f0-9]{64})\.archive$/u.test(entry)
+        if (!valid) fail('Development converter cache trash is unsafe.')
+        const source = join(categoryRoot, entry)
+        const destination = join(cacheRoot, category, entry)
+        const details = await lstat(source).catch(() => undefined)
+        if (!details || details.isSymbolicLink()
+          || (category === 'releases' ? !details.isDirectory() : !details.isFile())
+          || await lstat(destination).catch(() => undefined)) {
+          fail('Development converter cache trash cannot be recovered safely.')
+        }
+        moved.push({ destination, source })
+      }
+    }
+    const restored = []
+    let primary
+    for (const item of moved.reverse()) {
+      try {
+        await rename(item.source, item.destination)
+        restored.push(item)
+      } catch (error) {
+        primary = error
+        break
+      }
+    }
+    if (primary) {
+      const cleanupErrors = []
+      for (const item of restored.reverse()) {
+        try { await rename(item.destination, item.source) } catch (error) { cleanupErrors.push(error) }
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError([primary, ...cleanupErrors], primary instanceof Error ? primary.message : 'Cache trash recovery failed.')
+      }
+      throw primary
+    }
+    await rm(trash, { recursive: true, force: true })
+  }
+}
+
+async function executePruneTransaction(root, plan, renameForTest = rename) {
+  const trash = join(root, `.development-cache-trash-${randomUUID()}`)
+  await mkdir(trash, { mode: 0o700 })
+  const moved = []
+  let primary
+  try {
+    for (const target of plan.targets) {
+      const current = await lstat(target.path).catch(() => undefined)
+      if (!current || current.isSymbolicLink() || current.dev !== target.stat.dev || current.ino !== target.stat.ino) {
+        fail('Development converter cache changed before pruning.')
+      }
+      const destination = join(trash, relative(root, target.path))
+      await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
+      await renameForTest(target.path, destination)
+      moved.push({ destination, source: target.path })
+    }
+  } catch (error) {
+    primary = error
+  }
+  if (primary) {
+    const cleanupErrors = []
+    for (const item of moved.reverse()) {
+      try { await rename(item.destination, item.source) } catch (error) { cleanupErrors.push(error) }
+    }
+    if (cleanupErrors.length === 0) {
+      try { await rm(trash, { recursive: true, force: true }) } catch (error) { cleanupErrors.push(error) }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([primary, ...cleanupErrors], primary instanceof Error ? primary.message : 'Development cache prune failed.')
+    }
+    throw primary
+  }
+  await rm(trash, { recursive: true, force: true })
+}
+
 export async function pruneDevelopmentCache({
   cacheRoot,
   activeFingerprint,
   keepPrevious = 1,
   maximumBlobBytes = defaultMaximumBlobBytes,
+  beforeMutationForTest,
+  renameForTest,
 }) {
   const root = await canonicalRoot(cacheRoot)
-  const plan = await collectCache(root, activeFingerprint, keepPrevious, maximumBlobBytes)
-  if (plan.targets.length === 0) return Object.freeze({ removedReleases: [], removedBlobs: [] })
-  const trash = await realpath(await mkdtemp(join(root, '.development-cache-trash-')))
-  if (!trash.startsWith(`${root}/.development-cache-trash-`)) fail('Development converter cache trash is unsafe.')
-  try {
-    for (const [index, target] of plan.targets.entries()) {
-      const current = await lstat(target.path).catch(() => undefined)
-      if (
-        !current
-        || current.isSymbolicLink()
-        || current.dev !== target.stat.dev
-        || current.ino !== target.stat.ino
-      ) fail('Development converter cache changed before pruning.')
-      await rename(target.path, join(trash, `${index}-${basename(target.path)}`))
-    }
-  } finally {
-    await rm(trash, { recursive: true, force: true })
-  }
-  return Object.freeze({
-    removedReleases: Object.freeze(plan.removedReleases),
-    removedBlobs: Object.freeze(plan.removedBlobs),
+  return withDevelopmentCacheMutationClaim(root, async (claimedRoot) => {
+    await recoverTrash(claimedRoot)
+    const plan = await collectCache(claimedRoot, activeFingerprint, keepPrevious, maximumBlobBytes)
+    await beforeMutationForTest?.()
+    if (plan.targets.length > 0) await executePruneTransaction(claimedRoot, plan, renameForTest)
+    return Object.freeze({
+      removedReleases: Object.freeze(plan.removedReleases),
+      removedBlobs: Object.freeze(plan.removedBlobs),
+    })
   })
 }

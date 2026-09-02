@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import process from 'node:process'
+import { rename } from 'node:fs/promises'
 import { afterEach, describe, expect, it } from 'vitest'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 import {
@@ -14,9 +16,14 @@ import {
 import { writeDevelopmentReleaseMetadata } from '../../scripts/converter-packs/local-development-release-cache.mjs'
 
 const roots: string[] = []
+const children = new Set<ReturnType<typeof spawn>>()
 const GiB = 1024 * 1024 * 1024
 
 afterEach(() => {
+  for (const child of children) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  }
+  children.clear()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
@@ -46,6 +53,18 @@ function createBlob(cacheRoot: string, sha256: string, bytes: Buffer, age: numbe
 
 function writeActiveMarker(cacheRoot: string, value: string): void {
   writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${value}","schemaVersion":1}\n`)
+}
+
+function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now()
+  return new Promise((resolvePromise, rejectPromise) => {
+    const check = () => {
+      if (predicate()) resolvePromise()
+      else if (Date.now() - started >= timeoutMs) rejectPromise(new Error('Timed out waiting for cache mutation state.'))
+      else setTimeout(check, 20)
+    }
+    check()
+  })
 }
 
 async function createVerifiedRelease(cacheRoot: string, character: string, blobs: Array<{ sha256: string; bytes: number }>, age: number) {
@@ -191,5 +210,91 @@ describe('development converter cache budget', () => {
       release: `releases/${value}`,
       schemaVersion: 1,
     }))
+  })
+
+  it('recovers a metadata temporary and mutation claim after the publishing process is killed', async () => {
+    const cacheRoot = createCache()
+    const blob = fingerprint('a')
+    createBlob(cacheRoot, blob, Buffer.from('data'), 100)
+    const value = fingerprint('b')
+    mkdirSync(join(cacheRoot, 'releases', value))
+    const marker = join(cacheRoot, 'metadata-temp-ready')
+    const moduleUrl = new URL('../../scripts/converter-packs/local-development-release-cache.mjs', import.meta.url).href
+    const script = String.raw`
+      import { writeFile } from 'node:fs/promises'
+      const [moduleUrl, cacheRoot, fingerprint, blob, marker] = process.argv.slice(1)
+      const { writeDevelopmentReleaseMetadata } = await import(moduleUrl)
+      await writeDevelopmentReleaseMetadata({
+        cacheRoot, fingerprint, blobs: [{ sha256: blob, bytes: 4 }],
+        afterTemporaryCreateForTest: async () => {
+          await writeFile(marker, 'ready')
+          await new Promise(() => { setInterval(() => {}, 1_000) })
+        },
+      })
+    `
+    const child = spawn(process.execPath, [
+      '--input-type=module', '-e', script, moduleUrl, cacheRoot, value, blob, marker,
+    ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] })
+    children.add(child)
+    await waitUntil(() => existsSync(marker))
+    const closed = new Promise<void>((resolvePromise) => child.once('close', () => resolvePromise()))
+    child.kill('SIGKILL')
+    await closed
+    children.delete(child)
+    expect(existsSync(join(cacheRoot, 'release-metadata', `${value}.json`))).toBe(false)
+    expect(readdirSync(join(cacheRoot, 'release-metadata')).some((name) => name.endsWith('.tmp'))).toBe(true)
+
+    await expect(writeDevelopmentReleaseMetadata({
+      cacheRoot, fingerprint: value, blobs: [{ sha256: blob, bytes: 4 }],
+    })).resolves.toBe(join(cacheRoot, 'release-metadata', `${value}.json`))
+    expect(readdirSync(join(cacheRoot, 'release-metadata')).filter((name) => name.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('rolls back every moved entry when the second prune rename fails', async () => {
+    const cacheRoot = createCache()
+    const old = await createVerifiedRelease(cacheRoot, 'a', [], 100)
+    await createVerifiedRelease(cacheRoot, 'b', [], 200)
+    const active = await createVerifiedRelease(cacheRoot, 'c', [], 300)
+    writeActiveMarker(cacheRoot, active)
+    let calls = 0
+
+    await expect(pruneDevelopmentCache({
+      cacheRoot,
+      activeFingerprint: active,
+      maximumBlobBytes: 1,
+      renameForTest: async (source: string, destination: string) => {
+        calls += 1
+        if (calls === 2) {
+          const error = new Error('injected prune rename EACCES') as Error & { code: string }
+          error.code = 'EACCES'
+          throw error
+        }
+        await rename(source, destination)
+      },
+    })).rejects.toThrow('injected prune rename EACCES')
+    expect(existsSync(join(cacheRoot, 'releases', old))).toBe(true)
+    expect(existsSync(join(cacheRoot, 'release-metadata', `${old}.json`))).toBe(true)
+    expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.development-cache-trash-'))).toEqual([])
+  })
+
+  it('recovers a recognized interrupted prune trash before safely retrying the plan', async () => {
+    const cacheRoot = createCache()
+    const old = await createVerifiedRelease(cacheRoot, 'd', [], 100)
+    await createVerifiedRelease(cacheRoot, 'e', [], 200)
+    const active = await createVerifiedRelease(cacheRoot, 'f', [], 300)
+    writeActiveMarker(cacheRoot, active)
+    const trash = join(cacheRoot, `.development-cache-trash-${randomUUID()}`)
+    mkdirSync(join(trash, 'releases'), { recursive: true })
+    mkdirSync(join(trash, 'release-metadata'))
+    await rename(join(cacheRoot, 'releases', old), join(trash, 'releases', old))
+    await rename(
+      join(cacheRoot, 'release-metadata', `${old}.json`),
+      join(trash, 'release-metadata', `${old}.json`),
+    )
+
+    await expect(pruneDevelopmentCache({ cacheRoot, activeFingerprint: active, maximumBlobBytes: 1 }))
+      .resolves.toEqual({ removedReleases: [old], removedBlobs: [] })
+    expect(existsSync(join(cacheRoot, 'releases', old))).toBe(false)
+    expect(existsSync(trash)).toBe(false)
   })
 })

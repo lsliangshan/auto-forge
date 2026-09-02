@@ -1,6 +1,8 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import process from 'node:process'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   activateDevelopmentRelease,
@@ -11,10 +13,27 @@ import {
 } from '../../scripts/converter-packs/local-development-release-cache.mjs'
 
 const roots: string[] = []
+const children = new Set<ReturnType<typeof spawn>>()
 
 afterEach(() => {
+  for (const child of children) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  }
+  children.clear()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
+
+function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now()
+  return new Promise((resolvePromise, rejectPromise) => {
+    const check = () => {
+      if (predicate()) resolvePromise()
+      else if (Date.now() - started >= timeoutMs) rejectPromise(new Error('Timed out waiting for release mutation state.'))
+      else setTimeout(check, 20)
+    }
+    check()
+  })
+}
 
 function temporaryRoot(): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'autoforge-development-release-cache-')))
@@ -167,5 +186,51 @@ describe('local development release cache', () => {
     await expect(writeDevelopmentReleaseMetadata({
       cacheRoot, fingerprint: '3'.repeat(64), blobs: [{ sha256: 'alias', bytes: 4, path: alias }],
     })).rejects.toThrow()
+  })
+
+  it('serializes public activation against pruning so the marker never names a deleted release', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(join(cacheRoot, 'sources'), { recursive: true })
+    const oldFingerprint = '4'.repeat(64)
+    const nextFingerprint = '5'.repeat(64)
+    createRelease(cacheRoot, oldFingerprint)
+    createRelease(cacheRoot, nextFingerprint)
+    await writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint: oldFingerprint, blobs: [] })
+    await writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint: nextFingerprint, blobs: [] })
+    writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${oldFingerprint}","schemaVersion":1}\n`)
+    const marker = join(cacheRoot, 'activation-ready')
+    const release = join(cacheRoot, 'activation-release')
+    const moduleUrl = new URL('../../scripts/converter-packs/local-development-release-cache.mjs', import.meta.url).href
+    const script = String.raw`
+      import { access, writeFile } from 'node:fs/promises'
+      const [moduleUrl, cacheRoot, fingerprint, marker, release] = process.argv.slice(1)
+      const { activateDevelopmentRelease } = await import(moduleUrl)
+      await activateDevelopmentRelease({ cacheRoot, fingerprint }, {
+        beforePublishForTest: async () => {
+          await writeFile(marker, 'ready')
+          while (true) {
+            try { await access(release); break } catch { await new Promise((resolve) => setTimeout(resolve, 20)) }
+          }
+        },
+      })
+    `
+    const child = spawn(process.execPath, [
+      '--input-type=module', '-e', script, moduleUrl, cacheRoot, nextFingerprint, marker, release,
+    ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] })
+    children.add(child)
+    await waitUntil(() => existsSync(marker))
+    const { pruneDevelopmentCache } = await import('../../scripts/converter-packs/development-cache-budget.mjs')
+    await expect(pruneDevelopmentCache({ cacheRoot, activeFingerprint: oldFingerprint, maximumBlobBytes: 1 }))
+      .rejects.toThrow('already claimed')
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toContain(oldFingerprint)
+    expect(existsSync(join(cacheRoot, 'releases', oldFingerprint))).toBe(true)
+    writeFileSync(release, 'release')
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      child.once('error', rejectPromise)
+      child.once('close', (code) => code === 0 ? resolvePromise() : rejectPromise(new Error(`activation child ${code}`)))
+    })
+    children.delete(child)
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toContain(nextFingerprint)
+    expect(existsSync(join(cacheRoot, 'releases', nextFingerprint))).toBe(true)
   })
 })
