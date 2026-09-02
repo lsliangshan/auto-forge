@@ -6,7 +6,10 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import process from 'node:process'
 import { URL } from 'node:url'
 import { canonicalBytes } from './pack-tooling-lib.mjs'
-import { withDevelopmentCacheMutationClaim } from './local-development-release-cache.mjs'
+import {
+  inspectAndRecoverDevelopmentPreparationWorkspaces,
+  withDevelopmentCacheMutationClaim,
+} from './local-development-release-cache.mjs'
 
 const GiB = 1024 * 1024 * 1024
 const minimumFreeBytes = 10 * GiB
@@ -243,12 +246,31 @@ export async function preflightDevelopmentCache({ cacheRoot, requiredDownloadByt
   }
 }
 
-async function collectCache(cacheRoot, activeFingerprint, keepPrevious, maximumBlobBytes, removeInactiveLegacy) {
+async function collectCache(cacheRoot, activeFingerprint, keepPrevious, maximumBlobBytes, removeInactiveLegacy, liveWorkspaces) {
   if (!sha256Pattern.test(activeFingerprint) || !safeInteger(keepPrevious) || !safeInteger(maximumBlobBytes)) {
     fail('Development converter cache retention request is invalid.')
   }
   const rootNames = await readdir(cacheRoot)
-  if (rootNames.some((name) => !['.cache-mutation.claim', 'active-release.json', 'release-metadata', 'releases', 'sources'].includes(name))) {
+  const liveByName = new Map()
+  for (const workspace of liveWorkspaces) {
+    if (!exactKeys(workspace, ['dev', 'ino', 'name', 'path'])
+      || typeof workspace.name !== 'string'
+      || workspace.path !== join(cacheRoot, workspace.name)
+      || !safeInteger(workspace.dev)
+      || !safeInteger(workspace.ino)
+      || liveByName.has(workspace.name)) {
+      fail('Development preparation workspace inventory is invalid.')
+    }
+    const details = await lstat(workspace.path).catch(() => undefined)
+    if (!details?.isDirectory() || details.isSymbolicLink()
+      || details.dev !== workspace.dev || details.ino !== workspace.ino
+      || await realpath(workspace.path).catch(() => undefined) !== workspace.path) {
+      fail('Development preparation workspace changed before cache collection.')
+    }
+    liveByName.set(workspace.name, workspace)
+  }
+  if (rootNames.some((name) => !['.cache-mutation.claim', 'active-release.json', 'release-metadata', 'releases', 'sources'].includes(name)
+    && !liveByName.has(name))) {
     fail('Development converter cache contains an unknown entry.')
   }
   const releasesRoot = join(cacheRoot, 'releases')
@@ -657,11 +679,24 @@ export async function pruneDevelopmentCache({
   rmForTest,
   syncDirectoryForTest,
   migrateLegacyReleases = false,
+  processIdentity,
 }) {
   const root = await canonicalRoot(cacheRoot)
   return withDevelopmentCacheMutationClaim(root, async (claimedRoot, heartbeat) => {
     await recoverTrash(claimedRoot, heartbeat)
-    const plan = await collectCache(claimedRoot, activeFingerprint, keepPrevious, maximumBlobBytes, migrateLegacyReleases)
+    const workspaces = await inspectAndRecoverDevelopmentPreparationWorkspaces({
+      cacheRoot: claimedRoot,
+      heartbeat,
+      processIdentity,
+    })
+    const plan = await collectCache(
+      claimedRoot,
+      activeFingerprint,
+      keepPrevious,
+      maximumBlobBytes,
+      migrateLegacyReleases,
+      workspaces.live,
+    )
     await beforeMutationForTest?.()
     if (plan.targets.length > 0) {
       await executePruneTransaction({

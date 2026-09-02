@@ -62,7 +62,7 @@ function createReadyWorkspace(
   { age = Date.now() / 1000, birth = 'Tue Jan  2 00:00:00 2024' } = {},
 ) {
   const nonce = randomUUID()
-  const path = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}-A${String(index).padStart(5, '0')}`)
+  const path = join(cacheRoot, `.local-development-preparation-${fingerprint}-A${String(index).padStart(5, '0')}`)
   mkdirSync(path)
   const owner = join(path, `.owner-${nonce}.ready`)
   writeFileSync(owner, canonicalBytes({ birth, fingerprint, nonce, pid: process.pid, schemaVersion: 2 }))
@@ -137,18 +137,25 @@ describe('local development release cache', () => {
     rmSync(lease.path, { recursive: true })
   })
 
-  it('reclaims a reused PID owner before enforcing the eight-workspace bound', async () => {
+  it('globally reclaims a cross-fingerprint reused PID owner before enforcing the eight-workspace bound', async () => {
     const cacheRoot = join(temporaryRoot(), 'cache')
     mkdirSync(cacheRoot)
-    const fingerprint = '9'.repeat(64)
-    const expired = createReadyWorkspace(cacheRoot, fingerprint, 0, { birth: 'Mon Jan  1 00:00:00 2024' })
-    for (let index = 1; index < 8; index += 1) createReadyWorkspace(cacheRoot, fingerprint, index)
+    const expired = createReadyWorkspace(cacheRoot, '0'.repeat(64), 0, { birth: 'Mon Jan  1 00:00:00 2024' })
+    for (let index = 1; index < 8; index += 1) createReadyWorkspace(cacheRoot, index.toString(16).repeat(64), index)
     const processIdentity = async () => 'Tue Jan  2 00:00:00 2024'
 
-    const eighth = await createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint, processIdentity })
+    const eighth = await createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint: '8'.repeat(64),
+      processIdentity,
+    })
     expect(existsSync(expired)).toBe(false)
     await eighth.stop()
-    await expect(createDevelopmentPreparationWorkspace({ cacheRoot, fingerprint, processIdentity }))
+    await expect(createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint: '9'.repeat(64),
+      processIdentity,
+    }))
       .rejects.toThrow(/limit/iu)
     rmSync(eighth.path, { recursive: true })
   })

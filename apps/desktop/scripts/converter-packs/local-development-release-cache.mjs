@@ -20,6 +20,9 @@ const METADATA_TEMP_PATTERN = /^\.release-metadata-([a-f0-9]{64})-([a-f0-9-]{36}
 const CLAIM_PREDECESSOR_PATTERN = /^\.cache-mutation\.claim\.([a-f0-9-]+)\.predecessor$/u
 const ACTIVE_MARKER_TEMP_PATTERN = /^\.active-release-([a-f0-9-]{36})\.tmp$/u
 const PREPARATION_WORKSPACE_LIMIT = 8
+const PREPARATION_WORKSPACE_SCAN_LIMIT = 64
+const PREPARATION_WORKSPACE_PATTERN = /^\.local-development-preparation-([a-f0-9]{64})-([A-Za-z0-9]{6})$/u
+const LEGACY_PREPARATION_WORKSPACE_PATTERN = /^\.local-development-preparation-([a-f0-9]{12})(?:-([A-Za-z0-9]{6}))?$/u
 const PREPARATION_OWNER_PATTERN = /^\.owner-([a-f0-9-]{36})\.(writing|ready)$/u
 const PROCESS_BIRTH_PATTERN = /^(?:Fri|Mon|Sat|Sun|Thu|Tue|Wed) (?:Apr|Aug|Dec|Feb|Jan|Jul|Jun|Mar|May|Nov|Oct|Sep) (?: [1-9]|[12]\d|3[01]) \d{2}:\d{2}:\d{2} \d{4}$/u
 const REPLACED_RELEASE_PATTERN = /^\.replaced-active-release-([a-f0-9]{64})-([a-f0-9-]{36})$/u
@@ -395,13 +398,28 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
   }
 }
 
-async function recoverPreparationWorkspaces(root, fingerprint, heartbeat, processIdentity = readProcessIdentity) {
-  const prefix = `.local-development-preparation-${fingerprint.slice(0, 12)}`
-  const names = (await readdir(root)).filter((name) => name === prefix || new RegExp(`^${prefix}-[A-Za-z0-9]{6}$`, 'u').test(name))
+export async function inspectAndRecoverDevelopmentPreparationWorkspaces({
+  cacheRoot,
+  heartbeat,
+  processIdentity = readProcessIdentity,
+}) {
+  const root = await canonicalCacheRoot(cacheRoot)
+  if (typeof heartbeat?.pulse !== 'function' || typeof processIdentity !== 'function') {
+    throw new Error('Development preparation workspace inspection request is invalid')
+  }
+  const names = (await readdir(root))
+    .filter((name) => name.startsWith('.local-development-preparation-'))
+    .sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))
+  if (names.length > PREPARATION_WORKSPACE_SCAN_LIMIT) {
+    throw new Error('Development preparation workspace scan exceeds its limit')
+  }
   let recovered = false
-  let activeCount = 0
+  const live = []
   const processIdentities = new Map()
   for (const name of names) {
+    const currentCoordinate = PREPARATION_WORKSPACE_PATTERN.exec(name)
+    const legacyCoordinate = currentCoordinate ? undefined : LEGACY_PREPARATION_WORKSPACE_PATTERN.exec(name)
+    if (!currentCoordinate && !legacyCoordinate) throw new Error('Development preparation workspace name is invalid')
     const path = join(root, name)
     const details = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
     if (!details?.isDirectory() || details.isSymbolicLink() || await realpath(path).catch(() => undefined) !== path) {
@@ -426,7 +444,8 @@ async function recoverPreparationWorkspaces(root, fingerprint, heartbeat, proces
       if (!owner.bytes.equals(canonicalBytes(value))
         || Object.keys(value).sort().join('\0') !== ['birth', 'fingerprint', 'nonce', 'pid', 'schemaVersion'].join('\0')
         || !PROCESS_BIRTH_PATTERN.test(value.birth)
-        || value.fingerprint !== fingerprint
+        || !FINGERPRINT_PATTERN.test(value.fingerprint)
+        || (currentCoordinate ? value.fingerprint !== currentCoordinate[1] : !value.fingerprint.startsWith(legacyCoordinate[1]))
         || value.nonce !== ownerMatch[1]
         || !Number.isSafeInteger(value.pid)
         || value.pid <= 0
@@ -435,7 +454,7 @@ async function recoverPreparationWorkspaces(root, fingerprint, heartbeat, proces
       }
       if (!processIdentities.has(value.pid)) processIdentities.set(value.pid, await processIdentity(value.pid))
       if (processIdentities.get(value.pid) === value.birth) {
-        activeCount += 1
+        live.push(Object.freeze({ dev: details.dev, ino: details.ino, name, path }))
         continue
       }
     }
@@ -444,14 +463,14 @@ async function recoverPreparationWorkspaces(root, fingerprint, heartbeat, proces
     recovered = true
   }
   if (recovered) await syncDirectory(root)
-  return { activeCount, recovered }
+  return Object.freeze({ live: Object.freeze(live), recovered })
 }
 
 export async function recoverLegacyDevelopmentPreparation({ cacheRoot, fingerprint }) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
   return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => (
-    (await recoverPreparationWorkspaces(root, fingerprint, heartbeat)).recovered
+    (await inspectAndRecoverDevelopmentPreparationWorkspaces({ cacheRoot: root, heartbeat })).recovered
   ))
 }
 
@@ -516,13 +535,13 @@ export async function createDevelopmentPreparationWorkspace({
   assertFingerprint(fingerprint)
   if (typeof processIdentity !== 'function') throw new Error('Development preparation process identity reader is invalid')
   return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
-    const recovered = await recoverPreparationWorkspaces(root, fingerprint, heartbeat, processIdentity)
-    if (recovered.activeCount >= PREPARATION_WORKSPACE_LIMIT) {
+    const inspected = await inspectAndRecoverDevelopmentPreparationWorkspaces({ cacheRoot: root, heartbeat, processIdentity })
+    if (inspected.live.length >= PREPARATION_WORKSPACE_LIMIT) {
       throw new Error('Development preparation workspace limit was reached')
     }
     const birth = await processIdentity(process.pid)
     if (!PROCESS_BIRTH_PATTERN.test(birth)) throw new Error('Development preparation process identity is invalid')
-    const privateRoot = await realpath(await mkdtemp(join(root, `.local-development-preparation-${fingerprint.slice(0, 12)}-`)))
+    const privateRoot = await realpath(await mkdtemp(join(root, `.local-development-preparation-${fingerprint}-`)))
     const nonce = randomUUID()
     const writing = join(privateRoot, `.owner-${nonce}.writing`)
     const ready = join(privateRoot, `.owner-${nonce}.ready`)

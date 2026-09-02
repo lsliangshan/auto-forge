@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,7 +13,10 @@ import {
   preflightDevelopmentCache,
   pruneDevelopmentCache,
 } from '../../scripts/converter-packs/development-cache-budget.mjs'
-import { writeDevelopmentReleaseMetadata } from '../../scripts/converter-packs/local-development-release-cache.mjs'
+import {
+  createDevelopmentPreparationWorkspace,
+  writeDevelopmentReleaseMetadata,
+} from '../../scripts/converter-packs/local-development-release-cache.mjs'
 
 const roots: string[] = []
 const children = new Set<ReturnType<typeof spawn>>()
@@ -86,6 +89,47 @@ describe('development converter cache budget', () => {
     await expect(preflightDevelopmentCache({
       cacheRoot, requiredDownloadBytes: 10 * GiB, freeBytes: async () => 10 * GiB,
     })).resolves.toBeUndefined()
+  })
+
+  it('validates and ignores a live preparation workspace while pruning the real cache', async () => {
+    const cacheRoot = createCache()
+    const active = await createVerifiedRelease(cacheRoot, 'f', [], 100)
+    writeActiveMarker(cacheRoot, active)
+    const birth = 'Tue Jan  2 00:00:00 2024'
+    const processIdentity = async () => birth
+    const lease = await createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint: 'e'.repeat(64),
+      processIdentity,
+    })
+
+    await expect(pruneDevelopmentCache({
+      cacheRoot,
+      activeFingerprint: active,
+      processIdentity,
+    })).resolves.toEqual({ removedReleases: [], removedBlobs: [] })
+    expect(existsSync(lease.path)).toBe(true)
+    await lease.stop()
+    rmSync(lease.path, { recursive: true })
+  })
+
+  it('fails closed on a forged preparation workspace during pruning', async () => {
+    const cacheRoot = createCache()
+    const active = await createVerifiedRelease(cacheRoot, 'f', [], 100)
+    writeActiveMarker(cacheRoot, active)
+    const workspace = join(cacheRoot, `.local-development-preparation-${'d'.repeat(64)}-ABC123`)
+    const nonce = randomUUID()
+    mkdirSync(workspace)
+    const owner = join(workspace, `.owner-${nonce}.ready`)
+    writeFileSync(owner, '{}\n')
+    chmodSync(owner, 0o444)
+
+    await expect(pruneDevelopmentCache({
+      cacheRoot,
+      activeFingerprint: active,
+      processIdentity: async () => 'Tue Jan  2 00:00:00 2024',
+    })).rejects.toThrow(/preparation owner is invalid/iu)
+    expect(existsSync(workspace)).toBe(true)
   })
 
   it('retains the active and newest previous releases and prunes unreferenced blobs oldest first', async () => {
