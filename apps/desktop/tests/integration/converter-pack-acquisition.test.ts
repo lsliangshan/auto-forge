@@ -1,11 +1,15 @@
 import { createHash } from 'node:crypto'
-import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { open as openFile } from 'node:fs/promises'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   acquireLockedArtifacts,
   acquireVerifiedArchive,
+  hashOpenPartial,
+  writeAll,
 } from '../../scripts/converter-packs/acquire-sources.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 
@@ -33,6 +37,65 @@ function deferred<T>() {
     reject = rejectPromise
   })
   return { promise, resolve, reject }
+}
+
+function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const started = Date.now()
+  return new Promise((resolvePromise, rejectPromise) => {
+    const check = () => {
+      if (predicate()) resolvePromise()
+      else if (Date.now() - started >= timeoutMs) rejectPromise(new Error('Timed out waiting for child acquisition state.'))
+      else setTimeout(check, 20)
+    }
+    check()
+  })
+}
+
+function spawnAcquisitionChild({ cacheRoot, archive, counterPath, mode = 'complete' }: {
+  cacheRoot: string
+  archive: { url: string; sha256: string; bytes: number }
+  counterPath: string
+  mode?: 'complete' | 'crash-owner'
+}) {
+  const moduleUrl = new URL('../../scripts/converter-packs/acquire-sources.mjs', import.meta.url).href
+  const script = String.raw`
+    import { appendFile } from 'node:fs/promises'
+    const [moduleUrl, cacheRoot, archiveJson, counterPath, mode] = process.argv.slice(1)
+    const { acquireVerifiedArchive } = await import(moduleUrl)
+    const archive = JSON.parse(archiveJson)
+    const bytes = Buffer.from('cross-process artifact')
+    const result = await acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async () => {
+        await appendFile(counterPath, mode + '\n')
+        if (mode === 'crash-owner') await new Promise(() => { setInterval(() => {}, 1_000) })
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        return new Response(bytes, { status: 200 })
+      },
+    })
+    process.stdout.write(JSON.stringify(result))
+  `
+  const child = spawn(process.execPath, [
+    '--input-type=module', '-e', script, moduleUrl, cacheRoot, JSON.stringify(archive), counterPath, mode,
+  ], {
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', (value) => { stdout += value })
+  child.stderr.on('data', (value) => { stderr += value })
+  const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string }>((resolvePromise, rejectPromise) => {
+    child.once('error', rejectPromise)
+    child.once('exit', (code, signal) => {
+      if (code !== 0 && signal === null) rejectPromise(new Error(`Acquisition child failed: ${stderr}`))
+      else resolvePromise({ code, signal, stdout })
+    })
+  })
+  return { child, completion }
 }
 
 function acquisition(bytes: Buffer, name: string) {
@@ -75,6 +138,29 @@ function writePartial(cacheRoot: string, archive: { url: string; sha256: string;
 }
 
 describe('converter pack source acquisition', () => {
+  it('loops over short writes and advances only by confirmed bytes', async () => {
+    const calls: Array<{ offset: number; length: number; position: number }> = []
+    const shortWrites = [2, 1, 3]
+    const handle = {
+      async write(_bytes: Uint8Array, offset: number, length: number, position: number) {
+        calls.push({ offset, length, position })
+        return { bytesWritten: shortWrites.shift() }
+      },
+    }
+
+    await expect(writeAll(handle, Buffer.from('abcdef'), 10)).resolves.toBe(6)
+    expect(calls).toEqual([
+      { offset: 0, length: 6, position: 10 },
+      { offset: 2, length: 4, position: 12 },
+      { offset: 3, length: 3, position: 13 },
+    ])
+  })
+
+  it('fails closed when a local write reports no forward progress', async () => {
+    const handle = { async write() { return { bytesWritten: 0 } } }
+    await expect(writeAll(handle, Buffer.from('x'), 0)).rejects.toThrow('Converter source download failed.')
+  })
+
   it('resumes an exact partial with a matching byte range', async () => {
     const root = temporaryRoot()
     const cacheRoot = join(root, 'cache')
@@ -142,6 +228,64 @@ describe('converter pack source acquisition', () => {
     expect(result.networkBytes).toBe(10)
     expect(readFileSync(result.path)).toEqual(bytes)
     expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
+  it('batches sub-threshold chunks and safely truncates to the last canonical checkpoint on retry', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.alloc(101, 0x61)
+    const archive = {
+      url: 'https://downloads.example.test/checkpoint-batch.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    const reached = deferred<void>()
+    const blocked = deferred<void>()
+    let emitted = 0
+    let cancelled = false
+    const controller = new AbortController()
+    const first = acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      signal: controller.signal,
+      fetchImpl: async () => new Response(new ReadableStream<Uint8Array>({
+        pull(stream) {
+          if (emitted < 100) {
+            stream.enqueue(Uint8Array.of(0x61))
+            emitted += 1
+            if (emitted === 100) reached.resolve()
+            return
+          }
+          return blocked.promise
+        },
+        cancel() {
+          cancelled = true
+          blocked.resolve()
+        },
+      }), { status: 200 }),
+    })
+    await reached.promise
+    const partialPath = join(cacheRoot, `.${archive.sha256}.partial`)
+    const metadataPath = `${partialPath}.json`
+    await waitUntil(() => lstatSync(partialPath).size === 100)
+    expect(JSON.parse(readFileSync(metadataPath, 'utf8')).partialBytes).toBe(0)
+    controller.abort()
+    await expect(first).rejects.toThrow('Converter source download failed.')
+    expect(cancelled).toBe(true)
+    expect(lstatSync(partialPath).size).toBe(100)
+
+    let range: string | null = 'not-requested'
+    const recovered = await acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async (_input, init) => {
+        range = new Headers(init?.headers).get('range')
+        return new Response(bytes, { status: 200 })
+      },
+    })
+    expect(range).toBe(null)
+    expect(readFileSync(recovered.path)).toEqual(bytes)
   })
 
   it.each([
@@ -254,6 +398,61 @@ describe('converter pack source acquisition', () => {
     })).rejects.toThrow('Downloaded converter archive hash does not match the source lock.')
     expect(requests).toBe(0)
     expect(readdirSync(cacheRoot)).toEqual([])
+  })
+
+  it('recovers a verified link-after-publication crash without another request', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('already linked archive')
+    const archive = {
+      url: 'https://downloads.example.test/linked-crash.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    writePartial(cacheRoot, archive, bytes)
+    const partialPath = join(cacheRoot, `.${archive.sha256}.partial`)
+    const target = join(cacheRoot, `${archive.sha256}.archive`)
+    linkSync(partialPath, target)
+    expect(lstatSync(partialPath).nlink).toBe(2)
+    let requests = 0
+
+    const result = await acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async () => {
+        requests += 1
+        return new Response(bytes, { status: 200 })
+      },
+    })
+
+    expect(requests).toBe(0)
+    expect(result.networkBytes).toBe(0)
+    expect(lstatSync(result.path).nlink).toBe(1)
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
+  it('detects replacement of the canonical partial path while retaining the replacement', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.from('verified open handle')
+    const archive = {
+      url: 'https://downloads.example.test/path-replacement.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    const partialPath = join(root, 'partial')
+    writeFileSync(partialPath, bytes, { mode: 0o600 })
+    const handle = await openFile(partialPath, 'r')
+    try {
+      rmSync(partialPath)
+      writeFileSync(partialPath, bytes, { mode: 0o600 })
+      await expect(hashOpenPartial(handle, partialPath, archive, 1))
+        .rejects.toThrow('Converter source download failed.')
+      expect(readFileSync(partialPath)).toEqual(bytes)
+      expect(lstatSync(partialPath).ino).not.toBe((await handle.stat()).ino)
+    } finally {
+      await handle.close()
+    }
   })
 
   it('stores verified response bytes once and reuses the immutable cache entry', async () => {
@@ -479,7 +678,7 @@ describe('converter pack source acquisition', () => {
         return new Response('{}', {
           status: 401,
           headers: {
-            'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/openssl/3:pull"',
+            'www-authenticate': 'bEaReR\t scope="repository:homebrew/core/openssl/3:pull" , realm = "https://ghcr.io/token", service="ghcr.io"',
           },
         })
       }
@@ -533,6 +732,35 @@ describe('converter pack source acquisition', () => {
             'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/openssl:pull"',
           },
         })
+      },
+    })).rejects.toThrow('Converter source authentication failed.')
+    expect(requests).toBe(1)
+  })
+
+  it.each([
+    ['duplicate', 'Bearer realm="https://ghcr.io/token",realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/openssl/3:pull"'],
+    ['unknown', 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/openssl/3:pull",nonce="x"'],
+    ['unquoted', 'Bearer realm=https://ghcr.io/token,service="ghcr.io",scope="repository:homebrew/core/openssl/3:pull"'],
+    ['escaped', 'Bearer realm="https://ghcr.io\\/token",service="ghcr.io",scope="repository:homebrew/core/openssl/3:pull"'],
+    ['malformed trailing comma', 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:homebrew/core/openssl/3:pull",'],
+  ])('rejects a %s GHCR bearer challenge', async (_label, challenge) => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('malformed challenge')
+    const archive = {
+      url: `https://ghcr.io/v2/homebrew/core/openssl/3/blobs/sha256:${sha256(bytes)}`,
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    let requests = 0
+
+    await expect(acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async () => {
+        requests += 1
+        return new Response('unauthorized', { status: 401, headers: { 'www-authenticate': challenge } })
       },
     })).rejects.toThrow('Converter source authentication failed.')
     expect(requests).toBe(1)
@@ -603,7 +831,7 @@ describe('converter pack source acquisition', () => {
     const root = temporaryRoot()
     const cacheRoot = join(root, 'cache')
     mkdirSync(cacheRoot)
-    const bytes = Buffer.from('metadata failure')
+    const bytes = Buffer.alloc(16 * 1024 * 1024, 0x61)
     const archive = {
       url: 'https://downloads.example.test/metadata-failure.tar.gz',
       sha256: sha256(bytes),
@@ -705,6 +933,96 @@ describe('converter pack source acquisition', () => {
     expect(result.blobs).toBeInstanceOf(Map)
     expect(result.blobs.size).toBe(4)
     expect(result.networkBytes).toBe(22)
+  })
+
+  it('shares one in-process SHA owner while a later caller aborts independently', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('shared in-process download')
+    const archive = {
+      url: 'https://downloads.example.test/shared-owner.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    const response = deferred<Response>()
+    const started = deferred<void>()
+    let requests = 0
+    const fetchImpl: typeof fetch = async () => {
+      requests += 1
+      started.resolve()
+      return response.promise
+    }
+
+    const owner = acquireVerifiedArchive({ archive, cacheRoot, fetchImpl })
+    await started.promise
+    const follower = acquireVerifiedArchive({ archive, cacheRoot, fetchImpl })
+    const controller = new AbortController()
+    const waiter = acquireVerifiedArchive({ archive, cacheRoot, fetchImpl, signal: controller.signal })
+    controller.abort()
+    await expect(waiter).rejects.toThrow('Converter source download failed.')
+    expect(readdirSync(cacheRoot).sort()).toEqual([
+      `.${archive.sha256}.owner`,
+      `.${archive.sha256}.partial`,
+      `.${archive.sha256}.partial.json`,
+    ])
+    response.resolve(new Response(bytes, { status: 200 }))
+
+    const [result, followerResult] = await Promise.all([owner, follower])
+    expect(followerResult).toEqual(result)
+    expect(readFileSync(result.path)).toEqual(bytes)
+    expect(requests).toBe(1)
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
+  it('serializes concurrent child processes behind one SHA owner and one network request', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const counterPath = join(root, 'requests.log')
+    writeFileSync(counterPath, '')
+    const bytes = Buffer.from('cross-process artifact')
+    const archive = {
+      url: 'https://downloads.example.test/cross-process.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+
+    const first = spawnAcquisitionChild({ cacheRoot, archive, counterPath })
+    const second = spawnAcquisitionChild({ cacheRoot, archive, counterPath })
+    const [firstResult, secondResult] = await Promise.all([first.completion, second.completion])
+
+    const results = [JSON.parse(firstResult.stdout), JSON.parse(secondResult.stdout)]
+    expect(results.map(({ path, sha256: digest, bytes: size }) => ({ path, sha256: digest, bytes: size })))
+      .toEqual([0, 1].map(() => ({ path: join(cacheRoot, `${archive.sha256}.archive`), sha256: archive.sha256, bytes: archive.bytes })))
+    expect(results.map(({ networkBytes }) => networkBytes).sort((left, right) => left - right)).toEqual([0, archive.bytes])
+    expect(readFileSync(counterPath, 'utf8').trim().split('\n')).toEqual(['complete'])
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
+  it('reclaims a crashed child owner and resumes its canonical partial', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const counterPath = join(root, 'requests.log')
+    writeFileSync(counterPath, '')
+    const bytes = Buffer.from('cross-process artifact')
+    const archive = {
+      url: 'https://downloads.example.test/crash-recovery.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    const crashed = spawnAcquisitionChild({ cacheRoot, archive, counterPath, mode: 'crash-owner' })
+    await waitUntil(() => readFileSync(counterPath, 'utf8').includes('crash-owner'))
+    crashed.child.kill('SIGKILL')
+    const crashResult = await crashed.completion
+    expect(crashResult.signal).toBe('SIGKILL')
+
+    const recovered = spawnAcquisitionChild({ cacheRoot, archive, counterPath })
+    const recoveredResult = await recovered.completion
+    expect(JSON.parse(recoveredResult.stdout).sha256).toBe(archive.sha256)
+    expect(readFileSync(counterPath, 'utf8').trim().split('\n')).toEqual(['crash-owner', 'complete'])
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
   })
 
   it('deduplicates identical SHA coordinates and rejects conflicting identities before network access', async () => {

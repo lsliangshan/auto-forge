@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { link, lstat, open, realpath, rename, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL, URL } from 'node:url'
 import {
@@ -17,9 +17,12 @@ import {
 import { loadConverterClosureLock } from './closure-lock.mjs'
 
 const sha256Pattern = /^[a-f0-9]{64}$/u
+const noncePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
 const partialMetadataLimit = 4 * 1024
+const checkpointBytes = 16 * 1024 * 1024
 const downloadFailed = 'Converter source download failed.'
 const partialInvalid = 'Converter source partial cache is invalid.'
+const activeAcquisitions = new Map()
 
 function plainRecord(value) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
@@ -126,6 +129,38 @@ function expectedGhcrScope(archiveUrl, expectedSha256) {
   return `repository:${match[1]}:pull`
 }
 
+function parseBearerChallenge(value) {
+  if (typeof value !== 'string') throw acquisitionFailure('Converter source authentication failed.')
+  const scheme = /^([A-Za-z]+)[ \t]+/u.exec(value)
+  if (!scheme || scheme[1].toLocaleLowerCase('en-US') !== 'bearer') {
+    throw acquisitionFailure('Converter source authentication failed.')
+  }
+  let offset = scheme[0].length
+  const parameters = new Map()
+  while (offset < value.length) {
+    while (value[offset] === ' ' || value[offset] === '\t') offset += 1
+    const rest = value.slice(offset)
+    const parameter = /^([A-Za-z][A-Za-z0-9_-]*)[ \t]*=[ \t]*"([^"\\]*)"/u.exec(rest)
+    if (!parameter || [...parameter[2]].some((character) => {
+      const code = character.charCodeAt(0)
+      return code <= 0x1f || code === 0x7f
+    })) throw acquisitionFailure('Converter source authentication failed.')
+    const name = parameter[1].toLocaleLowerCase('en-US')
+    if (!['realm', 'service', 'scope'].includes(name) || parameters.has(name)) {
+      throw acquisitionFailure('Converter source authentication failed.')
+    }
+    parameters.set(name, parameter[2])
+    offset += parameter[0].length
+    while (value[offset] === ' ' || value[offset] === '\t') offset += 1
+    if (offset === value.length) break
+    if (value[offset] !== ',') throw acquisitionFailure('Converter source authentication failed.')
+    offset += 1
+    if (offset === value.length) throw acquisitionFailure('Converter source authentication failed.')
+  }
+  if (parameters.size !== 3) throw acquisitionFailure('Converter source authentication failed.')
+  return parameters
+}
+
 async function fetchArchive(fetchImpl, archive, init) {
   const archiveUrl = archive.url
   let response = await fetchImpl(archiveUrl, init)
@@ -133,11 +168,14 @@ async function fetchArchive(fetchImpl, archive, init) {
   if (response.status !== 401 || url.hostname !== 'ghcr.io') return response
   await response.body?.cancel().catch(() => undefined)
   const expectedScope = expectedGhcrScope(archiveUrl, archive.sha256)
-  const challenge = response.headers.get('www-authenticate')
-  const match = /^Bearer realm="(https:\/\/ghcr\.io\/token)",service="(ghcr\.io)",scope="([^"]+)"$/u.exec(challenge ?? '')
-  if (!match || match[3] !== expectedScope) throw acquisitionFailure('Converter source authentication failed.')
-  const tokenUrl = new URL(match[1])
-  tokenUrl.searchParams.set('service', match[2])
+  const challenge = parseBearerChallenge(response.headers.get('www-authenticate'))
+  if (
+    challenge.get('realm') !== 'https://ghcr.io/token'
+    || challenge.get('service') !== 'ghcr.io'
+    || challenge.get('scope') !== expectedScope
+  ) throw acquisitionFailure('Converter source authentication failed.')
+  const tokenUrl = new URL(challenge.get('realm'))
+  tokenUrl.searchParams.set('service', challenge.get('service'))
   tokenUrl.searchParams.set('scope', expectedScope)
   const token = await boundedToken(await fetchImpl(tokenUrl.href, { ...init, headers: undefined }), init.signal)
   const headers = new globalThis.Headers(init.headers)
@@ -165,6 +203,7 @@ async function hashRegularFile(path, label, expectedBytes) {
 async function cachedArchive(path, archive) {
   const metadata = await lstat(path).catch((error) => isMissing(error) ? undefined : Promise.reject(error))
   if (metadata === undefined) return undefined
+  if (metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 2) return undefined
   let digest
   try {
     digest = await hashRegularFile(path, 'Cached converter archive', archive.bytes)
@@ -190,6 +229,7 @@ async function writePartialMetadata(path, archive, partialBytes) {
     await handle.close()
     handle = undefined
     await rename(temporary, path)
+    await syncDirectory(dirname(path))
   } finally {
     await handle?.close().catch(() => undefined)
     await unlink(temporary).catch(() => undefined)
@@ -198,6 +238,149 @@ async function writePartialMetadata(path, archive, partialBytes) {
 
 async function removePartial(partialPath, metadataPath) {
   await Promise.all([unlink(partialPath).catch(() => undefined), unlink(metadataPath).catch(() => undefined)])
+}
+
+async function syncDirectory(path) {
+  const handle = await open(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+function ownerValue(archive, nonce) {
+  return { bytes: archive.bytes, nonce, pid: process.pid, sha256: archive.sha256, url: archive.url }
+}
+
+async function readOwnerLock(path) {
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch((error) => {
+    if (isMissing(error)) return undefined
+    throw error
+  })
+  if (!handle) return undefined
+  try {
+    const stat = await handle.stat()
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size > partialMetadataLimit) return { stat }
+    const bytes = await handle.readFile()
+    let value
+    try {
+      value = JSON.parse(bytes.toString('utf8'))
+    } catch {
+      return { stat }
+    }
+    if (
+      !bytes.equals(canonicalBytes(value))
+      || !exactKeys(value, ['bytes', 'nonce', 'pid', 'sha256', 'url'])
+      || !Number.isSafeInteger(value.bytes)
+      || value.bytes <= 0
+      || !noncePattern.test(value.nonce)
+      || !Number.isSafeInteger(value.pid)
+      || value.pid <= 0
+      || !sha256Pattern.test(value.sha256)
+      || !validHttpsUrl(value.url)
+    ) return { stat }
+    return { stat, value }
+  } finally {
+    await handle.close()
+  }
+}
+
+function ownerAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'EPERM')
+  }
+}
+
+async function unlinkMatchingOwner(path, expected) {
+  const current = await readOwnerLock(path)
+  if (
+    !current
+    || current.stat.dev !== expected.stat.dev
+    || current.stat.ino !== expected.stat.ino
+    || (expected.value && current.value?.nonce !== expected.value.nonce)
+  ) return false
+  await unlink(path).catch((error) => {
+    if (!isMissing(error)) throw error
+  })
+  return true
+}
+
+async function waitForOwner(signal) {
+  if (signal.aborted) throw acquisitionFailure(downloadFailed)
+  await new Promise((resolvePromise, rejectPromise) => {
+    const finish = () => {
+      signal.removeEventListener('abort', abort)
+      resolvePromise()
+    }
+    const timer = globalThis.setTimeout(finish, 25)
+    const abort = () => {
+      globalThis.clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+      rejectPromise(acquisitionFailure(downloadFailed))
+    }
+    signal.addEventListener('abort', abort, { once: true })
+  })
+}
+
+async function acquireOwnerLock({ path, cacheRoot, archive, signal }) {
+  while (true) {
+    if (signal.aborted) throw acquisitionFailure(downloadFailed)
+    const nonce = randomUUID()
+    let handle
+    try {
+      handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+      const value = ownerValue(archive, nonce)
+      await handle.writeFile(canonicalBytes(value))
+      await handle.sync()
+      const stat = await handle.stat()
+      await handle.close()
+      handle = undefined
+      await syncDirectory(cacheRoot)
+      return { stat, value }
+    } catch (error) {
+      await handle?.close().catch(() => undefined)
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
+    }
+
+    const owner = await readOwnerLock(path)
+    if (owner?.value && (
+      owner.value.sha256 !== archive.sha256
+      || owner.value.url !== archive.url
+      || owner.value.bytes !== archive.bytes
+    )) fail('Converter source artifact identities conflict.')
+    if (owner?.value?.pid === process.pid && await unlinkMatchingOwner(path, owner)) {
+      await syncDirectory(cacheRoot)
+      continue
+    }
+    if (owner?.value && ownerAlive(owner.value.pid)) {
+      await waitForOwner(signal)
+      continue
+    }
+    if (owner && (!owner.value && Date.now() - owner.stat.mtimeMs < 250)) {
+      await waitForOwner(signal)
+      continue
+    }
+    if (owner && await unlinkMatchingOwner(path, owner)) {
+      await syncDirectory(cacheRoot)
+      continue
+    }
+    await waitForOwner(signal)
+  }
+}
+
+async function releaseOwnerLock(path, cacheRoot, owner) {
+  try {
+    const released = await unlinkMatchingOwner(path, owner)
+    if (!released) throw acquisitionFailure(downloadFailed)
+    await syncDirectory(cacheRoot)
+  } catch {
+    throw acquisitionFailure(downloadFailed)
+  }
 }
 
 async function createPartial(partialPath, metadataPath, archive) {
@@ -313,10 +496,26 @@ function validateResponse(response, start, archive) {
   return { restart: false }
 }
 
+export async function writeAll(handle, bytes, position) {
+  if (!handle || typeof handle.write !== 'function' || !(bytes instanceof Uint8Array) || !Number.isSafeInteger(position) || position < 0) {
+    throw acquisitionFailure(downloadFailed)
+  }
+  let offset = 0
+  while (offset < bytes.byteLength) {
+    const result = await handle.write(bytes, offset, bytes.byteLength - offset, position + offset)
+    if (!Number.isSafeInteger(result?.bytesWritten) || result.bytesWritten <= 0 || result.bytesWritten > bytes.byteLength - offset) {
+      throw acquisitionFailure(downloadFailed)
+    }
+    offset += result.bytesWritten
+  }
+  return offset
+}
+
 async function streamResponse({ response, handle, archive, metadataPath, start, signal }) {
   const reader = response.body.getReader()
   let total = start
   let networkBytes = 0
+  let checkpoint = start
   let cancelling
   let consumed = false
   const abort = () => { cancelling = reader.cancel().catch(() => undefined) }
@@ -331,15 +530,17 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
         break
       }
       if (!(value instanceof Uint8Array) || value.byteLength === 0) throw acquisitionFailure(downloadFailed, true)
-      total += value.byteLength
       networkBytes += value.byteLength
-      if (!Number.isSafeInteger(total) || total > archive.bytes) {
+      if (!Number.isSafeInteger(total + value.byteLength) || total + value.byteLength > archive.bytes) {
         await reader.cancel().catch(() => undefined)
         throw acquisitionFailure(downloadFailed, true)
       }
-      await handle.write(value, 0, value.byteLength, total - value.byteLength)
-      await handle.sync()
-      await writePartialMetadata(metadataPath, archive, total)
+      total += await writeAll(handle, value, total)
+      if (total - checkpoint >= checkpointBytes) {
+        await handle.sync()
+        await writePartialMetadata(metadataPath, archive, total)
+        checkpoint = total
+      }
     }
   } catch (error) {
     if (signal.aborted) throw acquisitionFailure(downloadFailed)
@@ -351,32 +552,144 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
     reader.releaseLock()
   }
   if (total !== archive.bytes) throw acquisitionFailure(downloadFailed)
+  await handle.sync()
+  await writePartialMetadata(metadataPath, archive, total)
   return networkBytes
 }
 
-async function publishPartial({ partialPath, metadataPath, target, archive }) {
-  const digest = await hashRegularFile(partialPath, 'Downloaded converter archive', archive.bytes).catch(() => undefined)
-  if (digest !== archive.sha256) {
-    await removePartial(partialPath, metadataPath)
-    throw acquisitionFailure('Downloaded converter archive hash does not match the source lock.', true)
+export async function hashOpenPartial(handle, partialPath, archive, expectedLinks) {
+  const beforeHandle = await handle.stat()
+  const beforePath = await lstat(partialPath).catch(() => undefined)
+  if (
+    !beforePath?.isFile()
+    || beforePath.isSymbolicLink()
+    || beforeHandle.dev !== beforePath.dev
+    || beforeHandle.ino !== beforePath.ino
+    || beforeHandle.size !== archive.bytes
+    || beforePath.size !== archive.bytes
+    || beforeHandle.nlink !== expectedLinks
+    || beforePath.nlink !== expectedLinks
+  ) throw acquisitionFailure(downloadFailed)
+  const digest = createHash('sha256')
+  const buffer = Buffer.allocUnsafe(1024 * 1024)
+  let position = 0
+  while (position < archive.bytes) {
+    const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.byteLength, archive.bytes - position), position)
+    if (bytesRead <= 0) throw acquisitionFailure(downloadFailed)
+    digest.update(buffer.subarray(0, bytesRead))
+    position += bytesRead
   }
-  await link(partialPath, target).catch(async (error) => {
-    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
-    await cachedArchive(target, archive)
-  })
-  await removePartial(partialPath, metadataPath)
+  const [afterHandle, afterPath] = await Promise.all([handle.stat(), lstat(partialPath).catch(() => undefined)])
+  if (
+    !afterPath
+    || afterHandle.dev !== beforeHandle.dev
+    || afterHandle.ino !== beforeHandle.ino
+    || afterHandle.size !== beforeHandle.size
+    || afterHandle.nlink !== expectedLinks
+    || afterPath.dev !== beforeHandle.dev
+    || afterPath.ino !== beforeHandle.ino
+    || afterPath.size !== beforeHandle.size
+    || afterPath.nlink !== expectedLinks
+  ) throw acquisitionFailure(downloadFailed)
+  return { digest: digest.digest('hex'), stat: afterHandle }
 }
 
-export async function acquireVerifiedArchive({ archive, cacheRoot, fetchImpl = globalThis.fetch, signal }) {
-  if (!validArchiveIdentity(archive)) fail('Converter source archive identity is invalid.')
-  requireAbsolutePath(cacheRoot, 'Converter source cache root')
-  await requireDirectory(cacheRoot, 'Converter source cache root')
-  if (typeof fetchImpl !== 'function' || (signal !== undefined && !(signal instanceof globalThis.AbortSignal))) {
-    fail('Converter source acquisition options are invalid.')
+async function unlinkMatchingInode(path, expected) {
+  const current = await lstat(path).catch(() => undefined)
+  if (!current || current.dev !== expected.dev || current.ino !== expected.ino) return false
+  await unlink(path)
+  return true
+}
+
+async function recoverPublishedLink({ partialPath, metadataPath, target, archive, cacheRoot }) {
+  const [partial, published] = await Promise.all([
+    lstat(partialPath).catch(() => undefined),
+    lstat(target).catch(() => undefined),
+  ])
+  if (published === undefined) return undefined
+  if (
+    !partial?.isFile()
+    || partial.isSymbolicLink()
+    || !published.isFile()
+    || published.isSymbolicLink()
+    || partial.dev !== published.dev
+    || partial.ino !== published.ino
+    || partial.nlink !== 2
+    || published.nlink !== 2
+  ) return cachedArchive(target, archive)
+  const handle = await open(partialPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const verified = await hashOpenPartial(handle, partialPath, archive, 2)
+    if (verified.digest !== archive.sha256) throw acquisitionFailure(downloadFailed)
+    if (!await unlinkMatchingInode(partialPath, verified.stat)) throw acquisitionFailure(downloadFailed)
+    await unlink(metadataPath).catch((error) => { if (!isMissing(error)) throw error })
+    await syncDirectory(cacheRoot)
+  } finally {
+    await handle.close()
   }
+  return cachedArchive(target, archive)
+}
+
+async function publishPartial({ handle, partialPath, metadataPath, target, archive, cacheRoot }) {
+  let verified
+  try {
+    verified = await hashOpenPartial(handle, partialPath, archive, 1)
+  } catch {
+    throw acquisitionFailure(downloadFailed)
+  }
+  if (verified.digest !== archive.sha256) {
+    await unlinkMatchingInode(partialPath, verified.stat).catch(() => undefined)
+    await unlink(metadataPath).catch(() => undefined)
+    throw acquisitionFailure('Downloaded converter archive hash does not match the source lock.', true)
+  }
+  try {
+    await link(partialPath, target)
+  } catch (error) {
+    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
+    const existing = await cachedArchive(target, archive)
+    if (existing === undefined) throw acquisitionFailure(downloadFailed)
+    const owned = await handle.stat()
+    if (await unlinkMatchingInode(partialPath, owned)) {
+      await unlink(metadataPath).catch(() => undefined)
+      await syncDirectory(cacheRoot)
+    }
+    return
+  }
+  const [published, partial] = await Promise.all([lstat(target), lstat(partialPath)])
+  if (
+    published.dev !== verified.stat.dev
+    || published.ino !== verified.stat.ino
+    || partial.dev !== verified.stat.dev
+    || partial.ino !== verified.stat.ino
+    || published.nlink !== 2
+    || partial.nlink !== 2
+  ) {
+    if (published.dev === partial.dev && published.ino === partial.ino) {
+      await unlinkMatchingInode(target, published).catch(() => undefined)
+      await syncDirectory(cacheRoot).catch(() => undefined)
+    }
+    throw acquisitionFailure(downloadFailed)
+  }
+  await syncDirectory(cacheRoot)
+  if (!await unlinkMatchingInode(partialPath, published)) throw acquisitionFailure(downloadFailed)
+  await unlink(metadataPath).catch((error) => { if (!isMissing(error)) throw error })
+  await syncDirectory(cacheRoot)
+  const [finalHandle, finalTarget] = await Promise.all([handle.stat(), lstat(target)])
+  if (
+    finalHandle.dev !== published.dev
+    || finalHandle.ino !== published.ino
+    || finalHandle.nlink !== 1
+    || finalTarget.dev !== published.dev
+    || finalTarget.ino !== published.ino
+    || finalTarget.nlink !== 1
+  ) throw acquisitionFailure(downloadFailed)
+}
+
+async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
   const target = join(cacheRoot, `${archive.sha256}.archive`)
   const partialPath = join(cacheRoot, `.${archive.sha256}.partial`)
   const metadataPath = join(cacheRoot, `.${archive.sha256}.partial.json`)
+  const ownerPath = join(cacheRoot, `.${archive.sha256}.owner`)
   let cached
   try {
     cached = await cachedArchive(target, archive)
@@ -384,28 +697,35 @@ export async function acquireVerifiedArchive({ archive, cacheRoot, fetchImpl = g
     if (error instanceof Error && error.message.startsWith('Cached converter archive ')) throw error
     fail('Cached converter archive is invalid.')
   }
-  if (cached !== undefined) {
-    await removePartial(partialPath, metadataPath)
-    return cached
-  }
+  if (cached !== undefined) return cached
 
-  const controller = new globalThis.AbortController()
-  const callerAbort = () => controller.abort(signal?.reason)
-  signal?.addEventListener('abort', callerAbort, { once: true })
-  if (signal?.aborted) callerAbort()
+  let owner
+  try {
+    owner = await acquireOwnerLock({ path: ownerPath, cacheRoot, archive, signal })
+  } catch (error) {
+    if (error?.message === downloadFailed || error?.message === 'Converter source artifact identities conflict.') throw error
+    throw acquisitionFailure(downloadFailed)
+  }
   let handle
   let networkBytes = 0
   try {
+    cached = await cachedArchive(target, archive)
+    if (cached !== undefined) {
+      await removePartial(partialPath, metadataPath)
+      return cached
+    }
+    cached = await recoverPublishedLink({ partialPath, metadataPath, target, archive, cacheRoot })
+    if (cached !== undefined) return cached
     const partial = await openExistingPartial(partialPath, metadataPath, archive)
     handle = partial.handle
     let start = partial.partialBytes
     if (start < archive.bytes) {
-      if (controller.signal.aborted) throw acquisitionFailure(downloadFailed)
+      if (signal.aborted) throw acquisitionFailure(downloadFailed)
       const headers = new globalThis.Headers()
       if (start > 0) headers.set('range', `bytes=${start}-`)
       const requestInit = {
         method: 'GET', redirect: 'follow', credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer',
-        headers, signal: controller.signal,
+        headers, signal,
       }
       let response
       try {
@@ -427,23 +747,97 @@ export async function acquireVerifiedArchive({ archive, cacheRoot, fetchImpl = g
         await writePartialMetadata(metadataPath, archive, 0)
         start = 0
       }
-      networkBytes = await streamResponse({ response, handle, archive, metadataPath, start, signal: controller.signal })
+      networkBytes = await streamResponse({ response, handle, archive, metadataPath, start, signal })
     }
+    await publishPartial({ handle, partialPath, metadataPath, target, archive, cacheRoot })
     await handle.close()
     handle = undefined
-    await publishPartial({ partialPath, metadataPath, target, archive })
     return { path: target, sha256: archive.sha256, bytes: archive.bytes, networkBytes }
   } catch (error) {
+    if (error?.discardPartial === true && handle) {
+      const owned = await handle.stat().catch(() => undefined)
+      if (owned && await unlinkMatchingInode(partialPath, owned).catch(() => false)) {
+        await unlink(metadataPath).catch(() => undefined)
+      }
+    } else if (error?.discardPartial === true) {
+      await removePartial(partialPath, metadataPath)
+    }
     await handle?.close().catch(() => undefined)
-    if (error?.discardPartial === true) await removePartial(partialPath, metadataPath)
     if (error instanceof Error && [
       downloadFailed, partialInvalid, 'Converter source authentication failed.',
       'Downloaded converter archive hash does not match the source lock.',
     ].includes(error.message)) throw error
     throw acquisitionFailure(downloadFailed)
   } finally {
-    signal?.removeEventListener('abort', callerAbort)
+    await releaseOwnerLock(ownerPath, cacheRoot, owner)
   }
+}
+
+function waitForSharedAcquisition(shared, signal) {
+  shared.waiters += 1
+  let abort
+  const abortError = acquisitionFailure(downloadFailed)
+  const aborted = signal === undefined ? undefined : new Promise((_resolvePromise, rejectPromise) => {
+    abort = () => rejectPromise(abortError)
+    if (signal.aborted) abort()
+    else signal.addEventListener('abort', abort, { once: true })
+  })
+  let released = false
+  const release = () => {
+    if (released) return false
+    released = true
+    signal?.removeEventListener('abort', abort)
+    shared.waiters -= 1
+    const last = shared.waiters === 0 && !shared.settled
+    if (last) shared.controller.abort()
+    return last
+  }
+  return (async () => {
+    try {
+      return await (aborted === undefined ? shared.promise : Promise.race([shared.promise, aborted]))
+    } catch (error) {
+      if (error === abortError && release()) await shared.promise.catch(() => undefined)
+      throw error
+    } finally {
+      release()
+    }
+  })()
+}
+
+export async function acquireVerifiedArchive({ archive, cacheRoot, fetchImpl = globalThis.fetch, signal }) {
+  if (!validArchiveIdentity(archive)) fail('Converter source archive identity is invalid.')
+  requireAbsolutePath(cacheRoot, 'Converter source cache root')
+  await requireDirectory(cacheRoot, 'Converter source cache root')
+  if (typeof fetchImpl !== 'function' || (signal !== undefined && !(signal instanceof globalThis.AbortSignal))) {
+    fail('Converter source acquisition options are invalid.')
+  }
+  const key = `${cacheRoot}\0${archive.sha256}`
+  let shared = activeAcquisitions.get(key)
+  if (shared === undefined) {
+    const controller = new globalThis.AbortController()
+    const identity = Object.freeze({ ...archive })
+    shared = {
+      archive: identity,
+      controller,
+      waiters: 0,
+      settled: false,
+      promise: acquireOwnedArchive({ archive: identity, cacheRoot, fetchImpl, signal: controller.signal }),
+    }
+    activeAcquisitions.set(key, shared)
+    shared.promise.then(
+      () => {
+        shared.settled = true
+        if (activeAcquisitions.get(key) === shared) activeAcquisitions.delete(key)
+      },
+      () => {
+        shared.settled = true
+        if (activeAcquisitions.get(key) === shared) activeAcquisitions.delete(key)
+      },
+    )
+  } else if (shared.archive.url !== archive.url || shared.archive.bytes !== archive.bytes) {
+    fail('Converter source artifact identities conflict.')
+  }
+  return waitForSharedAcquisition(shared, signal)
 }
 
 function lockedArtifact(value) {
