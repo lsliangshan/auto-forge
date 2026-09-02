@@ -20,6 +20,7 @@ const formulaNamePattern = /^[a-z0-9][a-z0-9+_.@-]*$/u
 const versionSegmentPattern = /^[A-Za-z0-9._+-]+$/u
 const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const maximumClosureLockBytes = 64 * 1024 * 1024
+const maximumDownloadBytes = 1_800_000_000
 
 function plainRecord(value) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
@@ -272,6 +273,7 @@ export function validateTargetClosureLock(value, target) {
     || !PACK_NAMES.every((family) => validateFamily(value.families[family], formulae))
     || !exactKeys(value.measurements, ['downloadBytes', 'compressedPackBytes', 'installedReleaseBytes'])
     || !positiveInteger(value.measurements.downloadBytes)
+    || value.measurements.downloadBytes > maximumDownloadBytes
     || !exactKeys(value.measurements.compressedPackBytes, PACK_NAMES)
     || !PACK_NAMES.every((family) => positiveInteger(value.measurements.compressedPackBytes[family]))
     || !positiveInteger(value.measurements.installedReleaseBytes)

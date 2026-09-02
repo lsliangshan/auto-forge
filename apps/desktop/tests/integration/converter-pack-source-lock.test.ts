@@ -124,12 +124,26 @@ describe('converter pack source lock schema v2', () => {
       defaultLockPath: path,
       stdout: { write: (value: string) => { stdout.push(value); return true } },
       stderr: { write: () => { throw new Error('unexpected stderr') } },
-      load: async (request) => { calls.push(request) },
+      loadClosure: async (request) => { calls.push({ path: request.sourceLockPath, target: request.target }) },
     })
 
     expect(exitCode).toBe(0)
     expect(calls).toEqual(targets.map((target) => ({ path, target })))
     expect(stdout).toEqual(['verified converter source locks for darwin-arm64 and darwin-x64\n'])
+  })
+
+  it('fails no-argument verification when an authenticated closure file is missing', async () => {
+    const path = writeLock(temporaryRoot(), fixture())
+    const stderr: string[] = []
+
+    const exitCode = await loadConverterSourceLockMain([], {
+      defaultLockPath: path,
+      stdout: { write: () => { throw new Error('unexpected stdout') } },
+      stderr: { write: (value: string) => { stderr.push(value); return true } },
+    })
+
+    expect(exitCode).toBe(1)
+    expect(stderr).toEqual(['checked-in converter schema-v2 locks are not ready\n'])
   })
 
   it('preserves explicit lock and target verification mode', async () => {
@@ -154,7 +168,7 @@ describe('converter pack source lock schema v2', () => {
       defaultLockPath: secret,
       stdout: { write: () => { throw new Error('unexpected stdout') } },
       stderr: { write: (value: string) => { stderr.push(value); return true } },
-      load: async () => { throw new Error(`failed to read ${secret}`) },
+      loadClosure: async () => { throw new Error(`failed to read ${secret}`) },
     })
 
     expect(exitCode).toBe(1)

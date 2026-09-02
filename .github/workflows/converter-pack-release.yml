@@ -50,9 +50,13 @@ jobs:
           pnpm --filter @autoforge/desktop converter-packs:verify-sources --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target "$AUTOFORGE_CONVERTER_TARGET"
           pnpm --filter @autoforge/desktop converter-packs:acquire --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target "$AUTOFORGE_CONVERTER_TARGET" --cache "$RUNNER_TEMP/converter-source-cache"
       - name: Build helpers and create staging plan
+        env:
+          CONVERTER_ARCHIVE_BASE_URL: ${{ vars.CONVERTER_PUBLIC_BASE_URL }}
+          CONVERTER_SEQUENCE: ${{ inputs.sequence }}
+          CONVERTER_VERSION: ${{ inputs.version }}
         run: |
           pnpm --filter @autoforge/desktop converter-packs:build-native --target "$AUTOFORGE_CONVERTER_TARGET" --output "$RUNNER_TEMP/converter-helpers" --compiler /usr/bin/clang
-          pnpm --filter @autoforge/desktop converter-packs:prepare-staging --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target "$AUTOFORGE_CONVERTER_TARGET" --cache "$RUNNER_TEMP/converter-source-cache" --helpers "$RUNNER_TEMP/converter-helpers" --workspace "$RUNNER_TEMP/converter-prepared" --staging "$RUNNER_TEMP/converter-stage-$AUTOFORGE_CONVERTER_TARGET" --plan "$RUNNER_TEMP/converter-stage-plan.json" --version "${{ inputs.version }}" --sequence "${{ inputs.sequence }}" --generated-at "$AUTOFORGE_GENERATED_AT" --archive-base-url "${{ vars.CONVERTER_PUBLIC_BASE_URL }}/releases/${{ inputs.sequence }}"
+          pnpm --filter @autoforge/desktop converter-packs:prepare-staging --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target "$AUTOFORGE_CONVERTER_TARGET" --cache "$RUNNER_TEMP/converter-source-cache" --helpers "$RUNNER_TEMP/converter-helpers" --workspace "$RUNNER_TEMP/converter-prepared" --staging "$RUNNER_TEMP/converter-stage-$AUTOFORGE_CONVERTER_TARGET" --plan "$RUNNER_TEMP/converter-stage-plan.json" --version "$CONVERTER_VERSION" --sequence "$CONVERTER_SEQUENCE" --generated-at "$AUTOFORGE_GENERATED_AT" --archive-base-url "$CONVERTER_ARCHIVE_BASE_URL/releases/$CONVERTER_SEQUENCE"
           pnpm --filter @autoforge/desktop converter-packs:stage --plan "$RUNNER_TEMP/converter-stage-plan.json"
       - name: Preserve staged permissions
         run: tar -cf "$RUNNER_TEMP/converter-stage-$AUTOFORGE_CONVERTER_TARGET.tar" -C "$RUNNER_TEMP" "converter-stage-$AUTOFORGE_CONVERTER_TARGET"
@@ -140,13 +144,17 @@ jobs:
           pnpm --filter @autoforge/desktop verify:converter-packs --root "$RUNNER_TEMP/converter-release" --public-key "$RUNNER_TEMP/converter-index-public.pem" --mode production
       - name: Acquire pinned COSCLI publisher
         run: |
-          /usr/bin/curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --output "$RUNNER_TEMP/coscli" https://github.com/tencentyun/coscli/releases/download/v1.0.8/coscli-v1.0.8-darwin-arm64
+          /usr/bin/curl --disable --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location --no-location-trusted --remove-on-error --silent --show-error --output "$RUNNER_TEMP/coscli" https://github.com/tencentyun/coscli/releases/download/v1.0.8/coscli-v1.0.8-darwin-arm64
           printf '%s  %s\n' df0018fbf78b552cbe875ebe26e8bdf7938c7f4394959f913dfc2ea4d1252568 "$RUNNER_TEMP/coscli" | /usr/bin/shasum -a 256 -c -
           chmod 0500 "$RUNNER_TEMP/coscli"
       - name: Publish immutable objects and stable pair
+        env:
+          CONVERTER_COS_BUCKET: ${{ vars.CONVERTER_COS_BUCKET }}
+          CONVERTER_PUBLIC_BASE_URL: ${{ vars.CONVERTER_PUBLIC_BASE_URL }}
+          CONVERTER_SEQUENCE: ${{ inputs.sequence }}
         run: |
           mkdir -p "$RUNNER_TEMP/coscli-scratch"
-          pnpm --filter @autoforge/desktop converter-packs:publish --release "$RUNNER_TEMP/converter-release" --public-key "$RUNNER_TEMP/converter-index-public.pem" --public-base-url "${{ vars.CONVERTER_PUBLIC_BASE_URL }}" --sequence "${{ inputs.sequence }}" --coscli "$RUNNER_TEMP/coscli" --cos-config "$RUNNER_TEMP/coscli.yaml" --cos-bucket "${{ vars.CONVERTER_COS_BUCKET }}" --cos-scratch "$RUNNER_TEMP/coscli-scratch" --mode production
+          pnpm --filter @autoforge/desktop converter-packs:publish --release "$RUNNER_TEMP/converter-release" --public-key "$RUNNER_TEMP/converter-index-public.pem" --public-base-url "$CONVERTER_PUBLIC_BASE_URL" --sequence "$CONVERTER_SEQUENCE" --coscli "$RUNNER_TEMP/coscli" --cos-config "$RUNNER_TEMP/coscli.yaml" --cos-bucket "$CONVERTER_COS_BUCKET" --cos-scratch "$RUNNER_TEMP/coscli-scratch" --mode production
       - name: Build production Desktop bootstrap
         run: |
           pnpm --filter @autoforge/desktop converter-packs:create-bootstrap --index-url "${{ vars.CONVERTER_INDEX_URL }}" --public-key "$RUNNER_TEMP/converter-index-public.pem" --output "$RUNNER_TEMP/converter-bootstrap"

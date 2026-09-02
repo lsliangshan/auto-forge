@@ -246,6 +246,7 @@ describe('converter target closure lock', () => {
     ['incomplete family record', (value: ReturnType<typeof closureFixture>) => { delete (value.families as Record<string, unknown>).document }],
     ['zero pack measurement', (value: ReturnType<typeof closureFixture>) => { value.measurements.compressedPackBytes.media = 0 }],
     ['zero download measurement', (value: ReturnType<typeof closureFixture>) => { value.measurements.downloadBytes = 0 }],
+    ['download measurement above the 1.8 GB ceiling', (value: ReturnType<typeof closureFixture>) => { value.measurements.downloadBytes = 1_800_000_001 }],
     ['zero release measurement', (value: ReturnType<typeof closureFixture>) => { value.measurements.installedReleaseBytes = 0 }],
   ])('rejects %s', (_label, mutate) => {
     const value = closureFixture()

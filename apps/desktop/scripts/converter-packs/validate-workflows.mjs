@@ -118,6 +118,10 @@ export async function validateConverterPackWorkflows({ checkPath, releasePath, l
   validateActions(release.value)
   validateActions(lock.value)
   const combined = `${check.source}\n${release.source}`
+  const releaseRuns = actionSteps(release.value)
+    .map((step) => typeof step?.run === 'string' ? step.run : '')
+    .join('\n')
+  if (releaseRuns.includes('${{ inputs.')) fail('Converter release inputs must enter shell steps through the environment.')
   for (const command of commands) if (!combined.includes(command)) fail(`Converter workflow command is missing: ${command}`)
   if (!check.source.includes(lockedInputHash) || !release.source.includes(lockedInputHash)) {
     fail('Converter workflow cache keys must authenticate all checked-in locks.')

@@ -35,6 +35,12 @@ describe('converter pack workflows', () => {
     expect(JSON.stringify(release.jobs.stage_arm64)).not.toContain('secrets.')
     expect(JSON.stringify(release.jobs.stage_x64)).not.toContain('secrets.')
     expect(JSON.stringify(release.jobs.production)).toContain('secrets.')
+    const releaseJobs = release.jobs as Record<string, { steps?: Array<{ run?: unknown }> }>
+    const releaseRunScripts = Object.values(releaseJobs)
+      .flatMap((job) => job.steps ?? [])
+      .map((step) => step.run)
+      .filter((run: unknown): run is string => typeof run === 'string')
+    expect(releaseRunScripts.join('\n')).not.toContain('${{ inputs.')
   })
 
   it('keys ordinary caches from the complete authenticated lock set without Homebrew resolution', () => {

@@ -22,6 +22,11 @@ const maximumSourceLockBytes = 8 * 1024 * 1024
 const maximumClosureLockBytes = 64 * 1024 * 1024
 const defaultSourceLockPath = fileURLToPath(new URL('../../converter-packs/sources.lock.json', import.meta.url))
 
+async function loadAuthenticatedClosure(request) {
+  const { loadConverterClosureLock } = await import('./closure-lock.mjs')
+  return loadConverterClosureLock(request)
+}
+
 function plainRecord(value) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
   const prototype = Object.getPrototypeOf(value)
@@ -303,12 +308,13 @@ export async function loadConverterSourceLockMain(argv, {
   stdout = process.stdout,
   stderr = process.stderr,
   load = loadConverterSourceLock,
+  loadClosure = loadAuthenticatedClosure,
   defaultLockPath = defaultSourceLockPath,
 } = {}) {
   const defaultMode = argv.length === 0
   try {
     if (defaultMode) {
-      for (const target of targets) await load({ path: defaultLockPath, target })
+      for (const target of targets) await loadClosure({ sourceLockPath: defaultLockPath, target })
       stdout.write('verified converter source locks for darwin-arm64 and darwin-x64\n')
       return 0
     }
