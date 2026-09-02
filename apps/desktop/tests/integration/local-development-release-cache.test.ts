@@ -72,13 +72,14 @@ function createReadyWorkspace(
   return path
 }
 
-function createLegacyReadyWorkspace(cacheRoot: string, fingerprint: string, pid: number) {
+function createLegacyReadyWorkspace(cacheRoot: string, fingerprint: string, pid: number, age = Date.now() / 1000) {
   const nonce = randomUUID()
   const path = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}-ABC123`)
   mkdirSync(path)
   const owner = join(path, `.owner-${nonce}.ready`)
   writeFileSync(owner, canonicalBytes({ fingerprint, nonce, pid, schemaVersion: 1 }))
   chmodSync(owner, 0o444)
+  utimesSync(owner, age, age)
   return path
 }
 
@@ -244,6 +245,49 @@ describe('local development release cache', () => {
       processIdentity: testProcessIdentity,
     })).rejects.toThrow(/active legacy preparation owner cannot be recovered/iu)
     expect(existsSync(legacy)).toBe(true)
+  })
+
+  it('recovers a previous schema-v1 owner with a reused current PID after its lease expires', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const legacy = createLegacyReadyWorkspace(cacheRoot, 'e'.repeat(64), process.pid, 0)
+
+    const lease = await createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint: 'f'.repeat(64),
+      processIdentity: testProcessIdentity,
+    })
+
+    expect(existsSync(legacy)).toBe(false)
+    await lease.stop()
+    rmSync(lease.path, { recursive: true })
+  })
+
+  it('treats the previous schema-v1 lease boundary as live and the next millisecond as stale', async () => {
+    const fixedNow = Date.UTC(2024, 0, 2)
+    const liveCache = join(temporaryRoot(), 'cache')
+    mkdirSync(liveCache)
+    const live = createLegacyReadyWorkspace(liveCache, '1'.repeat(64), process.pid, (fixedNow - 30_000) / 1_000)
+    await expect(createDevelopmentPreparationWorkspace({
+      cacheRoot: liveCache,
+      fingerprint: '2'.repeat(64),
+      now: () => fixedNow,
+      processIdentity: testProcessIdentity,
+    })).rejects.toThrow(/active legacy preparation owner cannot be recovered/iu)
+    expect(existsSync(live)).toBe(true)
+
+    const staleCache = join(temporaryRoot(), 'cache')
+    mkdirSync(staleCache)
+    const stale = createLegacyReadyWorkspace(staleCache, '3'.repeat(64), process.pid, (fixedNow - 30_001) / 1_000)
+    const lease = await createDevelopmentPreparationWorkspace({
+      cacheRoot: staleCache,
+      fingerprint: '4'.repeat(64),
+      now: () => fixedNow,
+      processIdentity: testProcessIdentity,
+    })
+    expect(existsSync(stale)).toBe(false)
+    await lease.stop()
+    rmSync(lease.path, { recursive: true })
   })
 
   it('fences an owner lease whose stable inode grows behind the open handle', async () => {

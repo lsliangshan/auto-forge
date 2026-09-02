@@ -411,11 +411,16 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
 export async function inspectAndRecoverDevelopmentPreparationWorkspaces({
   cacheRoot,
   heartbeat,
+  now = Date.now,
   processIdentity = readDevelopmentPreparationProcessIdentity,
 }) {
   const root = await canonicalCacheRoot(cacheRoot)
-  if (typeof heartbeat?.pulse !== 'function' || typeof processIdentity !== 'function') {
+  if (typeof heartbeat?.pulse !== 'function' || typeof now !== 'function' || typeof processIdentity !== 'function') {
     throw new Error('Development preparation workspace inspection request is invalid')
+  }
+  const observedNow = now()
+  if (!Number.isSafeInteger(observedNow) || observedNow <= 0) {
+    throw new Error('Development preparation workspace inspection time is invalid')
   }
   const names = (await readdir(root))
     .filter((name) => name.startsWith('.local-development-preparation-'))
@@ -463,7 +468,9 @@ export async function inspectAndRecoverDevelopmentPreparationWorkspaces({
           || value.schemaVersion !== 1) {
           throw new Error('Development preparation owner is invalid')
         }
-        if (ownerAlive(value.pid)) throw new Error('Active legacy preparation owner cannot be recovered safely')
+        if (ownerAlive(value.pid) && observedNow - owner.metadata.mtimeMs <= CLAIM_LEASE_MS) {
+          throw new Error('Active legacy preparation owner cannot be recovered safely')
+        }
       } else if (!commonValid
         || Object.keys(value).sort().join('\0') !== ['birth', 'fingerprint', 'nonce', 'pid', 'schemaVersion'].join('\0')
         || !PROCESS_BIRTH_PATTERN.test(value.birth)
@@ -549,6 +556,7 @@ function startPreparationOwnerHeartbeat({ path, handle, identity, bytes }) {
 export async function createDevelopmentPreparationWorkspace({
   cacheRoot,
   fingerprint,
+  now = Date.now,
   processIdentity = readDevelopmentPreparationProcessIdentity,
   afterWorkspaceCreateForTest,
   afterOwnerWriteForTest,
@@ -559,7 +567,7 @@ export async function createDevelopmentPreparationWorkspace({
   assertFingerprint(fingerprint)
   if (typeof processIdentity !== 'function') throw new Error('Development preparation process identity reader is invalid')
   return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
-    const inspected = await inspectAndRecoverDevelopmentPreparationWorkspaces({ cacheRoot: root, heartbeat, processIdentity })
+    const inspected = await inspectAndRecoverDevelopmentPreparationWorkspaces({ cacheRoot: root, heartbeat, now, processIdentity })
     if (inspected.live.length >= PREPARATION_WORKSPACE_LIMIT) {
       throw new Error('Development preparation workspace limit was reached')
     }
