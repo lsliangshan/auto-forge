@@ -16,6 +16,7 @@ const CLAIM_MAXIMUM_BYTES = 4096
 const NONCE_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
 const METADATA_TEMP_PATTERN = /^\.release-metadata-([a-f0-9]{64})-([a-f0-9-]{36})\.tmp$/u
 const CLAIM_PREDECESSOR_PATTERN = /^\.cache-mutation\.claim\.([a-f0-9-]+)\.predecessor$/u
+const ACTIVE_MARKER_TEMP_PATTERN = /^\.active-release-([a-f0-9-]{36})\.tmp$/u
 
 function missing(error) {
   return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
@@ -107,7 +108,7 @@ async function fenceClaim(path, current) {
   return true
 }
 
-async function acquireMutationClaim(cacheRoot) {
+async function acquireMutationClaim(cacheRoot, afterClaimOpenForTest) {
   const path = join(cacheRoot, MUTATION_CLAIM)
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const value = { createdAtMs: Date.now(), nonce: randomUUID(), pid: process.pid }
@@ -115,11 +116,14 @@ async function acquireMutationClaim(cacheRoot) {
     let handle
     try {
       handle = await open(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+      await afterClaimOpenForTest?.({ claimPath: path })
       await handle.writeFile(bytes)
       await handle.sync()
       await syncDirectory(cacheRoot)
       const stat = await handle.stat()
-      return { bytes, dev: stat.dev, handle, ino: stat.ino, path }
+      const claim = { bytes, dev: stat.dev, handle, ino: stat.ino, path }
+      await verifyClaim(claim)
+      return claim
     } catch (error) {
       if (handle) {
         const stat = await handle.stat().catch(() => undefined)
@@ -145,7 +149,7 @@ async function acquireMutationClaim(cacheRoot) {
   throw new Error('Development converter cache mutation is already claimed.')
 }
 
-async function removeOrphanedClaimPredecessors(cacheRoot, activeClaim) {
+async function removeOrphanedClaimPredecessors(cacheRoot, activeClaim, heartbeat) {
   for (const name of await readdir(cacheRoot)) {
     const match = CLAIM_PREDECESSOR_PATTERN.exec(name)
     if (!match || (!NONCE_PATTERN.test(match[1]) && !/^\d+-\d+$/u.test(match[1]))) continue
@@ -155,7 +159,24 @@ async function removeOrphanedClaimPredecessors(cacheRoot, activeClaim) {
     if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1 || sameIdentity(details, activeClaim)) {
       throw new Error('Development converter cache mutation predecessor is unsafe.')
     }
+    await heartbeat.pulse()
     await unlinkIdentity(path, details)
+  }
+  await syncDirectory(cacheRoot)
+}
+
+async function removeOrphanedActiveMarkerTemporaries(cacheRoot, heartbeat) {
+  for (const name of await readdir(cacheRoot)) {
+    const match = ACTIVE_MARKER_TEMP_PATTERN.exec(name)
+    if (!match || !NONCE_PATTERN.test(match[1])) continue
+    const path = join(cacheRoot, name)
+    const details = await lstat(path).catch(() => undefined)
+    if (!details?.isFile() || details.isSymbolicLink() || details.nlink !== 1
+      || await realpath(path).catch(() => undefined) !== path) {
+      throw new Error('Development release marker temporary is unsafe.')
+    }
+    await heartbeat.pulse()
+    await unlink(path)
   }
   await syncDirectory(cacheRoot)
 }
@@ -193,14 +214,18 @@ function startClaimHeartbeat(claim) {
   }
 }
 
-export async function withDevelopmentCacheMutationClaim(cacheRoot, operation) {
+export async function withDevelopmentCacheMutationClaim(cacheRoot, operation, claimOperations = {}) {
   const root = await canonicalCacheRoot(cacheRoot)
-  const claim = await acquireMutationClaim(root)
+  const claim = await acquireMutationClaim(root, claimOperations.afterClaimOpenForTest)
   const heartbeat = startClaimHeartbeat(claim)
   let result
   let primary
   try {
-    await removeOrphanedClaimPredecessors(root, claim)
+    await heartbeat.pulse()
+    await removeOrphanedClaimPredecessors(root, claim, heartbeat)
+    await heartbeat.pulse()
+    await removeOrphanedActiveMarkerTemporaries(root, heartbeat)
+    await heartbeat.pulse()
     result = await operation(root, heartbeat)
     await heartbeat.pulse()
   } catch (error) {
@@ -325,7 +350,36 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
   }
 }
 
-export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, blobs, afterTemporaryCreateForTest }) {
+async function verifyMetadataFile(path, expectedBytes, allowedLinks) {
+  const before = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
+  if (!before?.isFile() || before.isSymbolicLink() || !allowedLinks.includes(before.nlink)
+    || (before.mode & 0o777) !== 0o444 || await realpath(path).catch(() => undefined) !== path) {
+    throw new Error('Development release metadata publication is unsafe')
+  }
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const opened = await handle.stat()
+    const content = await handle.readFile()
+    const after = await lstat(path).catch(() => undefined)
+    if (!after?.isFile() || after.isSymbolicLink() || !allowedLinks.includes(opened.nlink)
+      || !allowedLinks.includes(after.nlink) || !sameIdentity(opened, before) || !sameIdentity(after, before)
+      || content.byteLength !== expectedBytes.byteLength || !content.equals(expectedBytes)) {
+      throw new Error('Development release metadata publication does not match the requested release')
+    }
+    return before
+  } finally {
+    await handle.close()
+  }
+}
+
+export async function writeDevelopmentReleaseMetadata({
+  cacheRoot,
+  fingerprint,
+  blobs,
+  afterClaimOpenForTest,
+  afterTemporaryCreateForTest,
+  afterMetadataLinkForTest,
+}) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
   if (!Array.isArray(blobs)) throw new Error('Development release metadata blobs are invalid')
@@ -354,7 +408,7 @@ export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, 
     release: `releases/${fingerprint}`,
     schemaVersion: 1,
   })
-  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root) => {
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
     await validateRelease(root, fingerprint)
     const sources = join(root, 'sources')
     for (const blob of selected) {
@@ -369,24 +423,52 @@ export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, 
     if (metadataDetails.isSymbolicLink() || !metadataDetails.isDirectory() || await realpath(metadataRoot) !== metadataRoot) {
       throw new Error('Development release metadata root is unsafe')
     }
-    for (const name of await readdir(metadataRoot)) {
-      const match = METADATA_TEMP_PATTERN.exec(name)
-      if (!match || !NONCE_PATTERN.test(match[2])) continue
-      const stale = join(metadataRoot, name)
-      const details = await lstat(stale).catch(() => undefined)
-      if (!details?.isFile() || details.isSymbolicLink() || details.nlink !== 1 || await realpath(stale).catch(() => undefined) !== stale) {
-        throw new Error('Development release metadata temporary is unsafe')
-      }
-      await unlink(stale)
-    }
     const path = join(metadataRoot, `${fingerprint}.json`)
-    const temporary = join(metadataRoot, `.release-metadata-${fingerprint}-${randomUUID()}.tmp`)
+    const metadataNames = await readdir(metadataRoot)
+    const temporaryNames = metadataNames.filter((name) => name.startsWith('.release-metadata-'))
+    if (temporaryNames.some((name) => !METADATA_TEMP_PATTERN.test(name))) {
+      throw new Error('Development release metadata temporary is unsafe')
+    }
+    const matchingTemporaries = temporaryNames.filter((name) => {
+      const match = METADATA_TEMP_PATTERN.exec(name)
+      return Boolean(match && match[1] === fingerprint && NONCE_PATTERN.test(match[2]))
+    })
+    if (temporaryNames.length !== matchingTemporaries.length) {
+      throw new Error('Development release metadata for another release is incomplete')
+    }
+    if (matchingTemporaries.length > 1) throw new Error('Development release metadata recovery is ambiguous')
+    let temporary = matchingTemporaries.length === 1 ? join(metadataRoot, matchingTemporaries[0]) : undefined
+    const published = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    if (published) {
+      const expectedLinks = temporary ? [2] : [1]
+      const publishedIdentity = await verifyMetadataFile(path, bytes, expectedLinks)
+      if (temporary) {
+        const temporaryIdentity = await verifyMetadataFile(temporary, bytes, [2])
+        if (!sameIdentity(publishedIdentity, temporaryIdentity)) {
+          throw new Error('Development release metadata recovery does not match the published file')
+        }
+        await heartbeat.pulse()
+        await unlink(temporary)
+        await syncDirectory(metadataRoot)
+      }
+      await verifyMetadataFile(path, bytes, [1])
+      return path
+    }
+    if (temporary) await verifyMetadataFile(temporary, bytes, [1])
+    else temporary = join(metadataRoot, `.release-metadata-${fingerprint}-${randomUUID()}.tmp`)
     let handle
+    let createdTemporary = false
+    let linked = false
     try {
-      handle = await open(temporary, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
-      await handle.writeFile(bytes)
-      await handle.chmod(0o444)
-      await handle.sync()
+      if (matchingTemporaries.length === 0) {
+        handle = await open(temporary, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+        createdTemporary = true
+        await handle.writeFile(bytes)
+        await handle.chmod(0o444)
+        await handle.sync()
+      } else {
+        handle = await open(temporary, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+      }
       const prepared = await handle.stat()
       if (!prepared.isFile() || prepared.size !== bytes.byteLength || (prepared.mode & 0o777) !== 0o444) {
         throw new Error('Development release metadata temporary verification failed')
@@ -397,18 +479,23 @@ export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, 
         throw new Error('Development release metadata temporary verification failed')
       }
       await syncDirectory(metadataRoot)
-      await afterTemporaryCreateForTest?.({ temporary })
+      if (createdTemporary) await afterTemporaryCreateForTest?.({ temporary })
       const [openedAgain, temporaryAgain] = await Promise.all([handle.stat(), lstat(temporary).catch(() => undefined)])
       if (!temporaryAgain?.isFile() || temporaryAgain.isSymbolicLink() || temporaryAgain.nlink !== 1
         || openedAgain.nlink !== 1 || !sameIdentity(openedAgain, prepared) || !sameIdentity(temporaryAgain, prepared)
         || openedAgain.size !== bytes.byteLength || (openedAgain.mode & 0o777) !== 0o444) {
         throw new Error('Development release metadata temporary verification failed')
       }
+      await heartbeat.pulse()
       await link(temporary, path)
+      linked = true
+      await syncDirectory(metadataRoot)
+      await afterMetadataLinkForTest?.({ path, temporary })
       const [temporaryDetails, publishedDetails] = await Promise.all([lstat(temporary), lstat(path)])
       if (!sameIdentity(temporaryDetails, publishedDetails) || temporaryDetails.nlink !== 2 || publishedDetails.nlink !== 2) {
         throw new Error('Development release metadata publication failed')
       }
+      await heartbeat.pulse()
       await unlink(temporary)
       await syncDirectory(metadataRoot)
       await withStableRegularFile(path, 'Development release metadata', async (publishedHandle, details) => {
@@ -420,13 +507,16 @@ export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, 
       })
       return path
     } catch (error) {
-      await unlink(temporary).catch((cleanupError) => { if (!missing(cleanupError)) throw cleanupError })
-      await syncDirectory(metadataRoot)
+      if (createdTemporary && !linked) {
+        await heartbeat.pulse()
+        await unlink(temporary).catch((cleanupError) => { if (!missing(cleanupError)) throw cleanupError })
+        await syncDirectory(metadataRoot)
+      }
       throw error
     } finally {
       await handle?.close()
     }
-  })
+  }, { afterClaimOpenForTest })
 }
 
 export async function readActiveDevelopmentRelease({ cacheRoot }) {
@@ -446,7 +536,7 @@ export async function readActiveDevelopmentRelease({ cacheRoot }) {
 
 export async function activateDevelopmentRelease({ cacheRoot, fingerprint }, operations = {}) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
-  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root) => {
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
     const paths = developmentReleasePaths(root, fingerprint)
     const release = await validateRelease(root, fingerprint)
     try {
@@ -468,12 +558,15 @@ export async function activateDevelopmentRelease({ cacheRoot, fingerprint }, ope
         await markerHandle.close()
       }
       await operations.beforePublishForTest?.()
+      await heartbeat.pulse()
       await (operations.rename ?? rename)(temporaryMarker, paths.activeMarker)
       await syncDirectory(root)
     } catch (error) {
-      await unlink(temporaryMarker).catch(() => undefined)
+      await heartbeat.pulse()
+      await unlink(temporaryMarker).catch((cleanupError) => { if (!missing(cleanupError)) throw cleanupError })
+      await syncDirectory(root)
       throw error
     }
     return release
-  })
+  }, { afterClaimOpenForTest: operations.afterClaimOpenForTest })
 }

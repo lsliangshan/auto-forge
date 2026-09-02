@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import process from 'node:process'
@@ -179,13 +179,27 @@ describe('local development release cache', () => {
     )
     await expect(writeDevelopmentReleaseMetadata({
       cacheRoot, fingerprint, blobs: [{ sha256: blob, bytes: 4 }],
-    })).rejects.toThrow(/metadata|exist|immutable/iu)
+    })).resolves.toBe(metadata)
 
     const alias = join(cacheRoot, 'sources', 'alias.archive')
     symlinkSync(join(cacheRoot, 'sources', `${blob}.archive`), alias)
     await expect(writeDevelopmentReleaseMetadata({
       cacheRoot, fingerprint: '3'.repeat(64), blobs: [{ sha256: 'alias', bytes: 4, path: alias }],
     })).rejects.toThrow()
+  })
+
+  it('fails closed when existing release metadata does not match the requested payload', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(join(cacheRoot, 'sources'), { recursive: true })
+    mkdirSync(join(cacheRoot, 'release-metadata'))
+    const fingerprint = '3'.repeat(64)
+    createRelease(cacheRoot, fingerprint)
+    const metadata = join(cacheRoot, 'release-metadata', `${fingerprint}.json`)
+    writeFileSync(metadata, 'wrong', { mode: 0o444 })
+
+    await expect(writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, blobs: [] }))
+      .rejects.toThrow(/metadata|match|unsafe/iu)
+    expect(readFileSync(metadata, 'utf8')).toBe('wrong')
   })
 
   it('serializes public activation against pruning so the marker never names a deleted release', async () => {
@@ -232,5 +246,59 @@ describe('local development release cache', () => {
     children.delete(child)
     expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toContain(nextFingerprint)
     expect(existsSync(join(cacheRoot, 'releases', nextFingerprint))).toBe(true)
+  })
+
+  it('fences an initializer resumed after another process takes over its incomplete claim', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const delayed = '6'.repeat(64)
+    const winner = '7'.repeat(64)
+    createRelease(cacheRoot, delayed)
+    createRelease(cacheRoot, winner)
+    const ready = join(root, 'claim-ready')
+    const resume = join(root, 'claim-resume')
+    const moduleUrl = new URL('../../scripts/converter-packs/local-development-release-cache.mjs', import.meta.url).href
+    const script = String.raw`
+      import { access, writeFile } from 'node:fs/promises'
+      const [moduleUrl, cacheRoot, fingerprint, ready, resume] = process.argv.slice(1)
+      const { activateDevelopmentRelease } = await import(moduleUrl)
+      await activateDevelopmentRelease({ cacheRoot, fingerprint }, {
+        afterClaimOpenForTest: async () => {
+          await writeFile(ready, 'ready')
+          while (true) {
+            try { await access(resume); break } catch { await new Promise((resolve) => setTimeout(resolve, 20)) }
+          }
+        },
+      })
+    `
+    const child = spawn(process.execPath, [
+      '--input-type=module', '-e', script, moduleUrl, cacheRoot, delayed, ready, resume,
+    ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] })
+    children.add(child)
+    await waitUntil(() => existsSync(ready))
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 300))
+    await activateDevelopmentRelease({ cacheRoot, fingerprint: winner })
+    const closed = new Promise<number | null>((resolvePromise) => child.once('close', resolvePromise))
+    writeFileSync(resume, 'resume')
+    const exitCode = await closed
+    children.delete(child)
+    expect(exitCode).not.toBe(0)
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toContain(winner)
+  })
+
+  it('does not publish an activation marker after its mutation claim is deleted', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const oldFingerprint = '8'.repeat(64)
+    const nextFingerprint = '9'.repeat(64)
+    createRelease(cacheRoot, oldFingerprint)
+    createRelease(cacheRoot, nextFingerprint)
+    writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${oldFingerprint}","schemaVersion":1}\n`)
+
+    await expect(activateDevelopmentRelease({ cacheRoot, fingerprint: nextFingerprint }, {
+      beforePublishForTest: async () => unlinkSync(join(cacheRoot, '.cache-mutation.claim')),
+    })).rejects.toThrow(/claim|lost/iu)
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toContain(oldFingerprint)
   })
 })
