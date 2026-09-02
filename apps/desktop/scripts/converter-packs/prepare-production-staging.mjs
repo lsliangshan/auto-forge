@@ -60,6 +60,27 @@ const productionDependencies = Object.freeze({
   materializeEngineAssets: (request) => materializeLockedEngineAssets(request),
 })
 
+function acquisitionSummary(acquired) {
+  if (!(acquired?.blobs instanceof Map)) fail('Verified converter acquisition inventory is invalid.')
+  let measuredNetworkBytes = 0
+  const blobs = [...acquired.blobs.entries()].map(([key, blob]) => {
+    if (
+      typeof key !== 'string'
+      || key !== blob?.sha256
+      || !/^[a-f0-9]{64}$/u.test(key)
+      || !Number.isSafeInteger(blob.bytes)
+      || blob.bytes <= 0
+      || !Number.isSafeInteger(blob.networkBytes)
+      || blob.networkBytes < 0
+    ) fail('Verified converter acquisition inventory is invalid.')
+    measuredNetworkBytes += blob.networkBytes
+    if (!Number.isSafeInteger(measuredNetworkBytes)) fail('Verified converter acquisition measurement is invalid.')
+    return { bytes: blob.bytes, sha256: key }
+  }).sort((left, right) => left.sha256 < right.sha256 ? -1 : left.sha256 > right.sha256 ? 1 : 0)
+  if (acquired.networkBytes !== measuredNetworkBytes) fail('Verified converter acquisition measurement is invalid.')
+  return { blobs, networkBytes: measuredNetworkBytes }
+}
+
 export async function prepareProductionStagingPlan(request, dependencies = productionDependencies) {
   for (const [value, label] of [
     [request.lockPath, 'Source lock'], [request.cacheRoot, 'Source cache'], [request.helpersRoot, 'Native helpers'],
@@ -110,7 +131,7 @@ export async function prepareProductionStagingPlan(request, dependencies = produ
       requiredDownloadBytes: selected.closureLock?.measurements?.downloadBytes,
     })
     const acquired = await dependencies.acquireSources({ selected, cacheRoot: request.cacheRoot })
-    if (!(acquired?.blobs instanceof Map)) fail('Verified converter acquisition inventory is invalid.')
+    const summary = acquisitionSummary(acquired)
     const universeRoot = join(request.workspace, 'universe')
     const engineAssetsRoot = join(request.workspace, 'engine-assets')
     await dependencies.materializeUniverse({
@@ -146,20 +167,7 @@ export async function prepareProductionStagingPlan(request, dependencies = produ
     }
     if (isPathInsideRoot(request.staging, request.planPath)) fail('Staging plan must remain outside staging output.')
     await writeFile(request.planPath, canonicalBytes(value), { flag: 'wx', mode: 0o600 })
-    const blobs = [...acquired.blobs.entries()].map(([key, blob]) => {
-      if (
-        typeof key !== 'string'
-        || key !== blob?.sha256
-        || !/^[a-f0-9]{64}$/u.test(key)
-        || !Number.isSafeInteger(blob.bytes)
-        || blob.bytes <= 0
-      ) fail('Verified converter acquisition inventory is invalid.')
-      return { bytes: blob.bytes, sha256: key }
-    }).sort((left, right) => left.sha256 < right.sha256 ? -1 : left.sha256 > right.sha256 ? 1 : 0)
-    if (!Number.isSafeInteger(acquired.networkBytes) || acquired.networkBytes < 0) {
-      fail('Verified converter acquisition measurement is invalid.')
-    }
-    return { blobs, networkBytes: acquired.networkBytes }
+    return summary
   } catch (error) {
     const removeWorkspace = dependencies.removeWorkspace ?? ((path) => rm(path, { recursive: true, force: true }))
     await settleCleanup(error, [() => removeWorkspace(request.workspace)], 'Staging preparation cleanup failed.')

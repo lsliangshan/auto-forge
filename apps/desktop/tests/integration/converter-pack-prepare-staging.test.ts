@@ -165,6 +165,45 @@ describe('production staging plan preparation', () => {
     expect(JSON.parse(readFileSync(plan, 'utf8')).sourceLockPath).toBe(privateLock)
   })
 
+  it('rejects inconsistent acquisition measurements before publishing a plan', async () => {
+    const root = temporaryRoot()
+    const helpers = join(root, 'helpers')
+    const plan = join(root, 'staging-plan.json')
+    const workspace = join(root, 'prepared')
+    const privateLock = join(workspace, 'locks', 'sources.lock.json')
+    const cache = join(root, 'cache')
+    mkdirSync(cache)
+    mkdirSync(helpers)
+    const selected = {
+      target: 'darwin-arm64', sourceLock: { formulae: [] },
+      closureLock: { target: 'darwin-arm64', measurements: { downloadBytes: 3 } },
+    }
+    const digest = 'd'.repeat(64)
+
+    await expect(prepareProductionStagingPlan({
+      lockPath: join(root, 'sources.lock.json'), target: 'darwin-arm64', cacheRoot: cache, helpersRoot: helpers,
+      workspace, staging: join(root, 'staging'), planPath: plan, version: '1.2.3', sequence: 7,
+      generatedAt: '2026-08-31T00:00:00.000Z', archiveBaseUrl: 'https://example.test/releases/7',
+    }, {
+      loadLocks: async () => selected,
+      materializeLocks: async () => {
+        mkdirSync(join(workspace, 'locks'), { recursive: true })
+        writeFileSync(privateLock, '{}')
+        return { selected, sourceLockPath: privateLock }
+      },
+      preflightCache: async () => undefined,
+      acquireSources: async () => ({
+        blobs: new Map([[digest, { path: join(cache, `${digest}.archive`), sha256: digest, bytes: 3, networkBytes: 3 }]]),
+        networkBytes: 2,
+      }),
+      materializeUniverse: async ({ outputRoot }: { outputRoot: string }) => { mkdirSync(outputRoot) },
+      materializeEngineAssets: async ({ outputRoot }: { outputRoot: string }) => { mkdirSync(outputRoot) },
+    })).rejects.toThrow(/measurement/iu)
+
+    expect(() => readFileSync(plan)).toThrow()
+    expect(() => realpathSync(workspace)).toThrow()
+  })
+
   it('preserves the preparation failure first when workspace cleanup also fails', async () => {
     const root = temporaryRoot()
     const helpers = join(root, 'helpers')
