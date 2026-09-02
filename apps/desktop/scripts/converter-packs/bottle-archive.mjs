@@ -1,15 +1,14 @@
 import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
-import { Readable } from 'node:stream'
 import { TextDecoder } from 'node:util'
 import { createGunzip } from 'node:zlib'
 import { posix } from 'node:path'
-import { fail, readStableRegularFile, requireAbsolutePath } from './pack-tooling-lib.mjs'
+import { fail, requireAbsolutePath, withStableRegularFile } from './pack-tooling-lib.mjs'
 
 const maximumExpandedBytes = 4 * 1024 * 1024 * 1024
 const maximumPaxBytes = 64 * 1024
 const maximumPathBytes = 4 * 1024
-const maximumEntries = 1_000_000
+const maximumEntries = 100_000
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
 
@@ -35,8 +34,7 @@ function tarString(header, offset, length) {
 function tarNumber(header, offset, length) {
   const field = header.subarray(offset, offset + length)
   if (!field.every((byte) => byte === 0 || byte === 0x20 || (byte >= 0x30 && byte <= 0x37))) invalid()
-  const value = field.toString('ascii')
-  const match = /^[ \0]*([0-7]+)[ \0]*$/u.exec(value)
+  const match = /^[ \0]*([0-7]+)[ \0]*$/u.exec(field.toString('ascii'))
   if (!match) invalid()
   const number = Number.parseInt(match[1], 8)
   if (!Number.isSafeInteger(number) || number < 0) invalid()
@@ -59,8 +57,7 @@ function verifyHeader(header) {
   const expected = tarNumber(header, 148, 8)
   const copy = Buffer.from(header)
   copy.fill(0x20, 148, 156)
-  const actual = copy.reduce((sum, byte) => sum + byte, 0)
-  if (actual !== expected) invalid()
+  if (copy.reduce((sum, byte) => sum + byte, 0) !== expected) invalid()
   for (const [offset, length] of [[100, 8], [108, 8], [116, 8], [124, 12], [136, 12]]) {
     tarNumber(header, offset, length)
   }
@@ -136,16 +133,72 @@ function parsePax(bytes) {
   return values
 }
 
-function parseTar(archive) {
-  if (archive.byteLength === 0 || archive.byteLength % 512 !== 0) invalid()
+class StreamBytes {
+  constructor(readable) {
+    this.iterator = readable[Symbol.asyncIterator]()
+    this.chunk = Buffer.alloc(0)
+    this.offset = 0
+    this.expandedBytes = 0
+    this.done = false
+  }
+
+  async nextChunk() {
+    while (this.offset >= this.chunk.byteLength && !this.done) {
+      const next = await this.iterator.next()
+      this.done = Boolean(next.done)
+      if (this.done) break
+      if (!(next.value instanceof Uint8Array) || next.value.byteLength === 0) invalid()
+      this.chunk = Buffer.isBuffer(next.value)
+        ? next.value
+        : Buffer.from(next.value.buffer, next.value.byteOffset, next.value.byteLength)
+      this.offset = 0
+      this.expandedBytes += this.chunk.byteLength
+      if (!Number.isSafeInteger(this.expandedBytes) || this.expandedBytes > maximumExpandedBytes) invalid()
+    }
+    return this.offset < this.chunk.byteLength
+  }
+
+  async consume(length, consumer) {
+    let remaining = length
+    while (remaining > 0) {
+      if (!await this.nextChunk()) invalid()
+      const available = Math.min(remaining, this.chunk.byteLength - this.offset)
+      const value = this.chunk.subarray(this.offset, this.offset + available)
+      await consumer?.(value)
+      this.offset += available
+      remaining -= available
+    }
+  }
+
+  async collect(length) {
+    const result = Buffer.alloc(length)
+    let offset = 0
+    await this.consume(length, (chunk) => {
+      chunk.copy(result, offset)
+      offset += chunk.byteLength
+    })
+    return result
+  }
+
+  async blockOrEnd() {
+    if (!await this.nextChunk()) return undefined
+    return this.collect(512)
+  }
+
+  async finish() {
+    if (await this.nextChunk()) invalid()
+  }
+}
+
+async function scanTar(readable, onFile) {
+  const stream = new StreamBytes(readable)
   const entries = []
   const seen = new Set()
-  let offset = 0
   let zeroBlocks = 0
   let pax
-  while (offset < archive.byteLength) {
-    const header = archive.subarray(offset, offset + 512)
-    offset += 512
+  while (true) {
+    const header = await stream.blockOrEnd()
+    if (header === undefined) break
     if (header.every((byte) => byte === 0)) {
       zeroBlocks += 1
       continue
@@ -155,80 +208,129 @@ function parseTar(archive) {
     const typeByte = header[156]
     const type = typeByte === 0 ? '0' : String.fromCharCode(typeByte)
     if (type === 'g' || !['0', '2', '5', 'x'].includes(type)) invalid()
-
     const headerSize = tarNumber(header, 124, 12)
     const size = pax?.size ?? headerSize
     if (!Number.isSafeInteger(size) || size < 0 || size > maximumExpandedBytes) invalid()
-    const bytes = archive.subarray(offset, offset + size)
-    if (bytes.byteLength !== size) invalid()
-    offset += size
-    const padding = (512 - (size % 512)) % 512
-    if (offset + padding > archive.byteLength || !archive.subarray(offset, offset + padding).every((byte) => byte === 0)) invalid()
-    offset += padding
 
     if (type === 'x') {
       if (pax !== undefined || headerSize !== size || size > maximumPaxBytes) invalid()
-      pax = parsePax(bytes)
-      continue
+      pax = parsePax(await stream.collect(size))
+    } else {
+      const name = tarString(header, 0, 100)
+      const prefix = tarString(header, 345, 155)
+      const headerPath = prefix ? `${prefix}/${name}` : name
+      const path = safeArchivePath(pax?.path ?? headerPath, type === '5')
+      const folded = path.toLocaleLowerCase('en-US')
+      if (seen.has(folded) || entries.length >= maximumEntries) invalid()
+      seen.add(folded)
+      const mode = tarNumber(header, 100, 8)
+      if (mode > 0o777 || ((type === '2' || type === '5') && size !== 0)) invalid()
+      if (type !== '2' && pax?.linkpath !== undefined) invalid()
+      const kind = type === '0' ? 'file' : type === '2' ? 'symlink' : 'directory'
+      const linkpath = type === '2' ? (pax?.linkpath ?? tarString(header, 157, 100)) : undefined
+      const digest = type === '0' ? createHash('sha256') : undefined
+      const sink = type === '0' ? await onFile?.({ path, type: kind, mode, size }) : undefined
+      await stream.consume(size, async (chunk) => {
+        digest?.update(chunk)
+        await sink?.write(chunk)
+      })
+      const sha256 = digest?.digest('hex')
+      await sink?.finish({ path, type: kind, mode, size, sha256 })
+      entries.push(Object.freeze({
+        path,
+        type: kind,
+        mode,
+        size,
+        sha256,
+        linkTarget: type === '2' ? safeLinkTarget(path, linkpath) : undefined,
+      }))
+      pax = undefined
     }
-
-    const name = tarString(header, 0, 100)
-    const prefix = tarString(header, 345, 155)
-    const headerPath = prefix ? `${prefix}/${name}` : name
-    const path = safeArchivePath(pax?.path ?? headerPath, type === '5')
-    const folded = path.toLocaleLowerCase('en-US')
-    if (seen.has(folded) || entries.length >= maximumEntries) invalid()
-    seen.add(folded)
-
-    const mode = tarNumber(header, 100, 8)
-    if (mode > 0o777) invalid()
-    if ((type === '2' || type === '5') && size !== 0) invalid()
-    if (type !== '2' && pax?.linkpath !== undefined) invalid()
-    const linkpath = type === '2' ? (pax?.linkpath ?? tarString(header, 157, 100)) : undefined
-    entries.push(Object.freeze({
-      path,
-      type: type === '0' ? 'file' : type === '2' ? 'symlink' : 'directory',
-      mode,
-      bytes: type === '0' ? Buffer.from(bytes) : undefined,
-      linkTarget: type === '2' ? safeLinkTarget(path, linkpath) : undefined,
-    }))
-    pax = undefined
+    const padding = (512 - (size % 512)) % 512
+    if (padding > 0 && !(await stream.collect(padding)).every((byte) => byte === 0)) invalid()
   }
+  await stream.finish()
   if (zeroBlocks < 2 || pax !== undefined) invalid()
   return Object.freeze(entries)
 }
 
-async function gunzipBounded(compressed) {
-  const gunzip = createGunzip()
-  const chunks = []
-  let total = 0
-  try {
-    Readable.from([compressed]).pipe(gunzip)
-    for await (const chunk of gunzip) {
-      total += chunk.byteLength
-      if (!Number.isSafeInteger(total) || total > maximumExpandedBytes) {
-        gunzip.destroy()
-        invalid()
-      }
-      chunks.push(Buffer.from(chunk))
-    }
-    return Buffer.concat(chunks, total)
-  } catch (error) {
-    if (error instanceof Error && error.message === 'Bottle archive is invalid.') throw error
-    invalid()
+async function hashOpenFile(handle, expectedBytes) {
+  const digest = createHash('sha256')
+  const buffer = Buffer.allocUnsafe(1024 * 1024)
+  let position = 0
+  while (position < expectedBytes) {
+    const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.byteLength, expectedBytes - position), position)
+    if (bytesRead <= 0) invalid()
+    digest.update(buffer.subarray(0, bytesRead))
+    position += bytesRead
   }
+  return digest.digest('hex')
 }
 
-export async function readVerifiedBottleEntries({ archive, expectedBytes, expectedSha256 }) {
+async function drainReadable(readable) {
+  if (readable.readableEnded || readable.destroyed) return
+  await new Promise((resolvePromise, rejectPromise) => {
+    const cleanup = () => {
+      readable.off('end', onEnd)
+      readable.off('error', onError)
+      readable.off('close', onClose)
+    }
+    const onEnd = () => {
+      cleanup()
+      resolvePromise()
+    }
+    const onError = (error) => {
+      cleanup()
+      rejectPromise(error)
+    }
+    const onClose = () => {
+      cleanup()
+      if (readable.readableEnded) resolvePromise()
+      else rejectPromise(new Error('Compressed bottle stream closed early.'))
+    }
+    readable.once('end', onEnd)
+    readable.once('error', onError)
+    readable.once('close', onClose)
+    if (readable.readableEnded) {
+      cleanup()
+      resolvePromise()
+      return
+    }
+    readable.resume()
+  })
+}
+
+export async function scanVerifiedBottleEntries({ archive, expectedBytes, expectedSha256, onFile }) {
   requireAbsolutePath(archive, 'Bottle archive path')
   if (
     !Number.isSafeInteger(expectedBytes)
     || expectedBytes <= 0
     || expectedBytes > maximumExpandedBytes
     || !sha256Pattern.test(expectedSha256)
+    || (onFile !== undefined && typeof onFile !== 'function')
   ) invalid()
-  const compressed = await readStableRegularFile(archive, 'Bottle archive', expectedBytes)
-  if (compressed.byteLength !== expectedBytes) invalid()
-  if (createHash('sha256').update(compressed).digest('hex') !== expectedSha256) invalid()
-  return parseTar(await gunzipBounded(compressed))
+  return withStableRegularFile(archive, 'Bottle archive', async (handle, metadata) => {
+    if (metadata.size !== expectedBytes) invalid()
+    if (await hashOpenFile(handle, expectedBytes) !== expectedSha256) invalid()
+    const compressed = handle.createReadStream({ autoClose: false, start: 0, end: expectedBytes - 1 })
+    const gunzip = createGunzip()
+    try {
+      compressed.pipe(gunzip)
+      return await scanTar(gunzip, onFile)
+    } catch (error) {
+      if (
+        error instanceof Error
+        && ['Bottle archive is invalid.', 'Bottle universe inventory is invalid.'].includes(error.message)
+      ) throw error
+      invalid()
+    } finally {
+      compressed.unpipe(gunzip)
+      gunzip.destroy()
+      await drainReadable(compressed).catch(() => invalid())
+    }
+  })
+}
+
+export async function readVerifiedBottleEntries(options) {
+  return scanVerifiedBottleEntries(options)
 }

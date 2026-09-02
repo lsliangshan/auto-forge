@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import { gzipSync } from 'node:zlib'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,8 +11,14 @@ import { readVerifiedBottleEntries } from '../../scripts/converter-packs/bottle-
 import { extractVerifiedBottle, materializeBottleUniverse } from '../../scripts/converter-packs/bottle-universe.mjs'
 
 const temporaryRoots: string[] = []
+const spawnedChildren = new Set<ReturnType<typeof spawn>>()
 
-afterEach(() => {
+afterEach(async () => {
+  const children = [...spawnedChildren]
+  for (const child of children) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  }
+  await Promise.allSettled(children.map((child) => new Promise<void>((resolvePromise) => child.once('close', () => resolvePromise()))))
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
@@ -84,6 +91,25 @@ function writeBottleArchive(root: string, name: string, entries: TarFixtureEntry
   const archive = join(root, name)
   writeFileSync(archive, compressed)
   return { archive, compressed, sha256: sha256(compressed) }
+}
+
+function waitUntil(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const started = Date.now()
+  return new Promise((resolvePromise, rejectPromise) => {
+    const check = () => {
+      if (predicate()) resolvePromise()
+      else if (Date.now() - started >= timeoutMs) rejectPromise(new Error('Timed out waiting for bottle extraction state.'))
+      else setTimeout(check, 20)
+    }
+    check()
+  })
+}
+
+function trackChild(child: ReturnType<typeof spawn>) {
+  spawnedChildren.add(child)
+  child.once('close', () => spawnedChildren.delete(child))
+  child.once('error', () => spawnedChildren.delete(child))
+  return child
 }
 
 function file(formula: string, sourcePath: string, destination: string, bytes: Buffer, executable: boolean, role: 'executable' | 'code' | 'data') {
@@ -231,7 +257,7 @@ describe('converter bottle universe', () => {
 
     expect(readFileSync(join(destination, 'lib', 'libvips.1.dylib'))).toEqual(library)
     expect(readFileSync(join(destination, 'lib', 'libvips.dylib'))).toEqual(library)
-    expect(statSync(join(destination, 'lib', 'libvips.dylib')).isSymbolicLink()).toBe(false)
+    expect(lstatSync(join(destination, 'lib', 'libvips.dylib')).isSymbolicLink()).toBe(false)
     expect(statSync(join(destination, 'lib', 'libvips.dylib')).mode & 0o777).toBe(0o644)
   })
 
@@ -517,5 +543,160 @@ describe('converter bottle universe', () => {
 
     expect(existsSync(outputRoot)).toBe(false)
     expect(readdirSync(root).filter((name) => name.startsWith('.bottle-universe-'))).toEqual([])
+  })
+
+  it('streams a highly compressed multi-chunk entry without returning or retaining its file bytes', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.alloc(8 * 1024 * 1024, 0x61)
+    const bottle = writeBottleArchive(root, 'compressed.tar.gz', [{ path: 'data/1.0/share/large.dat', bytes, mode: 0o444 }])
+    const acquisition = { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength }
+    const entries = await readVerifiedBottleEntries({
+      archive: bottle.archive, expectedBytes: acquisition.bytes, expectedSha256: acquisition.sha256,
+    })
+    const metadata = entries.find((entry: { path: string }) => entry.path.endsWith('large.dat')) as Record<string, unknown>
+    expect(metadata.size).toBe(bytes.byteLength)
+    expect(metadata.sha256).toBe(sha256(bytes))
+    expect(Object.hasOwn(metadata, 'bytes')).toBe(false)
+
+    const parent = join(root, 'Cellar', 'data')
+    mkdirSync(parent, { recursive: true })
+    const destination = join(parent, '1.0')
+    await extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: { name: 'data', version: '1.0', acquisition },
+      selectedEntries: [{ sourcePath: 'share/large.dat', sha256: sha256(bytes), bytes: bytes.byteLength, executable: false, role: 'data' }],
+      destination,
+    })
+    expect(statSync(join(destination, 'share', 'large.dat')).size).toBe(bytes.byteLength)
+  })
+
+  it('validates a deep legal symbolic-link graph without recursive stack growth', async () => {
+    const root = temporaryRoot()
+    const chainLength = 12_000
+    const targetBytes = Buffer.from('deep target')
+    const links: TarFixtureEntry[] = Array.from({ length: chainLength }, (_, index) => ({
+      path: `deep/1.0/lib/link-${index}`,
+      type: '2',
+      linkpath: index + 1 === chainLength ? 'target' : `link-${index + 1}`,
+      mode: 0o777,
+    }))
+    const bottle = writeBottleArchive(root, 'deep-links.tar.gz', [
+      ...links,
+      { path: 'deep/1.0/lib/target', bytes: targetBytes, mode: 0o444 },
+    ])
+    const parent = join(root, 'Cellar', 'deep')
+    mkdirSync(parent, { recursive: true })
+
+    await expect(extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: {
+        name: 'deep', version: '1.0',
+        acquisition: { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength },
+      },
+      selectedEntries: [{ sourcePath: 'lib/target', sha256: sha256(targetBytes), bytes: targetBytes.byteLength, executable: false, role: 'code' }],
+      destination: join(parent, '1.0'),
+    })).resolves.toBeDefined()
+  })
+
+  it('rejects a deep symbolic-link cycle with a controlled error instead of RangeError', async () => {
+    const root = temporaryRoot()
+    const chainLength = 12_000
+    const selectedBytes = Buffer.from('selected')
+    const links: TarFixtureEntry[] = Array.from({ length: chainLength }, (_, index) => ({
+      path: `deep/1.0/lib/link-${index}`,
+      type: '2',
+      linkpath: index + 1 === chainLength ? 'link-0' : `link-${index + 1}`,
+      mode: 0o777,
+    }))
+    const bottle = writeBottleArchive(root, 'deep-cycle.tar.gz', [
+      ...links,
+      { path: 'deep/1.0/lib/selected', bytes: selectedBytes, mode: 0o444 },
+    ])
+    const parent = join(root, 'Cellar', 'deep')
+    mkdirSync(parent, { recursive: true })
+
+    await expect(extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: {
+        name: 'deep', version: '1.0',
+        acquisition: { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength },
+      },
+      selectedEntries: [{ sourcePath: 'lib/selected', sha256: sha256(selectedBytes), bytes: selectedBytes.byteLength, executable: false, role: 'code' }],
+      destination: join(parent, '1.0'),
+    })).rejects.toThrow('Bottle universe inventory is invalid.')
+  })
+
+  it('holds a sibling claim across processes until rename and parent sync complete', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.from('claimed tool')
+    const bottle = writeBottleArchive(root, 'claimed.tar.gz', [{ path: 'claim/1.0/bin/tool', bytes, mode: 0o555 }])
+    const parent = join(root, 'Cellar', 'claim')
+    mkdirSync(parent, { recursive: true })
+    const destination = join(parent, '1.0')
+    const marker = join(root, 'claimed-ready')
+    const release = join(root, 'claimed-release')
+    const moduleUrl = new URL('../../scripts/converter-packs/bottle-universe.mjs', import.meta.url).href
+    const acquisition = { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength }
+    const selected = [{ sourcePath: 'bin/tool', sha256: sha256(bytes), bytes: bytes.byteLength, executable: true, role: 'executable' }]
+    const script = String.raw`
+      import { access, writeFile } from 'node:fs/promises'
+      const [moduleUrl, archive, acquisitionJson, selectedJson, destination, marker, release] = process.argv.slice(1)
+      const { extractVerifiedBottle } = await import(moduleUrl)
+      await extractVerifiedBottle({
+        archive, coordinate: { name: 'claim', version: '1.0', acquisition: JSON.parse(acquisitionJson) },
+        selectedEntries: JSON.parse(selectedJson), destination,
+        beforePublishForTest: async () => {
+          await writeFile(marker, 'ready')
+          while (true) {
+            try { await access(release); break } catch { await new Promise((resolve) => setTimeout(resolve, 20)) }
+          }
+        },
+      })
+    `
+    const child = trackChild(spawn(process.execPath, [
+      '--input-type=module', '-e', script, moduleUrl, bottle.archive, JSON.stringify(acquisition), JSON.stringify(selected),
+      destination, marker, release,
+    ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] }))
+    let stderr = ''
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    const completion = new Promise<void>((resolvePromise, rejectPromise) => {
+      child.once('error', rejectPromise)
+      child.once('close', (code) => code === 0 ? resolvePromise() : rejectPromise(new Error(stderr)))
+    })
+    await waitUntil(() => existsSync(marker))
+
+    await expect(extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: { name: 'claim', version: '1.0', acquisition },
+      selectedEntries: selected,
+      destination,
+    })).rejects.toThrow('already claimed')
+    writeFileSync(release, 'release')
+    await completion
+    expect(readFileSync(join(destination, 'bin', 'tool'))).toEqual(bytes)
+    expect(existsSync(`${destination}.claim`)).toBe(false)
+  })
+
+  it('does not replace an empty destination that appears after the claim is acquired', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.from('raced tool')
+    const bottle = writeBottleArchive(root, 'raced.tar.gz', [{ path: 'race/1.0/bin/tool', bytes, mode: 0o555 }])
+    const parent = join(root, 'Cellar', 'race')
+    mkdirSync(parent, { recursive: true })
+    const destination = join(parent, '1.0')
+
+    await expect(extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: {
+        name: 'race', version: '1.0',
+        acquisition: { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength },
+      },
+      selectedEntries: [{ sourcePath: 'bin/tool', sha256: sha256(bytes), bytes: bytes.byteLength, executable: true, role: 'executable' }],
+      destination,
+      beforePublishForTest: () => { mkdirSync(destination) },
+    })).rejects.toThrow('Bottle universe inventory is invalid.')
+    expect(readdirSync(destination)).toEqual([])
+    expect(existsSync(`${destination}.claim`)).toBe(false)
   })
 })

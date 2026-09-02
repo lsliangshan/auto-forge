@@ -1,17 +1,20 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { constants, lstatSync, realpathSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, open, realpath, rename, rm } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, realpath, rename, rm, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import process from 'node:process'
 import {
+  canonicalBytes,
   fail,
   isPathInsideRoot,
   PACK_NAMES,
   requireAbsolutePath,
   requireDirectory,
   safeEntryPath,
+  withStableRegularFile,
 } from './pack-tooling-lib.mjs'
-import { readVerifiedBottleEntries } from './bottle-archive.mjs'
+import { scanVerifiedBottleEntries } from './bottle-archive.mjs'
 
 const formulaPattern = /^[a-z0-9][a-z0-9+_.@-]*$/u
 const versionPattern = /^[A-Za-z0-9._+-]+$/u
@@ -117,47 +120,26 @@ function verifyArchiveLinks(entries, rootPrefix) {
       if (!entry.linkTarget.startsWith(rootPrefix) || !byPath.has(entry.linkTarget)) invalid()
     }
   }
-  const visiting = new Set()
-  const done = new Set()
-  function visit(path) {
-    if (done.has(path)) return
-    if (visiting.has(path)) invalid()
-    visiting.add(path)
-    const entry = byPath.get(path)
-    if (entry?.type === 'symlink') visit(entry.linkTarget)
-    visiting.delete(path)
-    done.add(path)
-  }
-  for (const entry of entries) {
-    if (entry.type === 'symlink') visit(entry.path)
+  const state = new Map()
+  for (const start of entries) {
+    if (start.type !== 'symlink' || state.get(start.path) === 'done') continue
+    const stack = []
+    let path = start.path
+    while (true) {
+      if (state.get(path) === 'visiting') invalid()
+      if (state.get(path) === 'done') break
+      const entry = byPath.get(path)
+      if (entry?.type !== 'symlink') break
+      state.set(path, 'visiting')
+      stack.push(path)
+      path = entry.linkTarget
+    }
+    while (stack.length > 0) state.set(stack.pop(), 'done')
   }
   return byPath
 }
 
-function verifiedBytes(entry, selected, selectedByArchivePath, archiveByPath) {
-  if (entry.type === 'file') {
-    if (!validLockedBottleMode(selected, entry.mode)) invalid()
-    if (entry.bytes.byteLength !== selected.bytes) invalid()
-    if (createHash('sha256').update(entry.bytes).digest('hex') !== selected.sha256) invalid()
-    return entry.bytes
-  }
-  if (entry.type !== 'symlink') invalid()
-  const targetSelected = selectedByArchivePath.get(entry.linkTarget)
-  const target = archiveByPath.get(entry.linkTarget)
-  if (!targetSelected || target?.type !== 'file') invalid()
-  const bytes = verifiedBytes(target, targetSelected, selectedByArchivePath, archiveByPath)
-  if (
-    targetSelected.sha256 !== selected.sha256
-    || targetSelected.bytes !== selected.bytes
-    || targetSelected.executable !== selected.executable
-    || targetSelected.role !== selected.role
-    || bytes.byteLength !== selected.bytes
-    || createHash('sha256').update(bytes).digest('hex') !== selected.sha256
-  ) invalid()
-  return bytes
-}
-
-async function createOutputFile(root, relativePath, bytes, mode) {
+async function createOutputHandle(root, relativePath, mode) {
   const segments = relativePath.split('/')
   let directory = root
   for (const segment of segments.slice(0, -1)) {
@@ -174,13 +156,7 @@ async function createOutputFile(root, relativePath, bytes, mode) {
     mode,
   ).catch(() => undefined)
   if (!handle) invalid()
-  try {
-    await handle.writeFile(bytes)
-    await handle.chmod(mode)
-    await handle.sync()
-  } finally {
-    await handle.close()
-  }
+  return { handle, path: output }
 }
 
 async function createPrivateDirectory(parent, prefix) {
@@ -192,43 +168,204 @@ async function createPrivateDirectory(parent, prefix) {
   return root
 }
 
-export async function extractVerifiedBottle({ archive, coordinate, selectedEntries, destination }) {
+async function syncDirectory(path) {
+  const handle = await open(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function acquireDestinationClaim(destination) {
+  const path = `${destination}.claim`
+  const nonce = randomUUID()
+  const pid = process.pid
+  const bytes = canonicalBytes({ nonce, pid })
+  const handle = await open(
+    path,
+    constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  ).catch(() => undefined)
+  if (!handle) fail('Bottle extraction destination is already claimed.')
+  try {
+    await handle.writeFile(bytes)
+    await handle.sync()
+    await syncDirectory(dirname(path))
+    const metadata = await handle.stat()
+    return { path, handle, dev: metadata.dev, ino: metadata.ino, bytes, nonce }
+  } catch (error) {
+    await handle.close().catch(() => undefined)
+    await unlink(path).catch(() => undefined)
+    throw error
+  }
+}
+
+async function verifyDestinationClaim(claim) {
+  const content = Buffer.alloc(claim.bytes.byteLength)
+  const [opened, current, read] = await Promise.all([
+    claim.handle.stat(),
+    lstat(claim.path).catch(() => undefined),
+    claim.handle.read(content, 0, content.byteLength, 0),
+  ])
+  if (
+    !current?.isFile()
+    || current.isSymbolicLink()
+    || current.nlink !== 1
+    || opened.nlink !== 1
+    || current.dev !== claim.dev
+    || current.ino !== claim.ino
+    || opened.dev !== claim.dev
+    || opened.ino !== claim.ino
+    || opened.size !== claim.bytes.byteLength
+    || read.bytesRead !== claim.bytes.byteLength
+    || !content.equals(claim.bytes)
+  ) invalid()
+}
+
+async function releaseDestinationClaim(claim) {
+  await claim.handle.close().catch(() => undefined)
+  const current = await lstat(claim.path).catch(() => undefined)
+  if (current?.dev === claim.dev && current.ino === claim.ino) await unlink(claim.path)
+  await syncDirectory(dirname(claim.path))
+}
+
+async function writeAll(handle, bytes, position) {
+  let offset = 0
+  while (offset < bytes.byteLength) {
+    const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset, position + offset)
+    if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0) invalid()
+    offset += bytesWritten
+  }
+  return offset
+}
+
+async function copyVerifiedRegularFile({ source, destinationRoot, destinationPath, expected, openHandles }) {
+  return withStableRegularFile(source, 'Bottle selected link target', async (sourceHandle, metadata) => {
+    if (metadata.size !== expected.bytes) invalid()
+    const output = await createOutputHandle(destinationRoot, destinationPath, regularMode(expected))
+    openHandles.add(output.handle)
+    const digest = createHash('sha256')
+    const buffer = Buffer.allocUnsafe(1024 * 1024)
+    let position = 0
+    try {
+      while (position < metadata.size) {
+        const { bytesRead } = await sourceHandle.read(buffer, 0, Math.min(buffer.byteLength, metadata.size - position), position)
+        if (bytesRead <= 0) invalid()
+        const chunk = buffer.subarray(0, bytesRead)
+        digest.update(chunk)
+        await writeAll(output.handle, chunk, position)
+        position += bytesRead
+      }
+      if (digest.digest('hex') !== expected.sha256) invalid()
+      await output.handle.chmod(regularMode(expected))
+      await output.handle.sync()
+    } finally {
+      openHandles.delete(output.handle)
+      await output.handle.close()
+    }
+  })
+}
+
+export async function extractVerifiedBottle({
+  archive,
+  coordinate,
+  selectedEntries,
+  destination,
+  beforePublishForTest,
+}) {
   validateCoordinate(coordinate)
+  if (beforePublishForTest !== undefined && typeof beforePublishForTest !== 'function') invalid()
   requireAbsolutePath(destination, 'Bottle extraction destination')
   const parent = dirname(destination)
   await requireDirectory(parent, 'Bottle extraction parent')
   if (await lstat(destination).catch(() => undefined)) invalid()
   const selected = expectedEntries(selectedEntries)
   const acquisition = coordinate.acquisition
-  const archiveEntries = await readVerifiedBottleEntries({
-    archive,
-    expectedBytes: acquisition.bytes,
-    expectedSha256: acquisition.sha256,
-  })
   const rootPrefix = `${coordinate.name}/${coordinate.version}/`
-  const archiveByPath = verifyArchiveLinks(archiveEntries, rootPrefix)
   const selectedByArchivePath = new Map(selected.map((entry) => [`${rootPrefix}${entry.sourcePath}`, entry]))
-  const materialized = selected.map((entry) => {
-    const archivePath = `${rootPrefix}${entry.sourcePath}`
-    const archiveEntry = archiveByPath.get(archivePath)
-    if (!archiveEntry) invalid()
-    return { entry, bytes: verifiedBytes(archiveEntry, entry, selectedByArchivePath, archiveByPath) }
-  })
-
-  const privateRoot = await createPrivateDirectory(parent, '.bottle-extract-')
+  const claim = await acquireDestinationClaim(destination)
+  let privateRoot
+  let published = false
+  const openHandles = new Set()
   try {
-    for (const item of materialized) {
-      await createOutputFile(privateRoot, item.entry.sourcePath, item.bytes, regularMode(item.entry))
+    if (await lstat(destination).catch(() => undefined)) invalid()
+    privateRoot = await createPrivateDirectory(parent, '.bottle-extract-')
+    const archiveEntries = await scanVerifiedBottleEntries({
+      archive,
+      expectedBytes: acquisition.bytes,
+      expectedSha256: acquisition.sha256,
+      onFile: async (metadata) => {
+        const expected = selectedByArchivePath.get(metadata.path)
+        if (!expected) return undefined
+        if (!validLockedBottleMode(expected, metadata.mode) || metadata.size !== expected.bytes) invalid()
+        const output = await createOutputHandle(privateRoot, expected.sourcePath, regularMode(expected))
+        openHandles.add(output.handle)
+        let position = 0
+        return {
+          async write(chunk) {
+            position += await writeAll(output.handle, chunk, position)
+          },
+          async finish(entry) {
+            try {
+              if (entry.size !== expected.bytes || entry.sha256 !== expected.sha256 || position !== expected.bytes) invalid()
+              await output.handle.chmod(regularMode(expected))
+              await output.handle.sync()
+            } finally {
+              openHandles.delete(output.handle)
+              await output.handle.close()
+            }
+          },
+        }
+      },
+    })
+    const archiveByPath = verifyArchiveLinks(archiveEntries, rootPrefix)
+    for (const expected of selected) {
+      const archiveEntry = archiveByPath.get(`${rootPrefix}${expected.sourcePath}`)
+      if (!archiveEntry) invalid()
+      if (archiveEntry.type === 'file') {
+        if (
+          !validLockedBottleMode(expected, archiveEntry.mode)
+          || archiveEntry.size !== expected.bytes
+          || archiveEntry.sha256 !== expected.sha256
+        ) invalid()
+        continue
+      }
+      if (archiveEntry.type !== 'symlink') invalid()
+      const targetExpected = selectedByArchivePath.get(archiveEntry.linkTarget)
+      const target = archiveByPath.get(archiveEntry.linkTarget)
+      if (
+        !targetExpected
+        || target?.type !== 'file'
+        || targetExpected.sha256 !== expected.sha256
+        || targetExpected.bytes !== expected.bytes
+        || targetExpected.executable !== expected.executable
+        || targetExpected.role !== expected.role
+        || target.sha256 !== expected.sha256
+        || target.size !== expected.bytes
+      ) invalid()
+      await copyVerifiedRegularFile({
+        source: join(privateRoot, ...targetExpected.sourcePath.split('/')),
+        destinationRoot: privateRoot,
+        destinationPath: expected.sourcePath,
+        expected,
+        openHandles,
+      })
     }
+    await beforePublishForTest?.({ claimPath: claim.path, destination })
+    await verifyDestinationClaim(claim)
     await requireDirectory(parent, 'Bottle extraction parent')
     await requireDirectory(privateRoot, 'Bottle private extraction root')
     if (await lstat(destination).catch(() => undefined)) invalid()
     await rename(privateRoot, destination)
-  } catch (error) {
-    await rm(privateRoot, { recursive: true, force: true })
-    throw error
+    await syncDirectory(parent)
+    published = true
+  } finally {
+    await Promise.allSettled([...openHandles].map((handle) => handle.close()))
+    if (!published && privateRoot !== undefined) await rm(privateRoot, { recursive: true, force: true })
+    await releaseDestinationClaim(claim)
   }
-  return Object.freeze(materialized.map(({ entry }) => Object.freeze({
+  return Object.freeze(selected.map((entry) => Object.freeze({
     sourcePath: entry.sourcePath,
     path: join(destination, ...entry.sourcePath.split('/')),
   })))
@@ -349,8 +486,12 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
   if (sourceFormulae.size !== formulae.length) invalid()
   const closureNames = new Set()
   const records = []
-  const privateRoot = await createPrivateDirectory(parent, '.bottle-universe-')
+  const claim = await acquireDestinationClaim(outputRoot)
+  let privateRoot
+  let published = false
   try {
+    if (await lstat(outputRoot).catch(() => undefined)) invalid()
+    privateRoot = await createPrivateDirectory(parent, '.bottle-universe-')
     const cellarRoot = join(privateRoot, 'Cellar')
     await mkdir(cellarRoot, { mode: 0o755 })
     await requireDirectory(cellarRoot, 'Bottle universe Cellar')
@@ -384,13 +525,16 @@ export async function materializeBottleUniverse({ target, closureLock, formulae,
       })
     }
     if ([...selected.keys()].some((key) => !closureNames.has(key.slice(0, key.indexOf('\0'))))) invalid()
+    await verifyDestinationClaim(claim)
     await requireDirectory(parent, 'Bottle universe parent')
     await requireDirectory(privateRoot, 'Bottle private universe root')
     if (await lstat(outputRoot).catch(() => undefined)) invalid()
     await rename(privateRoot, outputRoot)
-  } catch (error) {
-    await rm(privateRoot, { recursive: true, force: true })
-    throw error
+    await syncDirectory(parent)
+    published = true
+  } finally {
+    if (!published && privateRoot !== undefined) await rm(privateRoot, { recursive: true, force: true })
+    await releaseDestinationClaim(claim)
   }
 
   const publishedRecords = records.map((record) => {
