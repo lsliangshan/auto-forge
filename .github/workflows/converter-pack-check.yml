@@ -42,7 +42,6 @@ jobs:
       - name: Verify workflow and source contracts
         run: |
           pnpm --filter @autoforge/desktop converter-packs:verify-workflows
-          pnpm --filter @autoforge/desktop converter-packs:verify-sources --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target darwin-arm64
-          pnpm --filter @autoforge/desktop converter-packs:verify-sources --lock "$PWD/apps/desktop/converter-packs/sources.lock.json" --target darwin-x64
+          pnpm --filter @autoforge/desktop converter-packs:verify-sources
       - name: Run credential-free converter tests
         run: pnpm exec vitest run apps/desktop/tests/integration/converter-pack-*.test.ts

@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer'
-import { pathToFileURL, URL } from 'node:url'
+import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import process from 'node:process'
 import {
   canonicalBytes,
@@ -20,6 +20,7 @@ const versionSegmentPattern = /^[A-Za-z0-9._+-]+$/u
 const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
 const maximumSourceLockBytes = 8 * 1024 * 1024
 const maximumClosureLockBytes = 64 * 1024 * 1024
+const defaultSourceLockPath = fileURLToPath(new URL('../../converter-packs/sources.lock.json', import.meta.url))
 
 function plainRecord(value) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
@@ -302,9 +303,16 @@ export async function loadConverterSourceLockMain(argv, {
   stdout = process.stdout,
   stderr = process.stderr,
   load = loadConverterSourceLock,
+  defaultLockPath = defaultSourceLockPath,
 } = {}) {
   try {
+    if (argv.length === 0) {
+      for (const target of targets) await load({ path: defaultLockPath, target })
+      stdout.write('verified converter source locks for darwin-arm64 and darwin-x64\n')
+      return 0
+    }
     const args = parseArguments(argv, ['--lock', '--target'])
+    if (typeof args['--lock'] !== 'string' || typeof args['--target'] !== 'string') fail('Source lock arguments are incomplete.')
     await load({ path: args['--lock'], target: args['--target'] })
     stdout.write(`verified converter source lock for ${args['--target']}\n`)
     return 0

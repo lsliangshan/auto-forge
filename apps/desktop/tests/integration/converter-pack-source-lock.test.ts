@@ -115,6 +115,37 @@ function writeLock(root: string, value: unknown): string {
 }
 
 describe('converter pack source lock schema v2', () => {
+  it('verifies both checked-in targets in no-argument mode', async () => {
+    const path = writeLock(temporaryRoot(), fixture())
+    const calls: Array<{ path: string, target: string }> = []
+    const stdout: string[] = []
+
+    const exitCode = await loadConverterSourceLockMain([], {
+      defaultLockPath: path,
+      stdout: { write: (value: string) => { stdout.push(value); return true } },
+      stderr: { write: () => { throw new Error('unexpected stderr') } },
+      load: async (request) => { calls.push(request) },
+    })
+
+    expect(exitCode).toBe(0)
+    expect(calls).toEqual(targets.map((target) => ({ path, target })))
+    expect(stdout).toEqual(['verified converter source locks for darwin-arm64 and darwin-x64\n'])
+  })
+
+  it('preserves explicit lock and target verification mode', async () => {
+    const path = writeLock(temporaryRoot(), fixture())
+    const calls: Array<{ path: string, target: string }> = []
+
+    const exitCode = await loadConverterSourceLockMain(['--lock', path, '--target', 'darwin-x64'], {
+      stdout: { write: () => true },
+      stderr: { write: () => { throw new Error('unexpected stderr') } },
+      load: async (request) => { calls.push(request) },
+    })
+
+    expect(exitCode).toBe(0)
+    expect(calls).toEqual([{ path, target: 'darwin-x64' }])
+  })
+
   it('reports CLI verification failures with a fixed path-free message', async () => {
     const stderr: string[] = []
     const secret = '/private/source-lock/customer-name/sources.lock.json'
