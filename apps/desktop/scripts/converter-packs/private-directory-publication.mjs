@@ -10,17 +10,20 @@ const noncePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a
 const maximumClaimBytes = 2048
 const initializationGraceMs = 250
 const heartbeatMs = 5 * 1000
+const leaseMs = 30 * 1000
 
 function missing(error) {
   return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
 }
 
-function ownerAlive(pid) {
+function ownerState(pid) {
   try {
     process.kill(pid, 0)
-    return true
+    return 'alive'
   } catch (error) {
-    return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'EPERM')
+    return error && typeof error === 'object' && 'code' in error && error.code === 'ESRCH'
+      ? 'dead'
+      : 'unknown'
   }
 }
 
@@ -34,9 +37,10 @@ function exactKeys(value, expected) {
 
 function validClaim(value, destination) {
   const expectedPartial = `.${basename(destination)}.${value?.nonce}.partial`
-  return exactKeys(value, ['createdAtMs', 'nonce', 'partialName', 'pid'])
+  return exactKeys(value, ['createdAtMs', 'leaseMs', 'nonce', 'partialName', 'pid'])
     && Number.isSafeInteger(value.createdAtMs)
     && value.createdAtMs > 0
+    && value.leaseMs === leaseMs
     && noncePattern.test(value.nonce)
     && value.partialName === expectedPartial
     && Number.isSafeInteger(value.pid)
@@ -197,6 +201,7 @@ async function acquireClaim(destination, afterClaimOpenForTest, claimInitializat
     const nonce = randomUUID()
     const value = {
       createdAtMs: Date.now(),
+      leaseMs,
       nonce,
       partialName: `.${basename(destination)}.${nonce}.partial`,
       pid: process.pid,
@@ -236,8 +241,10 @@ async function acquireClaim(destination, afterClaimOpenForTest, claimInitializat
       if (Date.now() - current.stat.mtimeMs <= initializationGraceMs) {
         fail('Private directory publication is already claimed.')
       }
-    } else if (ownerAlive(current.value.pid)) {
-      fail('Private directory publication is already claimed.')
+    } else {
+      const owner = ownerState(current.value.pid)
+      if (owner !== 'dead') fail('Private directory publication is already claimed.')
+      // ESRCH is a definitive local-owner death and safely revokes even a fresh lease.
     }
     await fenceClaim(path, destination, current)
   }

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import {
   chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync,
-  symlinkSync, writeFileSync,
+  symlinkSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -159,6 +159,11 @@ describe('locked engine asset set', () => {
     ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] })
     children.push(child)
     await waitUntil(() => existsSync(marker))
+    const claim = JSON.parse(readFileSync(`${outputRoot}.claim`, 'utf8'))
+    expect(claim.leaseMs).toBe(30_000)
+    expect(Object.keys(claim).sort()).toEqual(['createdAtMs', 'leaseMs', 'nonce', 'partialName', 'pid'])
+    const expired = new Date(Date.now() - 60_000)
+    utimesSync(`${outputRoot}.claim`, expired, expired)
 
     await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot }))
       .rejects.toThrow('Private directory publication is already claimed.')
