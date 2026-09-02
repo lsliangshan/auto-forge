@@ -115,7 +115,7 @@ const discoveryEntrypoints = Object.freeze({
 // These are runtime-loaded resources which cannot be reached through LC_LOAD_DYLIB.
 // The allowlist is intentionally code-owned: capture input cannot add roots or data.
 const imageRuntimePolicy = Object.freeze([
-  { formula: 'vips', role: 'code', pattern: /^lib\/vips-modules-[0-9.]+\/[^/]+\.so$/u },
+  { formula: 'vips', role: 'code', pattern: /^lib\/vips-modules-[0-9.]+\/vips-[^/]+\.dylib$/u },
   { formula: 'glib', role: 'data', pattern: /^share\/glib-2\.0\/schemas\/gschemas\.compiled$/u },
   { formula: 'gdk-pixbuf', role: 'code', pattern: /^lib\/gdk-pixbuf-2\.0\/[0-9.]+\/loaders\/[^/]+\.so$/u },
   { formula: 'gdk-pixbuf', role: 'data', pattern: /^lib\/gdk-pixbuf-2\.0\/[0-9.]+\/loaders\.cache$/u },
@@ -179,7 +179,8 @@ function discoveryRuntimeRole(family, file) {
 
 function licensePriority(file) {
   const name = posix.basename(file.sourcePath).toLocaleUpperCase('en-US')
-  return licenseNames.indexOf(name)
+  const match = /^(COPYING|LICENSE|LICENCE|COPYRIGHT|NOTICE)(?:\.[A-Z0-9][A-Z0-9._+-]*)?$/u.exec(name)
+  return match ? licenseNames.indexOf(match[1]) : -1
 }
 
 function discoveryReplacement(destination, dependencyDestination) {
@@ -188,8 +189,13 @@ function discoveryReplacement(destination, dependencyDestination) {
 
 function discoveryDestination(file, role, fixedDestination) {
   if (fixedDestination !== undefined) return fixedDestination
-  if (role === 'code') return `lib/${file.formula}/${posix.basename(file.sourcePath)}`
+  if (role === 'code') return namespacedCodeDestination(file.formula, file.sourcePath)
   return `share/runtime/${file.formula}/${file.sourcePath}`
+}
+
+function namespacedCodeDestination(formula, sourcePath) {
+  const relative = sourcePath.startsWith('lib/') ? sourcePath.slice('lib/'.length) : posix.basename(sourcePath)
+  return `lib/${formula}/${relative}`
 }
 
 function discoveryPathForFormula(byFormulaPath, formula, sourcePath) {
@@ -302,29 +308,34 @@ export async function discoverMachOClosure({ family, architecture, files, inspec
     const node = await add(file, 'executable', false, expected.destination, dirname(file.source))
     entrypoints.push({ source: file.source, destination: node.destination })
   }
+  let cursor = 0
+  const drainQueue = async () => {
+    while (cursor < queue.length) {
+      const node = queue[cursor]
+      cursor += 1
+      const inspection = validateInspection(await inspect(node.file.source), architecture)
+      for (const dependency of inspection.dependencies) {
+        const file = resolveDiscoveryDependency(dependency, inspection, node, { byFormulaPath, bySource })
+        if (file === undefined) continue
+        const dependencyNode = await add(file, 'code', false, undefined, node.executableDirectory)
+        if (dependencyNode === node) continue
+        const pair = `${node.destination}\0${dependency}`
+        if (rewritePairs.has(pair)) fail('Mach-O inspection contains a duplicate dependency.')
+        rewritePairs.add(pair)
+        rewrites.push({
+          destination: node.destination,
+          dependency,
+          replacement: discoveryReplacement(node.destination, dependencyNode.destination),
+        })
+      }
+    }
+  }
+  await drainQueue()
   for (const file of files) {
     const role = discoveryRuntimeRole(family, file)
     if (role) await add(file, role, role === 'code', undefined, undefined)
   }
-
-  for (let cursor = 0; cursor < queue.length; cursor += 1) {
-    const node = queue[cursor]
-    const inspection = validateInspection(await inspect(node.file.source), architecture)
-    for (const dependency of inspection.dependencies) {
-      const file = resolveDiscoveryDependency(dependency, inspection, node, { byFormulaPath, bySource })
-      if (file === undefined) continue
-      const dependencyNode = await add(file, 'code', false, undefined, node.executableDirectory)
-      if (dependencyNode === node) continue
-      const pair = `${node.destination}\0${dependency}`
-      if (rewritePairs.has(pair)) fail('Mach-O inspection contains a duplicate dependency.')
-      rewritePairs.add(pair)
-      rewrites.push({
-        destination: node.destination,
-        dependency,
-        replacement: discoveryReplacement(node.destination, dependencyNode.destination),
-      })
-    }
-  }
+  await drainQueue()
 
   const contributing = new Set([...selected.values()].map((node) => node.file.formula))
   const licenses = []
@@ -528,7 +539,7 @@ export async function planMachOClosure({ entrypoints, architecture, inspect, uni
     if (byDestination.has(destinationKey)) fail(`Mach-O destination collision: ${expected.destination}`)
     if (!expected.executable) {
       const requiredDestination = expected.role === 'code'
-        ? `lib/${expected.formula}/${posix.basename(expected.sourcePath)}`
+        ? namespacedCodeDestination(expected.formula, expected.sourcePath)
         : undefined
       if (requiredDestination && expected.destination !== requiredDestination) {
         fail(`Mach-O library destination is not namespaced: ${expected.destination}`)

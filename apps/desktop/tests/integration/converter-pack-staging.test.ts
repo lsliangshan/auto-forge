@@ -220,24 +220,28 @@ describe('converter pack Mach-O closure', () => {
     const root = temporaryRoot()
     const vips = discoveryFile(root, 'vips', '8.18.6', 'bin/vips')
     const libvips = discoveryFile(root, 'vips', '8.18.6', 'lib/libvips.42.dylib')
+    const vipsModule = discoveryFile(root, 'vips', '8.18.6', 'lib/vips-modules-8.18/vips-heif.dylib')
+    const vipsModuleHelper = discoveryFile(root, 'vips', '8.18.6', 'lib/vips-modules-8.18/vips-helper.dylib')
     const glib = discoveryFile(root, 'glib', '2.86.0', 'lib/libglib-2.0.0.dylib')
     const schemas = discoveryFile(root, 'glib', '2.86.0', 'share/glib-2.0/schemas/gschemas.compiled')
     const ignoredData = discoveryFile(root, 'glib', '2.86.0', 'share/arbitrary/host-controlled.dat')
-    const vipsLicense = discoveryFile(root, 'vips', '8.18.6', 'share/licenses/vips/COPYING')
-    const vipsLowerPriorityLicense = discoveryFile(root, 'vips', '8.18.6', 'share/licenses/vips/LICENSE.third-party')
-    const glibLicense = discoveryFile(root, 'glib', '2.86.0', 'share/licenses/glib/LICENSE')
+    const vipsLicense = discoveryFile(root, 'vips', '8.18.6', 'share/licenses/vips/COPYING.LIB')
+    const vipsLowerPriorityLicense = discoveryFile(root, 'vips', '8.18.6', 'share/licenses/vips/LICENSE.md')
+    const glibLicense = discoveryFile(root, 'glib', '2.86.0', 'share/licenses/glib/LICENSE.md')
     const dependency = '@@HOMEBREW_CELLAR@@/vips/8.18.6/lib/libvips.42.dylib'
     const prefixDependency = '@@HOMEBREW_PREFIX@@/opt/glib/lib/libglib-2.0.0.dylib'
     const inspections = new Map([
       [vips.source, { architectures: ['arm64'], dependencies: [dependency, prefixDependency, '/usr/lib/libSystem.B.dylib'], rpaths: [] }],
       [libvips.source, { architectures: ['arm64'], dependencies: [], rpaths: [] }],
+      [vipsModule.source, { architectures: ['arm64'], dependencies: ['@loader_path/vips-helper.dylib'], rpaths: [] }],
+      [vipsModuleHelper.source, { architectures: ['arm64'], dependencies: [], rpaths: [] }],
       [glib.source, { architectures: ['arm64'], dependencies: [], rpaths: [] }],
     ])
 
     const discovered = await discoverMachOClosure({
       family: 'image-icon',
       architecture: 'arm64',
-      files: [ignoredData, glibLicense, vipsLowerPriorityLicense, schemas, glib, vipsLicense, libvips, vips],
+      files: [ignoredData, glibLicense, vipsLowerPriorityLicense, schemas, glib, vipsLicense, vipsModuleHelper, vipsModule, libvips, vips],
       inspect: async (path: string) => inspections.get(path),
     })
 
@@ -246,15 +250,18 @@ describe('converter pack Mach-O closure', () => {
       { ...vips, destination: 'bin/vips', executable: true, role: 'executable', runtimeRoot: false },
       { ...glib, destination: 'lib/glib/libglib-2.0.0.dylib', executable: false, role: 'code', runtimeRoot: false },
       { ...libvips, destination: 'lib/vips/libvips.42.dylib', executable: false, role: 'code', runtimeRoot: false },
+      { ...vipsModule, destination: 'lib/vips/vips-modules-8.18/vips-heif.dylib', executable: false, role: 'code', runtimeRoot: true },
+      { ...vipsModuleHelper, destination: 'lib/vips/vips-modules-8.18/vips-helper.dylib', executable: false, role: 'code', runtimeRoot: true },
       { ...schemas, destination: 'share/runtime/glib/share/glib-2.0/schemas/gschemas.compiled', executable: false, role: 'data', runtimeRoot: false },
     ])
     expect(discovered.rewrites).toEqual([
       { destination: 'bin/vips', dependency, replacement: '@loader_path/../lib/vips/libvips.42.dylib' },
       { destination: 'bin/vips', dependency: prefixDependency, replacement: '@loader_path/../lib/glib/libglib-2.0.0.dylib' },
+      { destination: 'lib/vips/vips-modules-8.18/vips-heif.dylib', dependency: '@loader_path/vips-helper.dylib', replacement: '@loader_path/vips-helper.dylib' },
     ])
     expect(discovered.licenses).toEqual([
-      { ...glibLicense, destination: 'LICENSES/glib.LICENSE' },
-      { ...vipsLicense, destination: 'LICENSES/vips.COPYING' },
+      { ...glibLicense, destination: 'LICENSES/glib.LICENSE.md' },
+      { ...vipsLicense, destination: 'LICENSES/vips.COPYING.LIB' },
     ])
     expect(discovered.files.some((file: { sourcePath: string }) => file.sourcePath === ignoredData.sourcePath)).toBe(false)
 
@@ -287,6 +294,29 @@ describe('converter pack Mach-O closure', () => {
       files: [tool],
       inspect: async () => ({ architectures: ['arm64'], dependencies: [], rpaths: [] }),
     })).rejects.toThrow(/license/iu)
+  })
+
+  it('drains entrypoint dependencies before resolving executable-path dependencies from runtime roots', async () => {
+    const root = temporaryRoot()
+    const vips = discoveryFile(root, 'vips', '8.18.6', 'bin/vips')
+    const module = discoveryFile(root, 'vips', '8.18.6', 'lib/vips-modules-8.18/vips-heif.dylib')
+    const companion = discoveryFile(root, 'vips', '8.18.6', 'bin/companion.dylib')
+    const license = discoveryFile(root, 'vips', '8.18.6', 'share/licenses/vips/COPYING')
+    const inspections = new Map([
+      [vips.source, { architectures: ['arm64'], dependencies: ['@@HOMEBREW_CELLAR@@/vips/8.18.6/lib/vips-modules-8.18/vips-heif.dylib'], rpaths: [] }],
+      [module.source, { architectures: ['arm64'], dependencies: ['@executable_path/companion.dylib'], rpaths: [] }],
+      [companion.source, { architectures: ['arm64'], dependencies: [], rpaths: [] }],
+    ])
+
+    const discovered = await discoverMachOClosure({
+      family: 'image-icon', architecture: 'arm64', files: [vips, module, companion, license],
+      inspect: async (path: string) => inspections.get(path),
+    })
+
+    expect(discovered.files.find((file) => file.sourcePath === module.sourcePath)).toMatchObject({
+      destination: 'lib/vips/vips-modules-8.18/vips-heif.dylib', runtimeRoot: true,
+    })
+    expect(discovered.files.map((file) => file.sourcePath)).toContain('bin/companion.dylib')
   })
 
   it('expands locked Homebrew placeholders and matches the exact namespaced closure', async () => {
