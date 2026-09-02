@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -9,6 +10,8 @@ import {
   runLocalDevelopmentReleasePreparationCli,
   runLocalDevelopmentReleasePreparation,
 } from '../../scripts/converter-packs/prepare-local-development-release.mjs'
+import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
+import { writeDevelopmentReleaseMetadata } from '../../scripts/converter-packs/local-development-release-cache.mjs'
 
 const roots: string[] = []
 const fingerprintFiles = [
@@ -150,6 +153,34 @@ it('runs the authenticated cold pipeline in exact order and publishes metadata b
     'validate', 'preflight', 'acquire', 'universe', 'helpers', 'plan',
     'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune',
   ])
+})
+
+it('publishes canonical immutable metadata with the exact acquired blob measurements', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const archive = Buffer.from('archive')
+  const blob = { bytes: archive.byteLength, sha256: createHash('sha256').update(archive).digest('hex') }
+  const events: string[] = []
+  const result = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies(events, {
+    preparePlan: async (value: Record<string, unknown>) => {
+      await (value.afterMaterialize as () => Promise<void>)()
+      events.push('plan')
+      await writeFile(join(value.cacheRoot as string, `${blob.sha256}.archive`), archive)
+      await writeFile(value.planPath as string, '{}\n')
+      return { blobs: [blob], networkBytes: archive.byteLength }
+    },
+    writeMetadata: async (value: Parameters<typeof writeDevelopmentReleaseMetadata>[0]) => {
+      events.push('metadata')
+      await writeDevelopmentReleaseMetadata(value)
+    },
+  }))
+
+  const metadataPath = join(cacheRoot, 'release-metadata', `${result.fingerprint}.json`)
+  expect(readFileSync(metadataPath)).toEqual(canonicalBytes({
+    blobs: [blob], fingerprint: result.fingerprint,
+    release: `releases/${result.fingerprint}`, schemaVersion: 1,
+  }))
+  expect(statSync(metadataPath).mode & 0o777).toBe(0o444)
+  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
 })
 
 it('reuses only the verified active fingerprint with integrity and safe pruning while preserving mtimes', async () => {
@@ -343,6 +374,51 @@ it('removes a smoke-failed cold release, preserves the prior marker, and rebuild
   const secondEvents: string[] = []
   await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies(secondEvents))
   expect(secondEvents).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
+})
+
+it('preserves resumable source state and removes all unpublished cold state after staging fails', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const previous = 'a'.repeat(64)
+  const marker = `{"fingerprint":"${previous}","schemaVersion":1}\n`
+  const partialSha = 'c'.repeat(64)
+  const partialNonce = randomUUID()
+  const partial = join(cacheRoot, 'sources', `.${partialSha}.${partialNonce}.partial`)
+  const partialMetadata = canonicalBytes({
+    bytes: 20, nonce: partialNonce, partialBytes: 15, sha256: partialSha,
+    url: 'https://downloads.example.test/resumable',
+  })
+  const owner = canonicalBytes({
+    bytes: 20, nonce: partialNonce, pid: process.pid, sha256: partialSha, state: 'resume',
+    url: 'https://downloads.example.test/resumable',
+  })
+  await mkdir(join(cacheRoot, 'releases', previous), { recursive: true })
+  await mkdir(join(cacheRoot, 'sources'), { recursive: true })
+  await writeFile(join(cacheRoot, 'active-release.json'), marker)
+  await writeFile(join(cacheRoot, 'sources', `.${partialSha}.owner`), owner)
+  await writeFile(partial, 'resumable bytes')
+  await writeFile(`${partial}.json`, partialMetadata)
+  const events: string[] = []
+
+  await expect(prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies(events, {
+    stagePacks: async () => { events.push('stage'); throw new Error('staging failed') },
+  }))).rejects.toThrow('staging failed')
+
+  const inputs = await developmentFingerprintInputs(desktopRoot)
+  const { fingerprintDevelopmentRelease } = await import('../../scripts/converter-packs/local-development-release-cache.mjs')
+  const fingerprint = fingerprintDevelopmentRelease({ target: 'darwin-arm64', inputs })
+  expect(await readFile(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
+  expect(await readFile(partial, 'utf8')).toBe('resumable bytes')
+  expect(await readFile(`${partial}.json`)).toEqual(partialMetadata)
+  expect(await readFile(join(cacheRoot, 'sources', `.${partialSha}.owner`))).toEqual(owner)
+  expect(existsSync(join(cacheRoot, 'releases', fingerprint))).toBe(false)
+  expect(existsSync(join(cacheRoot, 'release-metadata', `${fingerprint}.json`))).toBe(false)
+  expect(existsSync(join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}`))).toBe(false)
+  expect(events).toEqual(['helpers', 'plan', 'stage'])
+
+  const retryEvents: string[] = []
+  const retry = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies(retryEvents))
+  expect(retry.reused).toBe(false)
+  expect(retryEvents).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
 })
 
 it('keeps a release when activation writes its marker and then throws', async () => {

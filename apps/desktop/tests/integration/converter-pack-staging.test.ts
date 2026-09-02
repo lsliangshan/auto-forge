@@ -151,6 +151,20 @@ function stagingFixture(root: string) {
       engineLicenses: name === 'document' ? [documentLicense] : [],
     }]
   }))
+  versions.shared = '1.0'
+  const sharedCode = lockedFile(
+    universeRoot, 'shared', '1.0', 'lib/libshared.dylib', 'lib/shared/libshared.dylib', false, 'code', true,
+  ).lock
+  const sharedLicense = lockedFile(
+    universeRoot, 'shared', '1.0', 'LICENSE', 'LICENSES/shared.txt', false, 'data', false,
+  ).lock
+  for (const name of ['image-icon', 'pdf']) {
+    families[name].files.push(structuredClone(sharedCode))
+    families[name].licenses.push({
+      formula: 'shared', source: 'LICENSE', destination: 'LICENSES/shared.txt',
+      sha256: sharedLicense.sha256, bytes: sharedLicense.bytes,
+    })
+  }
   const closure = {
     schemaVersion: 1,
     target: 'darwin-arm64',
@@ -831,6 +845,8 @@ describe('converter pack target staging', () => {
         .toEqual(expectedExecutables[name]!.sort())
     }
     expect(readFileSync(join(output, 'packs/document-darwin-arm64/payload/share/LibreOffice.dmg'))).toBeTruthy()
+    expect(readFileSync(join(output, 'packs/image-icon-darwin-arm64/payload/lib/shared/libshared.dylib')))
+      .toEqual(readFileSync(join(output, 'packs/pdf-darwin-arm64/payload/lib/shared/libshared.dylib')))
     const release = join(root, 'release')
     await buildConverterPackIndex({ input: output, output: release, mode: 'test' })
     expect(JSON.parse(readFileSync(join(release, 'index.json'), 'utf8')).packs).toHaveLength(4)
