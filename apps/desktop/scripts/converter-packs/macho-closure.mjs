@@ -99,12 +99,263 @@ function expandAnchor(value, sourceDirectory, executableDirectory) {
 const cellarPlaceholder = /^@@HOMEBREW_CELLAR@@\/([a-z0-9][a-z0-9+_.@-]*)\/([A-Za-z0-9._+-]+)\/(.+)$/u
 const prefixPlaceholder = /^@@HOMEBREW_PREFIX@@\/opt\/([a-z0-9][a-z0-9+_.@-]*)\/(.+)$/u
 
+const discoveryEntrypoints = Object.freeze({
+  'image-icon': Object.freeze([{ formula: 'vips', sourcePath: 'bin/vips', destination: 'bin/vips' }]),
+  document: Object.freeze([]),
+  pdf: Object.freeze([
+    { formula: 'poppler', sourcePath: 'bin/pdfinfo', destination: 'bin/pdfinfo' },
+    { formula: 'poppler', sourcePath: 'bin/pdftocairo', destination: 'bin/pdftocairo' },
+  ]),
+  media: Object.freeze([
+    { formula: 'ffmpeg', sourcePath: 'bin/ffmpeg', destination: 'bin/ffmpeg' },
+    { formula: 'ffmpeg', sourcePath: 'bin/ffprobe', destination: 'bin/ffprobe' },
+  ]),
+})
+
+// These are runtime-loaded resources which cannot be reached through LC_LOAD_DYLIB.
+// The allowlist is intentionally code-owned: capture input cannot add roots or data.
+const imageRuntimePolicy = Object.freeze([
+  { formula: 'vips', role: 'code', pattern: /^lib\/vips-modules-[0-9.]+\/[^/]+\.so$/u },
+  { formula: 'glib', role: 'data', pattern: /^share\/glib-2\.0\/schemas\/gschemas\.compiled$/u },
+  { formula: 'gdk-pixbuf', role: 'code', pattern: /^lib\/gdk-pixbuf-2\.0\/[0-9.]+\/loaders\/[^/]+\.so$/u },
+  { formula: 'gdk-pixbuf', role: 'data', pattern: /^lib\/gdk-pixbuf-2\.0\/[0-9.]+\/loaders\.cache$/u },
+  { formula: 'libheif', role: 'code', pattern: /^lib\/libheif\/[^/]+\.so$/u },
+  { formula: 'imagemagick', role: 'code', pattern: /^lib\/ImageMagick-[0-9.]+\/modules-[A-Z0-9]+\/[^/]+\/[^/]+\.so$/u },
+  { formula: 'imagemagick', role: 'data', pattern: /^etc\/ImageMagick-[0-9.]+\/[^/]+\.xml$/u },
+])
+
+const runtimePolicy = Object.freeze({
+  'image-icon': imageRuntimePolicy,
+  document: Object.freeze([]),
+  pdf: Object.freeze([]),
+  media: Object.freeze([]),
+})
+
+const licenseNames = Object.freeze(['COPYING', 'LICENSE', 'LICENCE', 'COPYRIGHT', 'NOTICE'])
+
 function lockedKey(formula, sourcePath) {
   return `${formula}\0${sourcePath}`
 }
 
 function pathKey(path) {
   return path.toLocaleLowerCase('en-US')
+}
+
+function validDiscoveryFile(file) {
+  return file
+    && typeof file === 'object'
+    && typeof file.formula === 'string'
+    && /^[a-z0-9][a-z0-9+_.@-]*$/u.test(file.formula)
+    && typeof file.version === 'string'
+    && /^[A-Za-z0-9._+-]+$/u.test(file.version)
+    && safeEntryPath(file.sourcePath)
+    && typeof file.source === 'string'
+    && isAbsolute(file.source)
+    && /^[a-f0-9]{64}$/u.test(file.sha256)
+    && Number.isSafeInteger(file.bytes)
+    && file.bytes > 0
+}
+
+async function verifyDiscoveryFile(file) {
+  const metadata = await lstat(file.source).catch(() => undefined)
+  if (
+    !metadata?.isFile()
+    || metadata.isSymbolicLink()
+    || metadata.nlink !== 1
+    || await realpath(file.source).catch(() => undefined) !== file.source
+  ) fail('Discovered bottle entry must be a canonical non-symbolic regular file.')
+  const bytes = await readStableRegularFile(file.source, 'Discovered bottle entry')
+  if (bytes.byteLength !== file.bytes || sha256(bytes) !== file.sha256) {
+    fail('Discovered bottle entry differs from its verified archive identity.')
+  }
+}
+
+function discoveryRuntimeRole(family, file) {
+  const rule = runtimePolicy[family].find((candidate) => (
+    candidate.formula === file.formula && candidate.pattern.test(file.sourcePath)
+  ))
+  return rule?.role
+}
+
+function licensePriority(file) {
+  const name = posix.basename(file.sourcePath).toLocaleUpperCase('en-US')
+  return licenseNames.indexOf(name)
+}
+
+function discoveryReplacement(destination, dependencyDestination) {
+  return `@loader_path/${posix.relative(posix.dirname(destination), dependencyDestination)}`
+}
+
+function discoveryDestination(file, role, fixedDestination) {
+  if (fixedDestination !== undefined) return fixedDestination
+  if (role === 'code') return `lib/${file.formula}/${posix.basename(file.sourcePath)}`
+  return `share/runtime/${file.formula}/${file.sourcePath}`
+}
+
+function discoveryPathForFormula(byFormulaPath, formula, sourcePath) {
+  if (!safeEntryPath(sourcePath)) return undefined
+  return byFormulaPath.get(lockedKey(formula, sourcePath))
+}
+
+function resolveDiscoveryRpath(rpath, node, suffix, locked) {
+  const cellar = cellarPlaceholder.exec(rpath)
+  if (cellar) {
+    const [, formula, version, sourcePath] = cellar
+    const candidate = discoveryPathForFormula(locked.byFormulaPath, formula, posix.normalize(posix.join(sourcePath, suffix)))
+    return candidate?.version === version ? candidate : undefined
+  }
+  const prefix = prefixPlaceholder.exec(rpath)
+  if (prefix) {
+    const [, formula, sourcePath] = prefix
+    return discoveryPathForFormula(locked.byFormulaPath, formula, posix.normalize(posix.join(sourcePath, suffix)))
+  }
+  if (rpath.includes('@@HOMEBREW_') || isAbsolute(rpath)) return undefined
+  const base = expandAnchor(rpath, dirname(node.file.source), node.executableDirectory)
+  return base === undefined ? undefined : locked.bySource.get(pathKey(join(base, suffix)))
+}
+
+function resolveDiscoveryDependency(dependency, inspection, node, locked) {
+  if (systemDependency(dependency)) return undefined
+  const cellar = cellarPlaceholder.exec(dependency)
+  if (cellar) {
+    const [, formula, version, sourcePath] = cellar
+    const candidate = discoveryPathForFormula(locked.byFormulaPath, formula, sourcePath)
+    if (!candidate || candidate.version !== version) fail('Mach-O dependency is absent from the verified bottle entries.')
+    return candidate
+  }
+  const prefix = prefixPlaceholder.exec(dependency)
+  if (prefix) {
+    const [, formula, sourcePath] = prefix
+    const candidate = discoveryPathForFormula(locked.byFormulaPath, formula, sourcePath)
+    if (!candidate) fail('Mach-O dependency is absent from the verified bottle entries.')
+    return candidate
+  }
+  if (dependency.includes('@@HOMEBREW_')) fail('Mach-O dependency contains an invalid Homebrew placeholder.')
+  if (isAbsolute(dependency)) fail('Mach-O host absolute dependency is forbidden.')
+  if (dependency.startsWith('@rpath/')) {
+    const suffix = dependency.slice('@rpath/'.length)
+    for (const rpath of inspection.rpaths) {
+      const candidate = resolveDiscoveryRpath(rpath, node, suffix, locked)
+      if (candidate) return candidate
+    }
+    fail('Mach-O dependency is unresolved in verified bottle entries.')
+  }
+  const expanded = expandAnchor(dependency, dirname(node.file.source), node.executableDirectory)
+  if (expanded === undefined) fail('Mach-O dependency is unresolved in verified bottle entries.')
+  const candidate = locked.bySource.get(pathKey(expanded))
+  if (!candidate) fail('Mach-O dependency is unresolved in verified bottle entries.')
+  return candidate
+}
+
+export async function discoverMachOClosure({ family, architecture, files, inspect }) {
+  if (
+    !Object.hasOwn(discoveryEntrypoints, family)
+    || (architecture !== 'arm64' && architecture !== 'x86_64')
+    || !Array.isArray(files)
+    || files.some((file) => !validDiscoveryFile(file))
+    || typeof inspect !== 'function'
+  ) fail('Mach-O discovery request is invalid.')
+
+  const byFormulaPath = new Map()
+  const bySource = new Map()
+  const versions = new Map()
+  for (const file of files) {
+    const key = lockedKey(file.formula, file.sourcePath)
+    const foldedSource = pathKey(file.source)
+    if (byFormulaPath.has(key) || bySource.has(foldedSource)) fail('Verified bottle entry inventory contains a duplicate.')
+    const version = versions.get(file.formula)
+    if (version !== undefined && version !== file.version) fail('Verified bottle formula has multiple versions.')
+    versions.set(file.formula, file.version)
+    byFormulaPath.set(key, file)
+    bySource.set(foldedSource, file)
+  }
+
+  const selected = new Map()
+  const destinations = new Map()
+  const queue = []
+  const rewrites = []
+  const rewritePairs = new Set()
+  const add = async (file, role, runtimeRoot, fixedDestination, executableDirectory) => {
+    const existing = selected.get(lockedKey(file.formula, file.sourcePath))
+    if (existing) {
+      if (existing.role !== role || (fixedDestination !== undefined && existing.destination !== fixedDestination)) {
+        fail('Verified bottle entry has conflicting closure roles.')
+      }
+      return existing
+    }
+    await verifyDiscoveryFile(file)
+    const destination = discoveryDestination(file, role, fixedDestination)
+    const foldedDestination = destination.toLocaleLowerCase('en-US')
+    if (destinations.has(foldedDestination)) fail(`Mach-O destination collision: ${destination}`)
+    const node = { file, destination, role, runtimeRoot, executableDirectory }
+    selected.set(lockedKey(file.formula, file.sourcePath), node)
+    destinations.set(foldedDestination, node)
+    if (role !== 'data') queue.push(node)
+    return node
+  }
+
+  const entrypoints = []
+  for (const expected of discoveryEntrypoints[family]) {
+    const file = byFormulaPath.get(lockedKey(expected.formula, expected.sourcePath))
+    if (!file) fail('Fixed converter entrypoint is absent from verified bottle entries.')
+    const node = await add(file, 'executable', false, expected.destination, dirname(file.source))
+    entrypoints.push({ source: file.source, destination: node.destination })
+  }
+  for (const file of files) {
+    const role = discoveryRuntimeRole(family, file)
+    if (role) await add(file, role, role === 'code', undefined, undefined)
+  }
+
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const node = queue[cursor]
+    const inspection = validateInspection(await inspect(node.file.source), architecture)
+    for (const dependency of inspection.dependencies) {
+      const file = resolveDiscoveryDependency(dependency, inspection, node, { byFormulaPath, bySource })
+      if (file === undefined) continue
+      const dependencyNode = await add(file, 'code', false, undefined, node.executableDirectory)
+      if (dependencyNode === node) continue
+      const pair = `${node.destination}\0${dependency}`
+      if (rewritePairs.has(pair)) fail('Mach-O inspection contains a duplicate dependency.')
+      rewritePairs.add(pair)
+      rewrites.push({
+        destination: node.destination,
+        dependency,
+        replacement: discoveryReplacement(node.destination, dependencyNode.destination),
+      })
+    }
+  }
+
+  const contributing = new Set([...selected.values()].map((node) => node.file.formula))
+  const licenses = []
+  for (const formula of [...contributing].sort(compareUtf8)) {
+    const candidates = files.filter((file) => file.formula === formula && licensePriority(file) >= 0)
+    candidates.sort((left, right) => (
+      licensePriority(left) - licensePriority(right)
+      || left.sourcePath.length - right.sourcePath.length
+      || compareUtf8(left.sourcePath, right.sourcePath)
+    ))
+    const license = candidates[0]
+    if (!license) fail(`Contributing formula is missing a bottle license: ${formula}`)
+    await verifyDiscoveryFile(license)
+    licenses.push({ ...license, destination: `licenses/${formula}/${posix.basename(license.sourcePath)}` })
+  }
+
+  const discoveredFiles = [...selected.values()].map((node) => ({
+    ...node.file,
+    destination: node.destination,
+    executable: node.role === 'executable',
+    role: node.role,
+    runtimeRoot: node.runtimeRoot,
+  })).sort((left, right) => compareUtf8(left.destination, right.destination))
+  rewrites.sort((left, right) => compareUtf8(
+    `${left.destination}\0${left.dependency}\0${left.replacement}`,
+    `${right.destination}\0${right.dependency}\0${right.replacement}`,
+  ))
+  licenses.sort((left, right) => compareUtf8(
+    `${left.destination}\0${left.formula}\0${left.sourcePath}`,
+    `${right.destination}\0${right.formula}\0${right.sourcePath}`,
+  ))
+  return { entrypoints, files: discoveredFiles, rewrites, licenses }
 }
 
 async function resolveDependency(dependency, inspection, node, locked) {

@@ -5,6 +5,7 @@ import { basename, dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   adhocSignMachOClosure,
+  discoverMachOClosure,
   inspectMachO,
   parseOtoolLibraries,
   parseOtoolRpaths,
@@ -47,6 +48,19 @@ function lockedFile(root: string, formula: string, version: string, sourcePath: 
       role,
       runtimeRoot,
     },
+  }
+}
+
+function discoveryFile(root: string, formula: string, version: string, sourcePath: string) {
+  const source = fixtureFile(root, `Cellar/${formula}/${version}/${sourcePath}`)
+  const bytes = readFileSync(source)
+  return {
+    formula,
+    version,
+    sourcePath,
+    source,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    bytes: bytes.byteLength,
   }
 }
 
@@ -202,6 +216,70 @@ function stagingFixture(root: string) {
 }
 
 describe('converter pack Mach-O closure', () => {
+  it('discovers fixed family entrypoints, recursive Mach-O dependencies, runtime policy files, and bottle licenses', async () => {
+    const root = temporaryRoot()
+    const vips = discoveryFile(root, 'vips', '8.18.6', 'bin/vips')
+    const libvips = discoveryFile(root, 'vips', '8.18.6', 'lib/libvips.42.dylib')
+    const glib = discoveryFile(root, 'glib', '2.86.0', 'lib/libglib-2.0.0.dylib')
+    const schemas = discoveryFile(root, 'glib', '2.86.0', 'share/glib-2.0/schemas/gschemas.compiled')
+    const ignoredData = discoveryFile(root, 'glib', '2.86.0', 'share/arbitrary/host-controlled.dat')
+    const vipsLicense = discoveryFile(root, 'vips', '8.18.6', 'share/licenses/vips/COPYING')
+    const vipsLowerPriorityLicense = discoveryFile(root, 'vips', '8.18.6', 'share/licenses/vips/LICENSE.third-party')
+    const glibLicense = discoveryFile(root, 'glib', '2.86.0', 'share/licenses/glib/LICENSE')
+    const dependency = '@@HOMEBREW_CELLAR@@/vips/8.18.6/lib/libvips.42.dylib'
+    const prefixDependency = '@@HOMEBREW_PREFIX@@/opt/glib/lib/libglib-2.0.0.dylib'
+    const inspections = new Map([
+      [vips.source, { architectures: ['arm64'], dependencies: [dependency, prefixDependency, '/usr/lib/libSystem.B.dylib'], rpaths: [] }],
+      [libvips.source, { architectures: ['arm64'], dependencies: [], rpaths: [] }],
+      [glib.source, { architectures: ['arm64'], dependencies: [], rpaths: [] }],
+    ])
+
+    const discovered = await discoverMachOClosure({
+      family: 'image-icon',
+      architecture: 'arm64',
+      files: [ignoredData, glibLicense, vipsLowerPriorityLicense, schemas, glib, vipsLicense, libvips, vips],
+      inspect: async (path: string) => inspections.get(path),
+    })
+
+    expect(discovered.entrypoints).toEqual([{ source: vips.source, destination: 'bin/vips' }])
+    expect(discovered.files).toEqual([
+      { ...vips, destination: 'bin/vips', executable: true, role: 'executable', runtimeRoot: false },
+      { ...glib, destination: 'lib/glib/libglib-2.0.0.dylib', executable: false, role: 'code', runtimeRoot: false },
+      { ...libvips, destination: 'lib/vips/libvips.42.dylib', executable: false, role: 'code', runtimeRoot: false },
+      { ...schemas, destination: 'share/runtime/glib/share/glib-2.0/schemas/gschemas.compiled', executable: false, role: 'data', runtimeRoot: false },
+    ])
+    expect(discovered.rewrites).toEqual([
+      { destination: 'bin/vips', dependency, replacement: '@loader_path/../lib/vips/libvips.42.dylib' },
+      { destination: 'bin/vips', dependency: prefixDependency, replacement: '@loader_path/../lib/glib/libglib-2.0.0.dylib' },
+    ])
+    expect(discovered.licenses).toEqual([
+      { ...glibLicense, destination: 'licenses/glib/LICENSE' },
+      { ...vipsLicense, destination: 'licenses/vips/COPYING' },
+    ])
+    expect(discovered.files.some((file: { sourcePath: string }) => file.sourcePath === ignoredData.sourcePath)).toBe(false)
+
+    const plan = await planMachOClosure({
+      architecture: 'arm64',
+      entrypoints: discovered.entrypoints,
+      expectedFiles: discovered.files.map(({ source: _source, version: _version, ...file }) => file),
+      expectedRewrites: discovered.rewrites,
+      inspect: async (path: string) => inspections.get(path),
+      universe: syntheticUniverse(root, { vips: '8.18.6', glib: '2.86.0' }),
+    })
+    expect(plan.rewrites).toEqual(discovered.rewrites)
+  })
+
+  it('fails closed when a discovered contributing formula has no bottle license', async () => {
+    const root = temporaryRoot()
+    const tool = discoveryFile(root, 'vips', '8.18.6', 'bin/vips')
+    await expect(discoverMachOClosure({
+      family: 'image-icon',
+      architecture: 'arm64',
+      files: [tool],
+      inspect: async () => ({ architectures: ['arm64'], dependencies: [], rpaths: [] }),
+    })).rejects.toThrow(/license/iu)
+  })
+
   it('expands locked Homebrew placeholders and matches the exact namespaced closure', async () => {
     const root = temporaryRoot()
     const vips = lockedFile(root, 'vips', '8.18.6', 'bin/vips', 'bin/vips', true)
