@@ -250,7 +250,6 @@ async function collectCache(cacheRoot, activeFingerprint, keepPrevious, maximumB
   if (!sha256Pattern.test(activeFingerprint) || !safeInteger(keepPrevious) || !safeInteger(maximumBlobBytes)) {
     fail('Development converter cache retention request is invalid.')
   }
-  const rootNames = await readdir(cacheRoot)
   const liveByName = new Map()
   for (const workspace of liveWorkspaces) {
     if (!exactKeys(workspace, ['dev', 'ino', 'name', 'path'])
@@ -261,14 +260,23 @@ async function collectCache(cacheRoot, activeFingerprint, keepPrevious, maximumB
       || liveByName.has(workspace.name)) {
       fail('Development preparation workspace inventory is invalid.')
     }
-    const details = await lstat(workspace.path).catch(() => undefined)
-    if (!details?.isDirectory() || details.isSymbolicLink()
+    let details
+    let canonical
+    try {
+      details = await lstat(workspace.path)
+      canonical = await realpath(workspace.path)
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+      throw error
+    }
+    if (!details.isDirectory() || details.isSymbolicLink()
       || details.dev !== workspace.dev || details.ino !== workspace.ino
-      || await realpath(workspace.path).catch(() => undefined) !== workspace.path) {
+      || canonical !== workspace.path) {
       fail('Development preparation workspace changed before cache collection.')
     }
     liveByName.set(workspace.name, workspace)
   }
+  const rootNames = await readdir(cacheRoot)
   if (rootNames.some((name) => !['.cache-mutation.claim', 'active-release.json', 'release-metadata', 'releases', 'sources'].includes(name)
     && !liveByName.has(name))) {
     fail('Development converter cache contains an unknown entry.')
@@ -674,6 +682,7 @@ export async function pruneDevelopmentCache({
   keepPrevious = 1,
   maximumBlobBytes = defaultMaximumBlobBytes,
   beforeMutationForTest,
+  afterWorkspaceInspectionForTest,
   afterClaimOpenForTest,
   renameForTest,
   rmForTest,
@@ -689,6 +698,7 @@ export async function pruneDevelopmentCache({
       heartbeat,
       processIdentity,
     })
+    await afterWorkspaceInspectionForTest?.()
     const plan = await collectCache(
       claimedRoot,
       activeFingerprint,

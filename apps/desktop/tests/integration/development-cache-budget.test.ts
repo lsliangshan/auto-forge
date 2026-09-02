@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { rename, rm } from 'node:fs/promises'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -111,6 +111,59 @@ describe('development converter cache budget', () => {
     expect(existsSync(lease.path)).toBe(true)
     await lease.stop()
     rmSync(lease.path, { recursive: true })
+  })
+
+  it('accepts a live workspace that normally finishes after inspection and before real prune collection', async () => {
+    const cacheRoot = createCache()
+    const active = await createVerifiedRelease(cacheRoot, 'f', [], 100)
+    writeActiveMarker(cacheRoot, active)
+    const birth = 'Tue Jan  2 00:00:00 2024'
+    const processIdentity = async () => birth
+    const lease = await createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint: 'e'.repeat(64),
+      processIdentity,
+    })
+    let inspected = false
+
+    await expect(pruneDevelopmentCache({
+      cacheRoot,
+      activeFingerprint: active,
+      processIdentity,
+      afterWorkspaceInspectionForTest: async () => {
+        inspected = true
+        await lease.stop()
+        rmSync(lease.path, { recursive: true })
+      },
+    })).resolves.toEqual({ removedReleases: [], removedBlobs: [] })
+    expect(inspected).toBe(true)
+  })
+
+  it('fails closed when a live workspace is replaced under the same name after inspection', async () => {
+    const cacheRoot = createCache()
+    const active = await createVerifiedRelease(cacheRoot, 'f', [], 100)
+    writeActiveMarker(cacheRoot, active)
+    const birth = 'Tue Jan  2 00:00:00 2024'
+    const processIdentity = async () => birth
+    const lease = await createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint: 'e'.repeat(64),
+      processIdentity,
+    })
+    const retired = join(dirname(cacheRoot), 'retired-workspace')
+
+    await expect(pruneDevelopmentCache({
+      cacheRoot,
+      activeFingerprint: active,
+      processIdentity,
+      afterWorkspaceInspectionForTest: async () => {
+        await lease.stop()
+        renameSync(lease.path, retired)
+        mkdirSync(lease.path)
+      },
+    })).rejects.toThrow(/workspace changed before cache collection/iu)
+    expect(existsSync(lease.path)).toBe(true)
+    expect(existsSync(retired)).toBe(true)
   })
 
   it('fails closed on a forged preparation workspace during pruning', async () => {
