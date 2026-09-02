@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -310,6 +310,49 @@ describe('development converter cache budget', () => {
     expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.development-cache-trash-'))).toEqual([])
   })
 
+  it('reconciles a staging rename that succeeds before its wrapper throws', async () => {
+    const cacheRoot = createCache()
+    const old = await createVerifiedRelease(cacheRoot, '7', [], 100)
+    await createVerifiedRelease(cacheRoot, '8', [], 200)
+    const active = await createVerifiedRelease(cacheRoot, '9', [], 300)
+    writeActiveMarker(cacheRoot, active)
+    let injected = false
+
+    await expect(pruneDevelopmentCache({
+      cacheRoot,
+      activeFingerprint: active,
+      maximumBlobBytes: 1,
+      renameForTest: async (source: string, destination: string) => {
+        await rename(source, destination)
+        if (!injected) {
+          injected = true
+          throw new Error('injected post-rename wrapper failure')
+        }
+      },
+    })).rejects.toThrow('injected post-rename wrapper failure')
+    expect(existsSync(join(cacheRoot, 'releases', old))).toBe(true)
+    expect(existsSync(join(cacheRoot, 'release-metadata', `${old}.json`))).toBe(true)
+    expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.development-cache-trash-'))).toEqual([])
+  })
+
+  it('reconciles a staging rename when syncing its source directory fails', async () => {
+    const cacheRoot = createCache()
+    const old = await createVerifiedRelease(cacheRoot, 'a', [], 100)
+    await createVerifiedRelease(cacheRoot, 'b', [], 200)
+    const active = await createVerifiedRelease(cacheRoot, 'c', [], 300)
+    writeActiveMarker(cacheRoot, active)
+
+    await expect(pruneDevelopmentCache({
+      cacheRoot,
+      activeFingerprint: active,
+      maximumBlobBytes: 1,
+      syncDirectoryForTest: async () => { throw new Error('injected post-rename sync failure') },
+    })).rejects.toThrow('injected post-rename sync failure')
+    expect(existsSync(join(cacheRoot, 'releases', old))).toBe(true)
+    expect(existsSync(join(cacheRoot, 'release-metadata', `${old}.json`))).toBe(true)
+    expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.development-cache-trash-'))).toEqual([])
+  })
+
   it('does not begin a prune transaction after its mutation claim is deleted', async () => {
     const cacheRoot = createCache()
     const old = await createVerifiedRelease(cacheRoot, '4', [], 100)
@@ -336,10 +379,15 @@ describe('development converter cache budget', () => {
     const trash = join(cacheRoot, `.development-cache-trash-${randomUUID()}`)
     mkdirSync(join(trash, 'releases'), { recursive: true })
     mkdirSync(join(trash, 'release-metadata'))
+    const releaseStat = statSync(join(cacheRoot, 'releases', old))
+    const metadataStat = statSync(join(cacheRoot, 'release-metadata', `${old}.json`))
     writeFileSync(join(trash, 'transaction.json'), canonicalBytes({
       phase: 'staging',
       schemaVersion: 1,
-      targets: [`release-metadata/${old}.json`, `releases/${old}`].sort(),
+      targets: [
+        { dev: metadataStat.dev, ino: metadataStat.ino, path: `release-metadata/${old}.json`, type: 'file' },
+        { dev: releaseStat.dev, ino: releaseStat.ino, path: `releases/${old}`, type: 'directory' },
+      ],
     }), { mode: 0o444 })
     await rename(join(cacheRoot, 'releases', old), join(trash, 'releases', old))
     await rename(

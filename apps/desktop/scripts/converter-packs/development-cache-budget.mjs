@@ -361,10 +361,17 @@ function parseTransaction(bytes) {
   }
   let previous = ''
   for (const target of value.targets) {
-    if (typeof target !== 'string' || !transactionTargetPattern.test(target) || target <= previous) {
+    if (!exactKeys(target, ['dev', 'ino', 'path', 'type'])
+      || !safeInteger(target.dev)
+      || !safeInteger(target.ino)
+      || typeof target.path !== 'string'
+      || !transactionTargetPattern.test(target.path)
+      || !['directory', 'file'].includes(target.type)
+      || (target.path.startsWith('releases/') ? target.type !== 'directory' : target.type !== 'file')
+      || target.path <= previous) {
       fail('Development converter cache transaction is invalid.')
     }
-    previous = target
+    previous = target.path
   }
   return value
 }
@@ -392,7 +399,7 @@ async function writeTransaction(trash, phase, targets, heartbeat) {
 }
 
 async function validateTransactionContents(trash, targets, heartbeat) {
-  const expected = new Set(targets)
+  const expected = new Set(targets.map((target) => target.path))
   for (const name of await readdir(trash)) {
     if (name === 'transaction.json') continue
     const temporaryMatch = transactionTemporaryPattern.exec(name)
@@ -431,16 +438,16 @@ async function readTransaction(trash) {
 
 function deletionOrder(targets) {
   return [...targets].sort((left, right) => {
-    const leftRelease = left.startsWith('releases/') ? 0 : 1
-    const rightRelease = right.startsWith('releases/') ? 0 : 1
-    return leftRelease - rightRelease || Buffer.compare(Buffer.from(left), Buffer.from(right))
+    const leftRelease = left.path.startsWith('releases/') ? 0 : 1
+    const rightRelease = right.path.startsWith('releases/') ? 0 : 1
+    return leftRelease - rightRelease || Buffer.compare(Buffer.from(left.path), Buffer.from(right.path))
   })
 }
 
 async function deleteCommittedTransaction(trash, targets, heartbeat, remove = rm) {
   for (const target of deletionOrder(targets)) {
     await heartbeat.pulse()
-    await remove(join(trash, target), { recursive: true, force: true })
+    await remove(join(trash, target.path), { recursive: true, force: true })
   }
   for (const category of ['release-metadata', 'releases', 'sources']) {
     await heartbeat.pulse()
@@ -448,6 +455,42 @@ async function deleteCommittedTransaction(trash, targets, heartbeat, remove = rm
   }
   await heartbeat.pulse()
   await rm(join(trash, 'transaction.json'), { force: true })
+  await heartbeat.pulse()
+  await rm(trash, { recursive: true, force: true })
+}
+
+function matchesTransactionIdentity(details, target) {
+  return Boolean(details
+    && !details.isSymbolicLink()
+    && details.dev === target.dev
+    && details.ino === target.ino
+    && (target.type === 'directory' ? details.isDirectory() : details.isFile()))
+}
+
+async function reconcileStagingTransaction(cacheRoot, trash, targets, heartbeat) {
+  for (const target of [...targets].reverse()) {
+    const source = join(cacheRoot, target.path)
+    const destination = join(trash, target.path)
+    const [sourceDetails, destinationDetails] = await Promise.all([
+      lstat(source).catch(() => undefined), lstat(destination).catch(() => undefined),
+    ])
+    if (sourceDetails && !destinationDetails) {
+      if (!matchesTransactionIdentity(sourceDetails, target)) {
+        fail('Development converter cache staging source identity changed.')
+      }
+      continue
+    }
+    if (!sourceDetails && destinationDetails) {
+      if (!matchesTransactionIdentity(destinationDetails, target)) {
+        fail('Development converter cache staging destination identity changed.')
+      }
+      await heartbeat.pulse()
+      await rename(destination, source)
+      await Promise.all([syncDirectory(dirname(source)), syncDirectory(dirname(destination))])
+      continue
+    }
+    fail('Development converter cache staging state is ambiguous.')
+  }
   await heartbeat.pulse()
   await rm(trash, { recursive: true, force: true })
 }
@@ -478,49 +521,27 @@ async function recoverTrash(cacheRoot, heartbeat) {
       await deleteCommittedTransaction(trash, transaction.targets, heartbeat)
       continue
     }
-    const restored = []
-    let primary
-    for (const target of [...transaction.targets].reverse()) {
-      const item = { destination: join(cacheRoot, target), source: join(trash, target) }
-      const [source, destination] = await Promise.all([
-        lstat(item.source).catch(() => undefined), lstat(item.destination).catch(() => undefined),
-      ])
-      if (!source && destination) continue
-      if (!source || destination) fail('Development converter cache trash cannot be recovered safely.')
-      try {
-        await heartbeat.pulse()
-        await rename(item.source, item.destination)
-        await Promise.all([syncDirectory(dirname(item.source)), syncDirectory(dirname(item.destination))])
-        restored.push(item)
-      } catch (error) {
-        primary = error
-        break
-      }
-    }
-    if (primary) {
-      const cleanupErrors = []
-      for (const item of restored.reverse()) {
-        try {
-          await heartbeat.pulse()
-          await rename(item.destination, item.source)
-          await Promise.all([syncDirectory(dirname(item.source)), syncDirectory(dirname(item.destination))])
-        } catch (error) { cleanupErrors.push(error) }
-      }
-      if (cleanupErrors.length > 0) {
-        throw new AggregateError([primary, ...cleanupErrors], primary instanceof Error ? primary.message : 'Cache trash recovery failed.')
-      }
-      throw primary
-    }
-    await heartbeat.pulse()
-    await rm(trash, { recursive: true, force: true })
+    await reconcileStagingTransaction(cacheRoot, trash, transaction.targets, heartbeat)
   }
 }
 
-async function executePruneTransaction(root, plan, heartbeat, renameForTest = rename, rmForTest = rm) {
+async function executePruneTransaction({
+  root,
+  plan,
+  heartbeat,
+  renameForTest = rename,
+  rmForTest = rm,
+  syncDirectoryForTest = syncDirectory,
+}) {
   const trash = join(root, `.development-cache-trash-${randomUUID()}`)
   await heartbeat.pulse()
   await mkdir(trash, { mode: 0o700 })
-  const targets = plan.targets.map((target) => relative(root, target.path)).sort()
+  const targets = plan.targets.map((target) => ({
+    dev: target.stat.dev,
+    ino: target.stat.ino,
+    path: relative(root, target.path),
+    type: target.stat.isDirectory() ? 'directory' : 'file',
+  })).sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)))
   try {
     await writeTransaction(trash, 'staging', targets, heartbeat)
   } catch (primary) {
@@ -538,7 +559,6 @@ async function executePruneTransaction(root, plan, heartbeat, renameForTest = re
     }
     throw primary
   }
-  const moved = []
   let primary
   let committed = false
   try {
@@ -551,8 +571,7 @@ async function executePruneTransaction(root, plan, heartbeat, renameForTest = re
       await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
       await heartbeat.pulse()
       await renameForTest(target.path, destination)
-      await Promise.all([syncDirectory(dirname(target.path)), syncDirectory(dirname(destination))])
-      moved.push({ destination, source: target.path })
+      await Promise.all([syncDirectoryForTest(dirname(target.path)), syncDirectoryForTest(dirname(destination))])
     }
     await writeTransaction(trash, 'committed', targets, heartbeat)
     committed = true
@@ -573,22 +592,14 @@ async function executePruneTransaction(root, plan, heartbeat, renameForTest = re
       }
     }
     if (committed) throw primary
-    const cleanupErrors = []
-    for (const item of moved.reverse()) {
-      try {
-        await heartbeat.pulse()
-        await rename(item.destination, item.source)
-        await Promise.all([syncDirectory(dirname(item.source)), syncDirectory(dirname(item.destination))])
-      } catch (error) { cleanupErrors.push(error) }
-    }
-    if (cleanupErrors.length === 0) {
-      try {
-        await heartbeat.pulse()
-        await rm(trash, { recursive: true, force: true })
-      } catch (error) { cleanupErrors.push(error) }
-    }
-    if (cleanupErrors.length > 0) {
-      throw new AggregateError([primary, ...cleanupErrors], primary instanceof Error ? primary.message : 'Development cache prune failed.')
+    try {
+      await reconcileStagingTransaction(root, trash, targets, heartbeat)
+    } catch (error) {
+      throw new AggregateError(
+        [primary, error],
+        primary instanceof Error ? primary.message : 'Development cache prune failed.',
+        { cause: error },
+      )
     }
     throw primary
   }
@@ -603,13 +614,23 @@ export async function pruneDevelopmentCache({
   afterClaimOpenForTest,
   renameForTest,
   rmForTest,
+  syncDirectoryForTest,
 }) {
   const root = await canonicalRoot(cacheRoot)
   return withDevelopmentCacheMutationClaim(root, async (claimedRoot, heartbeat) => {
     await recoverTrash(claimedRoot, heartbeat)
     const plan = await collectCache(claimedRoot, activeFingerprint, keepPrevious, maximumBlobBytes)
     await beforeMutationForTest?.()
-    if (plan.targets.length > 0) await executePruneTransaction(claimedRoot, plan, heartbeat, renameForTest, rmForTest)
+    if (plan.targets.length > 0) {
+      await executePruneTransaction({
+        root: claimedRoot,
+        plan,
+        heartbeat,
+        renameForTest,
+        rmForTest,
+        syncDirectoryForTest,
+      })
+    }
     return Object.freeze({
       removedReleases: Object.freeze(plan.removedReleases),
       removedBlobs: Object.freeze(plan.removedBlobs),
