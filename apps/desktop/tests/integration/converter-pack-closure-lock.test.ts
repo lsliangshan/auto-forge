@@ -209,6 +209,20 @@ describe('converter target closure lock', () => {
       .toThrow('Target closure lock has an invalid schema.')
   })
 
+  it.each([
+    ['uppercase protocol', 'HTTPS://licenses.example.test/LICENSE'],
+    ['uppercase host', 'https://LICENSES.example.test/LICENSE'],
+    ['default port', 'https://licenses.example.test:443/LICENSE'],
+    ['internal newline', 'https://licenses.example.test/LIC\nENSE'],
+    ['raw space', 'https://licenses.example.test/LIC ENSE'],
+    ['backslash', 'https://licenses.example.test\\LICENSE'],
+  ])('rejects a noncanonical direct-license URL with %s', (_label, source) => {
+    const value = closureFixture()
+    value.families.media.licenses[0]!.source = source
+    expect(() => validateTargetClosureLock(value, 'darwin-arm64'))
+      .toThrow('Target closure lock has an invalid schema.')
+  })
+
   it('rejects a cyclic dependency graph with a fixed diagnostic', () => {
     const value = closureFixture()
     value.formulae[1]!.dependencies = ['ffmpeg']
@@ -307,6 +321,26 @@ describe('converter target closure lock', () => {
         bytes: 140, destination: 'licenses/ffmpeg-extra.LICENSE',
       })
     })
+    await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
+      .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 600 } } })
+  })
+
+  it('ignores conflicting artifacts from source formulae outside the current closure', async () => {
+    const { sourcePath } = writeAuthenticatedFixture(temporaryRoot(), closureFixture(), (source) => {
+      const zlib = structuredClone(source.formulae[3]!)
+      zlib.name = 'zlib'
+      zlib.version = '1.3.1'
+      zlib.acquisitions['darwin-arm64'] = {
+        ...bottle('zlib', 'darwin-arm64', 'b', 7),
+        url: 'https://downloads.example.test/unselected-zlib.tar.gz',
+      }
+      zlib.acquisitions['darwin-x64'] = bottle('zlib', 'darwin-x64', '9', 151)
+      zlib.licenses = zlib.licenses.map((entry) => ({
+        ...entry, sha256: '9'.repeat(64), destination: 'licenses/zlib.LICENSE',
+      }))
+      source.formulae.push(zlib)
+    })
+
     await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
       .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 600 } } })
   })

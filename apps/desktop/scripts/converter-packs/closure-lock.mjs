@@ -61,10 +61,22 @@ function validVersionSegment(value) {
 }
 
 function validHttpsUrl(value) {
-  if (!validText(value, 2_048)) return false
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || Buffer.byteLength(value, 'utf8') > 2_048
+    || /[\u0000-\u0020\u007f]/u.test(value)
+    || /\s/u.test(value)
+    || value.includes('\\')
+  ) return false
   try {
     const url = new URL(value)
-    return url.protocol === 'https:' && Boolean(url.hostname) && !url.username && !url.password && !url.hash
+    return url.href === value
+      && url.protocol === 'https:'
+      && Boolean(url.hostname)
+      && !url.username
+      && !url.password
+      && !value.includes('#')
   } catch {
     return false
   }
@@ -272,7 +284,8 @@ function validateSourceRelationship(sourceLock, closureLock) {
     coordinates.set(coordinate.sha256, { url: coordinate.url, bytes: coordinate.bytes })
   }
   for (const engine of sourceLock.engines) add(engine.acquisition)
-  for (const formula of sourceLock.formulae) {
+  for (const closureFormula of closureLock.formulae) {
+    const formula = selectedFormulae.get(closureFormula.name)
     if (formula.acquisition !== null) add(formula.acquisition)
     for (const license of formula.licenses) {
       if (license.kind === 'download') add(license)

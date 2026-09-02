@@ -39,10 +39,22 @@ function positiveInteger(value, maximum = Number.MAX_SAFE_INTEGER) {
 }
 
 function validHttpsUrl(value) {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 2_048 || value !== value.trim()) return false
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length > 2_048
+    || /[\u0000-\u0020\u007f]/u.test(value)
+    || /\s/u.test(value)
+    || value.includes('\\')
+  ) return false
   try {
     const url = new URL(value)
-    return url.protocol === 'https:' && Boolean(url.hostname) && !url.username && !url.password && !url.hash
+    return url.href === value
+      && url.protocol === 'https:'
+      && Boolean(url.hostname)
+      && !url.username
+      && !url.password
+      && !value.includes('#')
   } catch {
     return false
   }
