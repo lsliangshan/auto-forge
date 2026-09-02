@@ -894,7 +894,21 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
     if (error instanceof Error && error.message.startsWith('Cached converter archive ')) throw error
     fail('Cached converter archive is invalid.')
   }
-  if (cached !== undefined && (await lockedPredecessors(cacheRoot, archive)).length === 0) return cached
+  if (cached !== undefined) {
+    const currentOwner = await readOwnerLock(ownerPath)
+    const freshLiveOwner = (
+      currentOwner?.value?.state === 'active'
+      && currentOwner.value.sha256 === archive.sha256
+      && currentOwner.value.url === archive.url
+      && currentOwner.value.bytes === archive.bytes
+      && ownerAlive(currentOwner.value.pid)
+      && freshOwnerLease(currentOwner)
+    )
+    if (
+      freshLiveOwner
+      || (currentOwner === undefined && (await lockedPredecessors(cacheRoot, archive)).length === 0)
+    ) return cached
+  }
 
   let owner
   try {

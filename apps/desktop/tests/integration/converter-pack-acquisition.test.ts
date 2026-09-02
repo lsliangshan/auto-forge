@@ -548,6 +548,37 @@ describe('converter pack source acquisition', () => {
     expect(requests).toBe(1)
   })
 
+  it.each([
+    ['dead active', 'active'],
+    ['parked resume', 'resume'],
+  ])('cleans a %s owner beside an already valid target without another request', async (_label, state) => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('valid target with stale owner')
+    const archive = {
+      url: 'https://downloads.example.test/valid-target-owner.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    writeFileSync(join(cacheRoot, `${archive.sha256}.archive`), bytes, { mode: 0o600 })
+    writeOwner(cacheRoot, archive, { state })
+    let requests = 0
+
+    const result = await acquireVerifiedArchive({
+      archive,
+      cacheRoot,
+      fetchImpl: async () => {
+        requests += 1
+        return new Response(bytes, { status: 200 })
+      },
+    })
+
+    expect(result.networkBytes).toBe(0)
+    expect(requests).toBe(0)
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
   it('rejects a corrupted existing cache entry instead of replacing or trusting it', async () => {
     const root = temporaryRoot()
     const cacheRoot = join(root, 'cache')
