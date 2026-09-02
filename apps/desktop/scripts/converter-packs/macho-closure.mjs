@@ -213,8 +213,10 @@ function validExpectedFile(file) {
     && Number.isSafeInteger(file.bytes)
     && file.bytes > 0
     && typeof file.executable === 'boolean'
+    && typeof file.runtimeRoot === 'boolean'
     && (file.role === 'executable' || file.role === 'code' || file.role === 'data')
     && (file.role === 'executable' ? file.executable : !file.executable)
+    && (file.role === 'code' ? true : !file.runtimeRoot)
 }
 
 function validExpectedRewrite(rewrite) {
@@ -234,7 +236,6 @@ function rewriteKey(rewrite) {
 export async function planMachOClosure({ entrypoints, architecture, inspect, universe, expectedFiles, expectedRewrites }) {
   if (
     !Array.isArray(entrypoints)
-    || entrypoints.length === 0
     || (architecture !== 'arm64' && architecture !== 'x86_64')
     || typeof inspect !== 'function'
     || !universe
@@ -243,7 +244,7 @@ export async function planMachOClosure({ entrypoints, architecture, inspect, uni
     || typeof universe.resolveLockedFile !== 'function'
     || typeof universe.contains !== 'function'
     || !Array.isArray(expectedFiles)
-    || expectedFiles.length === 0
+    || (entrypoints.length === 0 && expectedFiles.length !== 0 && !expectedFiles.some((file) => file?.runtimeRoot === true))
     || expectedFiles.some((file) => !validExpectedFile(file))
     || !Array.isArray(expectedRewrites)
     || expectedRewrites.some((rewrite) => !validExpectedRewrite(rewrite))
@@ -314,6 +315,9 @@ export async function planMachOClosure({ entrypoints, architecture, inspect, uni
     const node = bySource.get(pathKey(entrypoint.source))
     if (!node || !node.executable || node.destination !== entrypoint.destination) fail('Mach-O entrypoint is not in the locked inventory.')
     add(node, dirname(node.source))
+  }
+  for (const node of byFormulaPath.values()) {
+    if (node.expected.runtimeRoot) add(node, dirname(node.source))
   }
 
   for (let cursor = 0; cursor < queue.length; cursor += 1) {

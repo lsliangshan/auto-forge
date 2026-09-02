@@ -139,6 +139,15 @@ function validLicense(value) {
   return false
 }
 
+function validEngineLicense(value) {
+  return value?.kind === 'download'
+    && exactKeys(value, ['kind', 'url', 'sha256', 'bytes', 'destination'])
+    && validHttpsUrl(value.url)
+    && sha256Pattern.test(value.sha256)
+    && positiveInteger(value.bytes)
+    && safeEntryPath(value.destination)
+}
+
 function validFormula(value) {
   if (!exactKeys(value, ['name', 'version', 'revision', 'license', 'acquisitions', 'licenses'])) return false
   if (
@@ -168,12 +177,19 @@ function validFormula(value) {
 }
 
 function validEngine(value, expectedName, formulae) {
-  if (!exactKeys(value, ['name', 'version', 'license', 'rootFormula', 'acquisitions'])) return false
-  if (value.name !== expectedName || !validVersionSegment(value.version) || !validText(value.license, 512)) return false
+  if (!exactKeys(value, ['name', 'version', 'license', 'rootFormula', 'acquisitions', 'licenses'])) return false
+  if (
+    value.name !== expectedName
+    || !validVersionSegment(value.version)
+    || !validText(value.license, 512)
+    || !Array.isArray(value.licenses)
+    || !value.licenses.every(validEngineLicense)
+    || !sortedUnique(value.licenses, licenseSortKey)
+  ) return false
   if (expectedName === 'libreoffice') {
-    return value.rootFormula === null && validAcquisitions(value.acquisitions, 'dmg')
+    return value.rootFormula === null && value.licenses.length > 0 && validAcquisitions(value.acquisitions, 'dmg')
   }
-  if (!validName(value.rootFormula) || !validAcquisitions(value.acquisitions, 'homebrew-bottle')) return false
+  if (value.licenses.length !== 0 || !validName(value.rootFormula) || !validAcquisitions(value.acquisitions, 'homebrew-bottle')) return false
   const formula = formulae.get(value.rootFormula)
   return formula !== undefined
     && formula.version === value.version
@@ -249,6 +265,7 @@ export async function loadConverterSourceLock({ path, target }) {
       license: engine.license,
       rootFormula: engine.rootFormula,
       acquisition: structuredClone(engine.acquisitions[target]),
+      licenses: structuredClone(engine.licenses),
     })),
     formulae: value.formulae.map((formula) => ({
       name: formula.name,

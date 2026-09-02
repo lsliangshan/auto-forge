@@ -19,11 +19,17 @@ function temporaryRoot(): string {
 }
 
 function file(formula: string, sourcePath: string, destination: string, character: string) {
-  return { formula, sourcePath, destination, sha256: character.repeat(64), bytes: 10, executable: true, role: 'executable' }
+  return {
+    formula, sourcePath, destination, sha256: character.repeat(64), bytes: 10,
+    executable: true, role: 'executable', runtimeRoot: false,
+  }
 }
 
-function codeFile(formula: string, sourcePath: string, destination: string, character: string) {
-  return { formula, sourcePath, destination, sha256: character.repeat(64), bytes: 10, executable: false, role: 'code' }
+function codeFile(formula: string, sourcePath: string, destination: string, character: string, runtimeRoot = false) {
+  return {
+    formula, sourcePath, destination, sha256: character.repeat(64), bytes: 10,
+    executable: false, role: 'code', runtimeRoot,
+  }
 }
 
 function license(formula: string, character: string) {
@@ -34,7 +40,7 @@ function license(formula: string, character: string) {
 }
 
 function emptyFamily() {
-  return { files: [], rewrites: [], licenses: [] }
+  return { files: [], rewrites: [], licenses: [], nativeHelpers: [], engineAssets: [], engineLicenses: [] }
 }
 
 function closureFixture(target = 'darwin-arm64') {
@@ -48,10 +54,29 @@ function closureFixture(target = 'darwin-arm64') {
       { name: 'vips', version: '8.18.6', dependencies: ['glib'] },
     ],
     families: {
-      'image-icon': { files: [file('vips', 'bin/vips', 'bin/vips', 'c')], rewrites: [], licenses: [license('vips', 'c')] },
-      document: emptyFamily(),
-      pdf: { files: [file('poppler', 'bin/pdfinfo', 'bin/pdfinfo', 'd')], rewrites: [], licenses: [license('poppler', 'd')] },
+      'image-icon': {
+        ...emptyFamily(), files: [file('vips', 'bin/vips', 'bin/vips', 'c')], licenses: [license('vips', 'c')],
+        nativeHelpers: [{ helper: 'autoforge-image-converter', destination: 'bin/autoforge-image-converter' }],
+      },
+      document: {
+        ...emptyFamily(),
+        nativeHelpers: [{ helper: 'autoforge-soffice-launcher', destination: 'program/soffice' }],
+        engineAssets: [{
+          engine: 'libreoffice', source: 'acquisition', destination: 'share/LibreOffice.dmg',
+          sha256: (target === 'darwin-arm64' ? 'b' : 'f').repeat(64), bytes: target === 'darwin-arm64' ? 140 : 141,
+          executable: false, role: 'data',
+        }],
+        engineLicenses: [{
+          engine: 'libreoffice', source: 'https://downloads.example.test/libreoffice-LICENSE',
+          destination: 'licenses/libreoffice.LICENSE', sha256: '9'.repeat(64), bytes: 15,
+        }],
+      },
+      pdf: {
+        ...emptyFamily(), files: [file('poppler', 'bin/pdfinfo', 'bin/pdfinfo', 'd')], licenses: [license('poppler', 'd')],
+        nativeHelpers: [{ helper: 'autoforge-pdf-raster', destination: 'bin/autoforge-pdf-raster' }],
+      },
       media: {
+        ...emptyFamily(),
         files: [
           file('ffmpeg', 'bin/ffmpeg', 'bin/ffmpeg', 'a'),
           codeFile('ffmpeg', 'lib/libffmpeg.dylib', 'lib/ffmpeg/libffmpeg.dylib', '8'),
@@ -65,7 +90,7 @@ function closureFixture(target = 'darwin-arm64') {
       },
     },
     measurements: {
-      downloadBytes: 600,
+      downloadBytes: target === 'darwin-arm64' ? 615 : 620,
       compressedPackBytes: { 'image-icon': 20, document: 20, pdf: 20, media: 20 },
       installedReleaseBytes: 1_000,
     },
@@ -110,16 +135,20 @@ function sourceFixture(closureBytes: Buffer, target = 'darwin-arm64') {
     schemaVersion: 2, homebrewCoreRevision: '1'.repeat(40), homebrewCaskRevision: '2'.repeat(40),
     targets: ['darwin-arm64', 'darwin-x64'],
     engines: [
-      { name: 'ffmpeg', version: '9.0.1+1', license: 'GPL-3.0-or-later', rootFormula: 'ffmpeg', acquisitions: structuredClone(root('ffmpeg').acquisitions) },
+      { name: 'ffmpeg', version: '9.0.1+1', license: 'GPL-3.0-or-later', rootFormula: 'ffmpeg', acquisitions: structuredClone(root('ffmpeg').acquisitions), licenses: [] },
       {
         name: 'libreoffice', version: '26.8.0', license: 'MPL-2.0', rootFormula: null,
         acquisitions: {
           'darwin-arm64': { kind: 'dmg', url: 'https://downloads.example.test/libreoffice-arm64.dmg', sha256: 'b'.repeat(64), bytes: 140, cellar: null },
           'darwin-x64': { kind: 'dmg', url: 'https://downloads.example.test/libreoffice-x64.dmg', sha256: 'f'.repeat(64), bytes: 141, cellar: null },
         },
+        licenses: [{
+          kind: 'download', url: 'https://downloads.example.test/libreoffice-LICENSE',
+          sha256: '9'.repeat(64), bytes: 15, destination: 'licenses/libreoffice.LICENSE',
+        }],
       },
-      { name: 'libvips', version: '8.18.6', license: 'LGPL-2.1-or-later', rootFormula: 'vips', acquisitions: structuredClone(root('vips').acquisitions) },
-      { name: 'poppler', version: '26.8.0', license: 'GPL-3.0-only', rootFormula: 'poppler', acquisitions: structuredClone(root('poppler').acquisitions) },
+      { name: 'libvips', version: '8.18.6', license: 'LGPL-2.1-or-later', rootFormula: 'vips', acquisitions: structuredClone(root('vips').acquisitions), licenses: [] },
+      { name: 'poppler', version: '26.8.0', license: 'GPL-3.0-only', rootFormula: 'poppler', acquisitions: structuredClone(root('poppler').acquisitions), licenses: [] },
     ],
     formulae,
     closureLocks: {
@@ -140,7 +169,6 @@ function writeAuthenticatedFixture(
   writeFileSync(closurePath, closureBytes)
   const otherTarget = closure.target === 'darwin-arm64' ? 'darwin-x64' : 'darwin-arm64'
   const otherClosure = closureFixture(otherTarget)
-  otherClosure.measurements.downloadBytes = otherTarget === 'darwin-arm64' ? 600 : 605
   const otherBytes = canonicalBytes(otherClosure)
   writeFileSync(join(root, 'closures', `${otherTarget}.lock.json`), otherBytes)
   const sourcePath = join(root, 'sources.lock.json')
@@ -176,7 +204,7 @@ describe('converter target closure lock', () => {
 
     expect(arm64.closureLock.target).toBe('darwin-arm64')
     expect(x64.closureLock.target).toBe('darwin-x64')
-    expect(x64.closureLock.measurements.downloadBytes).toBe(605)
+    expect(x64.closureLock.measurements.downloadBytes).toBe(620)
   })
 
   it.each([
@@ -191,9 +219,19 @@ describe('converter target closure lock', () => {
     ['target mismatch', (value: ReturnType<typeof closureFixture>) => { value.target = 'darwin-x64' }],
     ['undeclared file formula', (value: ReturnType<typeof closureFixture>) => { value.families.media.files[0]!.formula = 'unknown' }],
     ['unsafe sourcePath', (value: ReturnType<typeof closureFixture>) => { value.families.media.files[0]!.sourcePath = '../ffmpeg' }],
+    ['missing runtimeRoot', (value: ReturnType<typeof closureFixture>) => { delete (value.families.media.files[0] as Record<string, unknown>).runtimeRoot }],
+    ['runtimeRoot executable', (value: ReturnType<typeof closureFixture>) => { value.families.media.files[0]!.runtimeRoot = true }],
+    ['runtimeRoot data', (value: ReturnType<typeof closureFixture>) => {
+      value.families.media.files[0]!.executable = false
+      value.families.media.files[0]!.role = 'data'
+      value.families.media.files[0]!.runtimeRoot = true
+    }],
     ['duplicate family file', (value: ReturnType<typeof closureFixture>) => { value.families.media.files.push(structuredClone(value.families.media.files[0]!)) }],
     ['case-folded destination collision', (value: ReturnType<typeof closureFixture>) => {
       value.families.media.files.push(file('ffmpeg', 'bin/ffprobe', 'BIN/FFMPEG', '9'))
+    }],
+    ['cross-provenance destination collision', (value: ReturnType<typeof closureFixture>) => {
+      value.families['image-icon'].nativeHelpers[0]!.destination = 'BIN/VIPS'
     }],
     ['invalid rewrite', (value: ReturnType<typeof closureFixture>) => {
       value.families.media.rewrites.push({ destination: 'bin/missing', dependency: '@rpath/libx.dylib', replacement: '/usr/local/libx.dylib' } as never)
@@ -280,6 +318,19 @@ describe('converter target closure lock', () => {
     const { sourcePath } = writeAuthenticatedFixture(temporaryRoot(), closure)
     await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
       .rejects.toThrow('Target closure lock license inventory is inconsistent.')
+  })
+
+  it.each([
+    ['missing engine license', (closure: ReturnType<typeof closureFixture>) => { closure.families.document.engineLicenses = [] }, 'engine license'],
+    ['license-only engine', (closure: ReturnType<typeof closureFixture>) => { closure.families.document.engineAssets = [] }, 'engine license'],
+    ['mismatched engine acquisition', (closure: ReturnType<typeof closureFixture>) => { closure.families.document.engineAssets[0]!.sha256 = '0'.repeat(64) }, 'engine inventory'],
+    ['mismatched engine license', (closure: ReturnType<typeof closureFixture>) => { closure.families.document.engineLicenses[0]!.bytes += 1 }, 'engine license'],
+  ])('rejects %s', async (_label, mutate, diagnostic) => {
+    const closure = closureFixture()
+    mutate(closure)
+    const { sourcePath } = writeAuthenticatedFixture(temporaryRoot(), closure)
+    await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
+      .rejects.toThrow(diagnostic)
   })
 
   it('rejects a closure formula unreachable from engines and family inventory', async () => {
@@ -407,7 +458,7 @@ describe('converter target closure lock', () => {
     })
 
     await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
-      .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 611 } } })
+      .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 626 } } })
   })
 
   it.each([
@@ -432,7 +483,7 @@ describe('converter target closure lock', () => {
       })
     })
     await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
-      .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 600 } } })
+      .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 615 } } })
   })
 
   it('ignores conflicting artifacts from source formulae outside the current closure', async () => {
@@ -452,7 +503,7 @@ describe('converter target closure lock', () => {
     })
 
     await expect(loadConverterClosureLock({ sourceLockPath: sourcePath, target: 'darwin-arm64' }))
-      .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 600 } } })
+      .resolves.toMatchObject({ closureLock: { measurements: { downloadBytes: 615 } } })
   })
 
   it('rejects a closure byte mismatch before JSON parsing', async () => {

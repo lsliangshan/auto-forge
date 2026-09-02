@@ -102,15 +102,43 @@ function validFormula(value) {
 }
 
 function validFile(value, formulae) {
-  return exactKeys(value, ['formula', 'sourcePath', 'destination', 'sha256', 'bytes', 'executable', 'role'])
+  return exactKeys(value, ['formula', 'sourcePath', 'destination', 'sha256', 'bytes', 'executable', 'role', 'runtimeRoot'])
     && formulae.has(value.formula)
     && safeEntryPath(value.sourcePath)
     && safeEntryPath(value.destination)
     && sha256Pattern.test(value.sha256)
     && positiveInteger(value.bytes)
     && typeof value.executable === 'boolean'
+    && typeof value.runtimeRoot === 'boolean'
     && roles.has(value.role)
     && (value.role === 'executable' ? value.executable : !value.executable)
+    && (value.role === 'code' ? true : !value.runtimeRoot)
+}
+
+function validNativeHelper(value) {
+  return exactKeys(value, ['helper', 'destination'])
+    && validFormulaName(value.helper)
+    && safeEntryPath(value.destination)
+}
+
+function validEngineAsset(value) {
+  return exactKeys(value, ['engine', 'source', 'destination', 'sha256', 'bytes', 'executable', 'role'])
+    && validFormulaName(value.engine)
+    && value.source === 'acquisition'
+    && safeEntryPath(value.destination)
+    && sha256Pattern.test(value.sha256)
+    && positiveInteger(value.bytes)
+    && value.executable === false
+    && value.role === 'data'
+}
+
+function validEngineLicense(value) {
+  return exactKeys(value, ['engine', 'source', 'destination', 'sha256', 'bytes'])
+    && validFormulaName(value.engine)
+    && validHttpsUrl(value.source)
+    && safeEntryPath(value.destination)
+    && sha256Pattern.test(value.sha256)
+    && positiveInteger(value.bytes)
 }
 
 function validLicense(value, formulae) {
@@ -140,18 +168,29 @@ function validRewrite(value, files) {
 
 function validateFamily(value, formulae) {
   if (
-    !exactKeys(value, ['files', 'rewrites', 'licenses'])
+    !exactKeys(value, ['files', 'rewrites', 'licenses', 'nativeHelpers', 'engineAssets', 'engineLicenses'])
     || !Array.isArray(value.files)
     || !Array.isArray(value.rewrites)
     || !Array.isArray(value.licenses)
+    || !Array.isArray(value.nativeHelpers)
+    || !Array.isArray(value.engineAssets)
+    || !Array.isArray(value.engineLicenses)
     || !value.files.every((file) => validFile(file, formulae))
     || !value.licenses.every((license) => validLicense(license, formulae))
+    || !value.nativeHelpers.every(validNativeHelper)
+    || !value.engineAssets.every(validEngineAsset)
+    || !value.engineLicenses.every(validEngineLicense)
     || !sortedUnique(value.files, (file) => `${file.destination}\0${file.formula}\0${file.sourcePath}`)
     || !sortedUnique(value.licenses, (license) => `${license.destination}\0${license.formula}\0${license.source}`)
+    || !sortedUnique(value.nativeHelpers, (helper) => `${helper.destination}\0${helper.helper}`)
+    || !sortedUnique(value.engineAssets, (asset) => `${asset.destination}\0${asset.engine}`)
+    || !sortedUnique(value.engineLicenses, (license) => `${license.destination}\0${license.engine}\0${license.source}`)
   ) return false
 
   const destinations = new Set()
-  for (const entry of [...value.files, ...value.licenses]) {
+  for (const entry of [
+    ...value.files, ...value.licenses, ...value.nativeHelpers, ...value.engineAssets, ...value.engineLicenses,
+  ]) {
     const destination = entry.destination.toLocaleLowerCase('en-US')
     if (destinations.has(destination)) return false
     destinations.add(destination)
@@ -279,6 +318,17 @@ function validateSourceRelationship(sourceLock, closureLock) {
       bytes: asset.bytes,
     }).toString('utf8'))),
   ]))
+  const sourceEngines = new Map(sourceLock.engines.map((engine) => [engine.name, engine]))
+  const sourceEngineLicenseTuples = new Map(sourceLock.engines.map((engine) => [
+    engine.name,
+    new Set(engine.licenses.map((asset) => canonicalBytes({
+      engine: engine.name,
+      source: asset.url,
+      destination: asset.destination,
+      sha256: asset.sha256,
+      bytes: asset.bytes,
+    }).toString('utf8'))),
+  ]))
   for (const family of Object.values(closureLock.families)) {
     const contributed = new Set(family.files.map((file) => file.formula))
     const licensed = new Set()
@@ -295,6 +345,30 @@ function validateSourceRelationship(sourceLock, closureLock) {
     ) {
       fail('Target closure lock license inventory is inconsistent.')
     }
+
+    const contributedEngines = new Set()
+    for (const asset of family.engineAssets) {
+      const engine = sourceEngines.get(asset.engine)
+      if (
+        !engine
+        || asset.source !== 'acquisition'
+        || asset.sha256 !== engine.acquisition.sha256
+        || asset.bytes !== engine.acquisition.bytes
+      ) fail('Target closure lock engine inventory is inconsistent.')
+      contributedEngines.add(asset.engine)
+    }
+    const licensedEngines = new Set()
+    for (const license of family.engineLicenses) {
+      const tuple = canonicalBytes(license).toString('utf8')
+      if (!sourceEngineLicenseTuples.get(license.engine)?.has(tuple)) {
+        fail('Target closure lock engine license inventory is inconsistent.')
+      }
+      licensedEngines.add(license.engine)
+    }
+    if (
+      licensedEngines.size !== contributedEngines.size
+      || [...contributedEngines].some((engine) => !licensedEngines.has(engine))
+    ) fail('Target closure lock engine license inventory is inconsistent.')
   }
 
   const coordinates = new Map()
@@ -305,7 +379,10 @@ function validateSourceRelationship(sourceLock, closureLock) {
     }
     coordinates.set(coordinate.sha256, { url: coordinate.url, bytes: coordinate.bytes })
   }
-  for (const engine of sourceLock.engines) add(engine.acquisition)
+  for (const engine of sourceLock.engines) {
+    add(engine.acquisition)
+    for (const license of engine.licenses) add(license)
+  }
   for (const closureFormula of closureLock.formulae) {
     const formula = selectedFormulae.get(closureFormula.name)
     if (formula.acquisition !== null) add(formula.acquisition)

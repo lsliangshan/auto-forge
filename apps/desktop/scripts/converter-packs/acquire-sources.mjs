@@ -1113,7 +1113,11 @@ function selectedArtifacts(selected) {
     fail('Converter source acquisition inventory is invalid.')
   }
   const values = []
-  for (const engine of selected.sourceLock.engines) values.push(lockedArtifact(engine?.acquisition))
+  for (const engine of selected.sourceLock.engines) {
+    values.push(lockedArtifact(engine?.acquisition))
+    if (!Array.isArray(engine?.licenses)) fail('Converter source acquisition inventory is invalid.')
+    for (const license of engine.licenses) values.push(lockedArtifact(license))
+  }
   const sourceFormulae = new Map()
   for (const formula of selected.sourceLock.formulae) {
     if (typeof formula?.name !== 'string' || sourceFormulae.has(formula.name)) {

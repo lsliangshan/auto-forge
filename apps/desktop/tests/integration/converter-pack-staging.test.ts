@@ -35,7 +35,7 @@ function fixtureFile(root: string, relative: string): string {
   return realpathSync(path)
 }
 
-function lockedFile(root: string, formula: string, version: string, sourcePath: string, destination: string, executable = false, role = executable ? 'executable' : 'code') {
+function lockedFile(root: string, formula: string, version: string, sourcePath: string, destination: string, executable = false, role = executable ? 'executable' : 'code', runtimeRoot = false) {
   const source = fixtureFile(root, `Cellar/${formula}/${version}/${sourcePath}`)
   const bytes = readFileSync(source)
   return {
@@ -46,6 +46,7 @@ function lockedFile(root: string, formula: string, version: string, sourcePath: 
       bytes: bytes.byteLength,
       executable,
       role,
+      runtimeRoot,
     },
   }
 }
@@ -550,6 +551,36 @@ describe('converter pack Mach-O closure', () => {
       dependency: '@loader_path/libb.2.dylib',
       replacement: '@loader_path/libb.2.dylib',
     })
+  })
+
+  it('accepts an exact empty bottle closure and seeds an explicit runtime code root', async () => {
+    const root = temporaryRoot()
+    const universe = syntheticUniverse(root, {})
+    await expect(planMachOClosure({
+      entrypoints: [], architecture: 'arm64', inspect: async () => undefined,
+      universe, expectedFiles: [], expectedRewrites: [],
+    })).resolves.toEqual({ files: [], rewrites: [] })
+
+    const module = lockedFile(root, 'module', '1.0', 'lib/module.dylib', 'lib/module/module.dylib', false, 'code', true)
+    const moduleUniverse = syntheticUniverse(root, { module: '1.0' })
+    await expect(planMachOClosure({
+      entrypoints: [], architecture: 'arm64',
+      inspect: async () => ({ architectures: ['arm64'], dependencies: ['/usr/lib/libSystem.B.dylib'], rpaths: [] }),
+      universe: moduleUniverse, expectedFiles: [module.lock], expectedRewrites: [],
+    })).resolves.toMatchObject({ files: [{ destination: 'lib/module/module.dylib' }] })
+    await expect(planMachOClosure({
+      entrypoints: [{ source: module.source, destination: module.lock.destination }], architecture: 'arm64',
+      inspect: async () => ({ architectures: ['arm64'], dependencies: [], rpaths: [] }),
+      universe: moduleUniverse, expectedFiles: [module.lock], expectedRewrites: [],
+    })).rejects.toThrow('Mach-O entrypoint is not in the locked inventory.')
+
+    const executable = lockedFile(root, 'module', '1.0', 'bin/tool', 'bin/tool', true)
+    const plan = await planMachOClosure({
+      entrypoints: [{ source: executable.source, destination: executable.lock.destination }], architecture: 'arm64',
+      inspect: async () => ({ architectures: ['arm64'], dependencies: [], rpaths: [] }),
+      universe: moduleUniverse, expectedFiles: [executable.lock, module.lock], expectedRewrites: [],
+    })
+    expect(plan.files.map((file) => file.destination)).toEqual(['bin/tool', 'lib/module/module.dylib'])
   })
 
   it('rejects architecture mismatches, unresolved dependencies, and destination collisions', async () => {

@@ -66,6 +66,7 @@ function fixture() {
       {
         name: 'ffmpeg', version: '9.0.1+1', license: 'GPL-3.0-or-later', rootFormula: 'ffmpeg',
         acquisitions: structuredClone(root('ffmpeg').acquisitions),
+        licenses: [],
       },
       {
         name: 'libreoffice', version: '26.8.0', license: 'MPL-2.0', rootFormula: null,
@@ -79,14 +80,20 @@ function fixture() {
             sha256: 'f'.repeat(64), bytes: 141, cellar: null,
           },
         },
+        licenses: [{
+          kind: 'download', url: 'https://downloads.example.test/libreoffice-LICENSE',
+          sha256: '9'.repeat(64), bytes: 15, destination: 'licenses/libreoffice.LICENSE',
+        }],
       },
       {
         name: 'libvips', version: '8.18.6', license: 'LGPL-2.1-or-later', rootFormula: 'vips',
         acquisitions: structuredClone(root('vips').acquisitions),
+        licenses: [],
       },
       {
         name: 'poppler', version: '26.8.0', license: 'GPL-2.0-only OR GPL-3.0-only', rootFormula: 'poppler',
         acquisitions: structuredClone(root('poppler').acquisitions),
+        licenses: [],
       },
     ],
     formulae,
@@ -117,6 +124,7 @@ describe('converter pack source lock schema v2', () => {
         {
           name: 'ffmpeg', version: '9.0.1+1', license: 'GPL-3.0-or-later', rootFormula: 'ffmpeg',
           acquisition: bottle('ffmpeg', 'darwin-arm64', 'a', 100),
+          licenses: [],
         },
         {
           name: 'libreoffice', version: '26.8.0', license: 'MPL-2.0', rootFormula: null,
@@ -124,6 +132,10 @@ describe('converter pack source lock schema v2', () => {
             kind: 'dmg', url: 'https://downloads.example.test/libreoffice-darwin-arm64.dmg',
             sha256: 'b'.repeat(64), bytes: 140, cellar: null,
           },
+          licenses: [{
+            kind: 'download', url: 'https://downloads.example.test/libreoffice-LICENSE',
+            sha256: '9'.repeat(64), bytes: 15, destination: 'licenses/libreoffice.LICENSE',
+          }],
         },
       ]),
       formulae: expect.arrayContaining([
@@ -170,6 +182,10 @@ describe('converter pack source lock schema v2', () => {
     ['non-NFC engine version', (value: ReturnType<typeof fixture>) => { value.engines[0]!.version = 'e\u0301' }],
     ['null bottle root', (value: ReturnType<typeof fixture>) => { value.engines[0]!.rootFormula = null }],
     ['LibreOffice formula root', (value: ReturnType<typeof fixture>) => { value.engines[1]!.rootFormula = 'glib' }],
+    ['missing LibreOffice license', (value: ReturnType<typeof fixture>) => { value.engines[1]!.licenses = [] }],
+    ['formula-backed engine license', (value: ReturnType<typeof fixture>) => {
+      value.engines[0]!.licenses = structuredClone(value.engines[1]!.licenses)
+    }],
     ['HTTP coordinate', (value: ReturnType<typeof fixture>) => { value.formulae[0]!.acquisitions['darwin-arm64']!.url = 'http://example.test/file' }],
     ['uppercase URL protocol', (value: ReturnType<typeof fixture>) => { value.formulae[1]!.acquisitions['darwin-arm64']!.url = 'HTTPS://downloads.example.test/glib.tar.gz' }],
     ['uppercase URL host', (value: ReturnType<typeof fixture>) => { value.formulae[1]!.acquisitions['darwin-arm64']!.url = 'https://DOWNLOADS.example.test/glib.tar.gz' }],

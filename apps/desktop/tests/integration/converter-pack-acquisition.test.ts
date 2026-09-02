@@ -161,7 +161,11 @@ function lockedSelection({
 }) {
   return {
     target: 'darwin-arm64',
-    sourceLock: { target: 'darwin-arm64', engines, formulae },
+    sourceLock: {
+      target: 'darwin-arm64',
+      engines: engines.map((engine) => ({ ...engine, licenses: engine.licenses ?? [] })),
+      formulae,
+    },
     closureLock: {
       target: 'darwin-arm64',
       formulae: closureFormulae.map((name) => ({ name })),
@@ -1395,6 +1399,33 @@ describe('converter pack source acquisition', () => {
     expect(result.networkBytes).toBe(engineBytes.byteLength + selectedBytes.byteLength + selectedLicenseBytes.byteLength)
     expect(result.blobs.has(unusedFormula.sha256)).toBe(false)
     expect(result.blobs.has(unusedLicense.sha256)).toBe(false)
+  })
+
+  it('acquires and SHA-deduplicates authenticated engine download licenses', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const engineBytes = Buffer.from('engine')
+    const licenseBytes = Buffer.from('engine license')
+    const engine = acquisition(engineBytes, 'engine')
+    const license = {
+      kind: 'download', url: 'https://downloads.example.test/engine-license.txt',
+      sha256: sha256(licenseBytes), bytes: licenseBytes.byteLength, destination: 'licenses/engine.txt',
+    }
+    const selected = lockedSelection({ engines: [{ name: 'engine', acquisition: engine, licenses: [license] }] })
+    const requests: string[] = []
+
+    const result = await acquireLockedArtifacts({
+      selected,
+      cacheRoot,
+      fetchImpl: async (input) => {
+        requests.push(String(input))
+        return new Response(String(input) === engine.url ? engineBytes : licenseBytes, { status: 200 })
+      },
+    })
+
+    expect(requests.sort()).toEqual([engine.url, license.url].sort())
+    expect(result.blobs.size).toBe(2)
   })
 
   it('rejects an unknown target-closure formula before making requests', async () => {
