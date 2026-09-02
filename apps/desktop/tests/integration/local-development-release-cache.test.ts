@@ -72,6 +72,16 @@ function createReadyWorkspace(
   return path
 }
 
+function createLegacyReadyWorkspace(cacheRoot: string, fingerprint: string, pid: number) {
+  const nonce = randomUUID()
+  const path = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}-ABC123`)
+  mkdirSync(path)
+  const owner = join(path, `.owner-${nonce}.ready`)
+  writeFileSync(owner, canonicalBytes({ fingerprint, nonce, pid, schemaVersion: 1 }))
+  chmodSync(owner, 0o444)
+  return path
+}
+
 describe('local development release cache', () => {
   it('runs the default process identity reader with fixed argv and a minimal environment', async () => {
     const calls: unknown[][] = []
@@ -205,6 +215,35 @@ describe('local development release cache', () => {
     expect(existsSync(live)).toBe(true)
     await lease.stop()
     rmSync(lease.path, { recursive: true })
+  })
+
+  it('recovers the exact previous schema-v1 ready owner after its process dies', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const legacy = createLegacyReadyWorkspace(cacheRoot, 'a'.repeat(64), 99_999_999)
+
+    const lease = await createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint: 'b'.repeat(64),
+      processIdentity: testProcessIdentity,
+    })
+
+    expect(existsSync(legacy)).toBe(false)
+    await lease.stop()
+    rmSync(lease.path, { recursive: true })
+  })
+
+  it('fails closed instead of treating a previous schema-v1 owner with a live PID as v2 live', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const legacy = createLegacyReadyWorkspace(cacheRoot, 'c'.repeat(64), process.pid)
+
+    await expect(createDevelopmentPreparationWorkspace({
+      cacheRoot,
+      fingerprint: 'd'.repeat(64),
+      processIdentity: testProcessIdentity,
+    })).rejects.toThrow(/active legacy preparation owner cannot be recovered/iu)
+    expect(existsSync(legacy)).toBe(true)
   })
 
   it('fences an owner lease whose stable inode grows behind the open handle', async () => {

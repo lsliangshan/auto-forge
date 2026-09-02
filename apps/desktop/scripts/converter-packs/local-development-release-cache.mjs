@@ -444,24 +444,38 @@ export async function inspectAndRecoverDevelopmentPreparationWorkspaces({
       })
       let value
       try { value = JSON.parse(owner.bytes.toString('utf8')) } catch { throw new Error('Development preparation owner is invalid') }
-      if (!owner.bytes.equals(canonicalBytes(value))
+      const commonValid = owner.bytes.equals(canonicalBytes(value))
+        && FINGERPRINT_PATTERN.test(value.fingerprint)
+        && value.nonce === ownerMatch[1]
+        && Number.isSafeInteger(value.pid)
+        && value.pid > 0
+      if (legacyCoordinate) {
+        if (!commonValid
+          || Object.keys(value).sort().join('\0') !== ['fingerprint', 'nonce', 'pid', 'schemaVersion'].join('\0')
+          || !value.fingerprint.startsWith(legacyCoordinate[1])
+          || value.schemaVersion !== 1) {
+          throw new Error('Development preparation owner is invalid')
+        }
+        if (ownerAlive(value.pid)) throw new Error('Active legacy preparation owner cannot be recovered safely')
+      } else if (!commonValid
         || Object.keys(value).sort().join('\0') !== ['birth', 'fingerprint', 'nonce', 'pid', 'schemaVersion'].join('\0')
         || !PROCESS_BIRTH_PATTERN.test(value.birth)
-        || !FINGERPRINT_PATTERN.test(value.fingerprint)
-        || (currentCoordinate ? value.fingerprint !== currentCoordinate[1] : !value.fingerprint.startsWith(legacyCoordinate[1]))
-        || value.nonce !== ownerMatch[1]
-        || !Number.isSafeInteger(value.pid)
-        || value.pid <= 0
+        || value.fingerprint !== currentCoordinate[1]
         || value.schemaVersion !== 2) {
         throw new Error('Development preparation owner is invalid')
-      }
-      if (!processIdentities.has(value.pid)) processIdentities.set(value.pid, await processIdentity(value.pid))
-      if (processIdentities.get(value.pid) === value.birth) {
-        live.push(Object.freeze({ dev: details.dev, ino: details.ino, name, path }))
-        continue
+      } else {
+        if (!processIdentities.has(value.pid)) processIdentities.set(value.pid, await processIdentity(value.pid))
+        if (processIdentities.get(value.pid) === value.birth) {
+          live.push(Object.freeze({ dev: details.dev, ino: details.ino, name, path }))
+          continue
+        }
       }
     }
     await heartbeat.pulse()
+    const current = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    if (!current?.isDirectory() || current.isSymbolicLink() || !sameIdentity(current, details)) {
+      throw new Error('Development preparation workspace changed before recovery')
+    }
     await rm(path, { recursive: true })
     recovered = true
   }
