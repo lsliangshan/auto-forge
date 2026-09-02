@@ -7,6 +7,7 @@ import {
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
+  writeDevelopmentReleaseMetadata,
 } from '../../scripts/converter-packs/local-development-release-cache.mjs'
 
 const roots: string[] = []
@@ -141,5 +142,30 @@ describe('local development release cache', () => {
     })).rejects.toThrow('rename failed')
     await expect(readActiveDevelopmentRelease({ cacheRoot })).resolves.toBe(join(cacheRoot, 'releases', oldFingerprint))
     expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.active-release-'))).toEqual([])
+  })
+
+  it('publishes immutable metadata only for a canonical existing release and complete blobs', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(join(cacheRoot, 'sources'), { recursive: true })
+    const fingerprint = '1'.repeat(64)
+    const blob = '2'.repeat(64)
+    createRelease(cacheRoot, fingerprint)
+    writeFileSync(join(cacheRoot, 'sources', `${blob}.archive`), 'blob')
+
+    const metadata = await writeDevelopmentReleaseMetadata({
+      cacheRoot, fingerprint, blobs: [{ sha256: blob, bytes: 4 }],
+    })
+    expect(readFileSync(metadata, 'utf8')).toBe(
+      `{"blobs":[{"bytes":4,"sha256":"${blob}"}],"fingerprint":"${fingerprint}","release":"releases/${fingerprint}","schemaVersion":1}`,
+    )
+    await expect(writeDevelopmentReleaseMetadata({
+      cacheRoot, fingerprint, blobs: [{ sha256: blob, bytes: 4 }],
+    })).rejects.toThrow(/metadata|exist|immutable/iu)
+
+    const alias = join(cacheRoot, 'sources', 'alias.archive')
+    symlinkSync(join(cacheRoot, 'sources', `${blob}.archive`), alias)
+    await expect(writeDevelopmentReleaseMetadata({
+      cacheRoot, fingerprint: '3'.repeat(64), blobs: [{ sha256: 'alias', bytes: 4, path: alias }],
+    })).rejects.toThrow()
   })
 })

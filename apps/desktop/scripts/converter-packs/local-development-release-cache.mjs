@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { lstatSync, realpathSync } from 'node:fs'
+import { Buffer } from 'node:buffer'
+import { constants, lstatSync, realpathSync } from 'node:fs'
 import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { canonicalBytes, withStableRegularFile } from './pack-tooling-lib.mjs'
 
 const FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/
 const TARGETS = new Set(['darwin-arm64', 'darwin-x64'])
@@ -106,9 +108,76 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
   return {
     sources: join(canonicalRoot, 'sources'),
     release: releasePath(canonicalRoot, fingerprint),
+    releaseMetadata: join(canonicalRoot, 'release-metadata', `${fingerprint}.json`),
+    releaseMetadataRoot: join(canonicalRoot, 'release-metadata'),
     activeMarker: join(canonicalRoot, 'active-release.json'),
     markerTemporaryRoot: join(canonicalRoot, '.active-release-'),
   }
+}
+
+export async function writeDevelopmentReleaseMetadata({ cacheRoot, fingerprint, blobs }) {
+  const canonicalRoot = await canonicalCacheRoot(cacheRoot)
+  assertFingerprint(fingerprint)
+  if (!Array.isArray(blobs)) throw new Error('Development release metadata blobs are invalid')
+  const selected = blobs.map((blob) => {
+    if (
+      !blob
+      || typeof blob !== 'object'
+      || Object.keys(blob).length !== 2
+      || !Object.hasOwn(blob, 'sha256')
+      || !Object.hasOwn(blob, 'bytes')
+      || typeof blob.sha256 !== 'string'
+      || !FINGERPRINT_PATTERN.test(blob.sha256)
+      || !Number.isSafeInteger(blob.bytes)
+      || blob.bytes <= 0
+    ) throw new Error('Development release metadata blob is invalid')
+    return { bytes: blob.bytes, sha256: blob.sha256 }
+  }).sort((left, right) => Buffer.compare(Buffer.from(left.sha256), Buffer.from(right.sha256)))
+  for (let index = 1; index < selected.length; index += 1) {
+    if (selected[index - 1].sha256 === selected[index].sha256) {
+      throw new Error('Development release metadata blobs must be unique')
+    }
+  }
+  await validateRelease(canonicalRoot, fingerprint)
+  const sources = join(canonicalRoot, 'sources')
+  for (const blob of selected) {
+    await withStableRegularFile(join(sources, `${blob.sha256}.archive`), 'Development release blob', async (_handle, details) => {
+      if (details.size !== blob.bytes) throw new Error('Development release metadata blob size is invalid')
+    })
+  }
+
+  const metadataRoot = join(canonicalRoot, 'release-metadata')
+  await mkdir(metadataRoot, { recursive: true, mode: 0o755 })
+  const metadataDetails = await lstat(metadataRoot)
+  if (metadataDetails.isSymbolicLink() || !metadataDetails.isDirectory() || await realpath(metadataRoot) !== metadataRoot) {
+    throw new Error('Development release metadata root is unsafe')
+  }
+  const path = join(metadataRoot, `${fingerprint}.json`)
+  const bytes = canonicalBytes({
+    blobs: selected,
+    fingerprint,
+    release: `releases/${fingerprint}`,
+    schemaVersion: 1,
+  })
+  let handle
+  try {
+    handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+    await handle.writeFile(bytes)
+    await handle.chmod(0o444)
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    const directoryHandle = await open(metadataRoot, 'r')
+    try {
+      await directoryHandle.sync()
+    } finally {
+      await directoryHandle.close()
+    }
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    throw error
+  }
+  return path
 }
 
 export async function readActiveDevelopmentRelease({ cacheRoot }) {
