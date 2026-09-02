@@ -1,10 +1,12 @@
-import { chmodSync, copyFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
-import { openBuiltHelperSet } from '../../scripts/converter-packs/build-native-helpers.mjs'
+import { buildNativeHelpers, openBuiltHelperSet } from '../../scripts/converter-packs/build-native-helpers.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const nativeRoot = join(desktopRoot, 'converter-packs', 'native')
@@ -105,6 +107,8 @@ describe('native converter helper contracts', () => {
     ], { encoding: 'utf8' })
 
     expect(result.status, result.stderr).toBe(0)
+    const manifest = JSON.parse(readFileSync(join(output, 'manifest.json'), 'utf8'))
+    expect(manifest.helpers.map((record: { mode: number }) => record.mode)).toEqual([0o755, 0o755, 0o755])
     const helperSet = await openBuiltHelperSet({ root: output, target })
     for (const relativePath of ['bin/autoforge-image-converter', 'bin/autoforge-pdf-raster', 'program/soffice']) {
       const path = join(output, relativePath)
@@ -119,8 +123,38 @@ describe('native converter helper contracts', () => {
       destination: 'program/soffice',
       path: join(output, 'program/soffice'),
     })
+    chmodSync(join(output, 'program/soffice'), 0o777)
+    await expect(helperSet.resolveHelper('autoforge-soffice-launcher')).rejects.toThrow('Native helper set is invalid.')
+    chmodSync(join(output, 'program/soffice'), 0o666)
+    await expect(helperSet.resolveHelper('autoforge-soffice-launcher')).rejects.toThrow('Native helper set is invalid.')
+    chmodSync(join(output, 'program/soffice'), 0o755)
+    chmodSync(join(output, 'manifest.json'), 0o666)
+    await expect(openBuiltHelperSet({ root: output, target })).rejects.toThrow('Native helper set is invalid.')
+    chmodSync(join(output, 'manifest.json'), 0o444)
     writeFileSync(join(output, 'program/soffice'), 'substituted')
     await expect(helperSet.resolveHelper('autoforge-soffice-launcher')).rejects.toThrow('Native helper set is invalid.')
+  })
+
+  it('keeps a live build claim and reopens an already published exact helper set', async () => {
+    const root = temporaryRoot()
+    const output = join(root, 'helpers')
+    const target = `darwin-${process.arch}`
+    let signalReady!: () => void
+    let releasePublish!: () => void
+    const ready = new Promise<void>((resolve) => { signalReady = resolve })
+    const release = new Promise<void>((resolve) => { releasePublish = resolve })
+    const first = buildNativeHelpers({
+      target, output, compiler: '/usr/bin/clang',
+      beforePublishForTest: async () => { signalReady(); await release },
+    })
+    await ready
+
+    await expect(buildNativeHelpers({ target, output, compiler: '/usr/bin/clang' }))
+      .rejects.toThrow('Private directory publication is already claimed.')
+    releasePublish()
+    await expect(first).resolves.toBeDefined()
+    await expect(buildNativeHelpers({ target, output, compiler: '/usr/bin/clang' })).resolves.toBeDefined()
+    expect(existsSync(`${output}.claim`)).toBe(false)
   })
 
   it('mounts the pinned LibreOffice DMG read-only, forwards arguments, and detaches it', () => {

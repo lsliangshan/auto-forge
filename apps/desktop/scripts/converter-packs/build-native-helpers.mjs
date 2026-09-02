@@ -1,11 +1,12 @@
 import { spawnSync } from 'node:child_process'
-import { chmod, lstat, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, open, realpath } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL, URL } from 'node:url'
 import {
   canonicalBytes, compareUtf8, parseArguments, readStableRegularFile, requireAbsolutePath, requireDirectory, sha256,
 } from './pack-tooling-lib.mjs'
+import { publishPrivateDirectory, writeDurableFile } from './private-directory-publication.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const nativeRoot = join(desktopRoot, 'converter-packs', 'native')
@@ -53,11 +54,12 @@ function exactKeys(value, keys) {
 
 async function verifiedHelper(root, record) {
   if (
-    !exactKeys(record, ['helper', 'destination', 'sha256', 'bytes'])
+    !exactKeys(record, ['helper', 'destination', 'sha256', 'bytes', 'mode'])
     || helperByName.get(record.helper)?.destination !== record.destination
     || !/^[a-f0-9]{64}$/u.test(record.sha256)
     || !Number.isSafeInteger(record.bytes)
     || record.bytes <= 0
+    || record.mode !== 0o755
   ) invalid()
   const path = join(root, ...record.destination.split('/'))
   const metadata = await lstat(path).catch(() => undefined)
@@ -65,7 +67,7 @@ async function verifiedHelper(root, record) {
     !metadata?.isFile()
     || metadata.isSymbolicLink()
     || metadata.nlink !== 1
-    || (metadata.mode & 0o111) === 0
+    || (metadata.mode & 0o777) !== record.mode
     || await realpath(path).catch(() => undefined) !== path
   ) invalid()
   const bytes = await readStableRegularFile(path, 'Native helper')
@@ -77,7 +79,10 @@ export async function openBuiltHelperSet({ root, target }) {
   if (!targetArchitectures[target]) invalid()
   requireAbsolutePath(root, 'Native helper root')
   await requireDirectory(root, 'Native helper root')
-  const manifestBytes = await readStableRegularFile(join(root, 'manifest.json'), 'Native helper manifest', 64 * 1024)
+  const manifestPath = join(root, 'manifest.json')
+  const manifestMetadata = await lstat(manifestPath).catch(() => undefined)
+  if (!manifestMetadata?.isFile() || (manifestMetadata.mode & 0o777) !== 0o444) invalid()
+  const manifestBytes = await readStableRegularFile(manifestPath, 'Native helper manifest', 64 * 1024)
   let manifest
   try { manifest = JSON.parse(manifestBytes.toString('utf8')) } catch { invalid() }
   if (!manifestBytes.equals(canonicalBytes(manifest))) invalid()
@@ -112,7 +117,15 @@ async function requireExecutable(path) {
   }
 }
 
-export async function buildNativeHelpers({ target, output, compiler }) {
+export async function buildNativeHelpers({
+  target,
+  output,
+  compiler,
+  beforePublishForTest,
+  afterClaimOpenForTest,
+  removePrivateRootForTest,
+  claimInitializationCleanupForTest,
+}) {
   const architecture = targetArchitectures[target]
   if (!architecture) throw new Error('Target must be darwin-arm64 or darwin-x64.')
   requireAbsolutePath(output, 'Output')
@@ -122,12 +135,18 @@ export async function buildNativeHelpers({ target, output, compiler }) {
     throw new Error('Output parent must be one canonical directory without symbolic path components.')
   }
 
-  await mkdir(output, { mode: 0o755 })
-  try {
-    const bin = join(output, 'bin')
+  await publishPrivateDirectory({
+    destination: output,
+    beforePublishForTest,
+    afterClaimOpenForTest,
+    removePrivateRootForTest,
+    claimInitializationCleanupForTest,
+    verifyExisting: (root) => openBuiltHelperSet({ root, target }),
+    populate: async (privateRoot, heartbeat) => {
+    const bin = join(privateRoot, 'bin')
     await mkdir(bin, { mode: 0o755 })
     for (const helper of helpers) {
-      const executable = join(output, ...helper.destination.split('/'))
+      const executable = join(privateRoot, ...helper.destination.split('/'))
       await mkdir(dirname(executable), { recursive: true, mode: 0o755 })
       const args = [
         '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
@@ -141,6 +160,14 @@ export async function buildNativeHelpers({ target, output, compiler }) {
       const metadata = await lstat(executable)
       if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error('Compiler did not produce a regular helper executable.')
       await chmod(executable, 0o755)
+      const handle = await open(executable, 'r+')
+      try {
+        await handle.chmod(0o755)
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      await heartbeat.pulse()
     }
     const manifest = {
       schemaVersion: 1,
@@ -148,21 +175,20 @@ export async function buildNativeHelpers({ target, output, compiler }) {
       helpers: [],
     }
     for (const helper of helpers) {
-      const path = join(output, ...helper.destination.split('/'))
+      const path = join(privateRoot, ...helper.destination.split('/'))
       const bytes = await readStableRegularFile(path, 'Native helper')
       manifest.helpers.push({
         helper: helper.name,
         destination: helper.destination,
         sha256: sha256(bytes),
         bytes: bytes.byteLength,
+        mode: 0o755,
       })
     }
-    await writeFile(join(output, 'manifest.json'), canonicalBytes(manifest), { flag: 'wx', mode: 0o444 })
-    return openBuiltHelperSet({ root: output, target })
-  } catch (error) {
-    await rm(output, { recursive: true, force: true })
-    throw error
-  }
+      await writeDurableFile(join(privateRoot, 'manifest.json'), canonicalBytes(manifest), 0o444)
+    },
+  })
+  return openBuiltHelperSet({ root: output, target })
 }
 
 async function main(argv) {

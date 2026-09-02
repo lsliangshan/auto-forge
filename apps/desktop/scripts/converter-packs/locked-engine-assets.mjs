@@ -1,8 +1,9 @@
-import { chmod, lstat, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { lstat, mkdir, realpath } from 'node:fs/promises'
+import { join } from 'node:path'
 import {
   canonicalBytes, compareUtf8, fail, isPathInsideRoot, readStableRegularFile, requireAbsolutePath, requireDirectory, sha256,
 } from './pack-tooling-lib.mjs'
+import { publishPrivateDirectory, writeDurableFile } from './private-directory-publication.mjs'
 
 const targets = new Set(['darwin-arm64', 'darwin-x64'])
 function invalid() {
@@ -47,7 +48,7 @@ function expectedRecords({ target, sourceLock, closureLock }) {
       ) invalid()
       const record = {
         kind: 'asset', engine: asset.engine, source: asset.source,
-        sha256: asset.sha256, bytes: asset.bytes, relativePath: `Assets/${asset.sha256}`,
+        sha256: asset.sha256, bytes: asset.bytes, mode: 0o444, relativePath: `Assets/${asset.sha256}`,
       }
       assets.set(tupleKey(asset), record)
     }
@@ -64,7 +65,7 @@ function expectedRecords({ target, sourceLock, closureLock }) {
       if (!matches) invalid()
       const record = {
         kind: 'license', engine: license.engine, source: license.source,
-        sha256: license.sha256, bytes: license.bytes, relativePath: `Licenses/${license.sha256}`,
+        sha256: license.sha256, bytes: license.bytes, mode: 0o444, relativePath: `Licenses/${license.sha256}`,
       }
       licenses.set(tupleKey(license), record)
     }
@@ -81,6 +82,7 @@ async function verifyRecord(root, record) {
     || !metadata?.isFile()
     || metadata.isSymbolicLink()
     || metadata.nlink !== 1
+    || (metadata.mode & 0o777) !== record.mode
     || await realpath(path).catch(() => undefined) !== path
   ) invalid()
   const bytes = await readStableRegularFile(path, 'Locked engine asset')
@@ -92,7 +94,10 @@ export async function openLockedEngineAssets({ root, target, sourceLock, closure
   requireAbsolutePath(root, 'Locked engine asset root')
   await requireDirectory(root, 'Locked engine asset root')
   const expected = expectedRecords({ target, sourceLock, closureLock })
-  const bytes = await readStableRegularFile(join(root, 'manifest.json'), 'Locked engine asset manifest', 1024 * 1024)
+  const manifestPath = join(root, 'manifest.json')
+  const manifestMetadata = await lstat(manifestPath).catch(() => undefined)
+  if (!manifestMetadata?.isFile() || (manifestMetadata.mode & 0o777) !== 0o444) invalid()
+  const bytes = await readStableRegularFile(manifestPath, 'Locked engine asset manifest', 1024 * 1024)
   let manifest
   try { manifest = JSON.parse(bytes.toString('utf8')) } catch { invalid() }
   if (
@@ -124,18 +129,28 @@ export async function openLockedEngineAssets({ root, target, sourceLock, closure
   })
 }
 
-export async function materializeLockedEngineAssets({ target, sourceLock, closureLock, blobs, outputRoot }) {
+export async function materializeLockedEngineAssets({
+  target,
+  sourceLock,
+  closureLock,
+  blobs,
+  outputRoot,
+  beforePublishForTest,
+  afterClaimOpenForTest,
+  removePrivateRootForTest,
+  claimInitializationCleanupForTest,
+}) {
   requireAbsolutePath(outputRoot, 'Locked engine asset root')
   if (!(blobs instanceof Map)) invalid()
-  const parent = dirname(outputRoot)
-  await requireDirectory(parent, 'Locked engine asset parent')
   const expected = expectedRecords({ target, sourceLock, closureLock })
-  const claim = `${outputRoot}.claim`
-  await mkdir(claim, { mode: 0o700 }).catch(() => invalid())
-  let privateRoot
-  try {
-    if (await lstat(outputRoot).catch(() => undefined)) invalid()
-    privateRoot = await mkdtemp(join(parent, '.locked-engine-assets-'))
+  await publishPrivateDirectory({
+    destination: outputRoot,
+    beforePublishForTest,
+    afterClaimOpenForTest,
+    removePrivateRootForTest,
+    claimInitializationCleanupForTest,
+    verifyExisting: (root) => openLockedEngineAssets({ root, target, sourceLock, closureLock }),
+    populate: async (privateRoot, heartbeat) => {
     await mkdir(join(privateRoot, 'Assets'), { mode: 0o700 })
     await mkdir(join(privateRoot, 'Licenses'), { mode: 0o700 })
     const copied = new Set()
@@ -147,19 +162,12 @@ export async function materializeLockedEngineAssets({ target, sourceLock, closur
       const source = await readStableRegularFile(blob.path, 'Locked engine blob')
       if (source.byteLength !== record.bytes || sha256(source) !== record.sha256) invalid()
       const destination = join(privateRoot, ...record.relativePath.split('/'))
-      await writeFile(destination, source, { flag: 'wx', mode: 0o444 })
-      await chmod(destination, 0o444)
+      await writeDurableFile(destination, source, record.mode)
+      await heartbeat.pulse()
     }
     const manifest = { schemaVersion: 1, target, records: expected.records }
-    await writeFile(join(privateRoot, 'manifest.json'), canonicalBytes(manifest), { flag: 'wx', mode: 0o444 })
-    if (await lstat(outputRoot).catch(() => undefined)) invalid()
-    await rename(privateRoot, outputRoot)
-    privateRoot = undefined
-    return openLockedEngineAssets({ root: outputRoot, target, sourceLock, closureLock })
-  } catch (error) {
-    if (privateRoot) await rm(privateRoot, { recursive: true, force: true })
-    throw error
-  } finally {
-    await rm(claim, { recursive: true, force: true })
-  }
+      await writeDurableFile(join(privateRoot, 'manifest.json'), canonicalBytes(manifest), 0o444)
+    },
+  })
+  return openLockedEngineAssets({ root: outputRoot, target, sourceLock, closureLock })
 }

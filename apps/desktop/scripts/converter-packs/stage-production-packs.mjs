@@ -18,10 +18,13 @@ import {
   sha256,
   validateExecutableSet,
 } from './pack-tooling-lib.mjs'
-import { adhocSignMachOClosure, inspectMachO, planMachOClosure, relocateMachOClosure } from './macho-closure.mjs'
+import {
+  adhocSignMachOClosure, inspectMachO, planMachOClosure, relocateMachOClosure, systemDependency,
+} from './macho-closure.mjs'
 import { loadConverterClosureLock } from './closure-lock.mjs'
 import { openBuiltHelperSet } from './build-native-helpers.mjs'
 import { openLockedEngineAssets } from './locked-engine-assets.mjs'
+import { settleCleanup } from './private-directory-publication.mjs'
 
 const familyNames = Object.freeze(['image-icon', 'document', 'pdf', 'media'])
 const exactExecutables = Object.freeze({
@@ -298,10 +301,6 @@ function validateFamily(name, family) {
   if (family.licenses.length + family.engineLicenses.length === 0) fail(`Pack family is missing a license: ${name}`)
 }
 
-function systemDependency(value) {
-  return typeof value === 'string' && (value.startsWith('/usr/lib/') || value.startsWith('/System/Library/'))
-}
-
 function validateHelperInspection(inspection, architecture) {
   if (
     !plainRecord(inspection)
@@ -359,6 +358,7 @@ export async function stageProductionPacks(request, dependencies = productionDep
     || (dependencies.openHelpers !== undefined && typeof dependencies.openHelpers !== 'function')
     || (dependencies.openEngineAssets !== undefined && typeof dependencies.openEngineAssets !== 'function')
     || (dependencies.inspectHelper !== undefined && typeof dependencies.inspectHelper !== 'function')
+    || (dependencies.removeOutput !== undefined && typeof dependencies.removeOutput !== 'function')
   ) fail('Pack staging dependencies are invalid.')
   if (await realpath(dirname(request.output)).catch(() => undefined) !== dirname(request.output)) {
     fail('Staging output parent must be a canonical directory.')
@@ -436,8 +436,9 @@ export async function stageProductionPacks(request, dependencies = productionDep
       for (const helper of family.nativeHelpers) {
         const resolved = await helperSet.resolveHelper(helper.helper)
         if (
-          !exactKeys(resolved, ['helper', 'destination', 'sha256', 'bytes', 'path'])
+          !exactKeys(resolved, ['helper', 'destination', 'sha256', 'bytes', 'mode', 'path'])
           || resolved.destination !== helper.destination
+          || resolved.mode !== 0o755
         ) fail(`Native helper differs from its locked inventory: ${name}`)
         validateHelperInspection(await inspectHelper(resolved.path), target.machoArchitecture)
         files.push(await copyDeclaredFile({
@@ -501,8 +502,8 @@ export async function stageProductionPacks(request, dependencies = productionDep
       sequence: request.sequence,
     }), { flag: 'wx', mode: 0o600 })
   } catch (error) {
-    await rm(request.output, { recursive: true, force: true })
-    throw error
+    const removeOutput = dependencies.removeOutput ?? ((path) => rm(path, { recursive: true, force: true }))
+    await settleCleanup(error, [() => removeOutput(request.output)], 'Pack staging cleanup failed.')
   }
 }
 

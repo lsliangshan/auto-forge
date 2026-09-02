@@ -91,4 +91,33 @@ describe('production staging plan preparation', () => {
     })
     expect(calls).toEqual(['locks', 'acquire', 'universe', 'engine-assets'])
   })
+
+  it('preserves the preparation failure first when workspace cleanup also fails', async () => {
+    const root = temporaryRoot()
+    const helpers = join(root, 'helpers')
+    const cache = join(root, 'cache')
+    mkdirSync(helpers)
+    mkdirSync(cache)
+    const failure = await prepareProductionStagingPlan({
+      lockPath: join(root, 'sources.lock.json'), target: 'darwin-arm64', cacheRoot: cache, helpersRoot: helpers,
+      workspace: join(root, 'prepared'), staging: join(root, 'staging'), planPath: join(root, 'plan.json'),
+      version: '1.2.3', sequence: 7, generatedAt: '2026-08-31T00:00:00.000Z',
+      archiveBaseUrl: 'https://example.test/releases/7',
+    }, {
+      loadLocks: async () => { throw new Error('lock primary') },
+      acquireSources: async () => ({ blobs: new Map() }),
+      materializeUniverse: async () => undefined,
+      materializeEngineAssets: async () => undefined,
+      removeWorkspace: async () => {
+        const error = new Error('workspace rm EACCES') as Error & { code: string }
+        error.code = 'EACCES'
+        throw error
+      },
+    }).then(() => undefined, (error: unknown) => error as AggregateError)
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect(failure.message).toBe('lock primary')
+    expect(failure.errors.map((error) => (error as Error).message))
+      .toEqual(['lock primary', 'workspace rm EACCES'])
+  })
 })

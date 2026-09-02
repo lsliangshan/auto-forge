@@ -76,7 +76,7 @@ export async function inspectMachO(path, { run = defaultRun } = {}) {
   }
 }
 
-function systemDependency(path) {
+export function systemDependency(path) {
   return typeof path === 'string'
     && posix.isAbsolute(path)
     && posix.normalize(path) === path
@@ -86,8 +86,12 @@ function systemDependency(path) {
 function expandAnchor(value, sourceDirectory, executableDirectory) {
   if (value === '@loader_path') return sourceDirectory
   if (value.startsWith('@loader_path/')) return join(sourceDirectory, value.slice('@loader_path/'.length))
-  if (value === '@executable_path') return executableDirectory
-  if (value.startsWith('@executable_path/')) return join(executableDirectory, value.slice('@executable_path/'.length))
+  if (value === '@executable_path' || value.startsWith('@executable_path/')) {
+    if (executableDirectory === undefined) fail('Independent Mach-O runtime root cannot resolve @executable_path.')
+    return value === '@executable_path'
+      ? executableDirectory
+      : join(executableDirectory, value.slice('@executable_path/'.length))
+  }
   if (isAbsolute(value)) return value
   return undefined
 }
@@ -316,26 +320,32 @@ export async function planMachOClosure({ entrypoints, architecture, inspect, uni
     if (!node || !node.executable || node.destination !== entrypoint.destination) fail('Mach-O entrypoint is not in the locked inventory.')
     add(node, dirname(node.source))
   }
-  for (const node of byFormulaPath.values()) {
-    if (node.expected.runtimeRoot) add(node, dirname(node.source))
-  }
-
-  for (let cursor = 0; cursor < queue.length; cursor += 1) {
-    const node = queue[cursor]
-    if (node.expected.role === 'data') continue
-    const inspection = validateInspection(await inspect(node.source), architecture)
-    for (const dependency of inspection.dependencies) {
-      const dependencyNode = await resolveDependency(dependency, inspection, node, { byFormulaPath, bySource, universe })
-      if (dependencyNode === undefined) continue
-      if (dependencyNode.expected.role !== 'code') fail('Mach-O dependency target must be a locked code file.')
-      if (dependencyNode.source === node.source) continue
-      add(dependencyNode, node.executableDirectory)
-      rewrites.push({
-        destination: node.destination,
-        dependency,
-        replacement: replacementFor(node.destination, dependencyNode.destination),
-      })
+  let cursor = 0
+  const drainQueue = async () => {
+    while (cursor < queue.length) {
+      const node = queue[cursor]
+      cursor += 1
+      if (node.expected.role === 'data') continue
+      const inspection = validateInspection(await inspect(node.source), architecture)
+      for (const dependency of inspection.dependencies) {
+        const dependencyNode = await resolveDependency(dependency, inspection, node, { byFormulaPath, bySource, universe })
+        if (dependencyNode === undefined) continue
+        if (dependencyNode.expected.role !== 'code') fail('Mach-O dependency target must be a locked code file.')
+        if (dependencyNode.source === node.source) continue
+        add(dependencyNode, node.executableDirectory)
+        rewrites.push({
+          destination: node.destination,
+          dependency,
+          replacement: replacementFor(node.destination, dependencyNode.destination),
+        })
+      }
     }
+  }
+  await drainQueue()
+  for (const node of byFormulaPath.values()) {
+    if (!node.expected.runtimeRoot || discoveredSources.has(node.source)) continue
+    add(node, undefined)
+    await drainQueue()
   }
 
   for (const node of byFormulaPath.values()) {

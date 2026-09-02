@@ -200,6 +200,24 @@ it('rejects symbolic fingerprint inputs instead of following them outside the de
   await expect(developmentFingerprintInputs(desktopRoot)).rejects.toThrow(/symbolic/i)
 })
 
+it('rejects unsafe closure coordinates and symbolic closure files before fingerprinting', async () => {
+  const unsafe = fixture()
+  const unsafePath = join(unsafe.desktopRoot, 'converter-packs', 'sources.lock.json')
+  const unsafeLock = JSON.parse(readFileSync(unsafePath, 'utf8'))
+  unsafeLock.closureLocks['darwin-arm64'].path = '../outside.lock.json'
+  writeFileSync(unsafePath, JSON.stringify(unsafeLock))
+  writeFileSync(join(unsafe.desktopRoot, 'converter-packs', 'outside.lock.json'), '{}')
+  await expect(developmentFingerprintInputs(unsafe.desktopRoot)).rejects.toThrow(/closure coordinates/iu)
+
+  const symbolic = fixture()
+  const closurePath = join(symbolic.desktopRoot, 'converter-packs', 'closures', 'darwin-arm64.lock.json')
+  const outside = join(symbolic.root, 'outside-closure.json')
+  writeFileSync(outside, '{"target":"darwin-arm64"}')
+  rmSync(closurePath)
+  symlinkSync(outside, closurePath)
+  await expect(developmentFingerprintInputs(symbolic.desktopRoot)).rejects.toThrow(/linked|symbolic/iu)
+})
+
 it.each([
   ['helper build', 'buildHelpers'],
   ['probe staging', 'stagePacks'],

@@ -14,6 +14,7 @@ import {
   requireAbsolutePath,
   requireDirectory,
 } from './pack-tooling-lib.mjs'
+import { settleCleanup } from './private-directory-publication.mjs'
 
 const productionDependencies = Object.freeze({
   loadLocks: (request) => loadConverterClosureLock(request),
@@ -34,6 +35,7 @@ export async function prepareProductionStagingPlan(request, dependencies = produ
     || typeof dependencies?.acquireSources !== 'function'
     || typeof dependencies?.materializeUniverse !== 'function'
     || typeof dependencies?.materializeEngineAssets !== 'function'
+    || (dependencies.removeWorkspace !== undefined && typeof dependencies.removeWorkspace !== 'function')
   ) {
     fail('Staging preparation dependencies are invalid.')
   }
@@ -83,8 +85,8 @@ export async function prepareProductionStagingPlan(request, dependencies = produ
     if (isPathInsideRoot(request.staging, request.planPath)) fail('Staging plan must remain outside staging output.')
     await writeFile(request.planPath, canonicalBytes(value), { flag: 'wx', mode: 0o600 })
   } catch (error) {
-    await rm(request.workspace, { recursive: true, force: true })
-    throw error
+    const removeWorkspace = dependencies.removeWorkspace ?? ((path) => rm(path, { recursive: true, force: true }))
+    await settleCleanup(error, [() => removeWorkspace(request.workspace)], 'Staging preparation cleanup failed.')
   }
 }
 

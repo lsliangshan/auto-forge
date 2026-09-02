@@ -97,7 +97,7 @@ function stagingFixture(root: string) {
     chmodSync(path, 0o755)
     const bytes = readFileSync(path)
     helperRecords.set(helper.helper, {
-      ...helper, path, sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.byteLength,
+      ...helper, path, sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.byteLength, mode: 0o755,
     })
   }
   const engineAssetsRoot = join(root, 'engine-assets')
@@ -551,6 +551,42 @@ describe('converter pack Mach-O closure', () => {
     expect(plan.files.map((file) => file.destination)).toEqual(['bin/tool', 'lib/module/module.dylib'])
   })
 
+  it('preserves entrypoint executable-path resolution when reachable code is also a runtime root', async () => {
+    const root = temporaryRoot()
+    const tool = lockedFile(root, 'tool', '1.0', 'bin/tool', 'bin/tool', true)
+    const module = lockedFile(root, 'tool', '1.0', 'lib/module.dylib', 'lib/tool/module.dylib', false, 'code', true)
+    const companion = lockedFile(root, 'tool', '1.0', 'bin/companion.dylib', 'lib/tool/companion.dylib')
+    const inspections = new Map([
+      [tool.source, { architectures: ['arm64'], dependencies: ['@@HOMEBREW_CELLAR@@/tool/1.0/lib/module.dylib'], rpaths: [] }],
+      [module.source, { architectures: ['arm64'], dependencies: ['@executable_path/companion.dylib'], rpaths: [] }],
+      [companion.source, { architectures: ['arm64'], dependencies: [], rpaths: [] }],
+    ])
+
+    const plan = await planMachOClosure({
+      entrypoints: [{ source: tool.source, destination: tool.lock.destination }],
+      architecture: 'arm64',
+      inspect: async (path: string) => inspections.get(path),
+      universe: syntheticUniverse(root, { tool: '1.0' }),
+      expectedFiles: [tool.lock, module.lock, companion.lock],
+      expectedRewrites: [
+        { destination: 'bin/tool', dependency: '@@HOMEBREW_CELLAR@@/tool/1.0/lib/module.dylib', replacement: '@loader_path/../lib/tool/module.dylib' },
+        { destination: 'lib/tool/module.dylib', dependency: '@executable_path/companion.dylib', replacement: '@loader_path/companion.dylib' },
+      ],
+    })
+    expect(plan.files.map((file) => file.destination)).toContain('lib/tool/companion.dylib')
+  })
+
+  it('rejects executable-path dependencies from an independent runtime root without a host executable', async () => {
+    const root = temporaryRoot()
+    const module = lockedFile(root, 'module', '1.0', 'lib/module.dylib', 'lib/module/module.dylib', false, 'code', true)
+
+    await expect(planMachOClosure({
+      entrypoints: [], architecture: 'arm64',
+      inspect: async () => ({ architectures: ['arm64'], dependencies: ['@executable_path/companion.dylib'], rpaths: [] }),
+      universe: syntheticUniverse(root, { module: '1.0' }), expectedFiles: [module.lock], expectedRewrites: [],
+    })).rejects.toThrow('Independent Mach-O runtime root cannot resolve @executable_path.')
+  })
+
   it('rejects architecture mismatches, unresolved dependencies, and destination collisions', async () => {
     const root = temporaryRoot()
     const tool = lockedFile(root, 'tool', '1.0', 'bin/tool', 'bin/tool', true)
@@ -683,6 +719,26 @@ describe('converter pack target staging', () => {
     expect(() => realpathSync(output)).toThrow()
   })
 
+  it('preserves the staging failure first when output cleanup also fails', async () => {
+    const root = temporaryRoot()
+    const output = join(root, 'release-input')
+    const fixture = stagingFixture(root)
+    const failure = await stageProductionPacks(fixture.request('darwin-arm64', output), {
+      ...fixture.dependencies,
+      probeFamily: async () => { throw new Error('capability primary') },
+      removeOutput: async () => {
+        const error = new Error('output rm EACCES') as Error & { code: string }
+        error.code = 'EACCES'
+        throw error
+      },
+    }).then(() => undefined, (error: unknown) => error as AggregateError)
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect(failure.message).toBe('capability primary')
+    expect(failure.errors.map((error) => (error as Error).message))
+      .toEqual(['capability primary', 'output rm EACCES'])
+  })
+
   it('rejects a native helper with any non-system dependency', async () => {
     const root = temporaryRoot()
     const output = join(root, 'release-input')
@@ -691,6 +747,19 @@ describe('converter pack target staging', () => {
       ...fixture.dependencies,
       inspectHelper: async () => ({
         architectures: ['arm64'], dependencies: ['@loader_path/libhost.dylib'], rpaths: [],
+      }),
+    })).rejects.toThrow('Native helper Mach-O inventory is invalid.')
+    expect(() => realpathSync(output)).toThrow()
+  })
+
+  it('rejects a non-canonical absolute dependency disguised by a system prefix', async () => {
+    const root = temporaryRoot()
+    const output = join(root, 'release-input')
+    const fixture = stagingFixture(root)
+    await expect(stageProductionPacks(fixture.request('darwin-arm64', output), {
+      ...fixture.dependencies,
+      inspectHelper: async () => ({
+        architectures: ['arm64'], dependencies: ['/usr/lib/../local/libhost.dylib'], rpaths: [],
       }),
     })).rejects.toThrow('Native helper Mach-O inventory is invalid.')
     expect(() => realpathSync(output)).toThrow()
