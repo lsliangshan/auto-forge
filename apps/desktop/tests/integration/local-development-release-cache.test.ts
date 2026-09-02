@@ -421,6 +421,42 @@ describe('local development release cache', () => {
     ]))
   })
 
+  it('waits for both rename-parent fsyncs before reporting a stable failure and rolling back', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '2'.repeat(64)
+    const active = createRelease(cacheRoot, fingerprint)
+    writeFileSync(join(active, 'state'), 'previous')
+    writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`)
+    const candidate = join(cacheRoot, '.candidate-blocked-sync')
+    mkdirSync(candidate)
+    writeFileSync(join(candidate, 'state'), 'candidate')
+    const events: string[] = []
+    let releaseSourceSync!: () => void
+    const sourceSync = new Promise<void>((resolvePromise) => { releaseSourceSync = resolvePromise })
+
+    const replacement = replaceActiveDevelopmentRelease({
+      cacheRoot,
+      fingerprint,
+      candidateRelease: candidate,
+      syncDirectoryForTest: async (_path: string, phase: string, run: () => Promise<void>) => {
+        events.push(phase)
+        if (phase === 'quarantine-source') await sourceSync
+        else if (phase === 'quarantine-destination') throw new Error('destination fsync failure')
+        else await run()
+      },
+    })
+    void replacement.catch(() => undefined)
+    await waitUntil(() => events.includes('quarantine-destination'))
+    expect(events.some((phase) => phase.startsWith('rollback-'))).toBe(false)
+    releaseSourceSync()
+
+    await expect(replacement).rejects.toThrow('destination fsync failure')
+    expect(events).toEqual(expect.arrayContaining(['rollback-source', 'rollback-destination']))
+    expect(readFileSync(join(active, 'state'), 'utf8')).toBe('previous')
+    expect(readFileSync(join(candidate, 'state'), 'utf8')).toBe('candidate')
+  })
+
   it.each([
     ['candidate rename', { afterCandidateRenameForTest: async () => { throw new Error('candidate rename tail failure') } }],
     ['quarantine delete', { afterQuarantineDeleteForTest: async () => { throw new Error('quarantine delete tail failure') } }],

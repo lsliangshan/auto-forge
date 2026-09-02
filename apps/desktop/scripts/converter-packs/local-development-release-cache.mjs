@@ -88,6 +88,13 @@ async function syncDirectory(path) {
   }
 }
 
+async function settleDirectorySyncs(operations, label) {
+  const results = await Promise.allSettled(operations.map(async (operation) => operation()))
+  const errors = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : [])
+  if (errors.length === 1) throw errors[0]
+  if (errors.length > 1) throw new AggregateError(errors, label, { cause: errors[0] })
+}
+
 async function readClaim(path, allowedLinks = [1]) {
   let handle
   try {
@@ -722,19 +729,19 @@ export async function replaceActiveDevelopmentRelease({
       await heartbeat.pulse()
       await rename(paths.release, quarantine)
       oldMoved = true
-      await Promise.all([
-        syncReplacementDirectory(dirname(paths.release), 'quarantine-source'),
-        syncReplacementDirectory(dirname(quarantine), 'quarantine-destination'),
-      ])
+      await settleDirectorySyncs([
+        () => syncReplacementDirectory(dirname(paths.release), 'quarantine-source'),
+        () => syncReplacementDirectory(dirname(quarantine), 'quarantine-destination'),
+      ], 'Development replacement quarantine directory sync failed')
       await afterOldReleaseRenameForTest?.()
       await heartbeat.pulse()
       await rename(candidateRelease, paths.release)
       candidateMoved = true
       await afterCandidateRenameForTest?.()
-      await Promise.all([
-        syncReplacementDirectory(dirname(candidateRelease), 'candidate-source'),
-        syncReplacementDirectory(dirname(paths.release), 'candidate-destination'),
-      ])
+      await settleDirectorySyncs([
+        () => syncReplacementDirectory(dirname(candidateRelease), 'candidate-source'),
+        () => syncReplacementDirectory(dirname(paths.release), 'candidate-destination'),
+      ], 'Development replacement candidate directory sync failed')
       await heartbeat.pulse()
       await rm(quarantine, { recursive: true })
       await afterQuarantineDeleteForTest?.()
@@ -746,10 +753,10 @@ export async function replaceActiveDevelopmentRelease({
       if (oldMoved) {
         try {
           await rename(quarantine, paths.release)
-          await Promise.all([
-            syncReplacementDirectory(dirname(quarantine), 'rollback-source'),
-            syncReplacementDirectory(dirname(paths.release), 'rollback-destination'),
-          ])
+          await settleDirectorySyncs([
+            () => syncReplacementDirectory(dirname(quarantine), 'rollback-source'),
+            () => syncReplacementDirectory(dirname(paths.release), 'rollback-destination'),
+          ], 'Development replacement rollback directory sync failed')
         } catch (error) { cleanup.push(error) }
       }
       if (cleanup.length > 0) {
@@ -793,7 +800,10 @@ export async function recoverInterruptedActiveReplacement({ cacheRoot }) {
       await heartbeat.pulse()
       if (published === undefined) await rename(quarantine.path, release)
       else await rm(quarantine.path, { recursive: true })
-      await Promise.all([syncDirectory(dirname(release)), syncDirectory(root)])
+      await settleDirectorySyncs([
+        () => syncDirectory(dirname(release)),
+        () => syncDirectory(root),
+      ], 'Development replacement recovery directory sync failed')
     }
     return quarantines.length
   })
