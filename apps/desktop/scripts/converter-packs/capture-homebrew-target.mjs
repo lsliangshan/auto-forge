@@ -9,6 +9,8 @@ import { materializeBottleUniverse } from './bottle-universe.mjs'
 import { adhocSignMachOClosure, inspectMachO, planMachOClosure, relocateMachOClosure } from './macho-closure.mjs'
 import { probeConverterFamily, stageProductionPacks } from './stage-production-packs.mjs'
 import { buildConverterPackIndex } from './build-index.mjs'
+import { buildNativeHelpers } from './build-native-helpers.mjs'
+import { materializeLockedEngineAssets } from './locked-engine-assets.mjs'
 import {
   canonicalBytes,
   compareUtf8,
@@ -298,7 +300,7 @@ async function sumRegularBytes(root) {
   return total
 }
 
-async function authenticateAndMeasureClosure({ target, closure, formulae, verified, workspace, run }) {
+async function authenticateAndMeasureClosure({ target, closure, engines, formulae, verified, workspace, run }) {
   const universeRoot = join(workspace, 'universe')
   const blobs = new Map([...verified].map(([digest, artifact]) => [digest, {
     path: artifact.path, sha256: digest, bytes: artifact.bytes, networkBytes: 0,
@@ -315,8 +317,13 @@ async function authenticateAndMeasureClosure({ target, closure, formulae, verifi
     blobs,
     outputRoot: universeRoot,
   })
-  const closurePath = join(workspace, 'candidate-closure.json')
-  await writeFile(closurePath, canonicalBytes(closure), { flag: 'wx', mode: 0o600 })
+  const sourceLock = { target, engines, formulae }
+  const engineAssetsRoot = join(workspace, 'engine-assets')
+  const engineAssets = await materializeLockedEngineAssets({
+    target, sourceLock, closureLock: closure, blobs, outputRoot: engineAssetsRoot,
+  })
+  const helpersRoot = join(workspace, 'helpers')
+  const helperSet = await buildNativeHelpers({ target, output: helpersRoot, compiler: '/usr/bin/clang' })
   const staging = join(workspace, 'staging')
   const toolRun = targetToolRunner(run, workspace)
   const probeDigests = {}
@@ -327,11 +334,16 @@ async function authenticateAndMeasureClosure({ target, closure, formulae, verifi
     sequence: 0,
     generatedAt: '1970-01-01T00:00:00.000Z',
     archiveBaseUrl: 'https://capture.invalid/converter-packs',
-    closureLockPath: closurePath,
+    sourceLockPath: join(workspace, 'candidate-source.json'),
     universeRoot,
+    helpersRoot,
+    engineAssetsRoot,
   }, {
-    loadClosure: async () => closure,
+    loadClosure: async () => ({ sourceLock, closureLock: closure, target }),
     openUniverse: async () => universe,
+    openHelpers: async () => helperSet,
+    openEngineAssets: async () => engineAssets,
+    inspectHelper: (path) => inspectMachO(path, { run: toolRun }),
     planClosure: ({ entrypoints, architecture, expectedFiles, expectedRewrites }) => planMachOClosure({
       entrypoints,
       architecture,
@@ -377,8 +389,24 @@ async function authenticateAndMeasureClosure({ target, closure, formulae, verifi
   }
 }
 
+function validEngineLicense(license) {
+  return exactKeys(license, ['kind', 'url', 'sha256', 'bytes', 'destination'])
+    && license.kind === 'download'
+    && validHttpsUrl(license.url)
+    && sha256Pattern.test(license.sha256)
+    && Number.isSafeInteger(license.bytes)
+    && license.bytes > 0
+    && typeof license.destination === 'string'
+}
+
 function validateEngine(engine, formulae, target) {
-  if (!exactKeys(engine, ['name', 'version', 'license', 'rootFormula', 'acquisition']) || typeof engine.version !== 'string' || typeof engine.license !== 'string') {
+  if (
+    !exactKeys(engine, ['name', 'version', 'license', 'rootFormula', 'acquisition', 'licenses'])
+    || typeof engine.version !== 'string'
+    || typeof engine.license !== 'string'
+    || !Array.isArray(engine.licenses)
+    || engine.licenses.some((license) => !validEngineLicense(license))
+  ) {
     invalid('Captured engine identity is invalid.')
   }
   if (engine.name === 'libreoffice') {
@@ -388,8 +416,10 @@ function validateEngine(engine, formulae, target) {
       || !sha256Pattern.test(engine.acquisition.sha256) || !Number.isSafeInteger(engine.acquisition.bytes)
       || engine.acquisition.bytes <= 0 || engine.acquisition.cellar !== null
     ) invalid('Captured LibreOffice identity is invalid.')
+    if (engine.licenses.length === 0) invalid('Captured LibreOffice license is invalid.')
     return cloneJson(engine)
   }
+  if (engine.licenses.length !== 0) invalid('Formula-backed engine licenses must be empty.')
   const formula = formulae.get(engine.rootFormula)
   if (!formula || formula.version !== engine.version || formula.license !== engine.license) invalid('Captured engine differs from its root formula.')
   const acquisition = {
@@ -397,7 +427,10 @@ function validateEngine(engine, formulae, target) {
     bytes: formula.bytes, cellar: expectedCellar(target),
   }
   if (!canonicalBytes(engine.acquisition).equals(canonicalBytes(acquisition))) invalid('Captured engine acquisition differs from its root formula.')
-  return { name: engine.name, version: engine.version, license: engine.license, rootFormula: engine.rootFormula, acquisition }
+  return {
+    name: engine.name, version: engine.version, license: engine.license,
+    rootFormula: engine.rootFormula, acquisition, licenses: [],
+  }
 }
 
 export async function captureHomebrewTarget({ target, brew, coreRevision, roots, output, run = defaultRun }) {
@@ -447,6 +480,9 @@ export async function captureHomebrewTarget({ target, brew, coreRevision, roots,
     })
     const extras = [
       ...engines.filter((engine) => engine.rootFormula === null).map((engine) => engine.acquisition),
+      ...engines.flatMap((engine) => engine.licenses.map((license) => ({
+        url: license.url, sha256: license.sha256, bytes: license.bytes,
+      }))),
       ...capturedFormulae.flatMap((formula) => formula.licenses.filter((license) => license.kind === 'download').map((license) => ({
         url: license.url, sha256: license.sha256, bytes: license.bytes,
       }))),
@@ -455,6 +491,7 @@ export async function captureHomebrewTarget({ target, brew, coreRevision, roots,
     const measured = await authenticateAndMeasureClosure({
       target,
       closure,
+      engines,
       formulae: capturedFormulae,
       verified,
       workspace,

@@ -5,8 +5,6 @@ import {
 } from './pack-tooling-lib.mjs'
 
 const targets = new Set(['darwin-arm64', 'darwin-x64'])
-const shaPattern = /^[a-f0-9]{64}$/u
-
 function invalid() {
   fail('Locked engine asset set is invalid.')
 }

@@ -43,7 +43,7 @@ function validText(value, maximumBytes = 4_096) {
     && value.length > 0
     && value === value.trim()
     && Buffer.byteLength(value, 'utf8') <= maximumBytes
-    && !value.includes('\0')
+    && !value.includes(String.fromCharCode(0))
 }
 
 function validFormulaName(value) {
@@ -65,7 +65,10 @@ function validHttpsUrl(value) {
     typeof value !== 'string'
     || value.length === 0
     || Buffer.byteLength(value, 'utf8') > 2_048
-    || /[\u0000-\u0020\u007f]/u.test(value)
+    || [...value].some((character) => {
+      const code = character.codePointAt(0)
+      return code <= 0x20 || code === 0x7f
+    })
     || /\s/u.test(value)
     || value.includes('\\')
   ) return false
@@ -274,7 +277,7 @@ export function validateTargetClosureLock(value, target) {
     || !positiveInteger(value.measurements.installedReleaseBytes)
   ) fail('Target closure lock has an invalid schema.')
 
-  return deepFreeze(structuredClone(value))
+  return deepFreeze(globalThis.structuredClone(value))
 }
 
 function validateSourceRelationship(sourceLock, closureLock) {

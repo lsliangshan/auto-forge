@@ -142,15 +142,19 @@ function validateFormula(formula, target) {
 
 function validateEngine(engine, expectedName, target, formulae) {
   if (
-    !exactKeys(engine, ['name', 'version', 'license', 'rootFormula', 'acquisition'])
+    !exactKeys(engine, ['name', 'version', 'license', 'rootFormula', 'acquisition', 'licenses'])
     || engine.name !== expectedName
     || typeof engine.version !== 'string'
     || typeof engine.license !== 'string'
+    || !Array.isArray(engine.licenses)
+    || engine.licenses.some((license) => license.kind !== 'download' || !validLicense(license, target))
+    || !sortedUnique(engine.licenses, licenseSortKey)
   ) invalid('Captured engine is invalid.')
   if (engine.name === 'libreoffice') {
-    if (engine.rootFormula !== null || !validCoordinate(engine.acquisition, target, 'dmg')) invalid('Captured LibreOffice engine is invalid.')
+    if (engine.rootFormula !== null || engine.licenses.length === 0 || !validCoordinate(engine.acquisition, target, 'dmg')) invalid('Captured LibreOffice engine is invalid.')
     return
   }
+  if (engine.licenses.length !== 0) invalid('Formula-backed engine licenses must be empty.')
   const formula = formulae.get(engine.rootFormula)
   if (
     !formula
@@ -222,7 +226,10 @@ function formulaIdentity(formula) {
 }
 
 function engineIdentity(engine) {
-  return canonicalBytes({ name: engine.name, version: engine.version, license: engine.license, rootFormula: engine.rootFormula })
+  return canonicalBytes({
+    name: engine.name, version: engine.version, license: engine.license,
+    rootFormula: engine.rootFormula, licenses: engine.licenses,
+  })
 }
 
 function mergeLicenses(arm, x64) {
@@ -269,6 +276,7 @@ function buildSourceLock(arm64, x64, closureCoordinates) {
         'darwin-arm64': cloneJson(armEngine.acquisition),
         'darwin-x64': cloneJson(x64Engine.acquisition),
       },
+      licenses: cloneJson(armEngine.licenses),
     }
   })
   return {

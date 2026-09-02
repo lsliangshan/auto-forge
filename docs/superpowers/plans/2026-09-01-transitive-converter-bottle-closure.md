@@ -236,7 +236,12 @@
 **Interfaces:**
 - Change: `planMachOClosure({ entrypoints, architecture, inspect, universe, expectedFiles, expectedRewrites })`.
 - Produce: an exact plan whose files and rewrites equal the selected family closure lock.
-- Change: `stageProductionPacks(request, dependencies?)` consumes a staging plan containing `closureLockPath` and `universeRoot`, not arbitrary host source paths for bottle-backed files.
+- Change: `stageProductionPacks(request, dependencies?)` consumes a staging plan
+  containing `sourceLockPath`, `universeRoot`, `helpersRoot`, and
+  `engineAssetsRoot`. The source lock authenticates the target closure. Bottle
+  files remain confined to `BottleUniverse`; non-bottle inputs resolve only
+  through target-bound helper and engine-asset manifests, never arbitrary host
+  source paths.
 - Preserve: fixed executable destinations and adapter capability probes.
 
 - [ ] **Step 1: Add failing placeholder and exact-inventory tests**

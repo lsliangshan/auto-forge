@@ -43,7 +43,10 @@ function validHttpsUrl(value) {
     typeof value !== 'string'
     || value.length === 0
     || value.length > 2_048
-    || /[\u0000-\u0020\u007f]/u.test(value)
+    || [...value].some((character) => {
+      const code = character.codePointAt(0)
+      return code <= 0x20 || code === 0x7f
+    })
     || /\s/u.test(value)
     || value.includes('\\')
   ) return false
@@ -65,7 +68,7 @@ function validText(value, maximumBytes = 256) {
     && value.length > 0
     && value === value.trim()
     && Buffer.byteLength(value, 'utf8') <= maximumBytes
-    && !value.includes('\0')
+    && !value.includes(String.fromCharCode(0))
 }
 
 function validName(value) {
@@ -186,6 +189,8 @@ function validEngine(value, expectedName, formulae) {
     || !value.licenses.every(validEngineLicense)
     || !sortedUnique(value.licenses, licenseSortKey)
   ) return false
+  const licenseDestinations = new Set(value.licenses.map((license) => license.destination.toLocaleLowerCase('en-US')))
+  if (licenseDestinations.size !== value.licenses.length) return false
   if (expectedName === 'libreoffice') {
     return value.rootFormula === null && value.licenses.length > 0 && validAcquisitions(value.acquisitions, 'dmg')
   }
@@ -264,20 +269,20 @@ export async function loadConverterSourceLock({ path, target }) {
       version: engine.version,
       license: engine.license,
       rootFormula: engine.rootFormula,
-      acquisition: structuredClone(engine.acquisitions[target]),
-      licenses: structuredClone(engine.licenses),
+      acquisition: globalThis.structuredClone(engine.acquisitions[target]),
+      licenses: globalThis.structuredClone(engine.licenses),
     })),
     formulae: value.formulae.map((formula) => ({
       name: formula.name,
       version: formula.version,
       revision: formula.revision,
       license: formula.license,
-      acquisition: structuredClone(formula.acquisitions[target]),
-      licenses: structuredClone(formula.licenses.filter((license) => (
+      acquisition: globalThis.structuredClone(formula.acquisitions[target]),
+      licenses: globalThis.structuredClone(formula.licenses.filter((license) => (
         license.kind === 'download' || license.target === target
       ))),
     })),
-    closureLock: structuredClone(value.closureLocks[target]),
+    closureLock: globalThis.structuredClone(value.closureLocks[target]),
   })
 }
 

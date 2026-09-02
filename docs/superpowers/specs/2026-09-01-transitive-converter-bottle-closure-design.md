@@ -66,6 +66,7 @@ type SourceLockV2 = {
     license: string
     rootFormula: string | null
     acquisitions: Record<Target, DownloadCoordinate>
+    licenses: LicenseAsset[]
   }>
   formulae: Array<{
     name: string
@@ -95,6 +96,10 @@ For a formula-backed engine, each engine acquisition must be byte-for-byte
 equal to the same target coordinate in its root formula catalog entry. This
 deliberate duplication preserves the existing engine-facing acquisition
 interface while making disagreement fail schema validation.
+
+Each engine also has an exact `licenses` array. Formula-backed engines keep it
+empty because their notices come from the formula catalog. A non-formula engine
+must contain at least one authenticated direct-download license coordinate.
 
 ### License assets
 
@@ -154,6 +159,7 @@ type TargetClosureLock = {
       bytes: number
       executable: boolean
       role: 'executable' | 'code' | 'data'
+      runtimeRoot: boolean
     }>
     rewrites: Array<{
       destination: string
@@ -162,6 +168,26 @@ type TargetClosureLock = {
     }>
     licenses: Array<{
       formula: string
+      source: string
+      destination: string
+      sha256: string
+      bytes: number
+    }>
+    nativeHelpers: Array<{
+      helper: string
+      destination: string
+    }>
+    engineAssets: Array<{
+      engine: string
+      source: 'acquisition'
+      destination: string
+      sha256: string
+      bytes: number
+      executable: false
+      role: 'data'
+    }>
+    engineLicenses: Array<{
+      engine: string
       source: string
       destination: string
       sha256: string
@@ -255,6 +281,12 @@ The universe accepts only formulae and versions in the selected closure lock.
 All selected files are regular, canonical, non-symbolic paths inside the
 private universe and match their closure-lock bytes and SHA-256.
 
+Native helpers and non-bottle engine artifacts never enter this universe.
+Helpers resolve through a target-bound canonical build manifest. Engine
+acquisitions and direct licenses are materialized into a separate private,
+SHA-addressed asset set. Staging accepts these authenticated resolvers only; it
+does not accept arbitrary host source paths.
+
 ## Mach-O and runtime closure
 
 The closure resolver accepts the bottle universe explicitly. It expands:
@@ -271,6 +303,10 @@ The runtime planner compares discovered Mach-O nodes with the exact closure
 lock. Missing, additional, differently hashed, differently sized, or
 differently addressed files fail closed. Explicit runtime modules and data are
 also copied only from the closure-lock inventory.
+
+An executable enters the graph through the family entrypoint list. A code file
+with `runtimeRoot: true` is an explicit dynamic-module graph root. Executables
+and data must set `runtimeRoot: false`; unmarked unreachable code fails closed.
 
 Every non-system dependency is rewritten to a pack-local `@loader_path` path.
 Library identities use a namespaced value such as

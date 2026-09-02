@@ -71,6 +71,56 @@ function sourceOffers() {
   }))
 }
 
+function writeSourceLockV2(root: string) {
+  const targets = ['darwin-arm64', 'darwin-x64'] as const
+  const coordinate = (name: string, target: typeof targets[number], character: string) => ({
+    kind: 'homebrew-bottle', url: `https://downloads.example.test/${name}-${target}.tar.gz`,
+    sha256: character.repeat(64), bytes: 10,
+    cellar: target === 'darwin-arm64' ? '/opt/homebrew/Cellar' : '/usr/local/Cellar',
+  })
+  const formula = (name: string, character: string) => ({
+    name, version: '1.0', revision: 0, license: 'MIT',
+    acquisitions: Object.fromEntries(targets.map((target) => [target, coordinate(name, target, character)])),
+    licenses: targets.map((target) => ({
+      kind: 'bottle-entry', target, path: 'LICENSE', sha256: character.repeat(64), bytes: 1,
+      destination: `LICENSES/${name}.txt`,
+    })),
+  })
+  const formulae = [formula('ffmpeg', 'a'), formula('poppler', 'c'), formula('vips', 'd')]
+  const byName = new Map(formulae.map((entry) => [entry.name, entry]))
+  const engine = (name: string, rootFormula: string) => ({
+    name, version: '1.0', license: 'MIT', rootFormula,
+    acquisitions: structuredClone(byName.get(rootFormula)!.acquisitions), licenses: [],
+  })
+  const value = {
+    schemaVersion: 2, homebrewCoreRevision: '1'.repeat(40), homebrewCaskRevision: '2'.repeat(40), targets: [...targets],
+    engines: [
+      engine('ffmpeg', 'ffmpeg'),
+      {
+        name: 'libreoffice', version: '1.0', license: 'MPL-2.0', rootFormula: null,
+        acquisitions: Object.fromEntries(targets.map((target) => [target, {
+          kind: 'dmg', url: `https://downloads.example.test/libreoffice-${target}.dmg`,
+          sha256: 'b'.repeat(64), bytes: 10, cellar: null,
+        }])),
+        licenses: [{
+          kind: 'download', url: 'https://downloads.example.test/libreoffice-LICENSE',
+          sha256: 'e'.repeat(64), bytes: 1, destination: 'LICENSES/libreoffice.txt',
+        }],
+      },
+      engine('libvips', 'vips'),
+      engine('poppler', 'poppler'),
+    ],
+    formulae,
+    closureLocks: {
+      'darwin-arm64': { path: 'closures/darwin-arm64.lock.json', sha256: '6'.repeat(64), bytes: 1 },
+      'darwin-x64': { path: 'closures/darwin-x64.lock.json', sha256: '7'.repeat(64), bytes: 1 },
+    },
+  }
+  const path = join(root, 'sources-v2.lock.json')
+  writeFileSync(path, canonicalBytes(value))
+  return path
+}
+
 function evidenceFixture(staging: string) {
   const files = []
   for (const name of Object.keys(familyEngine)) {
@@ -135,12 +185,13 @@ describe('converter pack release evidence', () => {
     const calls: Array<{ executable: string; args: readonly string[] }> = []
     const secret = 'PRIVATE-SENTINEL-DO-NOT-SERIALIZE'
     const oldSecret = process.env.AUTOFORGE_PRIVATE_SENTINEL
+    const selectedSourceLockPath = writeSourceLockV2(root)
     process.env.AUTOFORGE_PRIVATE_SENTINEL = secret
     try {
       await signPackPayloads({
         stagingRoot: staging,
         evidencePath,
-        sourceLockPath,
+        sourceLockPath: selectedSourceLockPath,
         target: 'darwin-arm64',
         identity: 'Developer ID Application: Example (TEAM123456)',
         teamId: 'TEAM123456',
@@ -167,7 +218,7 @@ describe('converter pack release evidence', () => {
     await expect(verifyReleaseEvidence({ stagingRoot: staging, evidencePath, expectedTeamId: 'TEAM123456' })).resolves.toBeUndefined()
 
     await expect(signPackPayloads({
-      stagingRoot: staging, evidencePath: join(root, 'missing.json'), sourceLockPath,
+      stagingRoot: staging, evidencePath: join(root, 'missing.json'), sourceLockPath: selectedSourceLockPath,
       target: 'darwin-arm64', identity: '', teamId: '', keychainProfile: '',
       generatedAt: '2026-08-31T00:00:00.000Z',
     }, {})).rejects.toThrow(/credential/iu)

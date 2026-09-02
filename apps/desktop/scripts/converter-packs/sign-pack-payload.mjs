@@ -220,8 +220,8 @@ export async function signPackPayloads(request, dependencies = productionDepende
     name: engine.name,
     version: engine.version,
     license: engine.license,
-    url: engine.source.url,
-    sha256: engine.source.sha256,
+    url: engine.acquisition.url,
+    sha256: engine.acquisition.sha256,
   })).sort((left, right) => compareUtf8(left.name, right.name))
   await writeFile(request.evidencePath, canonicalBytes({
     schemaVersion: 1,

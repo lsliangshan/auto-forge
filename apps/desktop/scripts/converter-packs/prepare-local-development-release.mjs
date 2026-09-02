@@ -3,6 +3,7 @@ import { createPrivateKey, createPublicKey } from 'node:crypto'
 import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import process from 'node:process'
 import {
   activateDevelopmentRelease,
   developmentReleasePaths,
@@ -19,8 +20,12 @@ import { smokeTestLocalDevelopmentRelease } from './verify-local-development-rel
 
 const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/source-lock.mjs',
+  'scripts/converter-packs/closure-lock.mjs',
   'scripts/converter-packs/acquire-sources.mjs',
+  'scripts/converter-packs/bottle-archive.mjs',
+  'scripts/converter-packs/bottle-universe.mjs',
   'scripts/converter-packs/build-native-helpers.mjs',
+  'scripts/converter-packs/locked-engine-assets.mjs',
   'scripts/converter-packs/prepare-production-staging.mjs',
   'scripts/converter-packs/macho-closure.mjs',
   'scripts/converter-packs/stage-production-packs.mjs',

@@ -183,6 +183,12 @@ describe('converter pack source lock schema v2', () => {
     ['null bottle root', (value: ReturnType<typeof fixture>) => { value.engines[0]!.rootFormula = null }],
     ['LibreOffice formula root', (value: ReturnType<typeof fixture>) => { value.engines[1]!.rootFormula = 'glib' }],
     ['missing LibreOffice license', (value: ReturnType<typeof fixture>) => { value.engines[1]!.licenses = [] }],
+    ['duplicate engine license destination', (value: ReturnType<typeof fixture>) => {
+      value.engines[1]!.licenses.push({
+        kind: 'download', url: 'https://downloads.example.test/libreoffice-NOTICE',
+        sha256: '8'.repeat(64), bytes: 8, destination: 'LICENSES/LIBREOFFICE.license',
+      })
+    }],
     ['formula-backed engine license', (value: ReturnType<typeof fixture>) => {
       value.engines[0]!.licenses = structuredClone(value.engines[1]!.licenses)
     }],

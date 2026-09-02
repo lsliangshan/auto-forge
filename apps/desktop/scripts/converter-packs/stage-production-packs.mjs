@@ -36,6 +36,12 @@ const exactNativeHelpers = Object.freeze({
   pdf: Object.freeze([{ helper: 'autoforge-pdf-raster', destination: 'bin/autoforge-pdf-raster' }]),
   media: Object.freeze([]),
 })
+const exactEngineAssets = Object.freeze({
+  'image-icon': Object.freeze([]),
+  document: Object.freeze([{ engine: 'libreoffice', source: 'acquisition', destination: 'share/LibreOffice.dmg' }]),
+  pdf: Object.freeze([]),
+  media: Object.freeze([]),
+})
 const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u
 
 function plainRecord(value) {
@@ -277,6 +283,9 @@ function validateFamily(name, family) {
   const helpers = family.nativeHelpers.map((helper) => `${helper.helper}\0${helper.destination}`)
   const wantedHelpers = exactNativeHelpers[name].map((helper) => `${helper.helper}\0${helper.destination}`)
   if (helpers.join('\0') !== wantedHelpers.join('\0')) fail(`Pack family native helper inventory is invalid: ${name}`)
+  const engineAssets = family.engineAssets.map((asset) => `${asset.engine}\0${asset.source}\0${asset.destination}`)
+  const wantedEngineAssets = exactEngineAssets[name].map((asset) => `${asset.engine}\0${asset.source}\0${asset.destination}`)
+  if (engineAssets.join('\0') !== wantedEngineAssets.join('\0')) fail(`Pack family engine asset inventory is invalid: ${name}`)
   const destinations = [
     ...family.files.filter((file) => file?.executable).map((file) => file.destination),
     ...family.nativeHelpers.map((helper) => helper.destination),

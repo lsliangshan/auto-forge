@@ -1,10 +1,12 @@
-import { spawnSync } from 'node:child_process'
 import { Buffer } from 'node:buffer'
 import { lstat, mkdir, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
-import { acquireConverterSources } from './acquire-sources.mjs'
+import { acquireLockedArtifacts } from './acquire-sources.mjs'
+import { loadConverterClosureLock } from './closure-lock.mjs'
+import { materializeBottleUniverse } from './bottle-universe.mjs'
+import { materializeLockedEngineAssets } from './locked-engine-assets.mjs'
 import {
   canonicalBytes,
   fail,
@@ -14,52 +16,8 @@ import {
   requireDirectory,
 } from './pack-tooling-lib.mjs'
 
-const executableSuffixes = Object.freeze({
-  ffmpeg: Object.freeze({ ffmpeg: '/bin/ffmpeg', ffprobe: '/bin/ffprobe' }),
-  libvips: Object.freeze({ vips: '/bin/vips' }),
-  poppler: Object.freeze({ pdfinfo: '/bin/pdfinfo', pdftocairo: '/bin/pdftocairo' }),
-})
-const licenseNames = Object.freeze({
-  ffmpeg: Object.freeze(['COPYING.GPLv3', 'COPYING.GPLv2', 'LICENSE.md']),
-  libreoffice: Object.freeze(['COPYING', 'LICENSE']),
-  libvips: Object.freeze(['COPYING', 'LICENSE']),
-  poppler: Object.freeze(['COPYING', 'COPYING3', 'LICENSE']),
-})
 const maximumSourceLicenseWrappers = 64
 const maximumSourceLicenseCandidates = 32
-
-async function extractArchive(archive, output) {
-  requireAbsolutePath(archive, 'Verified archive')
-  await mkdir(output, { mode: 0o700 })
-  const result = spawnSync('/usr/bin/tar', ['-xf', archive, '-C', output, '--no-same-owner', '--no-same-permissions'], {
-    encoding: 'utf8',
-    env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
-    maxBuffer: 4 * 1024 * 1024,
-  })
-  if (result.status !== 0) fail('Verified converter archive extraction failed.')
-}
-
-async function collectRegularFiles(root) {
-  const files = []
-  async function visit(directory) {
-    const entries = await readdir(directory, { withFileTypes: true })
-    for (const entry of entries) {
-      if (files.length > 100_000) fail('Verified converter archive contains too many files.')
-      const path = join(directory, entry.name)
-      if (entry.isDirectory()) await visit(path)
-      else if (entry.isFile()) files.push(path)
-      else if (!entry.isSymbolicLink()) fail('Verified converter archive contains an unsupported file type.')
-    }
-  }
-  await visit(root)
-  return files
-}
-
-function uniqueSuffix(files, suffix, label) {
-  const matches = files.filter((path) => path.endsWith(suffix))
-  if (matches.length !== 1) fail(`${label} is missing or ambiguous in the verified runtime archive.`)
-  return matches[0]
-}
 
 export async function selectVerifiedSourceLicense(root, names, label) {
   const rootMetadata = await lstat(root).catch(() => undefined)
@@ -130,32 +88,12 @@ export async function selectVerifiedSourceLicense(root, names, label) {
   fail(`${label} license is missing from the verified source archive.`)
 }
 
-async function defaultPrepareEngine({ engine, workspace }) {
-  const sourceRoot = join(workspace, 'sources', engine.name)
-  await mkdir(dirname(sourceRoot), { recursive: true, mode: 0o700 })
-  await extractArchive(engine.sourceArchive.path, sourceRoot)
-  const licensePath = await selectVerifiedSourceLicense(sourceRoot, licenseNames[engine.name], engine.name)
-  if (engine.name === 'libreoffice') return { executables: {}, licensePath }
-  const runtimeRoot = join(workspace, 'runtime', engine.name)
-  await mkdir(dirname(runtimeRoot), { recursive: true, mode: 0o700 })
-  await extractArchive(engine.acquisition.archive.path, runtimeRoot)
-  const runtimeFiles = await collectRegularFiles(runtimeRoot)
-  const executables = Object.fromEntries(Object.entries(executableSuffixes[engine.name]).map(([name, suffix]) => (
-    [name, uniqueSuffix(runtimeFiles, suffix, engine.name)]
-  )))
-  return { executables, licensePath }
-}
-
 const productionDependencies = Object.freeze({
-  acquireSources: (request) => acquireConverterSources(request),
-  prepareEngine: defaultPrepareEngine,
+  loadLocks: (request) => loadConverterClosureLock(request),
+  acquireSources: (request) => acquireLockedArtifacts(request),
+  materializeUniverse: (request) => materializeBottleUniverse(request),
+  materializeEngineAssets: (request) => materializeLockedEngineAssets(request),
 })
-
-function requireEngine(map, name) {
-  const engine = map.get(name)
-  if (engine === undefined) fail(`Verified converter acquisition is missing: ${name}`)
-  return engine
-}
 
 export async function prepareProductionStagingPlan(request, dependencies = productionDependencies) {
   for (const [value, label] of [
@@ -164,7 +102,12 @@ export async function prepareProductionStagingPlan(request, dependencies = produ
   ]) requireAbsolutePath(value, label)
   if (request.target !== 'darwin-arm64' && request.target !== 'darwin-x64') fail('Staging preparation target is unsupported.')
   if (!Number.isSafeInteger(request.sequence) || request.sequence < 0) fail('Staging preparation sequence is invalid.')
-  if (typeof dependencies?.acquireSources !== 'function' || typeof dependencies?.prepareEngine !== 'function') {
+  if (
+    typeof dependencies?.loadLocks !== 'function'
+    || typeof dependencies?.acquireSources !== 'function'
+    || typeof dependencies?.materializeUniverse !== 'function'
+    || typeof dependencies?.materializeEngineAssets !== 'function'
+  ) {
     fail('Staging preparation dependencies are invalid.')
   }
   await Promise.all([
@@ -176,30 +119,28 @@ export async function prepareProductionStagingPlan(request, dependencies = produ
   }
   await mkdir(request.workspace, { mode: 0o700 })
   try {
-    const acquired = await dependencies.acquireSources({
-      lockPath: request.lockPath, target: request.target, cacheRoot: request.cacheRoot,
+    const selected = await dependencies.loadLocks({ sourceLockPath: request.lockPath, target: request.target })
+    if (selected?.target !== request.target || !selected.sourceLock || !selected.closureLock) {
+      fail('Verified converter lock selection is invalid.')
+    }
+    const acquired = await dependencies.acquireSources({ selected, cacheRoot: request.cacheRoot })
+    if (!(acquired?.blobs instanceof Map)) fail('Verified converter acquisition inventory is invalid.')
+    const universeRoot = join(request.workspace, 'universe')
+    const engineAssetsRoot = join(request.workspace, 'engine-assets')
+    await dependencies.materializeUniverse({
+      target: request.target,
+      closureLock: selected.closureLock,
+      formulae: selected.sourceLock.formulae,
+      blobs: acquired.blobs,
+      outputRoot: universeRoot,
     })
-    if (acquired?.target !== request.target || !Array.isArray(acquired.engines) || acquired.engines.length !== 4) {
-      fail('Verified converter acquisition inventory is invalid.')
-    }
-    const engines = new Map(acquired.engines.map((engine) => [engine.name, engine]))
-    if (engines.size !== 4) fail('Verified converter acquisition inventory is invalid.')
-    const prepared = new Map()
-    for (const name of ['ffmpeg', 'libreoffice', 'libvips', 'poppler']) {
-      const engine = requireEngine(engines, name)
-      const result = await dependencies.prepareEngine({ engine, workspace: request.workspace })
-      if (typeof result?.licensePath !== 'string' || typeof result?.executables !== 'object' || result.executables === null) {
-        fail(`Prepared converter engine is invalid: ${name}`)
-      }
-      prepared.set(name, result)
-    }
-    const ffmpeg = prepared.get('ffmpeg')
-    const libreoffice = prepared.get('libreoffice')
-    const libvips = prepared.get('libvips')
-    const poppler = prepared.get('poppler')
-    const libreOfficeDmg = requireEngine(engines, 'libreoffice').acquisition?.archive?.path
-    requireAbsolutePath(libreOfficeDmg, 'LibreOffice DMG')
-    const license = (name, source) => ({ source, destination: `licenses/${name}.txt`, role: 'license' })
+    await dependencies.materializeEngineAssets({
+      target: request.target,
+      sourceLock: selected.sourceLock,
+      closureLock: selected.closureLock,
+      blobs: acquired.blobs,
+      outputRoot: engineAssetsRoot,
+    })
     const value = {
       target: request.target,
       output: request.staging,
@@ -207,37 +148,10 @@ export async function prepareProductionStagingPlan(request, dependencies = produ
       sequence: request.sequence,
       generatedAt: request.generatedAt,
       archiveBaseUrl: request.archiveBaseUrl,
-      families: {
-        'image-icon': {
-          entrypoints: [
-            { source: join(request.helpersRoot, 'bin', 'autoforge-image-converter'), destination: 'bin/autoforge-image-converter' },
-            { source: libvips.executables.vips, destination: 'bin/vips' },
-          ],
-          assets: [license('libvips', libvips.licensePath)],
-        },
-        document: {
-          entrypoints: [{ source: join(request.helpersRoot, 'program', 'soffice'), destination: 'program/soffice' }],
-          assets: [
-            { source: libreOfficeDmg, destination: 'share/LibreOffice.dmg', role: 'data' },
-            license('libreoffice', libreoffice.licensePath),
-          ],
-        },
-        pdf: {
-          entrypoints: [
-            { source: join(request.helpersRoot, 'bin', 'autoforge-pdf-raster'), destination: 'bin/autoforge-pdf-raster' },
-            { source: poppler.executables.pdfinfo, destination: 'bin/pdfinfo' },
-            { source: poppler.executables.pdftocairo, destination: 'bin/pdftocairo' },
-          ],
-          assets: [license('poppler', poppler.licensePath)],
-        },
-        media: {
-          entrypoints: [
-            { source: ffmpeg.executables.ffmpeg, destination: 'bin/ffmpeg' },
-            { source: ffmpeg.executables.ffprobe, destination: 'bin/ffprobe' },
-          ],
-          assets: [license('ffmpeg', ffmpeg.licensePath)],
-        },
-      },
+      sourceLockPath: request.lockPath,
+      universeRoot,
+      helpersRoot: request.helpersRoot,
+      engineAssetsRoot,
     }
     if (isPathInsideRoot(request.staging, request.planPath)) fail('Staging plan must remain outside staging output.')
     await writeFile(request.planPath, canonicalBytes(value), { flag: 'wx', mode: 0o600 })

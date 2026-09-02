@@ -103,19 +103,21 @@ function captureFixture(target = targetForHost()) {
     sha256: sha256(`${formula}-license`),
     bytes: Buffer.byteLength(`${formula}-license`),
   })
-  const file = (formula: string, sourcePath: string, destination: string, executable = true, role = executable ? 'executable' : 'code') => ({
+  const file = (formula: string, sourcePath: string, destination: string, executable = true, role = executable ? 'executable' : 'code', runtimeRoot = false) => ({
     formula, sourcePath, destination, sha256: sha256(fileBytes(formula, sourcePath)),
-    bytes: fileBytes(formula, sourcePath).byteLength, executable, role,
+    bytes: fileBytes(formula, sourcePath).byteLength, executable, role, runtimeRoot,
   })
   const libreOfficeBytes = Buffer.from(`libreoffice-${target}`)
+  const libreOfficeLicenseBytes = Buffer.from('libreoffice-license')
+  const emptyFamily = () => ({ files: [], rewrites: [], licenses: [], nativeHelpers: [], engineAssets: [], engineLicenses: [] })
   const closure = {
     schemaVersion: 1,
     target,
     formulae: formulae.map(({ name, version, dependencies }) => ({ name, version, dependencies: [...dependencies] })).sort((a, b) => Buffer.from(a.name).compare(Buffer.from(b.name))),
     families: {
       'image-icon': {
+        ...emptyFamily(),
         files: [
-          file('vips', 'bin/autoforge-image-converter', 'bin/autoforge-image-converter'),
           file('vips', 'bin/vips', 'bin/vips'),
           file('glib', 'lib/libglib.dylib', 'lib/glib/libglib.dylib', false, 'code'),
           file('vips', 'share/vips/runtime.conf', 'share/vips/runtime.conf', false, 'data'),
@@ -126,17 +128,32 @@ function captureFixture(target = targetForHost()) {
           replacement: '@loader_path/../lib/glib/libglib.dylib',
         }],
         licenses: [license('glib'), license('vips')],
+        nativeHelpers: [{ helper: 'autoforge-image-converter', destination: 'bin/autoforge-image-converter' }],
       },
-      document: { files: [file('glib', 'program/soffice', 'program/soffice')], rewrites: [], licenses: [license('glib')] },
+      document: {
+        ...emptyFamily(),
+        nativeHelpers: [{ helper: 'autoforge-soffice-launcher', destination: 'program/soffice' }],
+        engineAssets: [{
+          engine: 'libreoffice', source: 'acquisition', destination: 'share/LibreOffice.dmg',
+          sha256: sha256(libreOfficeBytes), bytes: libreOfficeBytes.byteLength, executable: false, role: 'data',
+        }],
+        engineLicenses: [{
+          engine: 'libreoffice', source: 'https://downloads.example.test/libreoffice-LICENSE',
+          destination: 'LICENSES/libreoffice.LICENSE', sha256: sha256(libreOfficeLicenseBytes),
+          bytes: libreOfficeLicenseBytes.byteLength,
+        }],
+      },
       pdf: {
+        ...emptyFamily(),
         files: [
-          file('poppler', 'bin/autoforge-pdf-raster', 'bin/autoforge-pdf-raster'),
           file('poppler', 'bin/pdfinfo', 'bin/pdfinfo'),
           file('poppler', 'bin/pdftocairo', 'bin/pdftocairo'),
         ],
         rewrites: [], licenses: [license('poppler')],
+        nativeHelpers: [{ helper: 'autoforge-pdf-raster', destination: 'bin/autoforge-pdf-raster' }],
       },
       media: {
+        ...emptyFamily(),
         files: [file('ffmpeg', 'bin/ffmpeg', 'bin/ffmpeg'), file('ffmpeg', 'bin/ffprobe', 'bin/ffprobe')],
         rewrites: [], licenses: [license('ffmpeg')],
       },
@@ -151,11 +168,10 @@ function captureFixture(target = targetForHost()) {
     ffmpeg: ['bin/ffmpeg', 'bin/ffprobe'].map((path) => ({ path, bytes: fileBytes('ffmpeg', path), mode: 0o555 })),
     glib: [
       { path: 'lib/libglib.dylib', bytes: fileBytes('glib', 'lib/libglib.dylib'), mode: 0o444 },
-      { path: 'program/soffice', bytes: fileBytes('glib', 'program/soffice'), mode: 0o555 },
     ],
-    poppler: ['bin/autoforge-pdf-raster', 'bin/pdfinfo', 'bin/pdftocairo'].map((path) => ({ path, bytes: fileBytes('poppler', path), mode: 0o555 })),
+    poppler: ['bin/pdfinfo', 'bin/pdftocairo'].map((path) => ({ path, bytes: fileBytes('poppler', path), mode: 0o555 })),
     vips: [
-      ...['bin/autoforge-image-converter', 'bin/vips'].map((path) => ({ path, bytes: fileBytes('vips', path), mode: 0o555 })),
+      { path: 'bin/vips', bytes: fileBytes('vips', 'bin/vips'), mode: 0o555 },
       { path: 'share/vips/runtime.conf', bytes: fileBytes('vips', 'share/vips/runtime.conf'), mode: 0o444 },
     ],
   }
@@ -171,25 +187,31 @@ function captureFixture(target = targetForHost()) {
       sha256: sha256(bytes), bytes: bytes.byteLength, cellar: cellarForTarget(target),
     }]
   }))
-  closure.measurements.downloadBytes = Object.values(coordinates).reduce((sum, coordinate) => sum + coordinate.bytes, 0) + libreOfficeBytes.byteLength
+  closure.measurements.downloadBytes = Object.values(coordinates).reduce((sum, coordinate) => sum + coordinate.bytes, 0)
+    + libreOfficeBytes.byteLength + libreOfficeLicenseBytes.byteLength
   const roots = {
     formulae: ['ffmpeg', 'poppler', 'vips'],
     homebrewCaskRevision: '2'.repeat(40),
     engines: [
-      { name: 'ffmpeg', version: '9.0.1+1', license: 'GPL-3.0-or-later', rootFormula: 'ffmpeg', acquisition: coordinates.ffmpeg },
+      { name: 'ffmpeg', version: '9.0.1+1', license: 'GPL-3.0-or-later', rootFormula: 'ffmpeg', acquisition: coordinates.ffmpeg, licenses: [] },
       {
         name: 'libreoffice', version: '26.8.0', license: 'MPL-2.0', rootFormula: null,
         acquisition: {
           kind: 'dmg', url: `https://downloads.example.test/libreoffice-${target}.dmg`,
           sha256: sha256(libreOfficeBytes), bytes: libreOfficeBytes.byteLength, cellar: null,
         },
+        licenses: [{
+          kind: 'download', url: 'https://downloads.example.test/libreoffice-LICENSE',
+          sha256: sha256(libreOfficeLicenseBytes), bytes: libreOfficeLicenseBytes.byteLength,
+          destination: 'LICENSES/libreoffice.LICENSE',
+        }],
       },
-      { name: 'libvips', version: '8.18.6', license: 'LGPL-2.1-or-later', rootFormula: 'vips', acquisition: coordinates.vips },
-      { name: 'poppler', version: '26.8.0', license: 'GPL-3.0-only', rootFormula: 'poppler', acquisition: coordinates.poppler },
+      { name: 'libvips', version: '8.18.6', license: 'LGPL-2.1-or-later', rootFormula: 'vips', acquisition: coordinates.vips, licenses: [] },
+      { name: 'poppler', version: '26.8.0', license: 'GPL-3.0-only', rootFormula: 'poppler', acquisition: coordinates.poppler, licenses: [] },
     ],
     closure,
   }
-  return { bottleBytes, formulae, coordinates, libreOfficeBytes, roots, closure }
+  return { bottleBytes, formulae, coordinates, libreOfficeBytes, libreOfficeLicenseBytes, roots, closure }
 }
 
 function brewFormulaJson(fixture: ReturnType<typeof captureFixture>, target = targetForHost()) {
@@ -238,7 +260,9 @@ function syntheticRun(fixture: ReturnType<typeof captureFixture>, calls: Capture
       const output = args[args.indexOf('--output') + 1]!
       const url = args.at(-1)!
       const formula = [...fixture.bottleBytes.keys()].find((name) => fixture.coordinates[name].url === url)
-      const bytes = formula ? fixture.bottleBytes.get(formula)! : fixture.libreOfficeBytes
+      const bytes = formula
+        ? fixture.bottleBytes.get(formula)!
+        : url.endsWith('libreoffice-LICENSE') ? fixture.libreOfficeLicenseBytes : fixture.libreOfficeBytes
       mkdirSync(dirname(output), { recursive: true })
       writeFileSync(output, bytes)
       return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }
@@ -413,7 +437,7 @@ describe('converter pack lock generation', () => {
       && options.env.HOMEBREW_NO_AUTO_UPDATE === '1'
       && options.env.HOMEBREW_NO_INSTALL_FROM_API === '1'
     ))).toBe(true)
-    expect(calls.filter(({ executable }) => executable === '/usr/bin/curl')).toHaveLength(5)
+    expect(calls.filter(({ executable }) => executable === '/usr/bin/curl')).toHaveLength(6)
     expect(calls.flatMap(({ args }) => args).filter(isAbsolute).every((path) => path === '/opt/test/bin/brew' || path.startsWith(root) || path.startsWith('/private/var/') || path.startsWith('/var/'))).toBe(true)
 
     const secondRoot = temporaryRoot()
