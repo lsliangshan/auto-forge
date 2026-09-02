@@ -807,6 +807,70 @@ describe('converter pack lock generation', () => {
     expect(closure.formulae.find((formula: { name: string }) => formula.name === 'vips').dependencies).toEqual([])
   })
 
+  it('merges target-local dependency formulae by name with nullable opposite-target acquisition', async () => {
+    const root = temporaryRoot()
+    const captures = join(root, 'captures')
+    const outputRoot = join(root, 'locks')
+    mkdirSync(captures)
+    mkdirSync(outputRoot)
+    const arm = captureDocument('darwin-arm64')
+    const x64 = captureDocument('darwin-x64')
+    const template = arm.payload.formulae.find((formula) => formula.name === 'glib')!
+    const armOnly = {
+      ...structuredClone(template),
+      name: 'arm-only',
+      dependencies: [],
+      acquisition: {
+        ...structuredClone(template.acquisition),
+        url: 'https://downloads.example.test/arm-only-darwin-arm64.tar.gz',
+        sha256: sha256('arm-only-bottle'),
+        bytes: Buffer.byteLength('arm-only-bottle'),
+      },
+      licenses: template.licenses.map((license) => ({
+        ...structuredClone(license), destination: 'LICENSES/arm-only.LICENSE',
+      })),
+    }
+    arm.payload.formulae.push(armOnly)
+    arm.payload.formulae.sort((left, right) => Buffer.from(left.name).compare(Buffer.from(right.name)))
+    arm.payload.formulae.find((formula) => formula.name === 'vips')!.dependencies.push('arm-only')
+    arm.payload.formulae.find((formula) => formula.name === 'vips')!.dependencies.sort()
+    arm.payload.closure.formulae.push({ name: 'arm-only', version: armOnly.version, dependencies: [] })
+    arm.payload.closure.formulae.sort((left, right) => Buffer.from(left.name).compare(Buffer.from(right.name)))
+    arm.payload.closure.formulae.find((formula) => formula.name === 'vips')!.dependencies.push('arm-only')
+    arm.payload.closure.formulae.find((formula) => formula.name === 'vips')!.dependencies.sort()
+    arm.payload.closure.measurements.downloadBytes += armOnly.acquisition.bytes
+    arm.payloadSha256 = sha256(canonicalBytes(arm.payload))
+    const arm64Capture = writeCapture(captures, 'arm64.json', arm)
+    const x64Capture = writeCapture(captures, 'x64.json', x64)
+    const provenanceManifest = writeProvenance(captures, arm64Capture, x64Capture)
+
+    await generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot })
+
+    const source = JSON.parse(readFileSync(join(outputRoot, 'sources.lock.json'), 'utf8'))
+    const merged = source.formulae.find((formula: { name: string }) => formula.name === 'arm-only')
+    expect(merged.acquisitions).toEqual({ 'darwin-arm64': armOnly.acquisition, 'darwin-x64': null })
+    expect(merged.licenses).toEqual(armOnly.licenses)
+  })
+
+  it.each([
+    ['surrounding whitespace', (value: object) => Buffer.from(` ${JSON.stringify(value)}\n`)],
+    ['noncanonical property order', (value: object) => Buffer.from(JSON.stringify(Object.fromEntries(Object.entries(value).reverse())))],
+  ])('rejects a provenance manifest with %s', async (_label, serialize) => {
+    const root = temporaryRoot()
+    const captures = join(root, 'captures')
+    const outputRoot = join(root, 'locks')
+    mkdirSync(captures)
+    mkdirSync(outputRoot)
+    const arm64Capture = writeCapture(captures, 'arm64.json', captureDocument('darwin-arm64'))
+    const x64Capture = writeCapture(captures, 'x64.json', captureDocument('darwin-x64'))
+    const provenanceManifest = writeProvenance(captures, arm64Capture, x64Capture)
+    const manifest = JSON.parse(readFileSync(provenanceManifest, 'utf8'))
+    writeFileSync(provenanceManifest, serialize(manifest))
+
+    await expect(generateTransitiveSourceLock({ arm64Capture, x64Capture, provenanceManifest, outputRoot })).rejects.toThrow(/canonical|manifest/iu)
+    expect(existsSync(join(outputRoot, 'sources.lock.json'))).toBe(false)
+  })
+
   it('refuses to overwrite a generated file unless all bytes are identical', async () => {
     const root = temporaryRoot()
     const captures = join(root, 'captures')

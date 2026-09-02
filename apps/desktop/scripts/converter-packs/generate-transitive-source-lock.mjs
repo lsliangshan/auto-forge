@@ -259,11 +259,13 @@ function engineIdentity(engine) {
 function mergeLicenses(arm, x64) {
   const armDownloads = arm.filter((license) => license.kind === 'download')
   const x64Downloads = x64.filter((license) => license.kind === 'download')
-  if (!canonicalBytes(armDownloads).equals(canonicalBytes(x64Downloads))) invalid('Downloaded license identities differ between targets.')
+  if (arm.length > 0 && x64.length > 0 && !canonicalBytes(armDownloads).equals(canonicalBytes(x64Downloads))) {
+    invalid('Downloaded license identities differ between targets.')
+  }
   const merged = [
     ...arm.filter((license) => license.kind === 'bottle-entry'),
     ...x64.filter((license) => license.kind === 'bottle-entry'),
-    ...armDownloads,
+    ...(arm.length > 0 ? armDownloads : x64Downloads),
   ].sort((left, right) => compareUtf8(licenseSortKey(left), licenseSortKey(right)))
   if (!sortedUnique(merged, licenseSortKey)) invalid('Merged license inventory contains duplicates.')
   return merged
@@ -275,20 +277,29 @@ function buildSourceLock(arm64, x64, closureCoordinates, manifest) {
     || arm64.homebrewCaskRevision !== x64.homebrewCaskRevision
     || !canonicalBytes(arm64.roots).equals(canonicalBytes(x64.roots))
   ) invalid('Capture revision or root identities differ between targets.')
-  if (arm64.formulae.length !== x64.formulae.length) invalid('Formula identities differ between targets.')
-  const formulae = arm64.formulae.map((armFormula, index) => {
-    const x64Formula = x64.formulae[index]
-    if (!x64Formula || !formulaIdentity(armFormula).equals(formulaIdentity(x64Formula))) invalid('Formula identities differ between targets.')
+  const armFormulae = new Map(arm64.formulae.map((formula) => [formula.name, formula]))
+  const x64Formulae = new Map(x64.formulae.map((formula) => [formula.name, formula]))
+  const formulaNames = [...new Set([...armFormulae.keys(), ...x64Formulae.keys()])].sort(compareUtf8)
+  const formulae = formulaNames.map((name) => {
+    const armFormula = armFormulae.get(name)
+    const x64Formula = x64Formulae.get(name)
+    if (armFormula && x64Formula && !formulaIdentity(armFormula).equals(formulaIdentity(x64Formula))) {
+      invalid('Formula identities differ between targets.')
+    }
+    if ((!armFormula || !x64Formula) && arm64.roots.includes(name)) {
+      invalid('Root formula must exist in both target captures.')
+    }
+    const formula = armFormula ?? x64Formula
     return {
-      name: armFormula.name,
-      version: armFormula.version,
-      revision: armFormula.revision,
-      license: armFormula.license,
+      name: formula.name,
+      version: formula.version,
+      revision: formula.revision,
+      license: formula.license,
       acquisitions: {
-        'darwin-arm64': cloneJson(armFormula.acquisition),
-        'darwin-x64': cloneJson(x64Formula.acquisition),
+        'darwin-arm64': armFormula ? cloneJson(armFormula.acquisition) : null,
+        'darwin-x64': x64Formula ? cloneJson(x64Formula.acquisition) : null,
       },
-      licenses: mergeLicenses(armFormula.licenses, x64Formula.licenses),
+      licenses: mergeLicenses(armFormula?.licenses ?? [], x64Formula?.licenses ?? []),
     }
   })
   const engines = arm64.engines.map((armEngine, index) => {
