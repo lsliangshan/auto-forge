@@ -127,6 +127,9 @@ function stagingFixture(root: string) {
       ...universe,
       target: closureLock.target,
       resolveLockedLicense(license: { source: string; sha256: string }) {
+        if (Object.keys(license).sort().join('\0') !== ['bytes', 'formula', 'sha256', 'source'].join('\0')) {
+          throw new Error('downloaded license resolver received an inexact request')
+        }
         return license.source.startsWith('https://')
           ? join(universeRoot, 'Licenses', license.sha256)
           : universe.resolveLockedFile((license as { formula: string }).formula, license.source)
@@ -297,6 +300,23 @@ describe('converter pack Mach-O closure', () => {
     await expect(planMachOClosure({ ...request(), inspect: async (path: string) => path === tool.source ? { architectures: ['arm64'], dependencies: ['/opt/homebrew/lib/libsame.dylib'], rpaths: [] } : inspect(path) })).rejects.toThrow(/absolute|host|unresolved/iu)
     await expect(planMachOClosure({ ...request(), inspect: async (path: string) => path === tool.source ? { architectures: ['arm64'], dependencies: ['/usr/lib/../local/libsame.dylib'], rpaths: [] } : inspect(path) })).rejects.toThrow(/absolute|host|system/iu)
     await expect(planMachOClosure({ ...request(), inspect: async (path: string) => path === tool.source ? { architectures: ['arm64'], dependencies: ['@@HOMEBREW_CELLAR@@/glib/0/lib/libsame.dylib'], rpaths: [] } : inspect(path) })).rejects.toThrow(/locked|version|formula/iu)
+    await expect(planMachOClosure({
+      ...request(),
+      inspect: async (path: string) => path === tool.source
+        ? { architectures: ['arm64'], dependencies: ['@loader_path/../../../glib/2.86.0/share/runtime.dat'], rpaths: [] }
+        : inspect(path),
+      expectedRewrites: [],
+    })).rejects.toThrow(/code file/iu)
+
+    const otherExecutable = lockedFile(root, 'vips', '8.18.6', 'bin/tool-two', 'bin/tool-two', true)
+    await expect(planMachOClosure({
+      ...request(),
+      inspect: async (path: string) => path === tool.source
+        ? { architectures: ['arm64'], dependencies: ['@loader_path/tool-two'], rpaths: [] }
+        : inspect(path),
+      expectedFiles: [...request().expectedFiles, otherExecutable.lock],
+      expectedRewrites: [],
+    })).rejects.toThrow(/code file/iu)
 
     writeFileSync(library.source, 'changed')
     await expect(planMachOClosure(request())).rejects.toThrow(/hash|size|inventory/iu)

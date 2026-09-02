@@ -363,7 +363,12 @@ export async function stageProductionPacks(request, dependencies = productionDep
       for (const license of family.licenses) {
         files.push(await copyDeclaredFile({
           source: license.source.startsWith('https://')
-            ? universe.resolveLockedLicense(license)
+            ? universe.resolveLockedLicense({
+                formula: license.formula,
+                source: license.source,
+                sha256: license.sha256,
+                bytes: license.bytes,
+              })
             : universe.resolveLockedFile(license.formula, license.source),
           destination: license.destination,
           role: 'license',

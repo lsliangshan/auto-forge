@@ -323,6 +323,7 @@ export async function planMachOClosure({ entrypoints, architecture, inspect, uni
     for (const dependency of inspection.dependencies) {
       const dependencyNode = await resolveDependency(dependency, inspection, node, { byFormulaPath, bySource, universe })
       if (dependencyNode === undefined) continue
+      if (dependencyNode.expected.role !== 'code') fail('Mach-O dependency target must be a locked code file.')
       if (dependencyNode.source === node.source) continue
       add(dependencyNode, node.executableDirectory)
       rewrites.push({
