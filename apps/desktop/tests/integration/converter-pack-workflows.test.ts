@@ -11,6 +11,7 @@ const releasePath = join(repositoryRoot, '.github', 'workflows', 'converter-pack
 const lockPath = join(repositoryRoot, '.github', 'workflows', 'converter-pack-lock.yml')
 const packagePath = join(repositoryRoot, 'apps', 'desktop', 'package.json')
 const budgetPath = join(repositoryRoot, 'apps', 'desktop', 'scripts', 'converter-packs', 'development-cache-budget.mjs')
+const readmePath = join(repositoryRoot, 'apps', 'desktop', 'converter-packs', 'README.md')
 const lockedInputHash = "hashFiles('apps/desktop/converter-packs/sources.lock.json', 'apps/desktop/converter-packs/closures/darwin-arm64.lock.json', 'apps/desktop/converter-packs/closures/darwin-x64.lock.json')"
 
 describe('converter pack workflows', () => {
@@ -58,6 +59,23 @@ describe('converter pack workflows', () => {
       expect(ordinaryWorkflows).not.toContain(command)
       expect(maintainerWorkflow).toContain(command)
     }
+  })
+
+  it('publishes the offline preparation budgets and maintainer review contract', () => {
+    const readme = readFileSync(readmePath, 'utf8')
+    const normalizedReadme = readme.replace(/\s+/gu, ' ')
+    const packageConfig = JSON.parse(readFileSync(packagePath, 'utf8')) as { scripts: Record<string, string> }
+
+    expect(packageConfig.scripts['converter-packs:verify-sources']).toBe('node scripts/converter-packs/source-lock.mjs')
+    for (const contract of [
+      '1.8 GB download ceiling',
+      '10 GiB free-space requirement',
+      '5 GiB blob-cache limit',
+      'active release plus one previous release',
+      'never reads host Homebrew',
+      'manual review',
+      'schema-v2',
+    ]) expect(normalizedReadme).toContain(contract)
   })
 
   it('pins every action, bounds artifacts, and invokes the complete tested CLI chain', () => {

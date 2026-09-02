@@ -1,8 +1,36 @@
 # Production converter packs
 
-The checked-in source lock is the authority for redistributed libvips,
-Poppler, FFmpeg, and LibreOffice inputs. Production jobs must run source-lock
-verification and verified acquisition before creating a staging plan.
+The checked-in schema-v2 `sources.lock.json` and the authenticated
+`closures/darwin-arm64.lock.json` and `closures/darwin-x64.lock.json` are one
+indivisible authority for redistributed libvips, Poppler, FFmpeg, and
+LibreOffice inputs. Production jobs verify that authority, acquire the exact
+selected target closure, and materialize it once before creating a staging
+plan. Cache keys authenticate all three files.
+
+The current checked-in production source lock is still schema v1 and has no
+authenticated closure coordinates. Consequently, the safe no-argument
+`converter-packs:verify-sources` command intentionally fails until replacement
+schema-v2 locks have passed manual review and all three files are committed
+together. Suppressing that failure or hand-editing placeholder coordinates is
+not an acceptable migration.
+
+## Lock maintenance and resource budgets
+
+Only `.github/workflows/converter-pack-lock.yml` may call
+`converter-packs:capture-lock-target` or `converter-packs:generate-lock`. A
+maintainer dispatch pins the exact Homebrew core and cask revisions, captures
+both architectures, and emits the three candidate locks as one artifact.
+Before committing them, manual review must confirm the provenance revisions,
+both capture and probe hashes, canonical ordering, exact URLs, byte counts,
+SHA-256 values, licenses, and the complete target closures. Check, release, and
+development workflows only consume reviewed locks; they never generate them.
+
+Cold preparation enforces a 1.8 GB download ceiling and a 10 GiB free-space
+requirement before acquisition. Safe pruning enforces a 5 GiB blob-cache limit
+and retains the active release plus one previous release. An ordinary
+preparation, including production staging and `pnpm dev`, never reads host
+Homebrew metadata or uses Homebrew-installed formula bytes. Homebrew resolution
+is isolated to the maintainer lock workflow.
 
 `converter-packs:stage` accepts one canonical JSON plan through `--plan`. The
 plan contains these exact top-level fields:
