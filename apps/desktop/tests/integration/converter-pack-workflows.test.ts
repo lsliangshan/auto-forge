@@ -8,10 +8,14 @@ import { validateConverterPackWorkflows } from '../../scripts/converter-packs/va
 const repositoryRoot = fileURLToPath(new URL('../../../..', import.meta.url))
 const checkPath = join(repositoryRoot, '.github', 'workflows', 'converter-pack-check.yml')
 const releasePath = join(repositoryRoot, '.github', 'workflows', 'converter-pack-release.yml')
+const lockPath = join(repositoryRoot, '.github', 'workflows', 'converter-pack-lock.yml')
+const packagePath = join(repositoryRoot, 'apps', 'desktop', 'package.json')
+const budgetPath = join(repositoryRoot, 'apps', 'desktop', 'scripts', 'converter-packs', 'development-cache-budget.mjs')
+const lockedInputHash = "hashFiles('apps/desktop/converter-packs/sources.lock.json', 'apps/desktop/converter-packs/closures/darwin-arm64.lock.json', 'apps/desktop/converter-packs/closures/darwin-x64.lock.json')"
 
 describe('converter pack workflows', () => {
   it('keeps pull-request validation credential-free and release publication protected', async () => {
-    await expect(validateConverterPackWorkflows({ checkPath, releasePath })).resolves.toBeUndefined()
+    await expect(validateConverterPackWorkflows({ checkPath, releasePath, lockPath, packagePath })).resolves.toBeUndefined()
 
     const check = parse(readFileSync(checkPath, 'utf8'))
     const release = parse(readFileSync(releasePath, 'utf8'))
@@ -30,6 +34,30 @@ describe('converter pack workflows', () => {
     expect(JSON.stringify(release.jobs.stage_arm64)).not.toContain('secrets.')
     expect(JSON.stringify(release.jobs.stage_x64)).not.toContain('secrets.')
     expect(JSON.stringify(release.jobs.production)).toContain('secrets.')
+  })
+
+  it('keys ordinary caches from the complete authenticated lock set without Homebrew resolution', () => {
+    const checkSource = readFileSync(checkPath, 'utf8')
+    const releaseSource = readFileSync(releasePath, 'utf8')
+    const packageConfig = JSON.parse(readFileSync(packagePath, 'utf8')) as { scripts: Record<string, string> }
+    const ordinarySource = `${checkSource}\n${releaseSource}\n${packageConfig.scripts.predev}\n${packageConfig.scripts.dev}`
+
+    expect(checkSource).toContain(lockedInputHash)
+    expect(releaseSource).toContain(lockedInputHash)
+    expect(ordinarySource).not.toMatch(/\bbrew\s+(?:install|fetch|info|deps)\b/u)
+    expect(releaseSource).toContain('converter-packs:acquire')
+    expect(releaseSource).toContain('converter-packs:prepare-staging')
+    expect(readFileSync(budgetPath, 'utf8')).toContain('const minimumFreeBytes = 10 * GiB')
+  })
+
+  it('reserves lock capture and generation commands for the maintainer workflow', () => {
+    const ordinaryWorkflows = `${readFileSync(checkPath, 'utf8')}\n${readFileSync(releasePath, 'utf8')}`
+    const maintainerWorkflow = readFileSync(lockPath, 'utf8')
+
+    for (const command of ['converter-packs:capture-lock-target', 'converter-packs:generate-lock']) {
+      expect(ordinaryWorkflows).not.toContain(command)
+      expect(maintainerWorkflow).toContain(command)
+    }
   })
 
   it('pins every action, bounds artifacts, and invokes the complete tested CLI chain', () => {

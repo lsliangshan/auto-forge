@@ -41,11 +41,9 @@ jobs:
       - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306
         with:
           path: ${{ runner.temp }}/converter-source-cache
-          key: converter-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('apps/desktop/converter-packs/sources.lock.json') }}
+          key: converter-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('apps/desktop/converter-packs/sources.lock.json', 'apps/desktop/converter-packs/closures/darwin-arm64.lock.json', 'apps/desktop/converter-packs/closures/darwin-x64.lock.json') }}
       - name: Set deterministic release time
         run: echo "AUTOFORGE_GENERATED_AT=$(node -p \"new Date(require('child_process').execFileSync('git',['show','-s','--format=%cI','HEAD'],{encoding:'utf8'}).trim()).toISOString()\")" >> "$GITHUB_ENV"
-      - name: Install locked bottle dependencies
-        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg vips poppler
       - name: Verify and acquire locked sources
         run: |
           mkdir -p "$RUNNER_TEMP/converter-source-cache"
@@ -140,11 +138,15 @@ jobs:
           pnpm --filter @autoforge/desktop converter-packs:build --input "$RUNNER_TEMP/converter-combined" --output "$RUNNER_TEMP/converter-release" --mode production
           pnpm --filter @autoforge/desktop converter-packs:sign --index "$RUNNER_TEMP/converter-release/index.json" --private-key "$RUNNER_TEMP/converter-index-private.pem" --mode production
           pnpm --filter @autoforge/desktop verify:converter-packs --root "$RUNNER_TEMP/converter-release" --public-key "$RUNNER_TEMP/converter-index-public.pem" --mode production
+      - name: Acquire pinned COSCLI publisher
+        run: |
+          /usr/bin/curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --output "$RUNNER_TEMP/coscli" https://github.com/tencentyun/coscli/releases/download/v1.0.8/coscli-v1.0.8-darwin-arm64
+          printf '%s  %s\n' df0018fbf78b552cbe875ebe26e8bdf7938c7f4394959f913dfc2ea4d1252568 "$RUNNER_TEMP/coscli" | /usr/bin/shasum -a 256 -c -
+          chmod 0500 "$RUNNER_TEMP/coscli"
       - name: Publish immutable objects and stable pair
         run: |
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install coscli
           mkdir -p "$RUNNER_TEMP/coscli-scratch"
-          pnpm --filter @autoforge/desktop converter-packs:publish --release "$RUNNER_TEMP/converter-release" --public-key "$RUNNER_TEMP/converter-index-public.pem" --public-base-url "${{ vars.CONVERTER_PUBLIC_BASE_URL }}" --sequence "${{ inputs.sequence }}" --coscli "$(realpath "$(command -v coscli)")" --cos-config "$RUNNER_TEMP/coscli.yaml" --cos-bucket "${{ vars.CONVERTER_COS_BUCKET }}" --cos-scratch "$RUNNER_TEMP/coscli-scratch" --mode production
+          pnpm --filter @autoforge/desktop converter-packs:publish --release "$RUNNER_TEMP/converter-release" --public-key "$RUNNER_TEMP/converter-index-public.pem" --public-base-url "${{ vars.CONVERTER_PUBLIC_BASE_URL }}" --sequence "${{ inputs.sequence }}" --coscli "$RUNNER_TEMP/coscli" --cos-config "$RUNNER_TEMP/coscli.yaml" --cos-bucket "${{ vars.CONVERTER_COS_BUCKET }}" --cos-scratch "$RUNNER_TEMP/coscli-scratch" --mode production
       - name: Build production Desktop bootstrap
         run: |
           pnpm --filter @autoforge/desktop converter-packs:create-bootstrap --index-url "${{ vars.CONVERTER_INDEX_URL }}" --public-key "$RUNNER_TEMP/converter-index-public.pem" --output "$RUNNER_TEMP/converter-bootstrap"
@@ -162,4 +164,4 @@ jobs:
         if: always()
         run: |
           security delete-keychain "$RUNNER_TEMP/converter-signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/converter-certificate.p12" "$RUNNER_TEMP/converter-index-private.pem" "$RUNNER_TEMP/coscli.yaml"
+          rm -f "$RUNNER_TEMP/converter-certificate.p12" "$RUNNER_TEMP/converter-index-private.pem" "$RUNNER_TEMP/coscli.yaml" "$RUNNER_TEMP/coscli"

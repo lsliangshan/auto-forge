@@ -21,6 +21,9 @@ const commands = [
   'converter-packs:sign', 'verify:converter-packs', 'converter-packs:publish',
   'converter-packs:create-bootstrap', 'dist:production',
 ]
+const lockMaintenanceCommands = ['converter-packs:capture-lock-target', 'converter-packs:generate-lock']
+const lockedInputHash = "hashFiles('apps/desktop/converter-packs/sources.lock.json', 'apps/desktop/converter-packs/closures/darwin-arm64.lock.json', 'apps/desktop/converter-packs/closures/darwin-x64.lock.json')"
+const forbiddenHomebrewResolution = /\bbrew\s+(?:install|fetch|info|deps)\b/u
 
 function record(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -70,11 +73,17 @@ function noSecrets(value, label) {
   if (JSON.stringify(value).includes('secrets.')) fail(`${label} must not access production secrets.`)
 }
 
-export async function validateConverterPackWorkflows({ checkPath, releasePath }) {
+export async function validateConverterPackWorkflows({ checkPath, releasePath, lockPath, packagePath }) {
   const check = await workflow(checkPath, 'Converter check workflow')
   const release = await workflow(releasePath, 'Converter release workflow')
+  const lock = await workflow(lockPath, 'Converter lock workflow')
+  requireAbsolutePath(packagePath, 'Desktop package')
+  let packageConfig
+  try { packageConfig = JSON.parse(await readFile(packagePath, 'utf8')) } catch { fail('Desktop package is invalid JSON.') }
+  if (!record(packageConfig) || !record(packageConfig.scripts)) fail('Desktop package scripts are invalid.')
   exactReadPermissions(check.value.permissions, 'Converter check workflow')
   exactReadPermissions(release.value.permissions, 'Converter release workflow')
+  exactReadPermissions(lock.value.permissions, 'Converter lock workflow')
   if (!record(check.value.on) || !record(check.value.on.pull_request) || !record(check.value.on.push)) {
     fail('Converter check workflow triggers are invalid.')
   }
@@ -107,16 +116,29 @@ export async function validateConverterPackWorkflows({ checkPath, releasePath })
   ) fail('Converter production job protection is invalid.')
   validateActions(check.value)
   validateActions(release.value)
+  validateActions(lock.value)
   const combined = `${check.source}\n${release.source}`
   for (const command of commands) if (!combined.includes(command)) fail(`Converter workflow command is missing: ${command}`)
+  if (!check.source.includes(lockedInputHash) || !release.source.includes(lockedInputHash)) {
+    fail('Converter workflow cache keys must authenticate all checked-in locks.')
+  }
+  const ordinary = `${combined}\n${packageConfig.scripts.predev ?? ''}\n${packageConfig.scripts.dev ?? ''}`
+  if (forbiddenHomebrewResolution.test(ordinary)) fail('Ordinary converter workflows must not resolve Homebrew dependencies.')
+  for (const command of lockMaintenanceCommands) {
+    if (combined.includes(command) || !lock.source.includes(command)) {
+      fail(`Converter lock maintenance command has an invalid workflow boundary: ${command}`)
+    }
+  }
 }
 
 const entry = process.argv[1]
 if (entry && import.meta.url === pathToFileURL(entry).href) {
-  const args = parseArguments(process.argv.slice(2), ['--check', '--release'], [])
+  const args = parseArguments(process.argv.slice(2), ['--check', '--release', '--lock', '--package'], [])
   await validateConverterPackWorkflows({
     checkPath: args['--check'] ?? join(repositoryRoot, '.github', 'workflows', 'converter-pack-check.yml'),
     releasePath: args['--release'] ?? join(repositoryRoot, '.github', 'workflows', 'converter-pack-release.yml'),
+    lockPath: args['--lock'] ?? join(repositoryRoot, '.github', 'workflows', 'converter-pack-lock.yml'),
+    packagePath: args['--package'] ?? join(repositoryRoot, 'apps', 'desktop', 'package.json'),
   })
   process.stdout.write('verified converter pack workflow boundaries\n')
 }

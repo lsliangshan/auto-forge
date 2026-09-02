@@ -35,6 +35,10 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306
+        with:
+          path: ${{ runner.temp }}/converter-source-cache
+          key: converter-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('apps/desktop/converter-packs/sources.lock.json', 'apps/desktop/converter-packs/closures/darwin-arm64.lock.json', 'apps/desktop/converter-packs/closures/darwin-x64.lock.json') }}
       - name: Verify workflow and source contracts
         run: |
           pnpm --filter @autoforge/desktop converter-packs:verify-workflows
