@@ -19,7 +19,9 @@ import {
   validateExecutableSet,
 } from './pack-tooling-lib.mjs'
 import { adhocSignMachOClosure, inspectMachO, planMachOClosure, relocateMachOClosure } from './macho-closure.mjs'
-import { validateTargetClosureLock } from './closure-lock.mjs'
+import { loadConverterClosureLock } from './closure-lock.mjs'
+import { openBuiltHelperSet } from './build-native-helpers.mjs'
+import { openLockedEngineAssets } from './locked-engine-assets.mjs'
 
 const familyNames = Object.freeze(['image-icon', 'document', 'pdf', 'media'])
 const exactExecutables = Object.freeze({
@@ -27,6 +29,12 @@ const exactExecutables = Object.freeze({
   document: Object.freeze(['program/soffice']),
   pdf: Object.freeze(['bin/autoforge-pdf-raster', 'bin/pdfinfo', 'bin/pdftocairo']),
   media: Object.freeze(['bin/ffmpeg', 'bin/ffprobe']),
+})
+const exactNativeHelpers = Object.freeze({
+  'image-icon': Object.freeze([{ helper: 'autoforge-image-converter', destination: 'bin/autoforge-image-converter' }]),
+  document: Object.freeze([{ helper: 'autoforge-soffice-launcher', destination: 'program/soffice' }]),
+  pdf: Object.freeze([{ helper: 'autoforge-pdf-raster', destination: 'bin/autoforge-pdf-raster' }]),
+  media: Object.freeze([]),
 })
 const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u
 
@@ -58,7 +66,8 @@ function validateArchiveBase(value) {
 
 function validateRequest(request) {
   if (!exactKeys(request, [
-    'target', 'output', 'version', 'sequence', 'generatedAt', 'archiveBaseUrl', 'closureLockPath', 'universeRoot',
+    'target', 'output', 'version', 'sequence', 'generatedAt', 'archiveBaseUrl',
+    'sourceLockPath', 'universeRoot', 'helpersRoot', 'engineAssetsRoot',
   ])) fail('Pack staging request is invalid.')
   if (request.target !== 'darwin-arm64' && request.target !== 'darwin-x64') {
     fail('Pack staging target is unsupported.')
@@ -73,8 +82,10 @@ function validateRequest(request) {
     if (new Date(request.generatedAt).toISOString() !== request.generatedAt) fail('Pack generatedAt is invalid.')
   } catch { fail('Pack generatedAt is invalid.') }
   validateArchiveBase(request.archiveBaseUrl)
-  requireAbsolutePath(request.closureLockPath, 'Target closure lock')
+  requireAbsolutePath(request.sourceLockPath, 'Source lock')
   requireAbsolutePath(request.universeRoot, 'Bottle universe root')
+  requireAbsolutePath(request.helpersRoot, 'Native helper root')
+  requireAbsolutePath(request.engineAssetsRoot, 'Locked engine asset root')
   return { platform, arch, machoArchitecture: arch === 'x64' ? 'x86_64' : arch }
 }
 
@@ -139,11 +150,13 @@ export async function probeConverterFamily({ name, payload, executables }, { run
 }
 
 const productionDependencies = Object.freeze({
-  loadClosure: async ({ closureLockPath, target }) => validateTargetClosureLock(
-    (await readCanonicalJson(closureLockPath, 'Target closure lock')).value,
-    target,
-  ),
+  loadClosure: ({ sourceLockPath, target }) => loadConverterClosureLock({ sourceLockPath, target }),
   openUniverse: ({ universeRoot, closureLock }) => openLockedUniverse({ universeRoot, closureLock }),
+  openHelpers: ({ helpersRoot, target }) => openBuiltHelperSet({ root: helpersRoot, target }),
+  openEngineAssets: ({ engineAssetsRoot, target, sourceLock, closureLock }) => openLockedEngineAssets({
+    root: engineAssetsRoot, target, sourceLock, closureLock,
+  }),
+  inspectHelper: (path) => inspectMachO(path),
   planClosure: ({ entrypoints, architecture, universe, expectedFiles, expectedRewrites }) => planMachOClosure({
     entrypoints,
     architecture,
@@ -250,16 +263,46 @@ async function copyDeclaredFile({ source, destination, role, payload, seen, expe
 }
 
 function validateFamily(name, family) {
-  if (!exactKeys(family, ['files', 'rewrites', 'licenses']) || !Array.isArray(family.files) || !Array.isArray(family.rewrites) || !Array.isArray(family.licenses)) {
+  if (
+    !exactKeys(family, ['files', 'rewrites', 'licenses', 'nativeHelpers', 'engineAssets', 'engineLicenses'])
+    || !Array.isArray(family.files)
+    || !Array.isArray(family.rewrites)
+    || !Array.isArray(family.licenses)
+    || !Array.isArray(family.nativeHelpers)
+    || !Array.isArray(family.engineAssets)
+    || !Array.isArray(family.engineLicenses)
+  ) {
     fail(`Pack family is invalid: ${name}`)
   }
-  const destinations = family.files.filter((file) => file?.executable).map((file) => file.destination)
+  const helpers = family.nativeHelpers.map((helper) => `${helper.helper}\0${helper.destination}`)
+  const wantedHelpers = exactNativeHelpers[name].map((helper) => `${helper.helper}\0${helper.destination}`)
+  if (helpers.join('\0') !== wantedHelpers.join('\0')) fail(`Pack family native helper inventory is invalid: ${name}`)
+  const destinations = [
+    ...family.files.filter((file) => file?.executable).map((file) => file.destination),
+    ...family.nativeHelpers.map((helper) => helper.destination),
+  ]
   if (
     destinations.length !== exactExecutables[name].length
     || [...destinations].sort(compareUtf8).join('\0') !== [...exactExecutables[name]].sort(compareUtf8).join('\0')
   ) fail(`Pack family executable inventory is invalid: ${name}`)
   validateExecutableSet(name, 'darwin', destinations)
-  if (family.licenses.length === 0) fail(`Pack family is missing a license: ${name}`)
+  if (family.licenses.length + family.engineLicenses.length === 0) fail(`Pack family is missing a license: ${name}`)
+}
+
+function systemDependency(value) {
+  return typeof value === 'string' && (value.startsWith('/usr/lib/') || value.startsWith('/System/Library/'))
+}
+
+function validateHelperInspection(inspection, architecture) {
+  if (
+    !plainRecord(inspection)
+    || !Array.isArray(inspection.architectures)
+    || !inspection.architectures.includes(architecture)
+    || !Array.isArray(inspection.dependencies)
+    || inspection.dependencies.some((dependency) => !systemDependency(dependency))
+    || !Array.isArray(inspection.rpaths)
+    || inspection.rpaths.length !== 0
+  ) fail('Native helper Mach-O inventory is invalid.')
 }
 
 function planFileKey(file) {
@@ -304,6 +347,9 @@ export async function stageProductionPacks(request, dependencies = productionDep
     || typeof dependencies.probeFamily !== 'function'
     || (dependencies.loadClosure !== undefined && typeof dependencies.loadClosure !== 'function')
     || (dependencies.openUniverse !== undefined && typeof dependencies.openUniverse !== 'function')
+    || (dependencies.openHelpers !== undefined && typeof dependencies.openHelpers !== 'function')
+    || (dependencies.openEngineAssets !== undefined && typeof dependencies.openEngineAssets !== 'function')
+    || (dependencies.inspectHelper !== undefined && typeof dependencies.inspectHelper !== 'function')
   ) fail('Pack staging dependencies are invalid.')
   if (await realpath(dirname(request.output)).catch(() => undefined) !== dirname(request.output)) {
     fail('Staging output parent must be a canonical directory.')
@@ -313,11 +359,19 @@ export async function stageProductionPacks(request, dependencies = productionDep
   try {
     const loadClosure = dependencies.loadClosure ?? productionDependencies.loadClosure
     const openUniverse = dependencies.openUniverse ?? productionDependencies.openUniverse
-    const closureLock = await loadClosure({ closureLockPath: request.closureLockPath, target: request.target })
+    const openHelpers = dependencies.openHelpers ?? productionDependencies.openHelpers
+    const openEngineAssets = dependencies.openEngineAssets ?? productionDependencies.openEngineAssets
+    const inspectHelper = dependencies.inspectHelper ?? productionDependencies.inspectHelper
+    const selected = await loadClosure({ sourceLockPath: request.sourceLockPath, target: request.target })
+    const { sourceLock, closureLock } = selected ?? {}
     if (!plainRecord(closureLock) || closureLock.target !== request.target || !exactKeys(closureLock.families, familyNames)) {
       fail('Target closure lock does not match the staging request.')
     }
     const universe = await openUniverse({ universeRoot: request.universeRoot, closureLock })
+    const helperSet = await openHelpers({ helpersRoot: request.helpersRoot, target: request.target })
+    const engineAssets = await openEngineAssets({
+      engineAssetsRoot: request.engineAssetsRoot, target: request.target, sourceLock, closureLock,
+    })
     if (
       !universe
       || universe.target !== request.target
@@ -326,6 +380,15 @@ export async function stageProductionPacks(request, dependencies = productionDep
     ) {
       fail('Bottle universe does not match the staging request.')
     }
+    if (!helperSet || helperSet.target !== request.target || typeof helperSet.resolveHelper !== 'function') {
+      fail('Native helper set does not match the staging request.')
+    }
+    if (
+      !engineAssets
+      || engineAssets.target !== request.target
+      || typeof engineAssets.resolveEngineAsset !== 'function'
+      || typeof engineAssets.resolveEngineLicense !== 'function'
+    ) fail('Locked engine asset set does not match the staging request.')
     const packsRoot = join(request.output, 'packs')
     await mkdir(packsRoot, { mode: 0o755 })
     for (const name of familyNames) {
@@ -348,6 +411,7 @@ export async function stageProductionPacks(request, dependencies = productionDep
       validateExactPlan(name, plan, family, universe)
       const seen = new Set()
       const files = []
+      const effectivePlan = { files: [...plan.files], rewrites: [...plan.rewrites] }
       for (const file of plan.files) {
         if (!exactKeys(file, ['source', 'destination', 'executable', 'formula', 'role'])) fail(`Mach-O closure file is invalid: ${name}`)
         files.push(await copyDeclaredFile({
@@ -358,6 +422,27 @@ export async function stageProductionPacks(request, dependencies = productionDep
           seen,
           expectedBytes: family.files.find((expected) => expected.destination === file.destination)?.bytes,
           expectedSha256: family.files.find((expected) => expected.destination === file.destination)?.sha256,
+        }))
+      }
+      for (const helper of family.nativeHelpers) {
+        const resolved = await helperSet.resolveHelper(helper.helper)
+        if (
+          !exactKeys(resolved, ['helper', 'destination', 'sha256', 'bytes', 'path'])
+          || resolved.destination !== helper.destination
+        ) fail(`Native helper differs from its locked inventory: ${name}`)
+        validateHelperInspection(await inspectHelper(resolved.path), target.machoArchitecture)
+        files.push(await copyDeclaredFile({
+          source: resolved.path, destination: helper.destination, role: 'executable', payload, seen,
+          expectedBytes: resolved.bytes, expectedSha256: resolved.sha256,
+        }))
+        effectivePlan.files.push({
+          source: resolved.path, destination: helper.destination, executable: true, role: 'executable',
+        })
+      }
+      for (const asset of family.engineAssets) {
+        files.push(await copyDeclaredFile({
+          source: await engineAssets.resolveEngineAsset(asset), destination: asset.destination, role: 'data', payload, seen,
+          expectedBytes: asset.bytes, expectedSha256: asset.sha256,
         }))
       }
       for (const license of family.licenses) {
@@ -378,7 +463,13 @@ export async function stageProductionPacks(request, dependencies = productionDep
           expectedSha256: license.sha256,
         }))
       }
-      await dependencies.applyRelocation({ name, payload, plan, architecture: target.machoArchitecture })
+      for (const license of family.engineLicenses) {
+        files.push(await copyDeclaredFile({
+          source: await engineAssets.resolveEngineLicense(license), destination: license.destination,
+          role: 'license', payload, seen, expectedBytes: license.bytes, expectedSha256: license.sha256,
+        }))
+      }
+      await dependencies.applyRelocation({ name, payload, plan: effectivePlan, architecture: target.machoArchitecture })
       await dependencies.probeFamily({
         name,
         payload,

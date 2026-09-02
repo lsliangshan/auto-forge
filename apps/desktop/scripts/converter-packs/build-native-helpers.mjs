@@ -1,9 +1,11 @@
 import { spawnSync } from 'node:child_process'
-import { chmod, lstat, mkdir, realpath, rm } from 'node:fs/promises'
+import { chmod, lstat, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL, URL } from 'node:url'
-import { parseArguments, requireAbsolutePath } from './pack-tooling-lib.mjs'
+import {
+  canonicalBytes, compareUtf8, parseArguments, readStableRegularFile, requireAbsolutePath, requireDirectory, sha256,
+} from './pack-tooling-lib.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const nativeRoot = join(desktopRoot, 'converter-packs', 'native')
@@ -36,6 +38,72 @@ const helpers = Object.freeze([
     includes: ['common'],
   }),
 ])
+const helperByName = new Map(helpers.map((helper) => [helper.name, helper]))
+
+function invalid() {
+  throw new Error('Native helper set is invalid.')
+}
+
+function exactKeys(value, keys) {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Object.keys(value).sort(compareUtf8).join('\0') === [...keys].sort(compareUtf8).join('\0')
+}
+
+async function verifiedHelper(root, record) {
+  if (
+    !exactKeys(record, ['helper', 'destination', 'sha256', 'bytes'])
+    || helperByName.get(record.helper)?.destination !== record.destination
+    || !/^[a-f0-9]{64}$/u.test(record.sha256)
+    || !Number.isSafeInteger(record.bytes)
+    || record.bytes <= 0
+  ) invalid()
+  const path = join(root, ...record.destination.split('/'))
+  const metadata = await lstat(path).catch(() => undefined)
+  if (
+    !metadata?.isFile()
+    || metadata.isSymbolicLink()
+    || metadata.nlink !== 1
+    || (metadata.mode & 0o111) === 0
+    || await realpath(path).catch(() => undefined) !== path
+  ) invalid()
+  const bytes = await readStableRegularFile(path, 'Native helper')
+  if (bytes.byteLength !== record.bytes || sha256(bytes) !== record.sha256) invalid()
+  return path
+}
+
+export async function openBuiltHelperSet({ root, target }) {
+  if (!targetArchitectures[target]) invalid()
+  requireAbsolutePath(root, 'Native helper root')
+  await requireDirectory(root, 'Native helper root')
+  const manifestBytes = await readStableRegularFile(join(root, 'manifest.json'), 'Native helper manifest', 64 * 1024)
+  let manifest
+  try { manifest = JSON.parse(manifestBytes.toString('utf8')) } catch { invalid() }
+  if (!manifestBytes.equals(canonicalBytes(manifest))) invalid()
+  if (
+    !exactKeys(manifest, ['schemaVersion', 'target', 'helpers'])
+    || manifest.schemaVersion !== 1
+    || manifest.target !== target
+    || !Array.isArray(manifest.helpers)
+    || manifest.helpers.length !== helpers.length
+    || manifest.helpers.some((record, index) => record.helper !== helpers[index].name)
+  ) invalid()
+  const records = new Map()
+  for (const record of manifest.helpers) {
+    await verifiedHelper(root, record)
+    records.set(record.helper, Object.freeze({ ...record }))
+  }
+  return Object.freeze({
+    target,
+    root,
+    async resolveHelper(helper) {
+      const record = records.get(helper)
+      if (!record) invalid()
+      return Object.freeze({ ...record, path: await verifiedHelper(root, record) })
+    },
+  })
+}
 
 async function requireExecutable(path) {
   const metadata = await lstat(path).catch(() => undefined)
@@ -74,7 +142,23 @@ export async function buildNativeHelpers({ target, output, compiler }) {
       if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error('Compiler did not produce a regular helper executable.')
       await chmod(executable, 0o755)
     }
-    return helpers.map(({ destination }) => join(output, ...destination.split('/')))
+    const manifest = {
+      schemaVersion: 1,
+      target,
+      helpers: [],
+    }
+    for (const helper of helpers) {
+      const path = join(output, ...helper.destination.split('/'))
+      const bytes = await readStableRegularFile(path, 'Native helper')
+      manifest.helpers.push({
+        helper: helper.name,
+        destination: helper.destination,
+        sha256: sha256(bytes),
+        bytes: bytes.byteLength,
+      })
+    }
+    await writeFile(join(output, 'manifest.json'), canonicalBytes(manifest), { flag: 'wx', mode: 0o444 })
+    return openBuiltHelperSet({ root: output, target })
   } catch (error) {
     await rm(output, { recursive: true, force: true })
     throw error

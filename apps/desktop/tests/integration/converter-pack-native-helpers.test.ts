@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { openBuiltHelperSet } from '../../scripts/converter-packs/build-native-helpers.mjs'
 
 const desktopRoot = fileURLToPath(new URL('../..', import.meta.url))
 const nativeRoot = join(desktopRoot, 'converter-packs', 'native')
@@ -95,7 +96,7 @@ afterAll(() => {
 })
 
 describe('native converter helper contracts', () => {
-  it('builds the three current-architecture Mach-O helpers into the exact pack paths', () => {
+  it('builds and reopens an authenticated helper set at the exact pack paths', async () => {
     const root = temporaryRoot()
     const output = join(root, 'helpers')
     const target = `darwin-${process.arch}`
@@ -104,6 +105,7 @@ describe('native converter helper contracts', () => {
     ], { encoding: 'utf8' })
 
     expect(result.status, result.stderr).toBe(0)
+    const helperSet = await openBuiltHelperSet({ root: output, target })
     for (const relativePath of ['bin/autoforge-image-converter', 'bin/autoforge-pdf-raster', 'program/soffice']) {
       const path = join(output, relativePath)
       expect(lstatSync(path).isFile()).toBe(true)
@@ -113,6 +115,12 @@ describe('native converter helper contracts', () => {
       expect(identified.stdout).toContain('Mach-O 64-bit executable')
       expect(identified.stdout).toContain(process.arch === 'arm64' ? 'arm64' : 'x86_64')
     }
+    await expect(helperSet.resolveHelper('autoforge-soffice-launcher')).resolves.toMatchObject({
+      destination: 'program/soffice',
+      path: join(output, 'program/soffice'),
+    })
+    writeFileSync(join(output, 'program/soffice'), 'substituted')
+    await expect(helperSet.resolveHelper('autoforge-soffice-launcher')).rejects.toThrow('Native helper set is invalid.')
   })
 
   it('mounts the pinned LibreOffice DMG read-only, forwards arguments, and detaches it', () => {

@@ -78,27 +78,64 @@ function stagingFixture(root: string) {
   mkdirSync(universeRoot)
   const versions: Record<string, string> = {}
   const destinationSets: Record<string, string[]> = {
-    'image-icon': ['bin/autoforge-image-converter', 'bin/vips'],
-    document: ['program/soffice'],
-    pdf: ['bin/autoforge-pdf-raster', 'bin/pdfinfo', 'bin/pdftocairo'],
+    'image-icon': ['bin/vips'],
+    document: [],
+    pdf: ['bin/pdfinfo', 'bin/pdftocairo'],
     media: ['bin/ffmpeg', 'bin/ffprobe'],
   }
+  const formulaNames: Record<string, string> = { 'image-icon': 'vips', pdf: 'poppler', media: 'ffmpeg' }
+  const nativeHelpers: Record<string, Array<{ helper: string; destination: string }>> = {
+    'image-icon': [{ helper: 'autoforge-image-converter', destination: 'bin/autoforge-image-converter' }],
+    document: [{ helper: 'autoforge-soffice-launcher', destination: 'program/soffice' }],
+    pdf: [{ helper: 'autoforge-pdf-raster', destination: 'bin/autoforge-pdf-raster' }],
+    media: [],
+  }
+  const helpersRoot = join(root, 'helpers')
+  mkdirSync(helpersRoot)
+  const helperRecords = new Map()
+  for (const helper of Object.values(nativeHelpers).flat()) {
+    const path = fixtureFile(helpersRoot, helper.destination)
+    chmodSync(path, 0o755)
+    const bytes = readFileSync(path)
+    helperRecords.set(helper.helper, {
+      ...helper, path, sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.byteLength,
+    })
+  }
+  const engineAssetsRoot = join(root, 'engine-assets')
+  mkdirSync(engineAssetsRoot)
+  const dmgPath = fixtureFile(engineAssetsRoot, 'Assets/dmg')
+  const engineLicensePath = fixtureFile(engineAssetsRoot, 'Licenses/libreoffice')
+  const dmgBytes = readFileSync(dmgPath)
+  const engineLicenseBytes = readFileSync(engineLicensePath)
+  const documentAsset = {
+    engine: 'libreoffice', source: 'acquisition', destination: 'share/LibreOffice.dmg',
+    sha256: createHash('sha256').update(dmgBytes).digest('hex'), bytes: dmgBytes.byteLength,
+    executable: false, role: 'data',
+  }
+  const documentLicense = {
+    engine: 'libreoffice', source: 'https://licenses.example.test/libreoffice',
+    destination: 'LICENSES/libreoffice.txt',
+    sha256: createHash('sha256').update(engineLicenseBytes).digest('hex'), bytes: engineLicenseBytes.byteLength,
+  }
   const families = Object.fromEntries(Object.entries(destinationSets).map(([name, destinations]) => {
-    const formula = name.replace('-', '_')
-    versions[formula] = '1.0'
-    const files = destinations.map((destination) => lockedFile(universeRoot, formula, '1.0', destination, destination, true).lock)
+    const formula = formulaNames[name]
+    const files = formula ? destinations.map((destination) => lockedFile(universeRoot, formula, '1.0', destination, destination, true).lock) : []
+    if (formula) versions[formula] = '1.0'
     if (name === 'image-icon') files.push(lockedFile(universeRoot, formula, '1.0', 'share/runtime.dat', 'share/runtime.dat', false, 'data').lock)
-    const licenseFile = lockedFile(universeRoot, formula, '1.0', 'LICENSE', `LICENSES/${formula}.txt`, false, 'data')
+    const licenseFile = formula ? lockedFile(universeRoot, formula, '1.0', 'LICENSE', `LICENSES/${formula}.txt`, false, 'data') : undefined
     return [name, {
       files,
       rewrites: [],
-      licenses: [{
+      licenses: licenseFile ? [{
         formula,
         source: 'LICENSE',
         destination: `LICENSES/${formula}.txt`,
         sha256: licenseFile.lock.sha256,
         bytes: licenseFile.lock.bytes,
-      }],
+      }] : [],
+      nativeHelpers: nativeHelpers[name],
+      engineAssets: name === 'document' ? [documentAsset] : [],
+      engineLicenses: name === 'document' ? [documentLicense] : [],
     }]
   }))
   const closure = {
@@ -113,17 +150,20 @@ function stagingFixture(root: string) {
     },
   }
   const universe = syntheticUniverse(universeRoot, versions)
-  const closureLockPath = join(root, 'closure.lock.json')
-  writeFileSync(closureLockPath, canonicalBytes(closure))
+  const sourceLockPath = join(root, 'sources.lock.json')
+  writeFileSync(sourceLockPath, canonicalBytes({ fixture: true }))
+  const sourceLock = { target: 'darwin-arm64', engines: [] }
   const request = (target: 'darwin-arm64' | 'darwin-x64', output: string) => ({
     target, output, version: '1.2.3', sequence: 17,
     generatedAt: '2026-08-31T00:00:00.000Z',
     archiveBaseUrl: 'https://cdn.example.test/converter-packs',
-    closureLockPath,
+    sourceLockPath,
     universeRoot,
+    helpersRoot,
+    engineAssetsRoot,
   })
   const dependencies = {
-    loadClosure: async ({ target }: { target: string }) => ({ ...closure, target }),
+    loadClosure: async ({ target }: { target: string }) => ({ sourceLock: { ...sourceLock, target }, closureLock: { ...closure, target }, target }),
     openUniverse: async ({ closureLock }: { closureLock: { target: string } }) => ({
       ...universe,
       target: closureLock.target,
@@ -136,6 +176,16 @@ function stagingFixture(root: string) {
           : universe.resolveLockedFile((license as { formula: string }).formula, license.source)
       },
     }),
+    openHelpers: async ({ target }: { target: string }) => ({
+      target,
+      async resolveHelper(helper: string) { return helperRecords.get(helper) },
+    }),
+    openEngineAssets: async ({ target }: { target: string }) => ({
+      target,
+      async resolveEngineAsset() { return dmgPath },
+      async resolveEngineLicense() { return engineLicensePath },
+    }),
+    inspectHelper: async () => ({ architectures: ['arm64', 'x86_64'], dependencies: ['/usr/lib/libSystem.B.dylib'], rpaths: [] }),
     planClosure: async ({ expectedFiles }: { expectedFiles: Array<{ formula: string; sourcePath: string; destination: string; executable: boolean; role: string }> }) => ({
       files: expectedFiles.map((file) => ({
         source: universe.resolveLockedFile(file.formula, file.sourcePath),
@@ -652,11 +702,7 @@ describe('converter pack target staging', () => {
       probeFamily: async ({ name }: { name: string }) => { probed.push(name) },
     }
 
-    await stageProductionPacks(fixture.request('darwin-arm64', output), {
-      planClosure: dependencies.planClosure,
-      applyRelocation: dependencies.applyRelocation,
-      probeFamily: dependencies.probeFamily,
-    })
+    await stageProductionPacks(fixture.request('darwin-arm64', output), dependencies)
 
     expect(probed.sort()).toEqual(['document', 'image-icon', 'media', 'pdf'])
     expect(JSON.parse(readFileSync(join(output, 'release.json'), 'utf8'))).toEqual({
@@ -665,6 +711,12 @@ describe('converter pack target staging', () => {
       sequence: 17,
     })
     const packNames = ['document', 'image-icon', 'media', 'pdf']
+    const expectedExecutables: Record<string, string[]> = {
+      'image-icon': ['bin/autoforge-image-converter', 'bin/vips'],
+      document: ['program/soffice'],
+      pdf: ['bin/autoforge-pdf-raster', 'bin/pdfinfo', 'bin/pdftocairo'],
+      media: ['bin/ffmpeg', 'bin/ffprobe'],
+    }
     for (const name of packNames) {
       const pack = join(output, 'packs', `${name}-darwin-arm64`)
       const manifest = JSON.parse(readFileSync(join(pack, 'pack.json'), 'utf8')) as {
@@ -676,7 +728,10 @@ describe('converter pack target staging', () => {
       expect(manifest.archiveUrl).toBe(`https://cdn.example.test/converter-packs/${name}-1.2.3-darwin-arm64.tar`)
       expect(manifest.files.some((file) => file.role === 'license')).toBe(true)
       expect(manifest.files.map((file) => file.path)).toEqual([...manifest.files.map((file) => file.path)].sort())
+      expect(manifest.files.filter((file) => file.role === 'executable').map((file) => file.path).sort())
+        .toEqual(expectedExecutables[name]!.sort())
     }
+    expect(readFileSync(join(output, 'packs/document-darwin-arm64/payload/share/LibreOffice.dmg'))).toBeTruthy()
     const release = join(root, 'release')
     await buildConverterPackIndex({ input: output, output: release, mode: 'test' })
     expect(JSON.parse(readFileSync(join(release, 'index.json'), 'utf8')).packs).toHaveLength(4)
@@ -710,6 +765,19 @@ describe('converter pack target staging', () => {
     expect(() => realpathSync(output)).toThrow()
   })
 
+  it('rejects a native helper with any non-system dependency', async () => {
+    const root = temporaryRoot()
+    const output = join(root, 'release-input')
+    const fixture = stagingFixture(root)
+    await expect(stageProductionPacks(fixture.request('darwin-arm64', output), {
+      ...fixture.dependencies,
+      inspectHelper: async () => ({
+        architectures: ['arm64'], dependencies: ['@loader_path/libhost.dylib'], rpaths: [],
+      }),
+    })).rejects.toThrow('Native helper Mach-O inventory is invalid.')
+    expect(() => realpathSync(output)).toThrow()
+  })
+
   it('rejects target strings with trailing components', async () => {
     const root = temporaryRoot()
     await expect(stageProductionPacks({
@@ -719,8 +787,10 @@ describe('converter pack target staging', () => {
       sequence: 17,
       generatedAt: '2026-08-31T00:00:00.000Z',
       archiveBaseUrl: 'https://cdn.example.test/converter-packs',
-      closureLockPath: join(root, 'closure.lock.json'),
+      sourceLockPath: join(root, 'sources.lock.json'),
       universeRoot: join(root, 'universe'),
+      helpersRoot: join(root, 'helpers'),
+      engineAssetsRoot: join(root, 'engine-assets'),
     }, {})).rejects.toThrow(/target/iu)
   })
 
@@ -756,14 +826,9 @@ describe('converter pack target staging', () => {
     license.source = 'https://licenses.example.test/media.txt'
     mkdirSync(join(fixture.request('darwin-arm64', join(root, 'ignored')).universeRoot, 'Licenses'))
     writeFileSync(join(fixture.request('darwin-arm64', join(root, 'ignored')).universeRoot, 'Licenses', license.sha256), bytes)
-    writeFileSync(fixture.request('darwin-arm64', join(root, 'ignored')).closureLockPath, canonicalBytes(fixture.closure))
     const output = join(root, 'download-license-output')
 
-    await stageProductionPacks(fixture.request('darwin-arm64', output), {
-      planClosure: fixture.dependencies.planClosure,
-      applyRelocation: fixture.dependencies.applyRelocation,
-      probeFamily: fixture.dependencies.probeFamily,
-    })
+    await stageProductionPacks(fixture.request('darwin-arm64', output), fixture.dependencies)
 
     expect(readFileSync(join(output, 'packs/media-darwin-arm64/payload', license.destination))).toEqual(bytes)
   })
