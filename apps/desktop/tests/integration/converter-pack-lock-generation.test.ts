@@ -1,14 +1,14 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { gzipSync } from 'node:zlib'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { parse } from 'yaml'
-import { captureHomebrewTarget } from '../../scripts/converter-packs/capture-homebrew-target.mjs'
+import { captureHomebrewTarget, streamCommandToExclusiveFile } from '../../scripts/converter-packs/capture-homebrew-target.mjs'
 import { generateTransitiveSourceLock } from '../../scripts/converter-packs/generate-transitive-source-lock.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 import { loadConverterClosureLock } from '../../scripts/converter-packs/closure-lock.mjs'
@@ -16,7 +16,7 @@ import { publishDurableLockFile } from '../../scripts/converter-packs/durable-lo
 
 const rootsToRemove: string[] = []
 const sha256 = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex')
-type RunOptions = { cwd: string; env: Record<string, string> }
+type RunOptions = { cwd: string; env: Record<string, string>; stdoutChunk?: (chunk: Buffer) => Promise<void> }
 type CapturedCall = { executable: string; args: string[]; options: RunOptions }
 
 afterEach(() => {
@@ -276,13 +276,11 @@ function syntheticRun(fixture: ReturnType<typeof captureFixture>, calls: Capture
       if (url.startsWith('https://ghcr.io/token?')) {
         return { status: 0, stdout: canonicalBytes({ token: 'synthetic-public-pull-token' }), stderr: Buffer.alloc(0) }
       }
-      const output = args[args.indexOf('--output') + 1]!
       const formula = [...fixture.bottleBytes.keys()].find((name) => fixture.coordinates[name].url === url)
       const bytes = formula
         ? fixture.bottleBytes.get(formula)!
         : url.endsWith('libreoffice-LICENSE') ? fixture.libreOfficeLicenseBytes : fixture.libreOfficeBytes
-      mkdirSync(dirname(output), { recursive: true })
-      writeFileSync(output, bytes)
+      await options.stdoutChunk!(bytes)
       return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }
     }
     if (executable === '/usr/bin/lipo') return { status: 0, stdout: Buffer.from(targetForHost() === 'darwin-arm64' ? 'arm64\n' : 'x86_64\n'), stderr: Buffer.alloc(0) }
@@ -408,6 +406,48 @@ describe('converter pack lock generation', () => {
   it('exposes the target capture and dual-target merge seams', () => {
     expect(captureHomebrewTarget).toBeTypeOf('function')
     expect(generateTransitiveSourceLock).toBeTypeOf('function')
+  })
+
+  it('streams a real child process into an exclusive no-follow bounded download sink', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.from('streamed-download')
+    const destination = join(root, 'download.bin')
+    await streamCommandToExclusiveFile({
+      executable: process.execPath,
+      args: ['-e', `process.stdout.write(${JSON.stringify(bytes.toString('utf8'))})`],
+      cwd: root,
+      env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+      destination,
+      expectedBytes: bytes.byteLength,
+      expectedSha256: sha256(bytes),
+      maximumBytes: bytes.byteLength,
+    })
+    expect(readFileSync(destination)).toEqual(bytes)
+
+    const linked = join(root, 'linked.bin')
+    symlinkSync(destination, linked)
+    await expect(streamCommandToExclusiveFile({
+      executable: process.execPath,
+      args: ['-e', "process.stdout.write('replacement')"],
+      cwd: root,
+      env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+      destination: linked,
+      expectedBytes: 11,
+      expectedSha256: sha256('replacement'),
+      maximumBytes: 11,
+    })).rejects.toThrow()
+    expect(readFileSync(destination)).toEqual(bytes)
+
+    await expect(streamCommandToExclusiveFile({
+      executable: process.execPath,
+      args: ['-e', 'process.stdout.write(Buffer.alloc(9))'],
+      cwd: root,
+      env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+      destination: join(root, 'oversized.bin'),
+      expectedSha256: sha256(Buffer.alloc(9)),
+      maximumBytes: 8,
+    })).rejects.toThrow(/limit|byte|large/iu)
+    expect(existsSync(join(root, 'oversized.bin'))).toBe(false)
   })
 
   it('durably publishes through short writes and recovers a fully synced SIGKILL temp', async () => {
@@ -571,6 +611,10 @@ describe('converter pack lock generation', () => {
     ))).toBe(true)
     expect(calls.filter(({ executable }) => executable === '/usr/bin/curl')).toHaveLength(7)
     expect(calls.some(({ args }) => args.includes('Authorization: Bearer synthetic-public-pull-token'))).toBe(true)
+    expect(calls.filter(({ executable }) => executable === '/usr/bin/curl').every(({ args }) => (
+      args[0] === '--disable' && args.includes('--no-location-trusted')
+    ))).toBe(true)
+    expect(calls.flatMap(({ executable, args }) => executable === '/usr/bin/curl' ? args : []).includes('--output')).toBe(false)
     expect(calls.flatMap(({ args }) => args).filter(isAbsolute).every((path) => path === '/opt/test/bin/brew' || path.startsWith(root) || path.startsWith('/private/var/') || path.startsWith('/var/'))).toBe(true)
 
     await captureWithFixture(root, fixture)
@@ -673,11 +717,13 @@ describe('converter pack lock generation', () => {
     const fixture = captureFixture()
     const base = syntheticRun(fixture, [])
     const run = async (executable: string, args: string[], options: RunOptions) => {
-      const result = await base(executable, args, options)
       if (executable === '/usr/bin/curl' && args.at(-1) === fixture.coordinates.glib.url) {
-        writeFileSync(args[args.indexOf('--output') + 1]!, 'tampered')
+        return base(executable, args, {
+          ...options,
+          stdoutChunk: async () => options.stdoutChunk!(Buffer.from('tampered')),
+        })
       }
-      return result
+      return base(executable, args, options)
     }
     await expect(captureWithFixture(root, fixture, run)).rejects.toThrow(/hash|byte/iu)
   })

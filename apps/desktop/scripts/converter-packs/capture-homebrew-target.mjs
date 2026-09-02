@@ -1,6 +1,8 @@
 import { Buffer } from 'node:buffer'
-import { spawnSync } from 'node:child_process'
-import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat } from 'node:fs/promises'
+import { spawn, spawnSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { constants } from 'node:fs'
+import { lstat, mkdtemp, open, readFile, readdir, realpath, rm, stat, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL, URL } from 'node:url'
@@ -19,12 +21,13 @@ import {
   fail,
   parseArguments,
   readCanonicalJson,
-  readStableRegularFile,
   requireAbsolutePath,
   sha256,
 } from './pack-tooling-lib.mjs'
 
 const maximumCommandBytes = 64 * 1024 * 1024
+const maximumArtifactDownloadBytes = 2 * 1024 * 1024 * 1024
+const maximumDirectLicenseBytes = 16 * 1024 * 1024
 const revisionPattern = /^[a-f0-9]{40}$/u
 const sha256Pattern = /^[a-f0-9]{64}$/u
 const formulaPattern = /^[a-z0-9][a-z0-9+_.@-]*$/u
@@ -80,11 +83,159 @@ function asBytes(value) {
   invalid('Maintainer command output is invalid.')
 }
 
-function defaultRun(executable, args, options) {
+async function collectBoundedStream(stream, maximumBytes, child) {
+  const chunks = []
+  let bytes = 0
+  for await (const chunk of stream) {
+    const value = asBytes(chunk)
+    bytes += value.byteLength
+    if (!Number.isSafeInteger(bytes) || bytes > maximumBytes) {
+      child.kill('SIGKILL')
+      invalid('Maintainer command output exceeds 64 MiB.')
+    }
+    chunks.push(value)
+  }
+  return Buffer.concat(chunks, bytes)
+}
+
+async function runStreaming(executable, args, options) {
+  const child = spawn(executable, args, {
+    cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const completion = new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (status, signal) => resolve({ status, signal }))
+  })
+  const stderrPromise = collectBoundedStream(child.stderr, maximumCommandBytes, child)
+  let primaryError
+  try {
+    for await (const chunk of child.stdout) await options.stdoutChunk(asBytes(chunk))
+  } catch (error) {
+    primaryError = error
+    child.kill('SIGKILL')
+  }
+  let completed
+  let stderr
+  try {
+    [completed, stderr] = await Promise.all([completion, stderrPromise])
+  } catch (error) {
+    if (primaryError === undefined) primaryError = error
+  }
+  if (primaryError !== undefined) throw primaryError
+  return {
+    status: completed.signal === null ? completed.status : null,
+    stdout: Buffer.alloc(0),
+    stderr,
+  }
+}
+
+async function defaultRun(executable, args, options) {
+  if (typeof options.stdoutChunk === 'function') return runStreaming(executable, args, options)
   const result = spawnSync(executable, args, {
     cwd: options.cwd, env: options.env, encoding: null, maxBuffer: maximumCommandBytes + 1,
   })
   return { status: result.status, stdout: result.stdout ?? Buffer.alloc(0), stderr: result.stderr ?? Buffer.alloc(0) }
+}
+
+async function writeChunk(handle, chunk, position) {
+  let offset = 0
+  while (offset < chunk.byteLength) {
+    const result = await handle.write(chunk, offset, chunk.byteLength - offset, position + offset)
+    if (!Number.isSafeInteger(result?.bytesWritten) || result.bytesWritten <= 0) invalid('Capture download write failed.')
+    offset += result.bytesWritten
+  }
+}
+
+async function streamRunToExclusiveFile({
+  run,
+  executable,
+  args,
+  cwd,
+  env,
+  destination,
+  expectedBytes,
+  expectedSha256,
+  maximumBytes,
+}) {
+  requireAbsolutePath(executable, 'Capture download executable')
+  requireAbsolutePath(cwd, 'Capture download working directory')
+  requireAbsolutePath(destination, 'Capture download destination')
+  if (
+    typeof run !== 'function'
+    || !Array.isArray(args)
+    || args.some((argument) => typeof argument !== 'string')
+    || !plainRecord(env)
+    || !sha256Pattern.test(expectedSha256)
+    || !Number.isSafeInteger(maximumBytes)
+    || maximumBytes <= 0
+    || maximumBytes > maximumArtifactDownloadBytes
+    || (expectedBytes !== undefined && (
+      !Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 || expectedBytes > maximumBytes
+    ))
+  ) invalid('Capture download request is invalid.')
+  const parent = dirname(destination)
+  const parentMetadata = await lstat(parent).catch(() => undefined)
+  if (!parentMetadata?.isDirectory() || parentMetadata.isSymbolicLink() || await realpath(parent).catch(() => undefined) !== parent) {
+    invalid('Capture download destination parent is unsafe.')
+  }
+
+  let handle
+  let created = false
+  let primaryError
+  try {
+    handle = await open(
+      destination,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    )
+    created = true
+    const digest = createHash('sha256')
+    let bytes = 0
+    const result = await run(executable, args, {
+      cwd,
+      env,
+      stdoutChunk: async (chunk) => {
+        const value = asBytes(chunk)
+        bytes += value.byteLength
+        if (!Number.isSafeInteger(bytes) || bytes > maximumBytes) invalid('Capture download exceeds its byte limit.')
+        digest.update(value)
+        await writeChunk(handle, value, bytes - value.byteLength)
+      },
+    })
+    const stdout = asBytes(result?.stdout)
+    const stderr = asBytes(result?.stderr)
+    if (stdout.byteLength !== 0 || stderr.byteLength > maximumCommandBytes || result?.status !== 0) {
+      invalid('Capture artifact download failed.')
+    }
+    const metadata = await handle.stat()
+    if (
+      !metadata.isFile()
+      || metadata.nlink !== 1
+      || (metadata.mode & 0o777) !== 0o600
+      || metadata.size !== bytes
+      || (expectedBytes !== undefined && bytes !== expectedBytes)
+    ) invalid('Downloaded capture artifact byte length differs from metadata.')
+    if (digest.digest('hex') !== expectedSha256) invalid('Downloaded capture artifact hash differs from metadata.')
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    return { path: destination, bytes }
+  } catch (error) {
+    primaryError = error
+  }
+  const cleanup = await Promise.allSettled([
+    ...(handle ? [handle.close()] : []),
+    ...(created ? [unlink(destination).catch((error) => { if (error?.code !== 'ENOENT') throw error })] : []),
+  ])
+  const cleanupErrors = cleanup.filter((result) => result.status === 'rejected').map((result) => result.reason)
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError([primaryError, ...cleanupErrors], primaryError?.message ?? 'Capture download cleanup failed.', { cause: primaryError })
+  }
+  throw primaryError
+}
+
+export async function streamCommandToExclusiveFile(options) {
+  return streamRunToExclusiveFile({ ...options, run: defaultRun })
 }
 
 async function runChecked(run, executable, args, options, label) {
@@ -146,6 +297,7 @@ function validateRoots(roots) {
           || !sha256Pattern.test(license.sha256)
           || !Number.isSafeInteger(license.bytes)
           || license.bytes <= 0
+          || license.bytes > maximumDirectLicenseBytes
           || license.destination !== 'LICENSES/libreoffice.LICENSE'
         ))
       ) invalid('Capture LibreOffice candidate is invalid.')
@@ -271,7 +423,7 @@ async function ghcrAuthorization(run, workspace, artifact) {
   tokenUrl.searchParams.set('service', 'ghcr.io')
   tokenUrl.searchParams.set('scope', scope)
   const bytes = await runChecked(run, '/usr/bin/curl', [
-    '--fail', '--proto', '=https', '--silent', '--show-error', tokenUrl.href,
+    '--disable', '--fail', '--no-location-trusted', '--proto', '=https', '--silent', '--show-error', tokenUrl.href,
   ], { cwd: workspace, env: maintainerEnv }, 'Capture GHCR token request')
   if (bytes.byteLength === 0 || bytes.byteLength > 16 * 1024) invalid('Capture GHCR token response is invalid.')
   const value = parseJson(bytes, 'Capture GHCR token response')
@@ -294,19 +446,23 @@ async function verifyDownload({ run, workspace, artifact, verified }) {
     return previous.bytes
   }
   if (!validHttpsUrl(artifact.url) || !sha256Pattern.test(artifact.sha256)) invalid('Capture artifact coordinate is invalid.')
-  const path = join(workspace, artifact.sha256)
   const authorization = await ghcrAuthorization(run, workspace, artifact)
-  await runChecked(run, '/usr/bin/curl', [
-    '--fail', '--location', '--proto', '=https', '--proto-redir', '=https',
-    '--silent', '--show-error', ...authorization, '--output', path, artifact.url,
-  ], { cwd: workspace, env: maintainerEnv }, 'Capture artifact download')
-  const bytes = await readStableRegularFile(path, 'Downloaded capture artifact')
-  if (bytes.byteLength <= 0 || (artifact.bytes !== undefined && bytes.byteLength !== artifact.bytes)) {
-    invalid('Downloaded capture artifact byte length differs from metadata.')
-  }
-  if (sha256(bytes) !== artifact.sha256) invalid('Downloaded capture artifact hash differs from metadata.')
-  verified.set(artifact.sha256, { url: artifact.url, bytes: bytes.byteLength, path })
-  return bytes.byteLength
+  const downloaded = await streamRunToExclusiveFile({
+    run,
+    executable: '/usr/bin/curl',
+    args: [
+      '--disable', '--fail', '--location', '--no-location-trusted', '--proto', '=https', '--proto-redir', '=https',
+      '--silent', '--show-error', ...authorization, artifact.url,
+    ],
+    cwd: workspace,
+    env: maintainerEnv,
+    destination: join(workspace, `.artifact-${randomUUID()}`),
+    expectedBytes: artifact.bytes,
+    expectedSha256: artifact.sha256,
+    maximumBytes: artifact.bytes ?? maximumArtifactDownloadBytes,
+  })
+  verified.set(artifact.sha256, { url: artifact.url, bytes: downloaded.bytes, path: downloaded.path })
+  return downloaded.bytes
 }
 
 function asText(value) {
