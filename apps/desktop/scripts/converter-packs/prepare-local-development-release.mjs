@@ -8,7 +8,9 @@ import {
   activateDevelopmentRelease,
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
+  writeDevelopmentReleaseMetadata,
 } from './local-development-release-cache.mjs'
+import { pruneDevelopmentCache } from './development-cache-budget.mjs'
 import { buildNativeHelpers } from './build-native-helpers.mjs'
 import { prepareProductionStagingPlan } from './prepare-production-staging.mjs'
 import { stageProductionPacks } from './stage-production-packs.mjs'
@@ -50,7 +52,9 @@ const productionDependencies = Object.freeze({
   buildRelease: (request) => buildLocalDevelopmentRelease(request),
   verifyRelease: (request) => verifyLocalDevelopmentReleaseIntegrity(request),
   smokeRelease: (request) => smokeTestLocalDevelopmentRelease(request),
+  writeMetadata: (request) => writeDevelopmentReleaseMetadata(request),
   activateRelease: ({ cacheRoot, fingerprint }) => activateDevelopmentRelease({ cacheRoot, fingerprint }),
+  pruneCache: (request) => pruneDevelopmentCache(request),
 })
 
 function isPlainRecord(value) {
@@ -149,7 +153,8 @@ export async function developmentFingerprintInputs(desktopRoot) {
 
 function validateDependencies(dependencies) {
   if (!isPlainRecord(dependencies) || [
-    'buildHelpers', 'preparePlan', 'stagePacks', 'buildRelease', 'verifyRelease', 'smokeRelease', 'activateRelease',
+    'buildHelpers', 'preparePlan', 'stagePacks', 'buildRelease', 'verifyRelease', 'smokeRelease',
+    'writeMetadata', 'activateRelease', 'pruneCache',
   ].some((name) => typeof dependencies[name] !== 'function')
     || (dependencies.removeRelease !== undefined && typeof dependencies.removeRelease !== 'function')
     || (dependencies.removePrivateRoot !== undefined && typeof dependencies.removePrivateRoot !== 'function')) {
@@ -186,9 +191,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
 
   const privateRoot = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}`)
   await mkdir(privateRoot, { mode: 0o700 })
-  let result
   let primaryError
-  let removeFailedRelease = true
   try {
     const helpersRoot = join(privateRoot, 'helpers')
     const workspace = join(privateRoot, 'workspace')
@@ -205,12 +208,15 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     await writeFile(publicKeyPath, createPublicKey(developmentPrivateKey).export({ format: 'pem', type: 'spki' }), { flag: 'wx', mode: 0o600 })
     const version = `0.0.0-dev+${fingerprint.slice(0, 12)}`
     const archiveBaseUrl = `https://local-development.invalid/converter-packs/${fingerprint}`
-    await dependencies.buildHelpers({ target, output: helpersRoot, compiler: request.compiler })
-    await dependencies.preparePlan({
+    const prepared = await dependencies.preparePlan({
       lockPath: join(desktopRoot, 'converter-packs', 'sources.lock.json'), cacheRoot: paths.sources, helpersRoot,
       workspace, staging: stagingRoot, planPath, target, version, sequence: 1,
       generatedAt: new Date().toISOString(), archiveBaseUrl,
+      afterMaterialize: () => dependencies.buildHelpers({ target, output: helpersRoot, compiler: request.compiler }),
     })
+    if (!isPlainRecord(prepared) || !Array.isArray(prepared.blobs)) {
+      throw new Error('Local development preparation artifact inventory is invalid')
+    }
     const plan = JSON.parse(await readFile(planPath, 'utf8'))
     await dependencies.stagePacks({ plan, output: stagingRoot })
     await dependencies.buildRelease({
@@ -220,17 +226,20 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     const smokeWorkRoot = join(privateRoot, 'smoke')
     await mkdir(smokeWorkRoot, { mode: 0o700 })
     await dependencies.smokeRelease({ releaseRoot: paths.release, workRoot: smokeWorkRoot })
-    removeFailedRelease = false
-    await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
-    result = { fingerprint, releaseRoot: paths.release, reused: false }
+    await removePrivateRoot(privateRoot)
+    await dependencies.writeMetadata({ cacheRoot, fingerprint, blobs: prepared.blobs })
   } catch (error) {
     primaryError = error
   }
-  await settleCleanup(primaryError, [
-    ...(primaryError !== undefined && removeFailedRelease ? [() => removeRelease(paths.release)] : []),
-    () => removePrivateRoot(privateRoot),
-  ], 'Local development preparation cleanup failed.')
-  return result
+  if (primaryError !== undefined) {
+    await settleCleanup(primaryError, [
+      () => removeRelease(paths.release),
+      () => removePrivateRoot(privateRoot),
+    ], 'Local development preparation cleanup failed.')
+  }
+  await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
+  await dependencies.pruneCache({ cacheRoot, activeFingerprint: fingerprint })
+  return { fingerprint, releaseRoot: paths.release, reused: false }
 }
 
 export async function runLocalDevelopmentReleasePreparation({

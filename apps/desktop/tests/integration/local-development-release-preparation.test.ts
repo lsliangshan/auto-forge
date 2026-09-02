@@ -83,9 +83,11 @@ function dependencies(events: string[], overrides: Record<string, unknown> = {})
       events.push('helpers')
       await mkdir(output)
     },
-    preparePlan: async ({ planPath }: { planPath: string }) => {
+    preparePlan: async ({ planPath, afterMaterialize }: { planPath: string, afterMaterialize: () => Promise<void> }) => {
+      await afterMaterialize()
       events.push('plan')
       await writeFile(planPath, '{}\n')
+      return { blobs: [], networkBytes: 0 }
     },
     stagePacks: async ({ output }: { output: string }) => {
       events.push('stage')
@@ -97,10 +99,13 @@ function dependencies(events: string[], overrides: Record<string, unknown> = {})
     },
     verifyRelease: async () => { events.push('verify') },
     smokeRelease: async () => { events.push('smoke') },
-    activateRelease: async ({ releaseRoot }: { releaseRoot: string }) => {
+    writeMetadata: async () => { events.push('metadata') },
+    activateRelease: async ({ cacheRoot, fingerprint, releaseRoot }: { cacheRoot: string, fingerprint: string, releaseRoot: string }) => {
       events.push('activate')
+      await writeFile(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`)
       return releaseRoot
     },
+    pruneCache: async () => { events.push('prune') },
     ...overrides,
   }
 }
@@ -113,7 +118,35 @@ it('prepares a cold development cache in order and activates only after verifica
 
   expect(result.reused).toBe(false)
   expect(result.releaseRoot).toBe(join(cacheRoot, 'releases', result.fingerprint))
-  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
+  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
+})
+
+it('runs the authenticated cold pipeline in exact order and publishes metadata before activation', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const events: string[] = []
+  const blob = { bytes: 7, sha256: 'b'.repeat(64) }
+  const injected = dependencies(events, {
+    preparePlan: async (value: Record<string, unknown>) => {
+      events.push('validate', 'preflight', 'acquire', 'universe')
+      await (value.afterMaterialize as () => Promise<void>)()
+      events.push('plan')
+      await writeFile(value.planPath as string, '{}\n')
+      return { blobs: [blob], networkBytes: 7 }
+    },
+    writeMetadata: async (value: Record<string, unknown>) => {
+      events.push('metadata')
+      expect(value.blobs).toEqual([blob])
+    },
+    pruneCache: async () => { events.push('prune') },
+  })
+
+  const result = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)
+
+  expect(result.reused).toBe(false)
+  expect(events).toEqual([
+    'validate', 'preflight', 'acquire', 'universe', 'helpers', 'plan',
+    'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune',
+  ])
 })
 
 it('reuses a verified matching release without build callbacks', async () => {
@@ -189,7 +222,7 @@ it('passes the requested x64 target to the release builder', async () => {
     injected,
   )
 
-  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
+  expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
 })
 
 it('rejects symbolic fingerprint inputs instead of following them outside the desktop root', async () => {
@@ -287,7 +320,7 @@ it('removes a smoke-failed cold release, preserves the prior marker, and rebuild
 
   const secondEvents: string[] = []
   await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies(secondEvents))
-  expect(secondEvents).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
+  expect(secondEvents).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
 })
 
 it('keeps a release when activation writes its marker and then throws', async () => {
@@ -334,7 +367,7 @@ it('removes only a corrupted derived release before rebuilding and activation', 
   const result = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)
 
   expect(result.reused).toBe(false)
-  expect(events).toEqual(['verify', 'helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'activate'])
+  expect(events).toEqual(['verify', 'helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
   await expect(readFile(join(cacheRoot, 'sources', 'keep.archive'), 'utf8')).resolves.toBe('source cache')
 })
 
@@ -350,7 +383,7 @@ it('does not overwrite a content-addressed source archive when source verificati
   }))).rejects.toThrow('source archive hash mismatch')
 
   await expect(readFile(archive, 'utf8')).resolves.toBe('old source archive')
-  expect(events).toEqual(['helpers'])
+  expect(events).toEqual([])
 })
 
 it('fails unsupported targets and non-canonical cache roots before callbacks', async () => {
@@ -378,7 +411,12 @@ it('passes callbacks only absolute paths inside the cache workspace or release r
   const events: string[] = []
   const injected = dependencies(events, {
     buildHelpers: async (value: Record<string, unknown>) => { collect(value); await mkdir(value.output as string) },
-    preparePlan: async (value: Record<string, unknown>) => { collect(value); await writeFile(value.planPath as string, '{}\n') },
+    preparePlan: async (value: Record<string, unknown>) => {
+      collect(value)
+      await (value.afterMaterialize as () => Promise<void>)()
+      await writeFile(value.planPath as string, '{}\n')
+      return { blobs: [], networkBytes: 0 }
+    },
     stagePacks: async (value: Record<string, unknown>) => { collect(value); await mkdir(value.output as string) },
     buildRelease: async (value: Record<string, unknown>) => { collect(value); await releaseBuilder({ outputRoot: value.outputRoot as string }) },
     verifyRelease: async (value: Record<string, unknown>) => { collect(value); events.push('verify') },
