@@ -353,7 +353,7 @@ async function unlinkMatchingIdentity(path, expected, allowedLinks = [1]) {
   return true
 }
 
-async function acquireDestinationClaim(destination, afterClaimOpenForTest) {
+async function acquireDestinationClaim(destination, afterClaimOpenForTest, claimInitializationCleanupForTest) {
   const path = `${destination}.claim`
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const nonce = randomUUID()
@@ -375,9 +375,23 @@ async function acquireDestinationClaim(destination, afterClaimOpenForTest) {
       const metadata = await handle.stat()
       return { path, handle, dev: metadata.dev, ino: metadata.ino, bytes, nonce }
     } catch (error) {
-      await handle?.close().catch(() => undefined)
+      if (handle) {
+        const run = (step, action) => () => claimInitializationCleanupForTest
+          ? claimInitializationCleanupForTest({ step, run: action })
+          : action()
+        const cleanupErrors = await collectCleanupErrors([
+          run('close', () => handle.close()),
+          ...(created ? [run('unlink', () => unlinkMatchingIdentity(path, created))] : []),
+          run('sync', () => syncDirectory(dirname(path))),
+        ])
+        finishAfterCleanup({
+          failed: true,
+          primaryError: error,
+          cleanupErrors,
+          cleanupMessage: 'Bottle claim initialization cleanup failed.',
+        })
+      }
       if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') {
-        if (created) await unlinkMatchingIdentity(path, created)
         throw error
       }
     }
@@ -543,12 +557,14 @@ export async function extractVerifiedBottle({
   beforePublishForTest,
   afterClaimOpenForTest,
   removePrivateRootForTest,
+  claimInitializationCleanupForTest,
 }) {
   validateCoordinate(coordinate)
   if (
     (beforePublishForTest !== undefined && typeof beforePublishForTest !== 'function')
     || (afterClaimOpenForTest !== undefined && typeof afterClaimOpenForTest !== 'function')
     || (removePrivateRootForTest !== undefined && typeof removePrivateRootForTest !== 'function')
+    || (claimInitializationCleanupForTest !== undefined && typeof claimInitializationCleanupForTest !== 'function')
   ) invalid()
   requireAbsolutePath(destination, 'Bottle extraction destination')
   const parent = dirname(destination)
@@ -558,7 +574,11 @@ export async function extractVerifiedBottle({
   const acquisition = coordinate.acquisition
   const rootPrefix = `${coordinate.name}/${coordinate.version}/`
   const selectedByArchivePath = new Map(selected.map((entry) => [`${rootPrefix}${entry.sourcePath}`, entry]))
-  const claim = await acquireDestinationClaim(destination, afterClaimOpenForTest)
+  const claim = await acquireDestinationClaim(
+    destination,
+    afterClaimOpenForTest,
+    claimInitializationCleanupForTest,
+  )
   const claimHeartbeat = startDestinationClaimHeartbeat(claim)
   let privateRoot
   let published = false

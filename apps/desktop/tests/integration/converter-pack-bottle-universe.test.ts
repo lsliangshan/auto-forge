@@ -503,6 +503,43 @@ describe('converter bottle universe', () => {
     })).resolves.toHaveLength(1)
   })
 
+  it('waits for a slow file sink to settle after a compressed source failure before rejecting', async () => {
+    const root = temporaryRoot()
+    const fixture = writeBottleArchive(root, 'slow-sink-source-failure.tar.gz', [{
+      path: 'vips/8.18.6/share/random.bin', bytes: randomBytes(1024 * 1024), mode: 0o444,
+    }])
+    let compressed: import('node:fs').ReadStream | undefined
+    let sinkStarted = false
+    let sinkSettled = false
+
+    await expect(readVerifiedBottleEntries({
+      archive: fixture.archive,
+      expectedBytes: fixture.compressed.byteLength,
+      expectedSha256: fixture.sha256,
+      beforeStreamForTest: (context: { compressed: import('node:fs').ReadStream }) => {
+        compressed = context.compressed
+      },
+      onFile: async () => ({
+        async write() {
+          if (!sinkStarted) {
+            sinkStarted = true
+            compressed?.destroy(new Error('injected source failure during slow sink'))
+          }
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+          sinkSettled = true
+        },
+        async finish() {},
+      }),
+    })).rejects.toThrow('Bottle archive is invalid.')
+    expect(sinkStarted).toBe(true)
+    expect(sinkSettled).toBe(true)
+    await expect(readVerifiedBottleEntries({
+      archive: fixture.archive,
+      expectedBytes: fixture.compressed.byteLength,
+      expectedSha256: fixture.sha256,
+    })).resolves.toHaveLength(1)
+  })
+
   it.each([
     ['link cycle', () => ({
       entries: [
@@ -934,6 +971,48 @@ describe('converter bottle universe', () => {
     })).resolves.toBeDefined()
     expect(readFileSync(join(destination, 'bin', 'tool'))).toEqual(bytes)
     expect(existsSync(`${destination}.claim`)).toBe(false)
+  })
+
+  it('preserves a claim initialization error while attempting close, unlink, and parent sync cleanup', async () => {
+    const root = temporaryRoot()
+    const bytes = Buffer.from('claim cleanup tool')
+    const bottle = writeBottleArchive(root, 'claim-cleanup.tar.gz', [{ path: 'claim-cleanup/1.0/bin/tool', bytes, mode: 0o555 }])
+    const parent = join(root, 'Cellar', 'claim-cleanup')
+    mkdirSync(parent, { recursive: true })
+    const destination = join(parent, '1.0')
+    const attempts: string[] = []
+    const failure = await extractVerifiedBottle({
+      archive: bottle.archive,
+      coordinate: {
+        name: 'claim-cleanup', version: '1.0',
+        acquisition: { kind: 'homebrew-bottle', sha256: bottle.sha256, bytes: bottle.compressed.byteLength },
+      },
+      selectedEntries: [{ sourcePath: 'bin/tool', sha256: sha256(bytes), bytes: bytes.byteLength, executable: true, role: 'executable' }],
+      destination,
+      afterClaimOpenForTest: () => { throw new Error('claim initialization primary') },
+      claimInitializationCleanupForTest: async (context: { step: string; run: () => Promise<unknown> }) => {
+        attempts.push(context.step)
+        if (context.step === 'close') {
+          await context.run()
+          throw new Error('injected close cleanup failure')
+        }
+        if (context.step === 'unlink') {
+          const error = new Error('injected unlink EACCES') as Error & { code: string }
+          error.code = 'EACCES'
+          throw error
+        }
+        await context.run()
+      },
+    }).then(() => undefined, (error: unknown) => error)
+
+    expect(attempts).toEqual(['close', 'unlink', 'sync'])
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).message).toBe('claim initialization primary')
+    expect((failure as AggregateError).errors.map((error) => (error as Error).message)).toEqual([
+      'claim initialization primary',
+      'injected close cleanup failure',
+      'injected unlink EACCES',
+    ])
   })
 
   it('releases the claim and stops cleanup after an injected private-root removal failure', async () => {

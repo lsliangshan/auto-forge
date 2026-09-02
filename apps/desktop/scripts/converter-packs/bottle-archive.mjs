@@ -315,22 +315,45 @@ export async function scanVerifiedBottleEntries({
       },
     })
     const gunzip = createGunzip()
+    let scanPromise
     let pipelinePromise
     let compressedPromise
+    let failed = false
     const forwardCompressedError = (error) => authenticated.destroy(error)
     try {
       await beforeStreamForTest?.({ archive, compressed })
       compressed.once('error', forwardCompressedError)
       pipelinePromise = pipeline(authenticated, gunzip)
       compressedPromise = new Promise((resolvePromise, rejectPromise) => {
-        compressed.once('end', resolvePromise)
-        compressed.once('error', rejectPromise)
+        const cleanup = () => {
+          compressed.off('end', onEnd)
+          compressed.off('error', onError)
+          compressed.off('close', onClose)
+        }
+        const onEnd = () => {
+          cleanup()
+          resolvePromise()
+        }
+        const onError = (error) => {
+          cleanup()
+          rejectPromise(error)
+        }
+        const onClose = () => {
+          cleanup()
+          if (compressed.readableEnded) resolvePromise()
+          else rejectPromise(new Error('Compressed bottle stream closed early.'))
+        }
+        compressed.once('end', onEnd)
+        compressed.once('error', onError)
+        compressed.once('close', onClose)
       })
       compressed.pipe(authenticated)
-      const [entries] = await Promise.all([scanTar(gunzip, onFile), pipelinePromise, compressedPromise])
+      scanPromise = scanTar(gunzip, onFile)
+      const [entries] = await Promise.all([scanPromise, pipelinePromise, compressedPromise])
       if (streamedBytes !== expectedBytes || streamedDigest.digest('hex') !== expectedSha256) invalid()
       return entries
     } catch (error) {
+      failed = true
       if (
         error instanceof Error
         && ['Bottle archive is invalid.', 'Bottle universe inventory is invalid.'].includes(error.message)
@@ -339,10 +362,11 @@ export async function scanVerifiedBottleEntries({
     } finally {
       compressed.off('error', forwardCompressedError)
       compressed.unpipe(authenticated)
-      if (!compressed.readableEnded && !compressed.destroyed) compressed.resume()
+      if (failed) compressed.destroy()
+      else if (!compressed.readableEnded && !compressed.destroyed) compressed.resume()
       authenticated.destroy()
       gunzip.destroy()
-      await Promise.allSettled([pipelinePromise, compressedPromise].filter(Boolean))
+      await Promise.allSettled([scanPromise, pipelinePromise, compressedPromise].filter(Boolean))
     }
   })
 }
