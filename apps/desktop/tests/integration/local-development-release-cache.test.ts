@@ -9,6 +9,7 @@ import {
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
+  removeInactiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
 } from '../../scripts/converter-packs/local-development-release-cache.mjs'
 
@@ -131,6 +132,24 @@ describe('local development release cache', () => {
     symlinkSync(externalRelease, release)
     writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`)
     await expect(readActiveDevelopmentRelease({ cacheRoot })).rejects.toThrow(/release|symbolic|inside/iu)
+  })
+
+  it('removes only a confirmed inactive release and never deletes a newly active winner', async () => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(join(cacheRoot, 'sources'), { recursive: true })
+    const oldFingerprint = '1'.repeat(64)
+    const candidate = '2'.repeat(64)
+    createRelease(cacheRoot, oldFingerprint)
+    createRelease(cacheRoot, candidate)
+    writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${oldFingerprint}","schemaVersion":1}\n`)
+
+    await expect(removeInactiveDevelopmentRelease({ cacheRoot, fingerprint: candidate })).resolves.toBe(true)
+    expect(existsSync(join(cacheRoot, 'releases', candidate))).toBe(false)
+
+    createRelease(cacheRoot, candidate)
+    writeFileSync(join(cacheRoot, 'active-release.json'), `{"fingerprint":"${candidate}","schemaVersion":1}\n`)
+    await expect(removeInactiveDevelopmentRelease({ cacheRoot, fingerprint: candidate })).resolves.toBe(false)
+    expect(existsSync(join(cacheRoot, 'releases', candidate))).toBe(true)
   })
 
   it('activates an existing release atomically without leaking marker temporaries', async () => {

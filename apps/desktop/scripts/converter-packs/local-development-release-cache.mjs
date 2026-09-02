@@ -367,6 +367,46 @@ export async function recoverLegacyDevelopmentPreparation({ cacheRoot, fingerpri
   })
 }
 
+export async function removeInactiveDevelopmentRelease({ cacheRoot, fingerprint }) {
+  const canonicalRoot = await canonicalCacheRoot(cacheRoot)
+  assertFingerprint(fingerprint)
+  return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
+    const paths = developmentReleasePaths(root, fingerprint)
+    const markerDetails = await lstat(paths.activeMarker).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    const marker = markerDetails === undefined ? undefined : await withStableRegularFile(
+      paths.activeMarker,
+      'Development release marker',
+      async (handle) => parseMarker(await handle.readFile({ encoding: 'utf8' })),
+    )
+    if (marker?.fingerprint === fingerprint) return false
+
+    const release = await lstat(paths.release).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    if (release !== undefined && (
+      !release.isDirectory()
+      || release.isSymbolicLink()
+      || await realpath(paths.release).catch(() => undefined) !== paths.release
+    )) throw new Error('Inactive development release is unsafe')
+    const metadata = await lstat(paths.releaseMetadata).catch((error) => missing(error) ? undefined : Promise.reject(error))
+    if (metadata !== undefined && (
+      !metadata.isFile()
+      || metadata.isSymbolicLink()
+      || metadata.nlink !== 1
+      || await realpath(paths.releaseMetadata).catch(() => undefined) !== paths.releaseMetadata
+    )) throw new Error('Inactive development release metadata is unsafe')
+    if (metadata !== undefined) {
+      await heartbeat.pulse()
+      await unlink(paths.releaseMetadata)
+      await syncDirectory(paths.releaseMetadataRoot)
+    }
+    if (release !== undefined) {
+      await heartbeat.pulse()
+      await rm(paths.release, { recursive: true })
+      await syncDirectory(dirname(paths.release))
+    }
+    return release !== undefined || metadata !== undefined
+  })
+}
+
 async function verifyMetadataFile(path, expectedBytes, allowedLinks) {
   const before = await lstat(path).catch((error) => missing(error) ? undefined : Promise.reject(error))
   if (!before?.isFile() || before.isSymbolicLink() || !allowedLinks.includes(before.nlink)

@@ -448,6 +448,56 @@ it('preserves resumable source state and removes all unpublished cold state afte
   expect(retryEvents).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
 })
 
+it('does not let a losing concurrent cold cleanup delete the release activated by the winner', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  let releaseFirst!: () => void
+  let signalFirstPlan!: () => void
+  let signalSecondPlan!: () => void
+  let signalActivated!: () => void
+  const firstPlan = new Promise<void>((resolve) => { signalFirstPlan = resolve })
+  const secondPlan = new Promise<void>((resolve) => { signalSecondPlan = resolve })
+  const releasePlan = new Promise<void>((resolve) => { releaseFirst = resolve })
+  const activated = new Promise<void>((resolve) => { signalActivated = resolve })
+  const firstDependencies = dependencies([], {
+    preparePlan: async (value: Record<string, unknown>) => {
+      signalFirstPlan()
+      await releasePlan
+      await (value.afterMaterialize as () => Promise<void>)()
+      await writeFile(value.planPath as string, '{}\n')
+      return { blobs: [], networkBytes: 0 }
+    },
+    activateRelease: async ({ cacheRoot: root, fingerprint, releaseRoot }: { cacheRoot: string, fingerprint: string, releaseRoot: string }) => {
+      await writeFile(join(root, 'active-release.json'), `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`)
+      signalActivated()
+      return releaseRoot
+    },
+  })
+  const losingDependencies = dependencies([], {
+    preparePlan: async (value: Record<string, unknown>) => {
+      await (value.afterMaterialize as () => Promise<void>)()
+      await writeFile(value.planPath as string, '{}\n')
+      signalSecondPlan()
+      return { blobs: [], networkBytes: 0 }
+    },
+    buildRelease: async () => {
+      await activated
+      throw new Error('lost concurrent publication')
+    },
+  })
+
+  const winner = prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), firstDependencies)
+  await firstPlan
+  const loser = prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), losingDependencies)
+  await secondPlan
+  releaseFirst()
+  const won = await winner
+  await expect(loser).rejects.toThrow('lost concurrent publication')
+
+  expect(existsSync(won.releaseRoot)).toBe(true)
+  expect(await readFile(join(cacheRoot, 'active-release.json'), 'utf8'))
+    .toBe(`{"fingerprint":"${won.fingerprint}","schemaVersion":1}\n`)
+})
+
 it('keeps a release when activation writes its marker and then throws', async () => {
   const { desktopRoot, cacheRoot } = fixture()
   let releaseRoot = ''

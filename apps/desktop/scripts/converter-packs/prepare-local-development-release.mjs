@@ -10,6 +10,7 @@ import {
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
   recoverLegacyDevelopmentPreparation,
+  removeInactiveDevelopmentRelease,
   writeDevelopmentReleaseMetadata,
 } from './local-development-release-cache.mjs'
 import { pruneDevelopmentCache } from './development-cache-budget.mjs'
@@ -182,7 +183,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
   const target = `${request.platform}-${request.arch}`
   const fingerprint = fingerprintDevelopmentRelease({ target, inputs: await developmentFingerprintInputs(desktopRoot) })
   const paths = developmentReleasePaths(cacheRoot, fingerprint)
-  const removeRelease = dependencies.removeRelease ?? ((path) => rm(path, { recursive: true, force: true }))
+  const removeRelease = dependencies.removeRelease ?? (() => removeInactiveDevelopmentRelease({ cacheRoot, fingerprint }))
   const removePrivateRoot = dependencies.removePrivateRoot ?? ((path) => rm(path, { recursive: true, force: true }))
 
   const activeRelease = await readActiveDevelopmentRelease({ cacheRoot }).catch((error) => {
