@@ -249,15 +249,15 @@ describe('converter pack Mach-O closure', () => {
     expect(discovered.files).toEqual([
       { ...vips, destination: 'bin/vips', executable: true, role: 'executable', runtimeRoot: false },
       { ...glib, destination: 'lib/glib/libglib-2.0.0.dylib', executable: false, role: 'code', runtimeRoot: false },
+      { ...vipsModule, destination: 'lib/vips-modules-8.18/vips-heif.dylib', executable: false, role: 'code', runtimeRoot: true },
+      { ...vipsModuleHelper, destination: 'lib/vips-modules-8.18/vips-helper.dylib', executable: false, role: 'code', runtimeRoot: true },
       { ...libvips, destination: 'lib/vips/libvips.42.dylib', executable: false, role: 'code', runtimeRoot: false },
-      { ...vipsModule, destination: 'lib/vips/vips-modules-8.18/vips-heif.dylib', executable: false, role: 'code', runtimeRoot: true },
-      { ...vipsModuleHelper, destination: 'lib/vips/vips-modules-8.18/vips-helper.dylib', executable: false, role: 'code', runtimeRoot: true },
       { ...schemas, destination: 'share/runtime/glib/share/glib-2.0/schemas/gschemas.compiled', executable: false, role: 'data', runtimeRoot: false },
     ])
     expect(discovered.rewrites).toEqual([
       { destination: 'bin/vips', dependency, replacement: '@loader_path/../lib/vips/libvips.42.dylib' },
       { destination: 'bin/vips', dependency: prefixDependency, replacement: '@loader_path/../lib/glib/libglib-2.0.0.dylib' },
-      { destination: 'lib/vips/vips-modules-8.18/vips-heif.dylib', dependency: '@loader_path/vips-helper.dylib', replacement: '@loader_path/vips-helper.dylib' },
+      { destination: 'lib/vips-modules-8.18/vips-heif.dylib', dependency: '@loader_path/vips-helper.dylib', replacement: '@loader_path/vips-helper.dylib' },
     ])
     expect(discovered.licenses).toEqual([
       { ...glibLicense, destination: 'LICENSES/glib.LICENSE.md' },
@@ -314,7 +314,7 @@ describe('converter pack Mach-O closure', () => {
     })
 
     expect(discovered.files.find((file) => file.sourcePath === module.sourcePath)).toMatchObject({
-      destination: 'lib/vips/vips-modules-8.18/vips-heif.dylib', runtimeRoot: true,
+      destination: 'lib/vips-modules-8.18/vips-heif.dylib', runtimeRoot: true,
     })
     expect(discovered.files.map((file) => file.sourcePath)).toContain('bin/companion.dylib')
   })
@@ -483,6 +483,34 @@ describe('converter pack Mach-O closure', () => {
     expect(calls).toContainEqual({
       executable: '/usr/bin/install_name_tool',
       args: ['-id', '@rpath/autoforge/a/liba.dylib', library],
+    })
+
+    const vipsModule = fixtureFile(payload, 'lib/vips-modules-8.18/vips-heif.dylib')
+    const moduleCalls: Array<{ executable: string; args: readonly string[] }> = []
+    await expect(relocateMachOClosure({
+      payload,
+      architecture: 'arm64',
+      plan: {
+        files: [{
+          source: vipsModule, destination: 'lib/vips-modules-8.18/vips-heif.dylib',
+          executable: false, formula: 'vips', role: 'code',
+        }],
+        rewrites: [],
+      },
+      run: async (command: string, args: readonly string[]) => {
+        moduleCalls.push({ executable: command, args })
+        if (command === '/usr/bin/lipo') return { status: 0, stdout: 'arm64\n', stderr: '' }
+        if (command === '/usr/bin/otool' && args[0] === '-L') {
+          return { status: 0, stdout: `${args[1]}:\n\t@rpath/autoforge/vips-modules-8.18/vips-heif.dylib (compatibility version 1.0.0, current version 1.0.0)\n`, stderr: '' }
+        }
+        if (command === '/usr/bin/otool' && args[0] === '-l') return { status: 0, stdout: '', stderr: '' }
+        if (command === '/usr/bin/install_name_tool') return { status: 0, stdout: '', stderr: '' }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    })).resolves.toBeUndefined()
+    expect(moduleCalls).toContainEqual({
+      executable: '/usr/bin/install_name_tool',
+      args: ['-id', '@rpath/autoforge/vips-modules-8.18/vips-heif.dylib', vipsModule],
     })
 
     await expect(relocateMachOClosure({

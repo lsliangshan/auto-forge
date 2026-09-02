@@ -114,8 +114,9 @@ const discoveryEntrypoints = Object.freeze({
 
 // These are runtime-loaded resources which cannot be reached through LC_LOAD_DYLIB.
 // The allowlist is intentionally code-owned: capture input cannot add roots or data.
+const vipsRuntimeModulePattern = /^lib\/vips-modules-[0-9.]+\/vips-[^/]+\.dylib$/u
 const imageRuntimePolicy = Object.freeze([
-  { formula: 'vips', role: 'code', pattern: /^lib\/vips-modules-[0-9.]+\/vips-[^/]+\.dylib$/u },
+  { formula: 'vips', role: 'code', pattern: vipsRuntimeModulePattern, preserveSourcePath: true },
   { formula: 'glib', role: 'data', pattern: /^share\/glib-2\.0\/schemas\/gschemas\.compiled$/u },
   { formula: 'gdk-pixbuf', role: 'code', pattern: /^lib\/gdk-pixbuf-2\.0\/[0-9.]+\/loaders\/[^/]+\.so$/u },
   { formula: 'gdk-pixbuf', role: 'data', pattern: /^lib\/gdk-pixbuf-2\.0\/[0-9.]+\/loaders\.cache$/u },
@@ -170,11 +171,10 @@ async function verifyDiscoveryFile(file) {
   }
 }
 
-function discoveryRuntimeRole(family, file) {
-  const rule = runtimePolicy[family].find((candidate) => (
+function discoveryRuntimeRule(family, file) {
+  return runtimePolicy[family].find((candidate) => (
     candidate.formula === file.formula && candidate.pattern.test(file.sourcePath)
   ))
-  return rule?.role
 }
 
 function licensePriority(file) {
@@ -189,13 +189,22 @@ function discoveryReplacement(destination, dependencyDestination) {
 
 function discoveryDestination(file, role, fixedDestination) {
   if (fixedDestination !== undefined) return fixedDestination
-  if (role === 'code') return namespacedCodeDestination(file.formula, file.sourcePath)
+  if (role === 'code') {
+    return fixedRuntimeCodeDestination(file.formula, file.sourcePath, true)
+      ?? namespacedCodeDestination(file.formula, file.sourcePath)
+  }
   return `share/runtime/${file.formula}/${file.sourcePath}`
 }
 
 function namespacedCodeDestination(formula, sourcePath) {
   const relative = sourcePath.startsWith('lib/') ? sourcePath.slice('lib/'.length) : posix.basename(sourcePath)
   return `lib/${formula}/${relative}`
+}
+
+function fixedRuntimeCodeDestination(formula, sourcePath, runtimeRoot) {
+  return runtimeRoot && formula === 'vips' && vipsRuntimeModulePattern.test(sourcePath)
+    ? sourcePath
+    : undefined
 }
 
 function discoveryPathForFormula(byFormulaPath, formula, sourcePath) {
@@ -332,8 +341,10 @@ export async function discoverMachOClosure({ family, architecture, files, inspec
   }
   await drainQueue()
   for (const file of files) {
-    const role = discoveryRuntimeRole(family, file)
-    if (role) await add(file, role, role === 'code', undefined, undefined)
+    const rule = discoveryRuntimeRule(family, file)
+    if (rule) {
+      await add(file, rule.role, rule.role === 'code', rule.preserveSourcePath ? file.sourcePath : undefined, undefined)
+    }
   }
   await drainQueue()
 
@@ -539,7 +550,8 @@ export async function planMachOClosure({ entrypoints, architecture, inspect, uni
     if (byDestination.has(destinationKey)) fail(`Mach-O destination collision: ${expected.destination}`)
     if (!expected.executable) {
       const requiredDestination = expected.role === 'code'
-        ? namespacedCodeDestination(expected.formula, expected.sourcePath)
+        ? fixedRuntimeCodeDestination(expected.formula, expected.sourcePath, expected.runtimeRoot)
+          ?? namespacedCodeDestination(expected.formula, expected.sourcePath)
         : undefined
       if (requiredDestination && expected.destination !== requiredDestination) {
         fail(`Mach-O library destination is not namespaced: ${expected.destination}`)
@@ -696,8 +708,13 @@ export async function relocateMachOClosure({ payload, architecture, plan, run = 
     if (!file.executable) {
       const segments = file.destination.split('/')
       const formula = typeof file.formula === 'string' ? file.formula : segments[0] === 'lib' ? segments[1] : undefined
-      if (!formula || segments[0] !== 'lib' || segments[1] !== formula) fail('Mach-O library destination is not namespaced.')
-      ownIdentity = `@rpath/autoforge/${formula}/${basename(file.destination)}`
+      const fixedVipsModule = formula === 'vips' && vipsRuntimeModulePattern.test(file.destination)
+      if (!formula || segments[0] !== 'lib' || (!fixedVipsModule && segments[1] !== formula)) {
+        fail('Mach-O library destination is not namespaced.')
+      }
+      ownIdentity = fixedVipsModule
+        ? `@rpath/autoforge/${file.destination.slice('lib/'.length)}`
+        : `@rpath/autoforge/${formula}/${basename(file.destination)}`
       await successfulRun(
         run,
         '/usr/bin/install_name_tool',
