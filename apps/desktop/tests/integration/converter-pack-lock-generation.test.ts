@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { gzipSync } from 'node:zlib'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import process from 'node:process'
@@ -563,6 +563,40 @@ describe('converter pack lock generation', () => {
 
     await expect(publishDurableLockFile({ destination, bytes, mode: 0o644 })).rejects.toThrow(/mode|unsafe/iu)
     expect(existsSync(destination)).toBe(false)
+  })
+
+  it('rejects an unrelated same-content hardlink that wins the destination EEXIST race', async () => {
+    const root = temporaryRoot()
+    const destination = join(root, 'raced.json')
+    const unrelated = join(root, 'unrelated.json')
+    const bytes = canonicalBytes({ durable: 'same-content-race' })
+    writeFileSync(unrelated, bytes, { mode: 0o600 })
+
+    await expect(publishDurableLockFile({
+      destination,
+      bytes,
+      mode: 0o600,
+      afterReadySyncForTest: () => linkSync(unrelated, destination),
+    })).rejects.toThrow(/hardlink|identity|linked/iu)
+
+    expect(statSync(destination).ino).toBe(statSync(unrelated).ino)
+    expect(statSync(destination).nlink).toBe(2)
+  })
+
+  it('accepts only this publication ready inode when it wins the destination link race', async () => {
+    const root = temporaryRoot()
+    const destination = join(root, 'current-ready.json')
+    const bytes = canonicalBytes({ durable: 'current-ready-race' })
+
+    await publishDurableLockFile({
+      destination,
+      bytes,
+      mode: 0o600,
+      afterReadySyncForTest: ({ ready }: { ready: string }) => linkSync(ready, destination),
+    })
+
+    expect(readFileSync(destination)).toEqual(bytes)
+    expect(statSync(destination).nlink).toBe(1)
   })
 
   it('reports the primary durable-publication failure before cleanup failures', async () => {

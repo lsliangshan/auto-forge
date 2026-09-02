@@ -200,13 +200,34 @@ export async function publishDurableLockFile({
     await (syncDirectoryForTest
       ? syncDirectoryForTest({ stage: 'ready', run: syncReadyDirectory })
       : syncReadyDirectory())
+    const readyIdentity = await requireTemp(ready, mode)
     await afterReadySyncForTest?.({ destination, ready })
+    const readyAtLink = await lstat(ready).catch(() => undefined)
+    if (
+      !readyAtLink?.isFile()
+      || readyAtLink.isSymbolicLink()
+      || ![1, 2].includes(readyAtLink.nlink)
+      || (readyAtLink.mode & 0o777) !== mode
+      || readyAtLink.dev !== readyIdentity.dev
+      || readyAtLink.ino !== readyIdentity.ino
+      || !await identical(ready, bytes)
+    ) invalid('Durable lock ready identity differs before publication.')
     let linked = true
+    let publishedIdentity
     try {
       await link(ready, destination)
     } catch (error) {
       if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
-      if (!await identical(destination, bytes)) invalid('Existing generated lock differs; refusing to overwrite it.')
+      const raced = await lstat(destination).catch(() => undefined)
+      const isCurrentReady = raced?.dev === readyIdentity.dev && raced?.ino === readyIdentity.ino
+      if (
+        !raced?.isFile()
+        || raced.isSymbolicLink()
+        || (raced.mode & 0o777) !== mode
+        || (isCurrentReady ? raced.nlink !== 2 : raced.nlink !== 1)
+        || !await identical(destination, bytes)
+      ) invalid('Destination EEXIST race has an unsafe hardlink identity.')
+      publishedIdentity = raced
       linked = false
     }
     await afterLinkForTest?.({ destination, ready, linked })
@@ -219,6 +240,7 @@ export async function publishDurableLockFile({
         || readyMetadata.dev !== destinationMetadata.dev
         || readyMetadata.ino !== destinationMetadata.ino
       ) invalid('Durable lock no-replace publication identity differs.')
+      publishedIdentity = destinationMetadata
     } else {
       const published = await lstat(destination)
       if ((published.mode & 0o777) !== mode) invalid('Existing generated lock mode differs.')
@@ -229,7 +251,15 @@ export async function publishDurableLockFile({
       ? syncDirectoryForTest({ stage: 'published', run: syncPublishedDirectory })
       : syncPublishedDirectory())
     const published = await lstat(destination)
-    if ((published.mode & 0o777) !== mode || !await identical(destination, bytes)) invalid('Durable lock publication failed verification.')
+    if (
+      !published.isFile()
+      || published.isSymbolicLink()
+      || published.nlink !== 1
+      || (published.mode & 0o777) !== mode
+      || published.dev !== publishedIdentity.dev
+      || published.ino !== publishedIdentity.ino
+      || !await identical(destination, bytes)
+    ) invalid('Durable lock publication failed verification.')
     return
   } catch (error) {
     primaryError = error
