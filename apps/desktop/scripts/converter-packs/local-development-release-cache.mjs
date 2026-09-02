@@ -25,6 +25,7 @@ const PREPARATION_WORKSPACE_PATTERN = /^\.local-development-preparation-([a-f0-9
 const LEGACY_PREPARATION_WORKSPACE_PATTERN = /^\.local-development-preparation-([a-f0-9]{12})(?:-([A-Za-z0-9]{6}))?$/u
 const PREPARATION_OWNER_PATTERN = /^\.owner-([a-f0-9-]{36})\.(writing|ready)$/u
 const PROCESS_BIRTH_PATTERN = /^(?:Fri|Mon|Sat|Sun|Thu|Tue|Wed) (?:Apr|Aug|Dec|Feb|Jan|Jul|Jun|Mar|May|Nov|Oct|Sep) (?: [1-9]|[12]\d|3[01]) \d{2}:\d{2}:\d{2} \d{4}$/u
+const PROCESS_IDENTITY_ENVIRONMENT = Object.freeze({ LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin', TZ: 'UTC0' })
 const REPLACED_RELEASE_PATTERN = /^\.replaced-active-release-([a-f0-9]{64})-([a-f0-9-]{36})$/u
 const REPLACED_RELEASE_LIMIT = 4
 const execFileAsync = promisify(execFile)
@@ -55,12 +56,14 @@ function ownerAlive(pid) {
   }
 }
 
-async function readProcessIdentity(pid) {
+export async function readDevelopmentPreparationProcessIdentity(pid, run = execFileAsync) {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Development preparation process identity request is invalid')
+  if (typeof run !== 'function') throw new Error('Development preparation process identity runner is invalid')
   let output
   try {
-    output = await execFileAsync('/bin/ps', ['-p', String(pid), '-o', 'lstart='], {
+    output = await run('/bin/ps', ['-p', String(pid), '-o', 'lstart='], {
       encoding: 'utf8',
+      env: PROCESS_IDENTITY_ENVIRONMENT,
       maxBuffer: 256,
       timeout: 1_000,
     })
@@ -401,7 +404,7 @@ export function developmentReleasePaths(cacheRoot, fingerprint) {
 export async function inspectAndRecoverDevelopmentPreparationWorkspaces({
   cacheRoot,
   heartbeat,
-  processIdentity = readProcessIdentity,
+  processIdentity = readDevelopmentPreparationProcessIdentity,
 }) {
   const root = await canonicalCacheRoot(cacheRoot)
   if (typeof heartbeat?.pulse !== 'function' || typeof processIdentity !== 'function') {
@@ -525,7 +528,7 @@ function startPreparationOwnerHeartbeat({ path, handle, identity, bytes }) {
 export async function createDevelopmentPreparationWorkspace({
   cacheRoot,
   fingerprint,
-  processIdentity = readProcessIdentity,
+  processIdentity = readDevelopmentPreparationProcessIdentity,
   afterWorkspaceCreateForTest,
   afterOwnerWriteForTest,
   afterOwnerFileSyncForTest,

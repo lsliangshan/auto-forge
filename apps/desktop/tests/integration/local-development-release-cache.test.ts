@@ -11,6 +11,7 @@ import {
   developmentReleasePaths,
   fingerprintDevelopmentRelease,
   readActiveDevelopmentRelease,
+  readDevelopmentPreparationProcessIdentity,
   recoverInterruptedActiveReplacement,
   replaceActiveDevelopmentRelease,
   removeInactiveDevelopmentRelease,
@@ -72,6 +73,35 @@ function createReadyWorkspace(
 }
 
 describe('local development release cache', () => {
+  it('runs the default process identity reader with fixed argv and a minimal environment', async () => {
+    const calls: unknown[][] = []
+    const birth = await readDevelopmentPreparationProcessIdentity(123, async (...args: unknown[]) => {
+      calls.push(args)
+      return { stderr: '', stdout: 'Tue Jan  2 00:00:00 2024\n' }
+    })
+
+    expect(birth).toBe('Tue Jan  2 00:00:00 2024')
+    expect(calls).toEqual([[
+      '/bin/ps',
+      ['-p', '123', '-o', 'lstart='],
+      {
+        encoding: 'utf8',
+        env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin', TZ: 'UTC0' },
+        maxBuffer: 256,
+        timeout: 1_000,
+      },
+    ]])
+  })
+
+  it('reads the real current-process birth identity or records the sandbox EPERM boundary', async () => {
+    try {
+      const birth = await readDevelopmentPreparationProcessIdentity(process.pid)
+      expect(birth).toMatch(/^(?:Fri|Mon|Sat|Sun|Thu|Tue|Wed) /u)
+    } catch (error) {
+      expect((error as Error & { cause?: { code?: string } }).cause?.code).toBe('EPERM')
+    }
+  })
+
   it.each([
     ['create', 'afterWorkspaceCreateForTest'],
     ['write', 'afterOwnerWriteForTest'],
