@@ -20,9 +20,15 @@ const sha256Pattern = /^[a-f0-9]{64}$/u
 const noncePattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
 const partialMetadataLimit = 4 * 1024
 const checkpointBytes = 16 * 1024 * 1024
+const ownerHeartbeatMs = 5 * 1_000
+const ownerLeaseTimeoutMs = 30 * 1_000
 const downloadFailed = 'Converter source download failed.'
 const partialInvalid = 'Converter source partial cache is invalid.'
-const activeAcquisitions = new Map()
+const activeAcquisitionsKey = Symbol.for('autoforge.converter-source-active-acquisitions')
+const activeAcquisitions = globalThis[activeAcquisitionsKey] instanceof Map
+  ? globalThis[activeAcquisitionsKey]
+  : new Map()
+globalThis[activeAcquisitionsKey] = activeAcquisitions
 
 function plainRecord(value) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
@@ -310,6 +316,64 @@ async function unlinkMatchingOwner(path, expected) {
   return true
 }
 
+function matchingOwner(current, expected) {
+  return Boolean(
+    current?.value
+    && current.stat.dev === expected.stat.dev
+    && current.stat.ino === expected.stat.ino
+    && current.value.nonce === expected.value.nonce,
+  )
+}
+
+function freshOwnerLease(owner) {
+  return Date.now() - owner.stat.mtimeMs <= ownerLeaseTimeoutMs
+}
+
+async function assertOwnerLease(path, owner) {
+  const [current, opened] = await Promise.all([readOwnerLock(path), owner.handle.stat()])
+  if (
+    !matchingOwner(current, owner)
+    || opened.dev !== owner.stat.dev
+    || opened.ino !== owner.stat.ino
+    || !freshOwnerLease(current)
+  ) throw acquisitionFailure(downloadFailed)
+  return current
+}
+
+async function renewOwnerLease(path, owner) {
+  await assertOwnerLease(path, owner)
+  const now = new Date()
+  await owner.handle.utimes(now, now)
+  const current = await assertOwnerLease(path, owner)
+  owner.stat = current.stat
+}
+
+function startOwnerHeartbeat(path, owner, loseLease) {
+  let pending = Promise.resolve()
+  let stopped = false
+  const heartbeat = () => {
+    if (stopped) return
+    pending = pending.then(() => renewOwnerLease(path, owner)).catch(() => {
+      stopped = true
+      loseLease()
+    })
+  }
+  const timer = globalThis.setInterval(heartbeat, ownerHeartbeatMs)
+  timer.unref?.()
+  return async () => {
+    stopped = true
+    globalThis.clearInterval(timer)
+    await pending
+  }
+}
+
+async function reclaimOwner({ path, cacheRoot, partialPath, metadataPath, owner }) {
+  if (!await unlinkMatchingOwner(path, owner)) return false
+  await removePartial(partialPath, metadataPath)
+  await syncDirectory(cacheRoot)
+  return true
+}
+
 async function waitForOwner(signal) {
   if (signal.aborted) throw acquisitionFailure(downloadFailed)
   await new Promise((resolvePromise, rejectPromise) => {
@@ -327,7 +391,7 @@ async function waitForOwner(signal) {
   })
 }
 
-async function acquireOwnerLock({ path, cacheRoot, archive, signal }) {
+async function acquireOwnerLock({ path, cacheRoot, partialPath, metadataPath, archive, signal }) {
   while (true) {
     if (signal.aborted) throw acquisitionFailure(downloadFailed)
     const nonce = randomUUID()
@@ -338,10 +402,8 @@ async function acquireOwnerLock({ path, cacheRoot, archive, signal }) {
       await handle.writeFile(canonicalBytes(value))
       await handle.sync()
       const stat = await handle.stat()
-      await handle.close()
-      handle = undefined
       await syncDirectory(cacheRoot)
-      return { stat, value }
+      return { handle, stat, value }
     } catch (error) {
       await handle?.close().catch(() => undefined)
       if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
@@ -353,11 +415,7 @@ async function acquireOwnerLock({ path, cacheRoot, archive, signal }) {
       || owner.value.url !== archive.url
       || owner.value.bytes !== archive.bytes
     )) fail('Converter source artifact identities conflict.')
-    if (owner?.value?.pid === process.pid && await unlinkMatchingOwner(path, owner)) {
-      await syncDirectory(cacheRoot)
-      continue
-    }
-    if (owner?.value && ownerAlive(owner.value.pid)) {
+    if (owner?.value && ownerAlive(owner.value.pid) && freshOwnerLease(owner)) {
       await waitForOwner(signal)
       continue
     }
@@ -365,8 +423,7 @@ async function acquireOwnerLock({ path, cacheRoot, archive, signal }) {
       await waitForOwner(signal)
       continue
     }
-    if (owner && await unlinkMatchingOwner(path, owner)) {
-      await syncDirectory(cacheRoot)
+    if (owner && await reclaimOwner({ path, cacheRoot, partialPath, metadataPath, owner })) {
       continue
     }
     await waitForOwner(signal)
@@ -380,6 +437,8 @@ async function releaseOwnerLock(path, cacheRoot, owner) {
     await syncDirectory(cacheRoot)
   } catch {
     throw acquisitionFailure(downloadFailed)
+  } finally {
+    await owner.handle.close().catch(() => undefined)
   }
 }
 
@@ -511,7 +570,7 @@ export async function writeAll(handle, bytes, position) {
   return offset
 }
 
-async function streamResponse({ response, handle, archive, metadataPath, start, signal }) {
+async function streamResponse({ response, handle, archive, metadataPath, start, signal, assertLease }) {
   const reader = response.body.getReader()
   let total = start
   let networkBytes = 0
@@ -537,8 +596,10 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
       }
       total += await writeAll(handle, value, total)
       if (total - checkpoint >= checkpointBytes) {
+        await assertLease()
         await handle.sync()
         await writePartialMetadata(metadataPath, archive, total)
+        await assertLease()
         checkpoint = total
       }
     }
@@ -552,8 +613,10 @@ async function streamResponse({ response, handle, archive, metadataPath, start, 
     reader.releaseLock()
   }
   if (total !== archive.bytes) throw acquisitionFailure(downloadFailed)
+  await assertLease()
   await handle.sync()
   await writePartialMetadata(metadataPath, archive, total)
+  await assertLease()
   return networkBytes
 }
 
@@ -601,7 +664,7 @@ async function unlinkMatchingInode(path, expected) {
   return true
 }
 
-async function recoverPublishedLink({ partialPath, metadataPath, target, archive, cacheRoot }) {
+async function recoverPublishedLink({ partialPath, metadataPath, target, archive, cacheRoot, assertLease }) {
   const [partial, published] = await Promise.all([
     lstat(partialPath).catch(() => undefined),
     lstat(target).catch(() => undefined),
@@ -621,6 +684,7 @@ async function recoverPublishedLink({ partialPath, metadataPath, target, archive
   try {
     const verified = await hashOpenPartial(handle, partialPath, archive, 2)
     if (verified.digest !== archive.sha256) throw acquisitionFailure(downloadFailed)
+    await assertLease()
     if (!await unlinkMatchingInode(partialPath, verified.stat)) throw acquisitionFailure(downloadFailed)
     await unlink(metadataPath).catch((error) => { if (!isMissing(error)) throw error })
     await syncDirectory(cacheRoot)
@@ -630,9 +694,10 @@ async function recoverPublishedLink({ partialPath, metadataPath, target, archive
   return cachedArchive(target, archive)
 }
 
-async function publishPartial({ handle, partialPath, metadataPath, target, archive, cacheRoot }) {
+async function publishPartial({ handle, partialPath, metadataPath, target, archive, cacheRoot, assertLease }) {
   let verified
   try {
+    await assertLease()
     verified = await hashOpenPartial(handle, partialPath, archive, 1)
   } catch {
     throw acquisitionFailure(downloadFailed)
@@ -643,7 +708,9 @@ async function publishPartial({ handle, partialPath, metadataPath, target, archi
     throw acquisitionFailure('Downloaded converter archive hash does not match the source lock.', true)
   }
   try {
+    await assertLease()
     await link(partialPath, target)
+    await assertLease()
   } catch (error) {
     if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
     const existing = await cachedArchive(target, archive)
@@ -671,6 +738,7 @@ async function publishPartial({ handle, partialPath, metadataPath, target, archi
     throw acquisitionFailure(downloadFailed)
   }
   await syncDirectory(cacheRoot)
+  await assertLease()
   if (!await unlinkMatchingInode(partialPath, published)) throw acquisitionFailure(downloadFailed)
   await unlink(metadataPath).catch((error) => { if (!isMissing(error)) throw error })
   await syncDirectory(cacheRoot)
@@ -701,31 +769,41 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
 
   let owner
   try {
-    owner = await acquireOwnerLock({ path: ownerPath, cacheRoot, archive, signal })
+    owner = await acquireOwnerLock({ path: ownerPath, cacheRoot, partialPath, metadataPath, archive, signal })
   } catch (error) {
     if (error?.message === downloadFailed || error?.message === 'Converter source artifact identities conflict.') throw error
     throw acquisitionFailure(downloadFailed)
   }
+  const operationController = new globalThis.AbortController()
+  const upstreamAbort = () => operationController.abort()
+  if (signal.aborted) upstreamAbort()
+  else signal.addEventListener('abort', upstreamAbort, { once: true })
+  const loseLease = () => operationController.abort()
+  const stopHeartbeat = startOwnerHeartbeat(ownerPath, owner, loseLease)
+  const operationSignal = operationController.signal
+  const assertLease = () => assertOwnerLease(ownerPath, owner)
   let handle
   let networkBytes = 0
   try {
+    await assertLease()
     cached = await cachedArchive(target, archive)
     if (cached !== undefined) {
+      await assertLease()
       await removePartial(partialPath, metadataPath)
       return cached
     }
-    cached = await recoverPublishedLink({ partialPath, metadataPath, target, archive, cacheRoot })
+    cached = await recoverPublishedLink({ partialPath, metadataPath, target, archive, cacheRoot, assertLease })
     if (cached !== undefined) return cached
     const partial = await openExistingPartial(partialPath, metadataPath, archive)
     handle = partial.handle
     let start = partial.partialBytes
     if (start < archive.bytes) {
-      if (signal.aborted) throw acquisitionFailure(downloadFailed)
+      if (operationSignal.aborted) throw acquisitionFailure(downloadFailed)
       const headers = new globalThis.Headers()
       if (start > 0) headers.set('range', `bytes=${start}-`)
       const requestInit = {
         method: 'GET', redirect: 'follow', credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer',
-        headers, signal,
+        headers, signal: operationSignal,
       }
       let response
       try {
@@ -742,14 +820,18 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
         throw error
       }
       if (validated.restart) {
+        await assertLease()
         await handle.truncate(0)
         await handle.sync()
         await writePartialMetadata(metadataPath, archive, 0)
+        await assertLease()
         start = 0
       }
-      networkBytes = await streamResponse({ response, handle, archive, metadataPath, start, signal })
+      networkBytes = await streamResponse({
+        response, handle, archive, metadataPath, start, signal: operationSignal, assertLease,
+      })
     }
-    await publishPartial({ handle, partialPath, metadataPath, target, archive, cacheRoot })
+    await publishPartial({ handle, partialPath, metadataPath, target, archive, cacheRoot, assertLease })
     await handle.close()
     handle = undefined
     return { path: target, sha256: archive.sha256, bytes: archive.bytes, networkBytes }
@@ -769,6 +851,8 @@ async function acquireOwnedArchive({ archive, cacheRoot, fetchImpl, signal }) {
     ].includes(error.message)) throw error
     throw acquisitionFailure(downloadFailed)
   } finally {
+    await stopHeartbeat()
+    signal.removeEventListener('abort', upstreamAbort)
     await releaseOwnerLock(ownerPath, cacheRoot, owner)
   }
 }

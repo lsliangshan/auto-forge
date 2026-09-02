@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { open as openFile } from 'node:fs/promises'
@@ -14,9 +14,40 @@ import {
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 
 const temporaryRoots: string[] = []
+const spawnedChildren = new Set<ReturnType<typeof spawn>>()
+const childCompletionTimeoutMs = 10_000
 
-afterEach(() => {
+function waitForChildClose(child: ReturnType<typeof spawn>, timeoutMs = childCompletionTimeoutMs): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  return new Promise((resolvePromise, rejectPromise) => {
+    const timeout = setTimeout(() => rejectPromise(new Error('Timed out waiting for child process cleanup.')), timeoutMs)
+    child.once('close', () => {
+      clearTimeout(timeout)
+      resolvePromise()
+    })
+    child.once('error', (error) => {
+      clearTimeout(timeout)
+      rejectPromise(error)
+    })
+  })
+}
+
+function trackChild(child: ReturnType<typeof spawn>) {
+  spawnedChildren.add(child)
+  child.once('close', () => spawnedChildren.delete(child))
+  child.once('error', () => spawnedChildren.delete(child))
+  return child
+}
+
+afterEach(async () => {
+  const children = [...spawnedChildren]
+  for (const child of children) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  }
+  const cleanup = await Promise.allSettled(children.map((child) => waitForChildClose(child)))
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true })
+  const failed = cleanup.find((result) => result.status === 'rejected')
+  if (failed?.status === 'rejected') throw failed.reason
 })
 
 function temporaryRoot(): string {
@@ -76,12 +107,12 @@ function spawnAcquisitionChild({ cacheRoot, archive, counterPath, mode = 'comple
     })
     process.stdout.write(JSON.stringify(result))
   `
-  const child = spawn(process.execPath, [
+  const child = trackChild(spawn(process.execPath, [
     '--input-type=module', '-e', script, moduleUrl, cacheRoot, JSON.stringify(archive), counterPath, mode,
   ], {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  }))
   let stdout = ''
   let stderr = ''
   child.stdout.setEncoding('utf8')
@@ -89,8 +120,13 @@ function spawnAcquisitionChild({ cacheRoot, archive, counterPath, mode = 'comple
   child.stdout.on('data', (value) => { stdout += value })
   child.stderr.on('data', (value) => { stderr += value })
   const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string }>((resolvePromise, rejectPromise) => {
-    child.once('error', rejectPromise)
-    child.once('exit', (code, signal) => {
+    const timeout = setTimeout(() => rejectPromise(new Error('Timed out waiting for acquisition child.')), childCompletionTimeoutMs)
+    child.once('error', (error) => {
+      clearTimeout(timeout)
+      rejectPromise(error)
+    })
+    child.once('close', (code, signal) => {
+      clearTimeout(timeout)
       if (code !== 0 && signal === null) rejectPromise(new Error(`Acquisition child failed: ${stderr}`))
       else resolvePromise({ code, signal, stdout })
     })
@@ -972,6 +1008,91 @@ describe('converter pack source acquisition', () => {
     expect(followerResult).toEqual(result)
     expect(readFileSync(result.path)).toEqual(bytes)
     expect(requests).toBe(1)
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
+  it('shares one fresh owner across independently imported module instances in the same process', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('query imported owner')
+    const archive = {
+      url: 'https://downloads.example.test/query-import-owner.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    const moduleUrl = new URL('../../scripts/converter-packs/acquire-sources.mjs', import.meta.url).href
+    const [firstModule, secondModule] = await Promise.all([
+      import(`${moduleUrl}?owner-instance=first`),
+      import(`${moduleUrl}?owner-instance=second`),
+    ])
+    const release = deferred<void>()
+    let requests = 0
+    const fetchImpl: typeof fetch = async () => {
+      requests += 1
+      await release.promise
+      return new Response(bytes, { status: 200 })
+    }
+
+    const first = firstModule.acquireVerifiedArchive({ archive, cacheRoot, fetchImpl })
+    await waitUntil(() => requests === 1)
+    const second = secondModule.acquireVerifiedArchive({ archive, cacheRoot, fetchImpl })
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+    release.resolve()
+
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(secondResult).toEqual(firstResult)
+    expect(requests).toBe(1)
+    expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
+  })
+
+  it('reclaims an expired owner lease even when its PID belongs to a live unrelated process', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const bytes = Buffer.from('lease recovered artifact')
+    const archive = {
+      url: 'https://downloads.example.test/expired-live-owner.tar.gz',
+      sha256: sha256(bytes),
+      bytes: bytes.byteLength,
+    }
+    writePartial(cacheRoot, archive, bytes.subarray(0, 5))
+    const unrelated = trackChild(spawn(process.execPath, ['--input-type=module', '-e', 'setInterval(() => {}, 1_000)'], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      stdio: 'ignore',
+    }))
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      unrelated.once('spawn', resolvePromise)
+      unrelated.once('error', rejectPromise)
+    })
+    const ownerPath = join(cacheRoot, `.${archive.sha256}.owner`)
+    writeFileSync(ownerPath, canonicalBytes({
+      bytes: archive.bytes,
+      nonce: '00000000-0000-4000-8000-000000000000',
+      pid: unrelated.pid,
+      sha256: archive.sha256,
+      url: archive.url,
+    }), { mode: 0o600 })
+    const expired = new Date(Date.now() - 2 * 60 * 1_000)
+    utimesSync(ownerPath, expired, expired)
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 750)
+    let range: string | null = 'not-requested'
+    try {
+      const result = await acquireVerifiedArchive({
+        archive,
+        cacheRoot,
+        signal: controller.signal,
+        fetchImpl: async (_input, init) => {
+          range = new Headers(init?.headers).get('range')
+          return new Response(bytes, { status: 200 })
+        },
+      })
+      expect(readFileSync(result.path)).toEqual(bytes)
+    } finally {
+      clearTimeout(timeout)
+    }
+    expect(range).toBe(null)
     expect(readdirSync(cacheRoot)).toEqual([`${archive.sha256}.archive`])
   })
 
