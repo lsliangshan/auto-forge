@@ -144,6 +144,7 @@ export async function materializeLockedEngineAssets({
   afterClaimOpenForTest,
   removePrivateRootForTest,
   claimInitializationCleanupForTest,
+  afterFenceStepForTest,
 }) {
   requireAbsolutePath(outputRoot, 'Locked engine asset root')
   if (!(blobs instanceof Map)) invalid()
@@ -154,6 +155,7 @@ export async function materializeLockedEngineAssets({
     afterClaimOpenForTest,
     removePrivateRootForTest,
     claimInitializationCleanupForTest,
+    afterFenceStepForTest,
     verifyExisting: (root) => openLockedEngineAssets({ root, target, sourceLock, closureLock }),
     populate: async (privateRoot, heartbeat) => {
     await mkdir(join(privateRoot, 'Assets'), { mode: 0o700 })

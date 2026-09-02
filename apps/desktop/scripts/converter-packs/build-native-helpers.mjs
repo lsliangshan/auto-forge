@@ -130,6 +130,7 @@ export async function buildNativeHelpers({
   afterClaimOpenForTest,
   removePrivateRootForTest,
   claimInitializationCleanupForTest,
+  afterFenceStepForTest,
 }) {
   const architecture = targetArchitectures[target]
   if (!architecture) throw new Error('Target must be darwin-arm64 or darwin-x64.')
@@ -146,6 +147,7 @@ export async function buildNativeHelpers({
     afterClaimOpenForTest,
     removePrivateRootForTest,
     claimInitializationCleanupForTest,
+    afterFenceStepForTest,
     verifyExisting: (root) => openBuiltHelperSet({ root, target }),
     populate: async (privateRoot, heartbeat) => {
     const bin = join(privateRoot, 'bin')

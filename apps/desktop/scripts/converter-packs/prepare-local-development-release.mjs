@@ -18,6 +18,7 @@ import {
 } from './build-local-development-release.mjs'
 import { smokeTestLocalDevelopmentRelease } from './verify-local-development-release.mjs'
 import { canonicalBytes, readStableRegularFile, safeEntryPath } from './pack-tooling-lib.mjs'
+import { settleCleanup } from './private-directory-publication.mjs'
 
 const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/source-lock.mjs',
@@ -27,6 +28,7 @@ const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/bottle-universe.mjs',
   'scripts/converter-packs/build-native-helpers.mjs',
   'scripts/converter-packs/locked-engine-assets.mjs',
+  'scripts/converter-packs/private-directory-publication.mjs',
   'scripts/converter-packs/prepare-production-staging.mjs',
   'scripts/converter-packs/macho-closure.mjs',
   'scripts/converter-packs/stage-production-packs.mjs',
@@ -148,7 +150,9 @@ export async function developmentFingerprintInputs(desktopRoot) {
 function validateDependencies(dependencies) {
   if (!isPlainRecord(dependencies) || [
     'buildHelpers', 'preparePlan', 'stagePacks', 'buildRelease', 'verifyRelease', 'smokeRelease', 'activateRelease',
-  ].some((name) => typeof dependencies[name] !== 'function')) {
+  ].some((name) => typeof dependencies[name] !== 'function')
+    || (dependencies.removeRelease !== undefined && typeof dependencies.removeRelease !== 'function')
+    || (dependencies.removePrivateRoot !== undefined && typeof dependencies.removePrivateRoot !== 'function')) {
     throw new Error('Local development preparation dependencies are invalid')
   }
 }
@@ -168,18 +172,23 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
   const target = `${request.platform}-${request.arch}`
   const fingerprint = fingerprintDevelopmentRelease({ target, inputs: await developmentFingerprintInputs(desktopRoot) })
   const paths = developmentReleasePaths(cacheRoot, fingerprint)
+  const removeRelease = dependencies.removeRelease ?? ((path) => rm(path, { recursive: true, force: true }))
+  const removePrivateRoot = dependencies.removePrivateRoot ?? ((path) => rm(path, { recursive: true, force: true }))
 
   if (await hasRelease(paths.release)) {
     try {
       await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
       return { fingerprint, releaseRoot: paths.release, reused: true }
     } catch {
-      await rm(paths.release, { recursive: true, force: true })
+      await removeRelease(paths.release)
     }
   }
 
   const privateRoot = join(cacheRoot, `.local-development-preparation-${fingerprint.slice(0, 12)}`)
   await mkdir(privateRoot, { mode: 0o700 })
+  let result
+  let primaryError
+  let removeFailedRelease = true
   try {
     const helpersRoot = join(privateRoot, 'helpers')
     const workspace = join(privateRoot, 'workspace')
@@ -196,31 +205,32 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     await writeFile(publicKeyPath, createPublicKey(developmentPrivateKey).export({ format: 'pem', type: 'spki' }), { flag: 'wx', mode: 0o600 })
     const version = `0.0.0-dev+${fingerprint.slice(0, 12)}`
     const archiveBaseUrl = `https://local-development.invalid/converter-packs/${fingerprint}`
-    try {
-      await dependencies.buildHelpers({ target, output: helpersRoot, compiler: request.compiler })
-      await dependencies.preparePlan({
+    await dependencies.buildHelpers({ target, output: helpersRoot, compiler: request.compiler })
+    await dependencies.preparePlan({
       lockPath: join(desktopRoot, 'converter-packs', 'sources.lock.json'), cacheRoot: paths.sources, helpersRoot,
       workspace, staging: stagingRoot, planPath, target, version, sequence: 1,
       generatedAt: new Date().toISOString(), archiveBaseUrl,
-      })
-      const plan = JSON.parse(await readFile(planPath, 'utf8'))
-      await dependencies.stagePacks({ plan, output: stagingRoot })
-      await dependencies.buildRelease({
+    })
+    const plan = JSON.parse(await readFile(planPath, 'utf8'))
+    await dependencies.stagePacks({ plan, output: stagingRoot })
+    await dependencies.buildRelease({
       stagingRoot, outputRoot: paths.release, privateKeyPath, publicKeyPath, platform: request.platform, arch: request.arch,
-      })
-      await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
-      const smokeWorkRoot = join(privateRoot, 'smoke')
-      await mkdir(smokeWorkRoot, { mode: 0o700 })
-      await dependencies.smokeRelease({ releaseRoot: paths.release, workRoot: smokeWorkRoot })
-    } catch (error) {
-      await rm(paths.release, { recursive: true, force: true })
-      throw error
-    }
+    })
+    await dependencies.verifyRelease({ releaseRoot: paths.release, platform: request.platform, arch: request.arch })
+    const smokeWorkRoot = join(privateRoot, 'smoke')
+    await mkdir(smokeWorkRoot, { mode: 0o700 })
+    await dependencies.smokeRelease({ releaseRoot: paths.release, workRoot: smokeWorkRoot })
+    removeFailedRelease = false
     await dependencies.activateRelease({ cacheRoot, fingerprint, releaseRoot: paths.release })
-    return { fingerprint, releaseRoot: paths.release, reused: false }
-  } finally {
-    await rm(privateRoot, { recursive: true, force: true })
+    result = { fingerprint, releaseRoot: paths.release, reused: false }
+  } catch (error) {
+    primaryError = error
   }
+  await settleCleanup(primaryError, [
+    ...(primaryError !== undefined && removeFailedRelease ? [() => removeRelease(paths.release)] : []),
+    () => removePrivateRoot(privateRoot),
+  ], 'Local development preparation cleanup failed.')
+  return result
 }
 
 export async function runLocalDevelopmentReleasePreparation({

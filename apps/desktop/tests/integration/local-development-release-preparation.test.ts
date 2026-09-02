@@ -19,6 +19,7 @@ const fingerprintFiles = [
   'scripts/converter-packs/bottle-universe.mjs',
   'scripts/converter-packs/build-native-helpers.mjs',
   'scripts/converter-packs/locked-engine-assets.mjs',
+  'scripts/converter-packs/private-directory-publication.mjs',
   'scripts/converter-packs/prepare-production-staging.mjs',
   'scripts/converter-packs/macho-closure.mjs',
   'scripts/converter-packs/stage-production-packs.mjs',
@@ -131,6 +132,7 @@ it.each([
   ['converter-packs/closures/darwin-arm64.lock.json'],
   ['converter-packs/closures/darwin-x64.lock.json'],
   ['converter-packs/native/common/helper.c'],
+  ['scripts/converter-packs/private-directory-publication.mjs'],
   ['scripts/converter-packs/prepare-production-staging.mjs'],
 ])('changes the fingerprint when %s bytes change', async (changedPath) => {
   const { desktopRoot, cacheRoot } = fixture()
@@ -240,6 +242,30 @@ it.each([
   await expect(readFile(join(cacheRoot, 'active-release.json'), 'utf8')).resolves.toBe(marker)
   expect(events).not.toContain('activate')
 })
+
+it.each(['buildRelease', 'verifyRelease', 'smokeRelease'] as const)(
+  'preserves the %s failure first and attempts both release and private cleanup',
+  async (failingDependency) => {
+    const { desktopRoot, cacheRoot } = fixture()
+    const attempts: string[] = []
+    const injected = dependencies([], {
+      [failingDependency]: async () => { throw new Error(`${failingDependency} primary`) },
+      removeRelease: async () => { attempts.push('release'); throw new Error('release rm EACCES') },
+      removePrivateRoot: async () => { attempts.push('private'); throw new Error('private rm EACCES') },
+    })
+
+    const failure = await prepareLocalDevelopmentRelease(
+      request({ desktopRoot, cacheRoot }),
+      injected,
+    ).then(() => undefined, (error: unknown) => error as AggregateError)
+
+    expect(attempts).toEqual(['release', 'private'])
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect(failure.message).toBe(`${failingDependency} primary`)
+    expect(failure.errors.map((error) => (error as Error).message))
+      .toEqual([`${failingDependency} primary`, 'release rm EACCES', 'private rm EACCES'])
+  },
+)
 
 it('removes a smoke-failed cold release, preserves the prior marker, and rebuilds on the next request', async () => {
   const { desktopRoot, cacheRoot } = fixture()

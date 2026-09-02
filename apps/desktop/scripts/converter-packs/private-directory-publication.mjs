@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { constants } from 'node:fs'
-import { link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink } from 'node:fs/promises'
+import { link, lstat, mkdir, open, opendir, readdir, realpath, rename, rm, unlink } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import process from 'node:process'
 import { canonicalBytes, fail, isPathInsideRoot, requireDirectory } from './pack-tooling-lib.mjs'
@@ -11,6 +11,8 @@ const maximumClaimBytes = 2048
 const initializationGraceMs = 250
 const heartbeatMs = 5 * 1000
 const leaseMs = 30 * 1000
+const maximumPredecessors = 1
+const maximumParentEntries = 4096
 
 function missing(error) {
   return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
@@ -140,15 +142,18 @@ async function unlinkIdentity(path, expected, allowedLinks = [1]) {
   return true
 }
 
-async function fenceClaim(path, destination, current) {
+async function fenceClaim(path, destination, current, afterFenceStepForTest) {
   const suffix = current.value?.nonce ?? `${current.stat.dev}-${current.stat.ino}`
   const predecessor = `${path}.${suffix}.predecessor`
+  let linked = false
   try {
     await link(path, predecessor)
+    linked = true
   } catch (error) {
     if (missing(error)) return false
-    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') throw error
   }
+  if (linked) await afterFenceStepForTest?.({ step: 'predecessor-link', predecessor })
   const [active, preserved] = await Promise.all([
     lstat(path).catch(() => undefined),
     lstat(predecessor).catch(() => undefined),
@@ -165,14 +170,75 @@ async function fenceClaim(path, destination, current) {
   ) fail('Private directory publication claim changed during recovery.')
   if (!await unlinkIdentity(path, current.stat, [2])) return false
   await syncDirectory(dirname(path))
+  await afterFenceStepForTest?.({ step: 'active-unlink', predecessor })
   if (current.value) {
     const partial = join(dirname(destination), current.value.partialName)
     if (!isPathInsideRoot(dirname(destination), partial)) fail('Private directory publication claim is invalid.')
     await rm(partial, { recursive: true, force: true })
   }
+  await afterFenceStepForTest?.({ step: 'partial-cleanup', predecessor })
   await unlinkIdentity(predecessor, current.stat)
   await syncDirectory(dirname(path))
   return true
+}
+
+async function predecessorPaths(destination) {
+  const claimPath = `${destination}.claim`
+  const prefix = `${basename(claimPath)}.`
+  const suffix = '.predecessor'
+  const paths = []
+  let inspected = 0
+  const directory = await opendir(dirname(claimPath))
+  for await (const entry of directory) {
+    inspected += 1
+    if (inspected > maximumParentEntries) fail('Private directory publication parent inventory is too large.')
+    if (!entry.name.startsWith(prefix) || !entry.name.endsWith(suffix)) continue
+    if (!entry.isFile()) fail('Private directory publication predecessor is invalid.')
+    const token = entry.name.slice(prefix.length, -suffix.length)
+    if (!noncePattern.test(token) && !/^[1-9]\d*-[1-9]\d*$/u.test(token)) {
+      fail('Private directory publication predecessor is invalid.')
+    }
+    paths.push({ path: join(dirname(claimPath), entry.name), token })
+    if (paths.length > maximumPredecessors) fail('Private directory publication has too many predecessors.')
+  }
+  return paths
+}
+
+async function recoverPredecessors(destination) {
+  const claimPath = `${destination}.claim`
+  for (const candidate of await predecessorPaths(destination)) {
+    const predecessor = await readClaim(candidate.path, destination, [1, 2])
+    if (!predecessor) continue
+    const identityToken = `${predecessor.stat.dev}-${predecessor.stat.ino}`
+    if (
+      (predecessor.value && candidate.token !== predecessor.value.nonce)
+      || (!predecessor.value && candidate.token !== identityToken)
+    ) fail('Private directory publication predecessor is invalid.')
+    if (predecessor.stat.nlink === 2) {
+      const active = await readClaim(claimPath, destination, [2])
+      if (
+        !active
+        || !sameIdentity(active.stat, predecessor.stat)
+        || Boolean(active.value) !== Boolean(predecessor.value)
+        || (active.value && active.value.nonce !== predecessor.value.nonce)
+      ) fail('Private directory publication predecessor does not match the active claim.')
+      if (!await unlinkIdentity(claimPath, predecessor.stat, [2])) {
+        fail('Private directory publication predecessor changed during recovery.')
+      }
+      await syncDirectory(dirname(claimPath))
+    } else if (predecessor.stat.nlink !== 1) {
+      fail('Private directory publication predecessor has an invalid link count.')
+    }
+    if (predecessor.value) {
+      const partial = join(dirname(destination), predecessor.value.partialName)
+      if (!isPathInsideRoot(dirname(destination), partial)) fail('Private directory publication predecessor is invalid.')
+      await rm(partial, { recursive: true, force: true })
+    }
+    if (!await unlinkIdentity(candidate.path, predecessor.stat)) {
+      fail('Private directory publication predecessor changed during cleanup.')
+    }
+    await syncDirectory(dirname(claimPath))
+  }
 }
 
 async function verifyClaim(claim) {
@@ -195,9 +261,10 @@ async function verifyClaim(claim) {
   ) fail('Private directory publication claim was lost.')
 }
 
-async function acquireClaim(destination, afterClaimOpenForTest, claimInitializationCleanupForTest) {
+async function acquireClaim(destination, afterClaimOpenForTest, claimInitializationCleanupForTest, afterFenceStepForTest) {
   const path = `${destination}.claim`
   for (let attempt = 0; attempt < 16; attempt += 1) {
+    await recoverPredecessors(destination)
     const nonce = randomUUID()
     const value = {
       createdAtMs: Date.now(),
@@ -221,7 +288,9 @@ async function acquireClaim(destination, afterClaimOpenForTest, claimInitializat
       await handle.sync()
       await syncDirectory(dirname(path))
       const metadata = await handle.stat()
-      return { path, handle, bytes, dev: metadata.dev, ino: metadata.ino, value }
+      const claim = { path, handle, bytes, dev: metadata.dev, ino: metadata.ino, value }
+      await verifyClaim(claim)
+      return claim
     } catch (error) {
       if (handle) {
         const run = (step, action) => () => claimInitializationCleanupForTest
@@ -246,7 +315,7 @@ async function acquireClaim(destination, afterClaimOpenForTest, claimInitializat
       if (owner !== 'dead') fail('Private directory publication is already claimed.')
       // ESRCH is a definitive local-owner death and safely revokes even a fresh lease.
     }
-    await fenceClaim(path, destination, current)
+    await fenceClaim(path, destination, current, afterFenceStepForTest)
   }
   fail('Private directory publication is already claimed.')
 }
@@ -297,13 +366,19 @@ export async function publishPrivateDirectory({
   afterClaimOpenForTest,
   removePrivateRootForTest,
   claimInitializationCleanupForTest,
+  afterFenceStepForTest,
 }) {
   if (typeof populate !== 'function' || typeof verifyExisting !== 'function') {
     fail('Private directory publication request is invalid.')
   }
   const parent = dirname(destination)
   await requireDirectory(parent, 'Private directory publication parent')
-  const claim = await acquireClaim(destination, afterClaimOpenForTest, claimInitializationCleanupForTest)
+  const claim = await acquireClaim(
+    destination,
+    afterClaimOpenForTest,
+    claimInitializationCleanupForTest,
+    afterFenceStepForTest,
+  )
   const heartbeat = startHeartbeat(claim)
   const privateRoot = join(parent, claim.value.partialName)
   let published = false

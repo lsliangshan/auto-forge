@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import {
   chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync,
@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   materializeLockedEngineAssets, openLockedEngineAssets,
 } from '../../scripts/converter-packs/locked-engine-assets.mjs'
+import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 
 const roots: string[] = []
 const children: ChildProcess[] = []
@@ -212,6 +213,138 @@ describe('locked engine asset set', () => {
 
     await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot })).resolves.toBeDefined()
     expect(existsSync(`${outputRoot}.claim`)).toBe(false)
+  })
+
+  it.each(['predecessor-link', 'active-unlink', 'partial-cleanup'] as const)(
+    'recovers the %s fencing snapshot left by SIGKILL',
+    async (step) => {
+      const root = temporaryRoot()
+      const value = fixture(root)
+      const outputRoot = join(root, `engine-assets-${step}`)
+      const claimPath = `${outputRoot}.claim`
+      const nonce = randomUUID()
+      const partialName = `.${step === 'predecessor-link' ? 'engine-assets-predecessor-link' : `engine-assets-${step}`}.${nonce}.partial`
+      const partialRoot = join(root, partialName)
+      const claim = { createdAtMs: Date.now(), leaseMs: 30_000, nonce, partialName, pid: 2_147_483_647 }
+      writeFileSync(claimPath, canonicalBytes(claim), { mode: 0o600 })
+      mkdirSync(partialRoot)
+      const predecessor = `${claimPath}.${nonce}.predecessor`
+      const marker = join(root, `${step}.ready`)
+      const moduleUrl = new URL('../../scripts/converter-packs/locked-engine-assets.mjs', import.meta.url).href
+      const script = String.raw`
+        import { writeFile } from 'node:fs/promises'
+        const [moduleUrl, target, sourceJson, closureJson, blobsJson, outputRoot, wantedStep, marker] = process.argv.slice(1)
+        const { materializeLockedEngineAssets } = await import(moduleUrl)
+        await materializeLockedEngineAssets({
+          target, sourceLock: JSON.parse(sourceJson), closureLock: JSON.parse(closureJson),
+          blobs: new Map(JSON.parse(blobsJson)), outputRoot,
+          afterFenceStepForTest: async ({ step }) => {
+            if (step !== wantedStep) return
+            await writeFile(marker, 'ready')
+            await new Promise(() => { setInterval(() => {}, 1_000) })
+          },
+        })
+      `
+      const child = spawn(process.execPath, [
+        '--input-type=module', '-e', script, moduleUrl, 'darwin-arm64', JSON.stringify(value.sourceLock),
+        JSON.stringify(value.closureLock), JSON.stringify([...value.blobs.entries()]), outputRoot, step, marker,
+      ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] })
+      children.push(child)
+      await waitUntil(() => existsSync(marker))
+      const closed = new Promise<void>((resolve) => child.once('close', () => resolve()))
+      child.kill('SIGKILL')
+      await closed
+
+      await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot })).resolves.toBeDefined()
+      expect(existsSync(claimPath)).toBe(false)
+      expect(existsSync(predecessor)).toBe(false)
+      expect(existsSync(partialRoot)).toBe(false)
+    },
+  )
+
+  it('fails closed when a fencing predecessor has extra links', async () => {
+    const root = temporaryRoot()
+    const value = fixture(root)
+    const outputRoot = join(root, 'engine-assets')
+    const claimPath = `${outputRoot}.claim`
+    const nonce = randomUUID()
+    const partialName = `.engine-assets.${nonce}.partial`
+    writeFileSync(claimPath, canonicalBytes({
+      createdAtMs: Date.now(), leaseMs: 30_000, nonce, partialName, pid: 2_147_483_647,
+    }), { mode: 0o600 })
+    mkdirSync(join(root, partialName))
+    linkSync(claimPath, `${claimPath}.${nonce}.predecessor`)
+    linkSync(claimPath, `${claimPath}.unexpected-link`)
+
+    await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot }))
+      .rejects.toThrow('Private directory publication claim is invalid.')
+    expect(existsSync(outputRoot)).toBe(false)
+  })
+
+  it('cleans an old predecessor without unlinking a newer live owner claim', async () => {
+    const root = temporaryRoot()
+    const value = fixture(root)
+    const outputRoot = join(root, 'engine-assets')
+    const claimPath = `${outputRoot}.claim`
+    const oldNonce = randomUUID()
+    const oldPartialName = `.engine-assets.${oldNonce}.partial`
+    const oldClaim = canonicalBytes({
+      createdAtMs: Date.now(), leaseMs: 30_000, nonce: oldNonce,
+      partialName: oldPartialName, pid: 2_147_483_647,
+    })
+    writeFileSync(claimPath, oldClaim, { mode: 0o600 })
+    mkdirSync(join(root, oldPartialName))
+    const predecessor = `${claimPath}.${oldNonce}.predecessor`
+    linkSync(claimPath, predecessor)
+    rmSync(claimPath)
+    const newNonce = randomUUID()
+    const newClaim = canonicalBytes({
+      createdAtMs: Date.now(), leaseMs: 30_000, nonce: newNonce,
+      partialName: `.engine-assets.${newNonce}.partial`, pid: process.pid,
+    })
+    writeFileSync(claimPath, newClaim, { mode: 0o600 })
+
+    await expect(materializeLockedEngineAssets({ target: 'darwin-arm64', ...value, outputRoot }))
+      .rejects.toThrow('Private directory publication is already claimed.')
+    expect(readFileSync(claimPath)).toEqual(newClaim)
+    expect(existsSync(predecessor)).toBe(false)
+    expect(existsSync(join(root, oldPartialName))).toBe(false)
+  })
+
+  it('prevents a replaced initializer from entering private population', async () => {
+    const root = temporaryRoot()
+    const value = fixture(root)
+    const outputRoot = join(root, 'engine-assets')
+    let releaseFirst!: () => void
+    let releaseSecond!: () => void
+    let readyFirst!: () => void
+    let readySecond!: () => void
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve })
+    const firstReady = new Promise<void>((resolve) => { readyFirst = resolve })
+    const secondReady = new Promise<void>((resolve) => { readySecond = resolve })
+    let firstReachedPopulation = false
+    const firstBlobs = new Map([...value.blobs].map(([digest, blob]) => [digest, {
+      ...blob,
+      get path() { firstReachedPopulation = true; return blob.path },
+    }]))
+    const first = materializeLockedEngineAssets({
+      target: 'darwin-arm64', ...value, blobs: firstBlobs, outputRoot,
+      afterClaimOpenForTest: async () => { readyFirst(); await firstGate },
+    })
+    await firstReady
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const second = materializeLockedEngineAssets({
+      target: 'darwin-arm64', ...value, outputRoot,
+      afterClaimOpenForTest: async () => { readySecond(); await secondGate },
+    })
+    await secondReady
+    releaseFirst()
+
+    await expect(first).rejects.toThrow('Private directory publication claim was lost.')
+    expect(firstReachedPopulation).toBe(false)
+    releaseSecond()
+    await expect(second).resolves.toBeDefined()
   })
 
   it('does not clobber a destination appearing in the publish window', async () => {
