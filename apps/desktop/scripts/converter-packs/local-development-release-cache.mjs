@@ -705,15 +705,18 @@ export async function replaceActiveDevelopmentRelease({
       await heartbeat.pulse()
       await rename(paths.release, quarantine)
       oldMoved = true
-      await syncReplacementDirectory(dirname(paths.release), 'quarantine')
+      await Promise.all([
+        syncReplacementDirectory(dirname(paths.release), 'quarantine-source'),
+        syncReplacementDirectory(dirname(quarantine), 'quarantine-destination'),
+      ])
       await afterOldReleaseRenameForTest?.()
       await heartbeat.pulse()
       await rename(candidateRelease, paths.release)
       candidateMoved = true
       await afterCandidateRenameForTest?.()
       await Promise.all([
-        syncReplacementDirectory(dirname(paths.release), 'candidate'),
-        syncReplacementDirectory(dirname(candidateRelease), 'candidate-parent'),
+        syncReplacementDirectory(dirname(candidateRelease), 'candidate-source'),
+        syncReplacementDirectory(dirname(paths.release), 'candidate-destination'),
       ])
       await heartbeat.pulse()
       await rm(quarantine, { recursive: true })
@@ -724,9 +727,14 @@ export async function replaceActiveDevelopmentRelease({
       if (candidateMoved) throw primary
       const cleanup = []
       if (oldMoved) {
-        try { await rename(quarantine, paths.release) } catch (error) { cleanup.push(error) }
+        try {
+          await rename(quarantine, paths.release)
+          await Promise.all([
+            syncReplacementDirectory(dirname(quarantine), 'rollback-source'),
+            syncReplacementDirectory(dirname(paths.release), 'rollback-destination'),
+          ])
+        } catch (error) { cleanup.push(error) }
       }
-      try { await Promise.all([syncDirectory(dirname(paths.release)), syncDirectory(dirname(candidateRelease))]) } catch (error) { cleanup.push(error) }
       if (cleanup.length > 0) {
         throw new AggregateError(
           [primary, ...cleanup],

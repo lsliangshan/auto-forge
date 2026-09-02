@@ -306,26 +306,50 @@ describe('local development release cache', () => {
     const failedCandidate = join(cacheRoot, '.candidate-failed')
     mkdirSync(failedCandidate)
     writeFileSync(join(failedCandidate, 'state'), 'candidate')
+    const syncs: Array<{ path: string, phase: string }> = []
+    const syncDirectoryForTest = async (path: string, phase: string, run: () => Promise<void>) => {
+      syncs.push({ path, phase })
+      await run()
+    }
 
     await expect(replaceActiveDevelopmentRelease({
       cacheRoot,
       fingerprint,
       candidateRelease: failedCandidate,
       afterOldReleaseRenameForTest: async () => { throw new Error('injected replacement failure') },
+      syncDirectoryForTest,
     })).rejects.toThrow('injected replacement failure')
     expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
     expect(readFileSync(join(active, 'state'), 'utf8')).toBe('corrupt')
     expect(readFileSync(join(failedCandidate, 'state'), 'utf8')).toBe('candidate')
+    expect(syncs).toEqual(expect.arrayContaining([
+      { path: join(cacheRoot, 'releases'), phase: 'quarantine-source' },
+      { path: cacheRoot, phase: 'quarantine-destination' },
+      { path: cacheRoot, phase: 'rollback-source' },
+      { path: join(cacheRoot, 'releases'), phase: 'rollback-destination' },
+    ]))
 
     const candidate = join(cacheRoot, '.candidate-ready')
     mkdirSync(candidate)
     writeFileSync(join(candidate, 'state'), 'verified')
-    await expect(replaceActiveDevelopmentRelease({ cacheRoot, fingerprint, candidateRelease: candidate }))
+    syncs.length = 0
+    await expect(replaceActiveDevelopmentRelease({
+      cacheRoot,
+      fingerprint,
+      candidateRelease: candidate,
+      syncDirectoryForTest,
+    }))
       .resolves.toBe(active)
     expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
     expect(readFileSync(join(active, 'state'), 'utf8')).toBe('verified')
     expect(existsSync(candidate)).toBe(false)
     expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.replaced-active-release-'))).toEqual([])
+    expect(syncs).toEqual(expect.arrayContaining([
+      { path: join(cacheRoot, 'releases'), phase: 'quarantine-source' },
+      { path: cacheRoot, phase: 'quarantine-destination' },
+      { path: cacheRoot, phase: 'candidate-source' },
+      { path: join(cacheRoot, 'releases'), phase: 'candidate-destination' },
+    ]))
   })
 
   it.each([
@@ -362,6 +386,50 @@ describe('local development release cache', () => {
     await expect(recoverInterruptedActiveReplacement({ cacheRoot })).resolves.toBeGreaterThanOrEqual(0)
     expect(readFileSync(join(active, 'state'), 'utf8')).toBe('verified')
     expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.replaced-active-release-'))).toEqual([])
+  })
+
+  it('recovers an old release after SIGKILL between its cross-directory rename and candidate commit', async () => {
+    const root = temporaryRoot()
+    const cacheRoot = join(root, 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '4'.repeat(64)
+    const active = createRelease(cacheRoot, fingerprint)
+    writeFileSync(join(active, 'state'), 'previous')
+    const markerBytes = `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`
+    writeFileSync(join(cacheRoot, 'active-release.json'), markerBytes)
+    const candidate = join(cacheRoot, '.candidate-killed')
+    mkdirSync(candidate)
+    writeFileSync(join(candidate, 'state'), 'candidate')
+    const marker = join(root, 'old-release-renamed')
+    const moduleUrl = new URL('../../scripts/converter-packs/local-development-release-cache.mjs', import.meta.url).href
+    const script = String.raw`
+      import { writeFile } from 'node:fs/promises'
+      const [moduleUrl, cacheRoot, fingerprint, candidate, marker] = process.argv.slice(1)
+      const { replaceActiveDevelopmentRelease } = await import(moduleUrl)
+      await replaceActiveDevelopmentRelease({
+        cacheRoot,
+        fingerprint,
+        candidateRelease: candidate,
+        afterOldReleaseRenameForTest: async () => {
+          await writeFile(marker, 'ready')
+          await new Promise(() => globalThis.setInterval(() => {}, 1_000))
+        },
+      })
+    `
+    const child = spawn(process.execPath, [
+      '--input-type=module', '-e', script, moduleUrl, cacheRoot, fingerprint, candidate, marker,
+    ], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'pipe'] })
+    children.add(child)
+    const closed = new Promise<void>((resolvePromise) => child.once('close', () => resolvePromise()))
+    await waitUntil(() => existsSync(marker))
+    child.kill('SIGKILL')
+    await closed
+    children.delete(child)
+
+    await expect(recoverInterruptedActiveReplacement({ cacheRoot })).resolves.toBe(1)
+    expect(readFileSync(join(active, 'state'), 'utf8')).toBe('previous')
+    expect(readFileSync(join(candidate, 'state'), 'utf8')).toBe('candidate')
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(markerBytes)
   })
 
   it('restores an active release from a bounded interrupted replacement quarantine', async () => {
