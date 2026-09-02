@@ -36,6 +36,7 @@ const fingerprintScriptPaths = Object.freeze([
   'scripts/converter-packs/locked-engine-assets.mjs',
   'scripts/converter-packs/local-development-release-cache.mjs',
   'scripts/converter-packs/private-directory-publication.mjs',
+  'scripts/converter-packs/prepare-local-development-release.mjs',
   'scripts/converter-packs/prepare-production-staging.mjs',
   'scripts/converter-packs/macho-closure.mjs',
   'scripts/converter-packs/stage-production-packs.mjs',
@@ -175,13 +176,42 @@ async function hasRelease(path) {
   }))
 }
 
+async function materializeLockSnapshot(privateRoot, inputs) {
+  const sourceRelativePath = 'converter-packs/sources.lock.json'
+  const sourceInput = inputs.find((input) => input.path === sourceRelativePath)
+  if (!sourceInput) throw new Error('Development source lock fingerprint input is missing')
+  let sourceLock
+  try {
+    sourceLock = JSON.parse(sourceInput.bytes.toString('utf8'))
+  } catch {
+    throw new Error('Development source lock fingerprint input is invalid')
+  }
+  const selected = [
+    sourceInput,
+    ...['darwin-arm64', 'darwin-x64'].map((target) => {
+      const path = `converter-packs/${sourceLock.closureLocks[target].path}`
+      const input = inputs.find((candidate) => candidate.path === path)
+      if (!input) throw new Error('Development closure lock fingerprint input is missing')
+      return input
+    }),
+  ]
+  const snapshotRoot = join(privateRoot, 'input-locks')
+  for (const input of selected) {
+    const path = join(snapshotRoot, ...input.path.split('/'))
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+    await writeFile(path, input.bytes, { flag: 'wx', mode: 0o444 })
+  }
+  return join(snapshotRoot, ...sourceRelativePath.split('/'))
+}
+
 export async function prepareLocalDevelopmentRelease(request, dependencies = productionDependencies) {
   requireRequest(request)
   validateDependencies(dependencies)
   const desktopRoot = await canonicalDirectory(request.desktopRoot, 'Desktop root')
   const cacheRoot = await canonicalDirectory(request.cacheRoot, 'Development cache root')
   const target = `${request.platform}-${request.arch}`
-  const fingerprint = fingerprintDevelopmentRelease({ target, inputs: await developmentFingerprintInputs(desktopRoot) })
+  const inputs = await developmentFingerprintInputs(desktopRoot)
+  const fingerprint = fingerprintDevelopmentRelease({ target, inputs })
   const paths = developmentReleasePaths(cacheRoot, fingerprint)
   const removeRelease = dependencies.removeRelease ?? (() => removeInactiveDevelopmentRelease({ cacheRoot, fingerprint }))
   const removePrivateRoot = dependencies.removePrivateRoot ?? ((path) => rm(path, { recursive: true, force: true }))
@@ -211,6 +241,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     const signingRoot = join(privateRoot, 'signing-key')
     const privateKeyPath = join(signingRoot, 'private.pem')
     const publicKeyPath = join(signingRoot, 'public.pem')
+    const lockPath = await materializeLockSnapshot(privateRoot, inputs)
     await mkdir(join(cacheRoot, 'sources'), { recursive: true, mode: 0o700 })
     await mkdir(join(cacheRoot, 'releases'), { recursive: true, mode: 0o700 })
     await mkdir(signingRoot, { mode: 0o700 })
@@ -220,9 +251,9 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     const version = `0.0.0-dev+${fingerprint.slice(0, 12)}`
     const archiveBaseUrl = `https://local-development.invalid/converter-packs/${fingerprint}`
     const prepared = await dependencies.preparePlan({
-      lockPath: join(desktopRoot, 'converter-packs', 'sources.lock.json'), cacheRoot: paths.sources, helpersRoot,
+      lockPath, cacheRoot: paths.sources, helpersRoot,
       workspace, staging: stagingRoot, planPath, target, version, sequence: 1,
-      generatedAt: new Date().toISOString(), archiveBaseUrl,
+      generatedAt: '1970-01-01T00:00:00.000Z', archiveBaseUrl,
       afterMaterialize: () => dependencies.buildHelpers({ target, output: helpersRoot, compiler: request.compiler }),
     })
     if (!isPlainRecord(prepared) || !Array.isArray(prepared.blobs)) {

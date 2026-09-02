@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
 import {
   developmentFingerprintInputs,
@@ -25,6 +25,7 @@ const fingerprintFiles = [
   'scripts/converter-packs/locked-engine-assets.mjs',
   'scripts/converter-packs/local-development-release-cache.mjs',
   'scripts/converter-packs/private-directory-publication.mjs',
+  'scripts/converter-packs/prepare-local-development-release.mjs',
   'scripts/converter-packs/prepare-production-staging.mjs',
   'scripts/converter-packs/macho-closure.mjs',
   'scripts/converter-packs/stage-production-packs.mjs',
@@ -292,6 +293,7 @@ it.each([
   ['scripts/converter-packs/prepare-production-staging.mjs'],
   ['scripts/converter-packs/development-cache-budget.mjs'],
   ['scripts/converter-packs/local-development-release-cache.mjs'],
+  ['scripts/converter-packs/prepare-local-development-release.mjs'],
   ['scripts/converter-packs/verify-local-development-release.mjs'],
 ])('changes the fingerprint when %s bytes change', async (changedPath) => {
   const { desktopRoot, cacheRoot } = fixture()
@@ -301,6 +303,53 @@ it.each([
   const second = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), dependencies([]))
 
   expect(second.fingerprint).not.toBe(first.fingerprint)
+})
+
+it('passes preparePlan a private snapshot made from the exact fingerprinted lock bytes', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const sourcePath = join(desktopRoot, 'converter-packs', 'sources.lock.json')
+  const closurePath = join(desktopRoot, 'converter-packs', 'closures', 'darwin-arm64.lock.json')
+  const originalSource = await readFile(sourcePath)
+  const originalClosure = await readFile(closurePath)
+  const injected = dependencies([], {
+    preparePlan: async (value: Record<string, unknown>) => {
+      const replacement = JSON.parse(originalSource.toString('utf8'))
+      replacement.fixtureRevision = 2
+      await writeFile(sourcePath, JSON.stringify(replacement))
+      await writeFile(closurePath, '{"fixtureRevision":2,"target":"darwin-arm64"}')
+      expect(value.lockPath).not.toBe(sourcePath)
+      expect(await readFile(value.lockPath as string)).toEqual(originalSource)
+      const snapshotSource = JSON.parse(await readFile(value.lockPath as string, 'utf8'))
+      const snapshotClosure = join(dirname(value.lockPath as string), ...snapshotSource.closureLocks['darwin-arm64'].path.split('/'))
+      expect(await readFile(snapshotClosure)).toEqual(originalClosure)
+      await (value.afterMaterialize as () => Promise<void>)()
+      await writeFile(value.planPath as string, '{}\n')
+      return { blobs: [], networkBytes: 0 }
+    },
+  })
+
+  await expect(prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), injected)).resolves.toMatchObject({ reused: false })
+})
+
+it('derives the production timestamp deterministically from the fingerprinted inputs', async () => {
+  const { desktopRoot, cacheRoot } = fixture()
+  const secondCacheRoot = join(dirname(cacheRoot), 'second-cache')
+  await mkdir(secondCacheRoot)
+  const generated: string[] = []
+  const capture = () => dependencies([], {
+    preparePlan: async (value: Record<string, unknown>) => {
+      generated.push(value.generatedAt as string)
+      await (value.afterMaterialize as () => Promise<void>)()
+      await writeFile(value.planPath as string, '{}\n')
+      return { blobs: [], networkBytes: 0 }
+    },
+  })
+
+  const first = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot }), capture())
+  const second = await prepareLocalDevelopmentRelease(request({ desktopRoot, cacheRoot: secondCacheRoot }), capture())
+
+  expect(second.fingerprint).toBe(first.fingerprint)
+  expect(generated).toEqual(['1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'])
 })
 
 it('changes the fingerprint when canonical source lock bytes change', async () => {
