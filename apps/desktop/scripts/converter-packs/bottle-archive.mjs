@@ -406,16 +406,24 @@ function privateDiscoveryMode(mode) {
   invalid()
 }
 
-function resolveDiscoveryLink(entry, byPath, rootPrefix) {
+function resolveDiscoveryLink(entry, byPath, rootPrefix, resolved) {
   const visited = new Set()
+  const trail = []
   let current = entry
   while (current?.type === 'symlink') {
+    const cached = resolved.get(current.path)
+    if (cached) {
+      current = cached
+      break
+    }
     if (visited.has(current.path) || visited.size >= maximumEntries) invalid()
     visited.add(current.path)
+    trail.push(current)
     if (!current.linkTarget.startsWith(rootPrefix)) invalid()
     current = byPath.get(current.linkTarget)
   }
   if (current?.type !== 'file') invalid()
+  for (const link of trail) resolved.set(link.path, current)
   return current
 }
 
@@ -455,6 +463,7 @@ export async function extractVerifiedBottleForDiscovery({
   version,
   archiveVersion = version,
   outputRoot,
+  maximumMaterializedBytesForTest,
 }) {
   requireAbsolutePath(outputRoot, 'Bottle discovery output root')
   if (
@@ -464,6 +473,11 @@ export async function extractVerifiedBottleForDiscovery({
     || !/^[A-Za-z0-9._+-]+$/u.test(version)
     || typeof archiveVersion !== 'string'
     || !/^[A-Za-z0-9._+-]+$/u.test(archiveVersion)
+    || (maximumMaterializedBytesForTest !== undefined && (
+      !Number.isSafeInteger(maximumMaterializedBytesForTest)
+      || maximumMaterializedBytesForTest <= 0
+      || maximumMaterializedBytesForTest > maximumExpandedBytes
+    ))
   ) invalid()
   const rootMetadata = await lstat(outputRoot).catch(() => undefined)
   if (
@@ -477,6 +491,12 @@ export async function extractVerifiedBottleForDiscovery({
   let privateRoot
   let primaryError
   const openHandles = new Set()
+  const materializedLimit = maximumMaterializedBytesForTest ?? maximumExpandedBytes
+  let materializedBytes = 0
+  const reserveMaterialized = (bytes) => {
+    materializedBytes += bytes
+    if (!Number.isSafeInteger(materializedBytes) || materializedBytes > materializedLimit) invalid()
+  }
   try {
     privateRoot = await realpath(await mkdtemp(join(outputRoot, `.bottle-discovery-${formula}-`)))
     if (!isPathInsideRoot(outputRoot, privateRoot)) invalid()
@@ -488,6 +508,7 @@ export async function extractVerifiedBottleForDiscovery({
       onFile: async (entry) => {
         if (!entry.path.startsWith(rootPrefix)) invalid()
         const sourcePath = entry.path.slice(rootPrefix.length)
+        reserveMaterialized(entry.size)
         const { executable, mode } = privateDiscoveryMode(entry.mode)
         const output = await createDiscoveryFile(privateRoot, sourcePath, executable)
         openHandles.add(output.handle)
@@ -522,14 +543,16 @@ export async function extractVerifiedBottleForDiscovery({
       if ((entry.path === formulaRoot || entry.path === versionRoot) && entry.type !== 'directory') invalid()
     }
     const discovered = []
+    const resolvedLinks = new Map()
     for (const entry of entries) {
       if (entry.type === 'directory') continue
-      const target = entry.type === 'file' ? entry : resolveDiscoveryLink(entry, byPath, rootPrefix)
+      const target = entry.type === 'file' ? entry : resolveDiscoveryLink(entry, byPath, rootPrefix, resolvedLinks)
       const targetFile = regular.get(target.path)
       if (!targetFile || targetFile.sha256 !== target.sha256 || targetFile.size !== target.size) invalid()
       const sourcePath = entry.path.slice(rootPrefix.length)
       let source = targetFile.source
       if (entry.type === 'symlink') {
+        reserveMaterialized(target.size)
         source = await copyDiscoveryFile(targetFile.source, privateRoot, sourcePath, target, openHandles)
       }
       const { executable } = privateDiscoveryMode(target.mode)

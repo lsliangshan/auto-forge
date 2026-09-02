@@ -205,6 +205,31 @@ describe('converter bottle universe', () => {
     expect(statSync(discovered[2].source).mode & 0o777).toBe(0o600)
   })
 
+  it('bounds total discovery bytes after internal links are flattened into regular copies', async () => {
+    const root = temporaryRoot()
+    const target = Buffer.from('123456')
+    const bottle = writeBottleArchive(root, 'discovery-materialized-limit.tar.gz', [
+      { path: 'vips/', type: '5' },
+      { path: 'vips/8.18.6/', type: '5' },
+      { path: 'vips/8.18.6/lib/', type: '5' },
+      { path: 'vips/8.18.6/lib/target', bytes: target, mode: 0o444 },
+      { path: 'vips/8.18.6/lib/alias', type: '2', linkpath: 'target', mode: 0o777 },
+    ])
+    const outputRoot = join(root, 'private-discovery')
+    mkdirSync(outputRoot, { mode: 0o700 })
+
+    await expect(extractVerifiedBottleForDiscovery({
+      archive: bottle.archive,
+      expectedBytes: bottle.compressed.byteLength,
+      expectedSha256: bottle.sha256,
+      formula: 'vips',
+      version: '8.18.6',
+      outputRoot: realpathSync(outputRoot),
+      maximumMaterializedBytesForTest: 11,
+    })).rejects.toThrow(/archive|byte|limit/iu)
+    expect(readdirSync(outputRoot)).toEqual([])
+  })
+
   it('materializes one verified formula once for multiple families behind immutable exact lookups', async () => {
     const root = temporaryRoot()
     const executable = Buffer.from('#!/bin/sh\necho vips\n')
