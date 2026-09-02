@@ -53,6 +53,8 @@ const developmentPrivateKeyDer = Buffer.from(
   'hex',
 )
 const requestKeys = Object.freeze(['desktopRoot', 'cacheRoot', 'platform', 'arch', 'compiler'])
+const maximumSourceLockBytes = 8 * 1024 * 1024
+const maximumClosureLockBytes = 64 * 1024 * 1024
 const maximumNativeHelperSourceBytes = 1024 * 1024
 const maximumNativeHelperInventoryBytes = 4 * 1024 * 1024
 
@@ -102,10 +104,10 @@ function relativeInputPath(root, path) {
   return value
 }
 
-async function regularFileUnderRoot(desktopRoot, path) {
+async function regularFileUnderRoot(desktopRoot, path, label = 'Development fingerprint input', maximumBytes) {
   return {
     path: relativeInputPath(desktopRoot, path),
-    bytes: await readStableRegularFile(path, 'Development fingerprint input'),
+    bytes: await readStableRegularFile(path, label, maximumBytes),
   }
 }
 
@@ -118,10 +120,12 @@ async function nativeInputs(desktopRoot) {
   const files = []
   let totalBytes = 0
   for (const relativePath of nativeHelperSourceInventory()) {
-    const input = await regularFileUnderRoot(desktopRoot, join(nativeRoot, ...relativePath.split('/')))
-    if (input.bytes.byteLength > maximumNativeHelperSourceBytes) {
-      throw new Error('Development native helper source exceeds its byte limit')
-    }
+    const input = await regularFileUnderRoot(
+      desktopRoot,
+      join(nativeRoot, ...relativePath.split('/')),
+      'Development native helper source',
+      maximumNativeHelperSourceBytes,
+    )
     totalBytes += input.bytes.byteLength
     if (!Number.isSafeInteger(totalBytes) || totalBytes > maximumNativeHelperInventoryBytes) {
       throw new Error('Development native helper inventory exceeds its byte limit')
@@ -134,7 +138,7 @@ async function nativeInputs(desktopRoot) {
 export async function developmentFingerprintInputs(desktopRoot) {
   await canonicalDirectory(desktopRoot, 'Desktop root')
   const sourcePath = join(desktopRoot, 'converter-packs', 'sources.lock.json')
-  const sourceInput = await regularFileUnderRoot(desktopRoot, sourcePath)
+  const sourceInput = await regularFileUnderRoot(desktopRoot, sourcePath, 'Development source lock', maximumSourceLockBytes)
   let sourceLock
   try {
     sourceLock = JSON.parse(sourceInput.bytes.toString('utf8'))
@@ -154,6 +158,8 @@ export async function developmentFingerprintInputs(desktopRoot) {
     ...await Promise.all(targets.map((target) => regularFileUnderRoot(
       desktopRoot,
       join(desktopRoot, 'converter-packs', ...closureLocks[target].path.split('/')),
+      `Development ${target} closure lock`,
+      maximumClosureLockBytes,
     ))),
     ...await nativeInputs(desktopRoot),
   ]

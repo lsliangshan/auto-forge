@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -649,6 +649,16 @@ it('ignores unlisted native files and bounds every inventoried helper source', a
 
   await writeFile(join(desktopRoot, 'converter-packs', 'native', 'common', 'arguments.c'), Buffer.alloc(1024 * 1024 + 1))
   await expect(developmentFingerprintInputs(desktopRoot)).rejects.toThrow(/native helper.*limit/iu)
+})
+
+it('bounds source and closure lock reads before fingerprinting their contents', async () => {
+  const sourceFixture = fixture()
+  truncateSync(join(sourceFixture.desktopRoot, 'converter-packs', 'sources.lock.json'), 8 * 1024 * 1024 + 1)
+  await expect(developmentFingerprintInputs(sourceFixture.desktopRoot)).rejects.toThrow(/source lock.*size limit/iu)
+
+  const closureFixture = fixture()
+  truncateSync(join(closureFixture.desktopRoot, 'converter-packs', 'closures', 'darwin-arm64.lock.json'), 64 * 1024 * 1024 + 1)
+  await expect(developmentFingerprintInputs(closureFixture.desktopRoot)).rejects.toThrow(/closure lock.*size limit/iu)
 })
 
 it('passes the requested x64 target to the release builder', async () => {
