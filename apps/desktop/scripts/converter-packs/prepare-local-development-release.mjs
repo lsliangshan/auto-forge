@@ -259,7 +259,7 @@ export async function prepareLocalDevelopmentRelease(request, dependencies = pro
     const developmentPrivateKey = createPrivateKey({ key: developmentPrivateKeyDer, format: 'der', type: 'pkcs8' })
     await writeFile(privateKeyPath, developmentPrivateKey.export({ format: 'pem', type: 'pkcs8' }), { flag: 'wx', mode: 0o600 })
     await writeFile(publicKeyPath, createPublicKey(developmentPrivateKey).export({ format: 'pem', type: 'spki' }), { flag: 'wx', mode: 0o600 })
-    const version = `0.0.0-dev+${fingerprint.slice(0, 12)}`
+    const version = `0.0.0-dev.${fingerprint.slice(0, 12)}`
     const archiveBaseUrl = `https://local-development.invalid/converter-packs/${fingerprint}`
     const prepared = await dependencies.preparePlan({
       lockPath, cacheRoot: paths.sources, helpersRoot,

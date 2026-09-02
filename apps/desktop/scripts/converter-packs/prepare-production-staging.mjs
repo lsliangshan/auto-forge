@@ -20,7 +20,7 @@ import {
 } from './pack-tooling-lib.mjs'
 import { settleCleanup } from './private-directory-publication.mjs'
 
-async function materializeAuthenticatedLocks({ sourceLockPath, workspace, selected }) {
+export async function materializeAuthenticatedLocks({ sourceLockPath, workspace, selected }) {
   const closureRelative = selected?.sourceLock?.closureLock?.path
   const expectedClosureBytes = selected?.sourceLock?.closureLock?.bytes
   const expectedClosureSha256 = selected?.sourceLock?.closureLock?.sha256

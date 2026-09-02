@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { gzipSync } from 'node:zlib'
 import { afterEach, expect, it } from 'vitest'
 import {
   developmentFingerprintInputs,
@@ -16,6 +17,19 @@ import {
   writeDevelopmentReleaseMetadata,
 } from '../../scripts/converter-packs/local-development-release-cache.mjs'
 import { nativeHelperSourceInventory } from '../../scripts/converter-packs/build-native-helpers.mjs'
+import { buildNativeHelpers } from '../../scripts/converter-packs/build-native-helpers.mjs'
+import { acquireLockedArtifacts } from '../../scripts/converter-packs/acquire-sources.mjs'
+import { loadConverterClosureLock } from '../../scripts/converter-packs/closure-lock.mjs'
+import { materializeBottleUniverse } from '../../scripts/converter-packs/bottle-universe.mjs'
+import { materializeLockedEngineAssets } from '../../scripts/converter-packs/locked-engine-assets.mjs'
+import { preflightDevelopmentCache, pruneDevelopmentCache } from '../../scripts/converter-packs/development-cache-budget.mjs'
+import {
+  materializeAuthenticatedLocks,
+  prepareProductionStagingPlan,
+} from '../../scripts/converter-packs/prepare-production-staging.mjs'
+import { stageProductionPacks } from '../../scripts/converter-packs/stage-production-packs.mjs'
+import { buildLocalDevelopmentRelease, verifyLocalDevelopmentReleaseIntegrity } from '../../scripts/converter-packs/build-local-development-release.mjs'
+import { activateDevelopmentRelease } from '../../scripts/converter-packs/local-development-release-cache.mjs'
 
 const roots: string[] = []
 const fingerprintFiles = [
@@ -87,6 +101,144 @@ async function releaseBuilder({ outputRoot }: { outputRoot: string }) {
   await mkdir(outputRoot, { recursive: true })
 }
 
+function tarString(header: Buffer, offset: number, length: number, value: string) {
+  Buffer.from(value).copy(header, offset, 0, length)
+}
+
+function tarOctal(header: Buffer, offset: number, length: number, value: number) {
+  tarString(header, offset, length, `${value.toString(8).padStart(length - 1, '0')}\0`)
+}
+
+function syntheticTar(entries: Array<{ path: string, bytes?: Buffer, directory?: boolean, mode?: number }>) {
+  const records = entries.flatMap((entry) => {
+    const bytes = entry.bytes ?? Buffer.alloc(0)
+    const header = Buffer.alloc(512)
+    tarString(header, 0, 100, entry.path)
+    tarOctal(header, 100, 8, entry.mode ?? (entry.directory ? 0o755 : 0o444))
+    tarOctal(header, 108, 8, 0)
+    tarOctal(header, 116, 8, 0)
+    tarOctal(header, 124, 12, bytes.byteLength)
+    tarOctal(header, 136, 12, 0)
+    header.fill(0x20, 148, 156)
+    tarString(header, 156, 1, entry.directory ? '5' : '0')
+    tarString(header, 257, 6, 'ustar\0')
+    tarString(header, 263, 2, '00')
+    header.fill(0x20, 148, 156)
+    const checksum = header.reduce((sum, byte) => sum + byte, 0)
+    tarString(header, 148, 8, `${checksum.toString(8).padStart(6, '0')}\0 `)
+    return [header, bytes, Buffer.alloc((512 - (bytes.byteLength % 512)) % 512)]
+  })
+  return gzipSync(Buffer.concat([...records, Buffer.alloc(1024)]), { mtime: 0 })
+}
+
+function writeSyntheticBottleLocks(desktopRoot: string) {
+  const executableBytes = Object.fromEntries(['vips', 'pdfinfo', 'pdftocairo', 'ffmpeg', 'ffprobe'].map((name) => [
+    name,
+    Buffer.from(`#!/bin/sh\necho synthetic-${name}\n`),
+  ])) as Record<string, Buffer>
+  const licenseBytes = Buffer.from('synthetic bottle license\n')
+  const bottle = syntheticTar([
+    { path: 'fixture/', directory: true },
+    { path: 'fixture/1.0/', directory: true },
+    { path: 'fixture/1.0/bin/', directory: true },
+    ...Object.entries(executableBytes).map(([name, bytes]) => ({ path: `fixture/1.0/bin/${name}`, bytes, mode: 0o555 })),
+    { path: 'fixture/1.0/LICENSE', bytes: licenseBytes, mode: 0o644 },
+  ])
+  const dmg = Buffer.from('synthetic libreoffice dmg')
+  const engineLicense = Buffer.from('synthetic engine license\n')
+  const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
+  const bottleCoordinate = (target: string) => ({
+    kind: 'homebrew-bottle',
+    url: 'https://downloads.example.test/fixture.tar.gz',
+    sha256: digest(bottle),
+    bytes: bottle.byteLength,
+    cellar: target === 'darwin-arm64' ? '/opt/homebrew/Cellar' : '/usr/local/Cellar',
+  })
+  const dmgCoordinate = {
+    kind: 'dmg', url: 'https://downloads.example.test/libreoffice.dmg', sha256: digest(dmg), bytes: dmg.byteLength, cellar: null,
+  }
+  const engineLicenseCoordinate = {
+    kind: 'download', url: 'https://downloads.example.test/libreoffice.LICENSE', sha256: digest(engineLicense),
+    bytes: engineLicense.byteLength, destination: 'LICENSES/libreoffice.LICENSE',
+  }
+  const formulaLicense = (target: string) => ({
+    kind: 'bottle-entry', target, path: 'LICENSE', sha256: digest(licenseBytes), bytes: licenseBytes.byteLength,
+    destination: 'LICENSES/fixture.LICENSE',
+  })
+  const formula = {
+    name: 'fixture', version: '1.0', revision: 0, license: 'MIT',
+    acquisitions: { 'darwin-arm64': bottleCoordinate('darwin-arm64'), 'darwin-x64': bottleCoordinate('darwin-x64') },
+    licenses: [formulaLicense('darwin-arm64'), formulaLicense('darwin-x64')],
+  }
+  const engines = ['ffmpeg', 'libvips', 'poppler'].map((name) => ({
+    name, version: '1.0', license: 'MIT', rootFormula: 'fixture', acquisitions: structuredClone(formula.acquisitions), licenses: [],
+  }))
+  engines.splice(1, 0, {
+    name: 'libreoffice', version: '1.0', license: 'MPL-2.0', rootFormula: null,
+    acquisitions: { 'darwin-arm64': structuredClone(dmgCoordinate), 'darwin-x64': structuredClone(dmgCoordinate) },
+    licenses: [engineLicenseCoordinate],
+  } as never)
+  const emptyFamily = () => ({ files: [], rewrites: [], licenses: [], nativeHelpers: [], engineAssets: [], engineLicenses: [] })
+  const lockedFile = (name: string) => ({
+    formula: 'fixture', sourcePath: `bin/${name}`, destination: `bin/${name}`, sha256: digest(executableBytes[name]),
+    bytes: executableBytes[name].byteLength, executable: true, role: 'executable', runtimeRoot: false,
+  })
+  const lockedLicense = {
+    formula: 'fixture', source: 'LICENSE', destination: 'LICENSES/fixture.LICENSE',
+    sha256: digest(licenseBytes), bytes: licenseBytes.byteLength,
+  }
+  const closure = (target: string) => ({
+    schemaVersion: 1,
+    target,
+    formulae: [{ name: 'fixture', version: '1.0', dependencies: [] }],
+    families: {
+      'image-icon': { ...emptyFamily(), files: [lockedFile('vips')], licenses: [lockedLicense], nativeHelpers: [{ helper: 'autoforge-image-converter', destination: 'bin/autoforge-image-converter' }] },
+      document: { ...emptyFamily(), nativeHelpers: [{ helper: 'autoforge-soffice-launcher', destination: 'program/soffice' }], engineAssets: [{ engine: 'libreoffice', source: 'acquisition', destination: 'share/LibreOffice.dmg', sha256: digest(dmg), bytes: dmg.byteLength, executable: false, role: 'data' }], engineLicenses: [{ engine: 'libreoffice', source: engineLicenseCoordinate.url, destination: engineLicenseCoordinate.destination, sha256: engineLicenseCoordinate.sha256, bytes: engineLicenseCoordinate.bytes }] },
+      pdf: { ...emptyFamily(), files: [lockedFile('pdfinfo'), lockedFile('pdftocairo')].sort((a, b) => a.destination.localeCompare(b.destination)), licenses: [lockedLicense], nativeHelpers: [{ helper: 'autoforge-pdf-raster', destination: 'bin/autoforge-pdf-raster' }] },
+      media: { ...emptyFamily(), files: [lockedFile('ffmpeg'), lockedFile('ffprobe')], licenses: [lockedLicense] },
+    },
+    measurements: {
+      downloadBytes: bottle.byteLength + dmg.byteLength + engineLicense.byteLength,
+      compressedPackBytes: { 'image-icon': 1, document: 1, pdf: 1, media: 1 },
+      installedReleaseBytes: 1,
+    },
+  })
+  const closures = Object.fromEntries(['darwin-arm64', 'darwin-x64'].map((target) => {
+    const bytes = canonicalBytes(closure(target))
+    const path = join(desktopRoot, 'converter-packs', 'closures', `${target}.lock.json`)
+    writeFileSync(path, bytes)
+    return [target, { path: `closures/${target}.lock.json`, sha256: digest(bytes), bytes: bytes.byteLength }]
+  }))
+  const source = {
+    schemaVersion: 2,
+    homebrewCoreRevision: '1'.repeat(40),
+    homebrewCaskRevision: '2'.repeat(40),
+    targets: ['darwin-arm64', 'darwin-x64'],
+    engines,
+    formulae: [formula],
+    closureLocks: closures,
+    provenance: {
+      repositoryRevision: '3'.repeat(40),
+      captures: {
+        'darwin-arm64': { captureSha256: '4'.repeat(64), probesSha256: '5'.repeat(64) },
+        'darwin-x64': { captureSha256: '6'.repeat(64), probesSha256: '7'.repeat(64) },
+      },
+    },
+  }
+  writeFileSync(join(desktopRoot, 'converter-packs', 'sources.lock.json'), canonicalBytes(source))
+  const downloads = new Map([
+    [bottleCoordinate('darwin-arm64').url, bottle],
+    [dmgCoordinate.url, dmg],
+    [engineLicenseCoordinate.url, engineLicense],
+  ])
+  return async (input: string | URL | Request) => {
+    const url = String(input)
+    const bytes = downloads.get(url)
+    if (!bytes) throw new Error(`unexpected network URL ${url}`)
+    return new Response(bytes, { status: 200 })
+  }
+}
+
 function request({ desktopRoot, cacheRoot }: { desktopRoot: string, cacheRoot: string }) {
   return { desktopRoot, cacheRoot, platform: 'darwin', arch: 'arm64', compiler: '/usr/bin/clang' }
 }
@@ -134,6 +286,59 @@ it('prepares a cold development cache in order and activates only after verifica
   expect(result.reused).toBe(false)
   expect(result.releaseRoot).toBe(join(cacheRoot, 'releases', result.fingerprint))
   expect(events).toEqual(['helpers', 'plan', 'stage', 'build', 'verify', 'smoke', 'metadata', 'activate', 'prune'])
+})
+
+it('runs the public cold entry through real lock, acquisition, universe, metadata, activation, and prune modules', async () => {
+  const { root, desktopRoot, cacheRoot } = fixture()
+  const fetchImpl = writeSyntheticBottleLocks(desktopRoot)
+  const compiler = join(root, 'synthetic-compiler')
+  writeFileSync(compiler, '#!/bin/sh\nfor output do :; done\nprintf "#!/bin/sh\\nexit 0\\n" > "$output"\nchmod 755 "$output"\n')
+  await import('node:fs/promises').then(({ chmod }) => chmod(compiler, 0o755))
+  const result = await prepareLocalDevelopmentRelease({
+    desktopRoot, cacheRoot, platform: 'darwin', arch: 'arm64', compiler,
+  }, {
+    buildHelpers: (value: Parameters<typeof buildNativeHelpers>[0]) => buildNativeHelpers(value),
+    preparePlan: (value: Parameters<typeof prepareProductionStagingPlan>[0]) => prepareProductionStagingPlan(value, {
+      loadLocks: (request) => loadConverterClosureLock(request),
+      materializeLocks: (request) => materializeAuthenticatedLocks(request),
+      preflightCache: (request) => preflightDevelopmentCache(request),
+      acquireSources: (request) => acquireLockedArtifacts({ ...request, fetchImpl }),
+      materializeUniverse: (request) => materializeBottleUniverse(request),
+      materializeEngineAssets: (request) => materializeLockedEngineAssets(request),
+    }),
+    stagePacks: ({ plan }: { plan: Parameters<typeof stageProductionPacks>[0] }) => stageProductionPacks(plan, {
+      planClosure: ({ expectedFiles, expectedRewrites, universe }: {
+        expectedFiles: Array<{ formula: string, sourcePath: string, destination: string, executable: boolean, role: string }>
+        expectedRewrites: unknown[]
+        universe: { resolveLockedFile: (formula: string, sourcePath: string) => string }
+      }) => ({
+        files: expectedFiles.map((file) => ({
+          source: universe.resolveLockedFile(file.formula, file.sourcePath),
+          destination: file.destination,
+          executable: file.executable,
+          formula: file.formula,
+          role: file.role,
+        })),
+        rewrites: expectedRewrites,
+      }),
+      inspectHelper: async () => ({ architectures: ['arm64'], dependencies: ['/usr/lib/libSystem.B.dylib'], rpaths: [] }),
+      applyRelocation: async () => undefined,
+      probeFamily: async () => undefined,
+    }),
+    buildRelease: (value) => buildLocalDevelopmentRelease(value),
+    verifyRelease: (value) => verifyLocalDevelopmentReleaseIntegrity(value),
+    smokeRelease: async () => undefined,
+    writeMetadata: (value) => writeDevelopmentReleaseMetadata(value),
+    replaceActiveRelease: (value) => replaceActiveDevelopmentRelease(value),
+    activateRelease: (value) => activateDevelopmentRelease(value),
+    pruneCache: (value) => pruneDevelopmentCache({ ...value, migrateLegacyReleases: true }),
+  })
+
+  expect(result.reused).toBe(false)
+  await expect(readFile(join(cacheRoot, 'active-release.json'), 'utf8'))
+    .resolves.toBe(`{"fingerprint":"${result.fingerprint}","schemaVersion":1}\n`)
+  expect(existsSync(join(cacheRoot, 'release-metadata', `${result.fingerprint}.json`))).toBe(true)
+  expect(readdirSync(join(result.releaseRoot, 'installed')).sort()).toEqual(['document', 'image-icon', 'media', 'pdf'])
 })
 
 it('recovers a legacy fixed private workspace and prepares in a unique private directory', async () => {
