@@ -540,6 +540,9 @@ export async function replaceActiveDevelopmentRelease({
   fingerprint,
   candidateRelease,
   afterOldReleaseRenameForTest,
+  afterCandidateRenameForTest,
+  afterQuarantineDeleteForTest,
+  syncDirectoryForTest,
 }) {
   const canonicalRoot = await canonicalCacheRoot(cacheRoot)
   assertFingerprint(fingerprint)
@@ -551,6 +554,9 @@ export async function replaceActiveDevelopmentRelease({
     throw new Error('Development replacement release must be inside the cache root')
   }
   const paths = developmentReleasePaths(canonicalRoot, fingerprint)
+  const syncReplacementDirectory = (path, phase) => syncDirectoryForTest
+    ? syncDirectoryForTest(path, phase, () => syncDirectory(path))
+    : syncDirectory(path)
   return withDevelopmentCacheMutationClaim(canonicalRoot, async (root, heartbeat) => {
     if (await readActiveDevelopmentRelease({ cacheRoot: root }) !== paths.release) {
       throw new Error('Development replacement release is no longer active')
@@ -568,21 +574,24 @@ export async function replaceActiveDevelopmentRelease({
       await heartbeat.pulse()
       await rename(paths.release, quarantine)
       oldMoved = true
-      await syncDirectory(dirname(paths.release))
+      await syncReplacementDirectory(dirname(paths.release), 'quarantine')
       await afterOldReleaseRenameForTest?.()
       await heartbeat.pulse()
       await rename(candidateRelease, paths.release)
       candidateMoved = true
-      await Promise.all([syncDirectory(dirname(paths.release)), syncDirectory(dirname(candidateRelease))])
+      await afterCandidateRenameForTest?.()
+      await Promise.all([
+        syncReplacementDirectory(dirname(paths.release), 'candidate'),
+        syncReplacementDirectory(dirname(candidateRelease), 'candidate-parent'),
+      ])
       await heartbeat.pulse()
       await rm(quarantine, { recursive: true })
-      await syncDirectory(root)
+      await afterQuarantineDeleteForTest?.()
+      await syncReplacementDirectory(root, 'final')
       return paths.release
     } catch (primary) {
+      if (candidateMoved) throw primary
       const cleanup = []
-      if (candidateMoved) {
-        try { await rename(paths.release, candidateRelease) } catch (error) { cleanup.push(error) }
-      }
       if (oldMoved) {
         try { await rename(quarantine, paths.release) } catch (error) { cleanup.push(error) }
       }

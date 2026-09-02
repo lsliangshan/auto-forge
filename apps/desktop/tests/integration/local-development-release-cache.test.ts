@@ -188,6 +188,42 @@ describe('local development release cache', () => {
     expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.replaced-active-release-'))).toEqual([])
   })
 
+  it.each([
+    ['candidate rename', { afterCandidateRenameForTest: async () => { throw new Error('candidate rename tail failure') } }],
+    ['quarantine delete', { afterQuarantineDeleteForTest: async () => { throw new Error('quarantine delete tail failure') } }],
+    ['final directory fsync', {
+      syncDirectoryForTest: async (path: string, phase: string, run: () => Promise<void>) => {
+        if (phase === 'final') throw new Error('final directory fsync failure')
+        await run()
+      },
+    }],
+  ])('keeps the committed candidate active after a %s failure', async (_scenario, fault) => {
+    const cacheRoot = join(temporaryRoot(), 'cache')
+    mkdirSync(cacheRoot)
+    const fingerprint = '5'.repeat(64)
+    const active = createRelease(cacheRoot, fingerprint)
+    writeFileSync(join(active, 'state'), 'corrupt')
+    const marker = `{"fingerprint":"${fingerprint}","schemaVersion":1}\n`
+    writeFileSync(join(cacheRoot, 'active-release.json'), marker)
+    const candidate = join(cacheRoot, `.candidate-${_scenario.replaceAll(' ', '-')}`)
+    mkdirSync(candidate)
+    writeFileSync(join(candidate, 'state'), 'verified')
+
+    await expect(replaceActiveDevelopmentRelease({
+      cacheRoot,
+      fingerprint,
+      candidateRelease: candidate,
+      ...fault,
+    })).rejects.toThrow(/failure/)
+
+    expect(readFileSync(join(cacheRoot, 'active-release.json'), 'utf8')).toBe(marker)
+    expect(readFileSync(join(active, 'state'), 'utf8')).toBe('verified')
+    expect(existsSync(candidate)).toBe(false)
+    await expect(recoverInterruptedActiveReplacement({ cacheRoot })).resolves.toBeGreaterThanOrEqual(0)
+    expect(readFileSync(join(active, 'state'), 'utf8')).toBe('verified')
+    expect(readdirSync(cacheRoot).filter((name) => name.startsWith('.replaced-active-release-'))).toEqual([])
+  })
+
   it('restores an active release from a bounded interrupted replacement quarantine', async () => {
     const cacheRoot = join(temporaryRoot(), 'cache')
     mkdirSync(join(cacheRoot, 'releases'), { recursive: true })
