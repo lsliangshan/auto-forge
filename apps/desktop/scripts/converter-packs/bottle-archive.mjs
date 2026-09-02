@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
+import { constants } from 'node:fs'
+import { lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises'
 import { TextDecoder } from 'node:util'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { createGunzip } from 'node:zlib'
-import { posix } from 'node:path'
-import { fail, requireAbsolutePath, withStableRegularFile } from './pack-tooling-lib.mjs'
+import { dirname, join, posix } from 'node:path'
+import { compareUtf8, fail, isPathInsideRoot, requireAbsolutePath, withStableRegularFile } from './pack-tooling-lib.mjs'
 
 const maximumExpandedBytes = 4 * 1024 * 1024 * 1024
 const maximumPaxBytes = 64 * 1024
@@ -373,4 +375,184 @@ export async function scanVerifiedBottleEntries({
 
 export async function readVerifiedBottleEntries(options) {
   return scanVerifiedBottleEntries(options)
+}
+
+async function writeAll(handle, bytes, initialPosition = 0) {
+  let offset = 0
+  while (offset < bytes.byteLength) {
+    const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset, initialPosition + offset)
+    if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0) invalid()
+    offset += bytesWritten
+  }
+  return offset
+}
+
+async function createDiscoveryFile(root, sourcePath, executable) {
+  const path = join(root, ...sourcePath.split('/'))
+  const parent = dirname(path)
+  await mkdir(parent, { recursive: true, mode: 0o700 })
+  if (!isPathInsideRoot(root, await realpath(parent))) invalid()
+  const handle = await open(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+    executable ? 0o700 : 0o600,
+  )
+  return { handle, path }
+}
+
+function privateDiscoveryMode(mode) {
+  if (mode === 0o555) return { executable: true, mode: 0o700 }
+  if (mode === 0o444 || mode === 0o644) return { executable: false, mode: 0o600 }
+  invalid()
+}
+
+function resolveDiscoveryLink(entry, byPath, rootPrefix) {
+  const visited = new Set()
+  let current = entry
+  while (current?.type === 'symlink') {
+    if (visited.has(current.path) || visited.size >= maximumEntries) invalid()
+    visited.add(current.path)
+    if (!current.linkTarget.startsWith(rootPrefix)) invalid()
+    current = byPath.get(current.linkTarget)
+  }
+  if (current?.type !== 'file') invalid()
+  return current
+}
+
+async function copyDiscoveryFile(source, root, sourcePath, expected, openHandles) {
+  return withStableRegularFile(source, 'Bottle discovery link target', async (sourceHandle, metadata) => {
+    if (metadata.size !== expected.size) invalid()
+    const { executable, mode } = privateDiscoveryMode(expected.mode)
+    const output = await createDiscoveryFile(root, sourcePath, executable)
+    openHandles.add(output.handle)
+    const digest = createHash('sha256')
+    const buffer = Buffer.allocUnsafe(1024 * 1024)
+    let position = 0
+    try {
+      while (position < metadata.size) {
+        const { bytesRead } = await sourceHandle.read(buffer, 0, Math.min(buffer.byteLength, metadata.size - position), position)
+        if (bytesRead <= 0) invalid()
+        const chunk = buffer.subarray(0, bytesRead)
+        digest.update(chunk)
+        position += await writeAll(output.handle, chunk, position)
+      }
+      if (digest.digest('hex') !== expected.sha256) invalid()
+      await output.handle.chmod(mode)
+      await output.handle.sync()
+    } finally {
+      openHandles.delete(output.handle)
+      await output.handle.close()
+    }
+    return output.path
+  })
+}
+
+export async function extractVerifiedBottleForDiscovery({
+  archive,
+  expectedBytes,
+  expectedSha256,
+  formula,
+  version,
+  outputRoot,
+}) {
+  requireAbsolutePath(outputRoot, 'Bottle discovery output root')
+  if (
+    typeof formula !== 'string'
+    || !/^[a-z0-9][a-z0-9+_.@-]*$/u.test(formula)
+    || typeof version !== 'string'
+    || !/^[A-Za-z0-9._+-]+$/u.test(version)
+  ) invalid()
+  const rootMetadata = await lstat(outputRoot).catch(() => undefined)
+  if (
+    !rootMetadata?.isDirectory()
+    || rootMetadata.isSymbolicLink()
+    || (rootMetadata.mode & 0o077) !== 0
+    || await realpath(outputRoot).catch(() => undefined) !== outputRoot
+  ) invalid()
+
+  const rootPrefix = `${formula}/${version}/`
+  let privateRoot
+  let primaryError
+  const openHandles = new Set()
+  try {
+    privateRoot = await realpath(await mkdtemp(join(outputRoot, `.bottle-discovery-${formula}-`)))
+    if (!isPathInsideRoot(outputRoot, privateRoot)) invalid()
+    const regular = new Map()
+    const entries = await scanVerifiedBottleEntries({
+      archive,
+      expectedBytes,
+      expectedSha256,
+      onFile: async (entry) => {
+        if (!entry.path.startsWith(rootPrefix)) invalid()
+        const sourcePath = entry.path.slice(rootPrefix.length)
+        const { executable, mode } = privateDiscoveryMode(entry.mode)
+        const output = await createDiscoveryFile(privateRoot, sourcePath, executable)
+        openHandles.add(output.handle)
+        let position = 0
+        return {
+          async write(chunk) {
+            position += await writeAll(output.handle, chunk, position)
+          },
+          async finish(completed) {
+            try {
+              if (position !== completed.size) invalid()
+              await output.handle.chmod(mode)
+              await output.handle.sync()
+              regular.set(completed.path, { ...completed, source: output.path })
+            } finally {
+              openHandles.delete(output.handle)
+              await output.handle.close()
+            }
+          },
+        }
+      },
+    })
+    const byPath = new Map(entries.map((entry) => [entry.path, entry]))
+    const formulaRoot = rootPrefix.slice(0, formula.length)
+    const versionRoot = rootPrefix.slice(0, -1)
+    for (const entry of entries) {
+      if (
+        entry.path !== formulaRoot
+        && entry.path !== versionRoot
+        && !entry.path.startsWith(rootPrefix)
+      ) invalid()
+      if ((entry.path === formulaRoot || entry.path === versionRoot) && entry.type !== 'directory') invalid()
+    }
+    const discovered = []
+    for (const entry of entries) {
+      if (entry.type === 'directory') continue
+      const target = entry.type === 'file' ? entry : resolveDiscoveryLink(entry, byPath, rootPrefix)
+      const targetFile = regular.get(target.path)
+      if (!targetFile || targetFile.sha256 !== target.sha256 || targetFile.size !== target.size) invalid()
+      const sourcePath = entry.path.slice(rootPrefix.length)
+      let source = targetFile.source
+      if (entry.type === 'symlink') {
+        source = await copyDiscoveryFile(targetFile.source, privateRoot, sourcePath, target, openHandles)
+      }
+      const { executable } = privateDiscoveryMode(target.mode)
+      discovered.push(Object.freeze({
+        formula,
+        version,
+        sourcePath,
+        source: await realpath(source),
+        sha256: target.sha256,
+        bytes: target.size,
+        executable,
+      }))
+    }
+    discovered.sort((left, right) => compareUtf8(left.sourcePath, right.sourcePath))
+    return Object.freeze(discovered)
+  } catch (error) {
+    primaryError = error
+  }
+
+  const cleanup = await Promise.allSettled([
+    ...[...openHandles].map((handle) => handle.close()),
+    ...(privateRoot === undefined ? [] : [rm(privateRoot, { recursive: true, force: true })]),
+  ])
+  const cleanupErrors = cleanup.filter((result) => result.status === 'rejected').map((result) => result.reason)
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError([primaryError, ...cleanupErrors], primaryError?.message ?? 'Bottle discovery cleanup failed.', { cause: primaryError })
+  }
+  throw primaryError
 }

@@ -281,6 +281,7 @@ export async function discoverMachOClosure({ family, architecture, files, inspec
       if (existing.role !== role || (fixedDestination !== undefined && existing.destination !== fixedDestination)) {
         fail('Verified bottle entry has conflicting closure roles.')
       }
+      if (runtimeRoot) existing.runtimeRoot = true
       return existing
     }
     await verifyDiscoveryFile(file)

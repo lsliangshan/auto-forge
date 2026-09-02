@@ -7,7 +7,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { readVerifiedBottleEntries } from '../../scripts/converter-packs/bottle-archive.mjs'
+import { extractVerifiedBottleForDiscovery, readVerifiedBottleEntries } from '../../scripts/converter-packs/bottle-archive.mjs'
 import { extractVerifiedBottle, materializeBottleUniverse } from '../../scripts/converter-packs/bottle-universe.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 
@@ -165,6 +165,46 @@ function downloadLicenseFixture(root: string) {
 }
 
 describe('converter bottle universe', () => {
+  it('extracts every verified regular bottle entry and internal link into a private discovery root', async () => {
+    const root = temporaryRoot()
+    const executable = Buffer.from('discovery executable')
+    const license = Buffer.from('discovery license')
+    const bottle = writeBottleArchive(root, 'discovery.tar.gz', [
+      { path: 'vips/', type: '5' },
+      { path: 'vips/8.18.6/', type: '5' },
+      { path: 'vips/8.18.6/bin/', type: '5' },
+      { path: 'vips/8.18.6/bin/vips-real', bytes: executable, mode: 0o555 },
+      { path: 'vips/8.18.6/bin/vips', type: '2', linkpath: 'vips-real', mode: 0o777 },
+      { path: 'vips/8.18.6/share/', type: '5' },
+      { path: 'vips/8.18.6/share/LICENSE', bytes: license, mode: 0o444 },
+    ])
+    const outputRoot = join(root, 'private-discovery')
+    mkdirSync(outputRoot, { mode: 0o700 })
+
+    const discovered = await extractVerifiedBottleForDiscovery({
+      archive: bottle.archive,
+      expectedBytes: bottle.compressed.byteLength,
+      expectedSha256: bottle.sha256,
+      formula: 'vips',
+      version: '8.18.6',
+      outputRoot: realpathSync(outputRoot),
+    })
+
+    expect(discovered.map((entry: { sourcePath: string }) => entry.sourcePath)).toEqual([
+      'bin/vips',
+      'bin/vips-real',
+      'share/LICENSE',
+    ])
+    const linked = discovered[0]
+    expect(lstatSync(linked.source).isFile()).toBe(true)
+    expect(lstatSync(linked.source).isSymbolicLink()).toBe(false)
+    expect(readFileSync(linked.source)).toEqual(executable)
+    expect(linked.sha256).toBe(sha256(executable))
+    expect(linked.bytes).toBe(executable.byteLength)
+    expect(statSync(linked.source).mode & 0o777).toBe(0o700)
+    expect(statSync(discovered[2].source).mode & 0o777).toBe(0o600)
+  })
+
   it('materializes one verified formula once for multiple families behind immutable exact lookups', async () => {
     const root = temporaryRoot()
     const executable = Buffer.from('#!/bin/sh\necho vips\n')
