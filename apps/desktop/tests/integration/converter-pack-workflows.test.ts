@@ -15,6 +15,18 @@ const readmePath = join(repositoryRoot, 'apps', 'desktop', 'converter-packs', 'R
 const lockedInputHash = "hashFiles('apps/desktop/converter-packs/sources.lock.json', 'apps/desktop/converter-packs/closures/darwin-arm64.lock.json', 'apps/desktop/converter-packs/closures/darwin-x64.lock.json')"
 
 describe('converter pack workflows', () => {
+  it('pins a published Node runtime for every converter job', () => {
+    const workflows = [checkPath, releasePath, lockPath].map((path) => parse(readFileSync(path, 'utf8')))
+    const nodeVersions = workflows.flatMap((workflow) => (
+      Object.values(workflow.jobs) as Array<{ steps: Array<{ uses?: string, with?: Record<string, unknown> }> }>
+    )).flatMap((job) => job.steps)
+      .filter((step) => step.uses?.startsWith('actions/setup-node@'))
+      .map((step) => step.with?.['node-version'])
+
+    expect(nodeVersions.length).toBeGreaterThan(0)
+    expect(new Set(nodeVersions)).toEqual(new Set(['24.20.0']))
+  })
+
   it('keeps pull-request validation credential-free and release publication protected', async () => {
     await expect(validateConverterPackWorkflows({ checkPath, releasePath, lockPath, packagePath })).resolves.toBeUndefined()
 
