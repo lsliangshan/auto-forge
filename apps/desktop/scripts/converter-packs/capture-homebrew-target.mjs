@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdtemp, open, readFile, readdir, realpath, rm, stat, unlink } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL, URL } from 'node:url'
@@ -761,22 +761,25 @@ export async function captureHomebrewTarget({ target, brew, repositoryRevision, 
   const workspace = await mkdtemp(join(parent, '.converter-lock-capture-'))
   let primaryError
   try {
+    const brewHome = join(workspace, 'home')
+    await mkdir(brewHome, { mode: 0o700 })
+    const brewEnv = Object.freeze({ ...maintainerEnv, HOME: brewHome })
     parseTapInfo(parseJson(await runChecked(
-      run, brew, ['tap-info', '--json=v1', 'homebrew/core'], { cwd: workspace, env: maintainerEnv }, 'Homebrew tap inspection',
+      run, brew, ['tap-info', '--json=v1', 'homebrew/core'], { cwd: workspace, env: brewEnv }, 'Homebrew tap inspection',
     ), 'Homebrew tap metadata'), 'homebrew/core', coreRevision)
     parseTapInfo(parseJson(await runChecked(
-      run, brew, ['tap-info', '--json=v1', 'homebrew/cask'], { cwd: workspace, env: maintainerEnv }, 'Homebrew tap inspection',
+      run, brew, ['tap-info', '--json=v1', 'homebrew/cask'], { cwd: workspace, env: brewEnv }, 'Homebrew tap inspection',
     ), 'Homebrew tap metadata'), 'homebrew/cask', caskRevision)
     const libreOfficeCandidate = roots.engines.find((engine) => engine.name === 'libreoffice')
     const cask = parseCask(parseJson(await runChecked(
-      run, brew, ['info', '--json=v2', '--cask', libreOfficeCandidate.cask], { cwd: workspace, env: maintainerEnv }, 'Homebrew cask inspection',
+      run, brew, ['info', '--json=v2', '--cask', libreOfficeCandidate.cask], { cwd: workspace, env: brewEnv }, 'Homebrew cask inspection',
     ), 'Homebrew cask metadata'), libreOfficeCandidate)
     const dependencies = dependencyNames(await runChecked(
-      run, brew, ['deps', '--union', '--formula', ...roots.formulaRoots], { cwd: workspace, env: maintainerEnv }, 'Homebrew dependency discovery',
+      run, brew, ['deps', '--union', '--formula', ...roots.formulaRoots], { cwd: workspace, env: brewEnv }, 'Homebrew dependency discovery',
     ))
     const names = [...new Set([...roots.formulaRoots, ...dependencies])].sort(compareUtf8)
     const formulae = parseFormulae(parseJson(await runChecked(
-      run, brew, ['info', '--json=v2', '--formula', ...names], { cwd: workspace, env: maintainerEnv }, 'Homebrew formula inspection',
+      run, brew, ['info', '--json=v2', '--formula', ...names], { cwd: workspace, env: brewEnv }, 'Homebrew formula inspection',
     ), 'Homebrew formula metadata'), names, target)
     requireReachable(formulae, roots.formulaRoots)
 

@@ -726,6 +726,9 @@ describe('converter pack lock generation', () => {
       { executable: '/opt/test/bin/brew', args: ['deps', '--union', '--formula', 'ffmpeg', 'poppler', 'vips'] },
       { executable: '/opt/test/bin/brew', args: ['info', '--json=v2', '--formula', 'ffmpeg', 'glib', 'poppler', 'vips'] },
     ])
+    expect(calls.filter(({ executable }) => executable === '/opt/test/bin/brew').every(({ options }) => (
+      typeof options.env.HOME === 'string' && options.env.HOME.startsWith(`${root}/`)
+    ))).toBe(true)
     expect(calls.every(({ options }) => (
       options.env.LANG === 'C'
       && options.env.LC_ALL === 'C'
