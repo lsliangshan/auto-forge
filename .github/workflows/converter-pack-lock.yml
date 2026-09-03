@@ -50,9 +50,9 @@ jobs:
           CORE_REPOSITORY="$(brew --repo homebrew/core)"
           CASK_REPOSITORY="$(brew --repo homebrew/cask)"
           git -C "$CORE_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CORE_REVISION"
-          git -C "$CORE_REPOSITORY" switch --detach -- "$AUTOFORGE_CORE_REVISION"
+          git -C "$CORE_REPOSITORY" switch --detach --discard-changes -- "$AUTOFORGE_CORE_REVISION"
           git -C "$CASK_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CASK_REVISION"
-          git -C "$CASK_REPOSITORY" switch --detach -- "$AUTOFORGE_CASK_REVISION"
+          git -C "$CASK_REPOSITORY" switch --detach --discard-changes -- "$AUTOFORGE_CASK_REVISION"
           test "$(git -C "$CORE_REPOSITORY" rev-parse HEAD)" = "$AUTOFORGE_CORE_REVISION"
           test "$(git -C "$CASK_REPOSITORY" rev-parse HEAD)" = "$AUTOFORGE_CASK_REVISION"
       - name: Capture and probe arm64 closure
@@ -101,9 +101,9 @@ jobs:
           CORE_REPOSITORY="$(brew --repo homebrew/core)"
           CASK_REPOSITORY="$(brew --repo homebrew/cask)"
           git -C "$CORE_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CORE_REVISION"
-          git -C "$CORE_REPOSITORY" switch --detach -- "$AUTOFORGE_CORE_REVISION"
+          git -C "$CORE_REPOSITORY" switch --detach --discard-changes -- "$AUTOFORGE_CORE_REVISION"
           git -C "$CASK_REPOSITORY" fetch --force --depth=1 origin "$AUTOFORGE_CASK_REVISION"
-          git -C "$CASK_REPOSITORY" switch --detach -- "$AUTOFORGE_CASK_REVISION"
+          git -C "$CASK_REPOSITORY" switch --detach --discard-changes -- "$AUTOFORGE_CASK_REVISION"
           test "$(git -C "$CORE_REPOSITORY" rev-parse HEAD)" = "$AUTOFORGE_CORE_REVISION"
           test "$(git -C "$CASK_REPOSITORY" rev-parse HEAD)" = "$AUTOFORGE_CASK_REVISION"
       - name: Capture and probe x64 closure

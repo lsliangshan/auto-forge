@@ -844,8 +844,15 @@ export async function captureHomebrewTargetMain(argv) {
     })
     process.stdout.write('captured verified Homebrew converter target\n')
     return 0
-  } catch {
-    process.stderr.write('converter target capture failed\n')
+  } catch (error) {
+    const reason = error instanceof Error && error.message.length > 0
+      ? error.message.replace(/\p{Cc}/gu, ' ').slice(0, 512)
+      : 'Unexpected capture failure.'
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      process.stderr.write(`::error title=Converter target capture failed::${reason.replaceAll('%', '%25')}\n`)
+    } else {
+      process.stderr.write(`converter target capture failed: ${reason}\n`)
+    }
     return 1
   }
 }

@@ -6,9 +6,9 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parse } from 'yaml'
-import { captureHomebrewTarget, streamCommandToExclusiveFile } from '../../scripts/converter-packs/capture-homebrew-target.mjs'
+import { captureHomebrewTarget, captureHomebrewTargetMain, streamCommandToExclusiveFile } from '../../scripts/converter-packs/capture-homebrew-target.mjs'
 import { generateTransitiveSourceLock } from '../../scripts/converter-packs/generate-transitive-source-lock.mjs'
 import { canonicalBytes } from '../../scripts/converter-packs/pack-tooling-lib.mjs'
 import { loadConverterClosureLock } from '../../scripts/converter-packs/closure-lock.mjs'
@@ -20,6 +20,8 @@ type RunOptions = { cwd: string; env: Record<string, string>; stdoutChunk?: (chu
 type CapturedCall = { executable: string; args: string[]; options: RunOptions }
 
 afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllEnvs()
   for (const root of rootsToRemove.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
@@ -657,7 +659,7 @@ describe('converter pack lock generation', () => {
     }
     const captureSource = JSON.stringify([workflow.jobs.capture_arm64, workflow.jobs.capture_x64])
     expect(captureSource).toContain('converter-packs:capture-lock-target')
-    expect(captureSource).toContain('switch --detach --')
+    expect(captureSource).toContain('switch --detach --discard-changes --')
     expect(captureSource).toContain('core_revision')
     expect(captureSource).toContain('cask_revision')
     expect(captureSource).toContain('apps/desktop/converter-packs/lock-candidates.json')
@@ -665,13 +667,22 @@ describe('converter pack lock generation', () => {
       const pin = workflow.jobs[name].steps.find((step: { name?: string }) => step.name === 'Pin exact Homebrew revisions').run as string
       expect(pin).toMatch(/\^\[0-9a-f\]\{40\}\$/u)
       expect(pin.indexOf('^[0-9a-f]{40}$')).toBeLessThan(pin.indexOf('git -C'))
-      expect(pin).toContain('switch --detach -- "$AUTOFORGE_CORE_REVISION"')
-      expect(pin).toContain('switch --detach -- "$AUTOFORGE_CASK_REVISION"')
+      expect(pin).toContain('switch --detach --discard-changes -- "$AUTOFORGE_CORE_REVISION"')
+      expect(pin).toContain('switch --detach --discard-changes -- "$AUTOFORGE_CASK_REVISION"')
     }
     const mergeSource = JSON.stringify(workflow.jobs.merge)
     expect(mergeSource).toContain('converter-packs:generate-lock')
     expect(mergeSource).toContain('provenance-manifest')
     expect(mergeSource).not.toMatch(/\bgit (?:commit|push)\b|converter-packs:publish/u)
+  })
+
+  it('reports a safe capture failure reason as a workflow annotation', async () => {
+    vi.stubEnv('GITHUB_ACTIONS', 'true')
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+    await expect(captureHomebrewTargetMain([])).resolves.toBe(1)
+
+    expect(stderr).toHaveBeenCalledWith('::error title=Converter target capture failed::All required command arguments must be provided.\n')
   })
 
   it.runIf(process.platform === 'darwin')('captures one canonical target from fixed Homebrew commands and verified downloads', async () => {
