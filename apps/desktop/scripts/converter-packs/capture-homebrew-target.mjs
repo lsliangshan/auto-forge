@@ -370,7 +370,8 @@ function parseFormulae(value, names, target) {
       || formula.dependencies.some((dependency) => typeof dependency !== 'string' || !formulaPattern.test(dependency))
       || byName.has(formula.name)
     ) invalid('Homebrew formula metadata is invalid.')
-    const bottle = formula.bottle?.stable?.files?.[bottleTag(target)]
+    const files = formula.bottle?.stable?.files
+    const bottle = files?.[bottleTag(target)] ?? files?.all
     if (
       !plainRecord(bottle)
       || ![expectedCellar(target), ':any', ':any_skip_relocation'].includes(bottle.cellar)

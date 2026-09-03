@@ -854,6 +854,21 @@ describe('converter pack lock generation', () => {
     await expect(captureWithFixture(root, fixture, run)).rejects.toThrow(/hash|byte/iu)
   })
 
+  it.runIf(process.platform === 'darwin')('accepts an architecture-independent Homebrew bottle', async () => {
+    const root = temporaryRoot()
+    const fixture = captureFixture()
+    const base = syntheticRun(fixture, [])
+    const run = async (executable: string, args: string[], options: RunOptions) => {
+      if (args[0] !== 'info' || args.includes('--cask')) return base(executable, args, options)
+      const json = brewFormulaJson(fixture)
+      const glib = json.formulae.find((formula) => formula.name === 'glib')!
+      glib.bottle.stable.files = { all: Object.values(glib.bottle.stable.files)[0]! }
+      return { status: 0, stdout: canonicalBytes(json), stderr: Buffer.alloc(0) }
+    }
+
+    await expect(captureWithFixture(root, fixture, run)).resolves.toBeUndefined()
+  })
+
   it.runIf(process.platform === 'darwin')('prunes declared Homebrew dependencies that are absent from the authenticated runtime closure', async () => {
     const root = temporaryRoot()
     const fixture = captureFixture()
